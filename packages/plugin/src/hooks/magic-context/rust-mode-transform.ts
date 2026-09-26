@@ -135,6 +135,7 @@ import {
     resolveOrdinalsForModule,
 } from "./module-wire";
 import { onNoteTrigger } from "./note-nudger";
+import { digestOpenCodeServedMessages, recordServedDigests } from "./prefix-bound-thinking";
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
@@ -3695,6 +3696,16 @@ export function createRustModeTransform(
                             frozenReleaseReason = releaseReason;
                         } else {
                             appliedMessages = frozen.messages;
+                            // The stored prefix already carries the binding-mismatch
+                            // strips; the replayed tail comes from the raw input, so
+                            // apply the persisted set there too. A removed thinking
+                            // block must not return on a replayed pass.
+                            replayRustModeBindingMismatchStrips({
+                                db: deps.db,
+                                sessionId,
+                                messages: appliedMessages as MessageLike[],
+                                resolvedProviderID: model?.providerID,
+                            });
                             replayedFrozenRepresentation = true;
                             servedFrom = "lkg_frozen";
                             sessionLog(sessionId, "lkg_frozen_replay_served");
@@ -3728,6 +3739,7 @@ export function createRustModeTransform(
                             model?.providerID,
                             model?.modelID,
                         ),
+                        cacheBustingPass,
                         trailingBlankSourceDecisions,
                         trailingBlankNewestAssistantId:
                             typeof trailingBlankNewestAssistantId === "string"
@@ -3777,6 +3789,14 @@ export function createRustModeTransform(
                 const applyReplaceStartedAt = performance.now();
                 installNativeMessages(output, appliedMessages);
                 logStage(sessionId, "apply", applyReplaceStartedAt, timings);
+                // Record the installed array so the next busting pass can find the
+                // first message it changes relative to these served bytes.
+                if (isPrefixBoundThinkingModel(model?.providerID, model?.modelID)) {
+                    recordServedDigests(
+                        sessionId,
+                        digestOpenCodeServedMessages(output.messages as MessageLike[]),
+                    );
+                }
                 if (thinkingBindingRecovery) {
                     const cleared = clearThinkingBindingRecoveryIf(
                         deps.db,

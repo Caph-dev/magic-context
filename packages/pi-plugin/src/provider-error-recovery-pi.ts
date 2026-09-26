@@ -14,6 +14,12 @@ import {
 	thinkingBindingRecoveryFrozenId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { dropSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import {
+	digestPiServedMessages,
+	firstServedDivergence,
+	getLastServedDigests,
+	recordServedDigests,
+} from "@magic-context/core/hooks/magic-context/prefix-bound-thinking";
 import { log } from "@magic-context/core/shared/logger";
 
 import { clearPiLkgSessionState } from "./pi-lkg";
@@ -235,4 +241,106 @@ export function applyPiThinkingBindingRecovery(args: {
 			stripThinkingParts(args.messages[index]);
 	}
 	return applied;
+}
+
+/** Thinking removed by a busting pass because the same pass changed bytes before it. */
+export interface PiProactiveThinkingStrip {
+	/** Index in the served array of the first message that differs from the previous serve. */
+	firstChangedIndex: number;
+	/** Branch entries whose thinking this pass freezes into the binding-mismatch set. */
+	entryIds: string[];
+}
+
+/**
+ * Remove thinking that this busting pass invalidated on a prefix-bound model
+ * (Fable 5.1, Opus 5.5).
+ *
+ * `messages` is the final array this pass serves, after binding-mismatch strips
+ * were replayed on it. It is compared, message by message, with the digests
+ * recorded for the previous serve. Every assistant entry at or after the first
+ * differing message that still carries thinking is frozen into the same
+ * binding-mismatch set the reactive recovery uses, then stripped: after that
+ * change the provider would drop or reject those blocks anyway. An open tool
+ * round loses its thinking too; its tool call stays. Later passes replay the
+ * set through applyPiThinkingBindingRecovery at the same point of the pass, so
+ * they serve identical bytes, and a removed block never comes back. Thinking
+ * produced after this pass is kept until a later busting pass changes bytes
+ * before it.
+ *
+ * `cacheBustingPass` must be true only on a pass that already busts the cache;
+ * a defer pass never originates a strip.
+ */
+export function applyPiProactiveThinkingStrip(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	messages: unknown[];
+	entryIds: readonly (string | undefined)[];
+	provider?: string;
+	model?: string;
+	cacheBustingPass: boolean;
+	report?: (message: string) => void;
+}): PiProactiveThinkingStrip | null {
+	if (!args.cacheBustingPass) return null;
+	if (!isPrefixBoundThinkingModel(args.provider, args.model)) return null;
+	const previous = getLastServedDigests(args.sessionId);
+	if (!previous) {
+		reportBindingRecovery(
+			args.sessionId,
+			args.report,
+			"proactive thinking strip: no record of the previously served array in this process; binding recovery remains the fallback",
+		);
+		return null;
+	}
+	const firstChangedIndex = firstServedDivergence(
+		previous,
+		digestPiServedMessages(args.messages),
+	);
+	if (firstChangedIndex < 0) return null;
+	const entryIds: string[] = [];
+	const indices: number[] = [];
+	for (
+		let index = firstChangedIndex;
+		index < args.messages.length;
+		index += 1
+	) {
+		const entryId = args.entryIds[index];
+		// Without a stable entry id the strip could not be replayed on later
+		// passes, so it is not started; binding recovery covers that block.
+		if (!entryId || !hasThinkingPart(args.messages[index])) continue;
+		entryIds.push(entryId);
+		indices.push(index);
+	}
+	if (entryIds.length === 0) return null;
+	if (
+		!addMergedReasoningStrippedIds(
+			args.db,
+			args.sessionId,
+			entryIds.map(thinkingBindingRecoveryFrozenId),
+		)
+	) {
+		reportBindingRecovery(
+			args.sessionId,
+			args.report,
+			"proactive thinking strip: persistence failed; serving the thinking unchanged",
+		);
+		return null;
+	}
+	for (const index of indices) stripThinkingParts(args.messages[index]);
+	reportBindingRecovery(
+		args.sessionId,
+		args.report,
+		`proactive thinking strip: first changed served message ${firstChangedIndex} of ${previous.length} previously served; froze thinking of ${entryIds.length} entr${entryIds.length === 1 ? "y" : "ies"} [${entryIds.join(",")}]`,
+	);
+	return { firstChangedIndex, entryIds };
+}
+
+/** Record the array a successful pass served, for prefix-bound models only. */
+export function recordPiServedArrayForThinkingBinding(args: {
+	sessionId: string;
+	messages: readonly unknown[];
+	provider?: string;
+	model?: string;
+}): void {
+	if (!isPrefixBoundThinkingModel(args.provider, args.model)) return;
+	recordServedDigests(args.sessionId, digestPiServedMessages(args.messages));
 }

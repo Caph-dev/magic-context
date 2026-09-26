@@ -66,6 +66,11 @@ import {
     injectM0M1,
     type M0HardSignals,
 } from "./inject-compartments";
+import {
+    digestOpenCodeServedMessages,
+    recordServedDigests,
+    resetServedDigestsForTest,
+} from "./prefix-bound-thinking";
 import * as readSessionFormatting from "./read-session-formatting";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { stripStructuralNoise } from "./strip-structural-noise";
@@ -8961,5 +8966,344 @@ describe("pending-ops and heuristics permission labels", () => {
             "pending ops WILL APPLY — reason=ride=force (scheduler=defer), pendingOps=0, context=96.0%",
         ]);
         expect(publishedHistory).not.toEqual(forceBand);
+    });
+});
+
+// Claude Fable 5.1 and Claude Opus 5.5 bind each signed thinking block to every
+// byte served before it. A pass that busts the cache and changes bytes before
+// existing thinking removes that thinking itself (the provider would drop it or
+// reject the request), and every later pass replays the removal byte-identically.
+describe("proactive strip of thinking invalidated by a busting pass", () => {
+    const sha256 = (value: unknown): string =>
+        createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    const REASONING = new Set(["thinking", "reasoning", "redacted_thinking"]);
+    const reasoningCount = (message: MessageLike): number =>
+        message.parts.filter(
+            (part) =>
+                part !== null &&
+                typeof part === "object" &&
+                REASONING.has(String((part as { type?: unknown }).type)),
+        ).length;
+
+    // user-prefix stands in for the served head (m0/m1 or the first user turn).
+    // The newest assistant holds an open tool round.
+    const buildSession = (
+        sessionId: string,
+        edits: { prefix?: string; userTwo?: string } = {},
+    ): MessageLike[] =>
+        [
+            {
+                info: { id: "user-prefix", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: edits.prefix ?? "original first user message" }],
+            },
+            {
+                info: { id: "assistant-one", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "thinking", thinking: "signed one", signature: "sig-one" },
+                    { type: "text", text: "answer one" },
+                ],
+            },
+            {
+                info: { id: "user-two", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: edits.userTwo ?? "second question" }],
+            },
+            {
+                info: { id: "assistant-two", role: "assistant", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "reasoning",
+                        text: "signed two",
+                        metadata: { anthropic: { signature: "sig-two" } },
+                    },
+                    { type: "text", text: "answer two" },
+                ],
+            },
+            {
+                info: { id: "user-three", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "run the tool" }],
+            },
+            {
+                info: { id: "assistant-open-tool", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "thinking", thinking: "signed three", signature: "sig-three" },
+                    {
+                        type: "tool",
+                        callID: "call-open",
+                        tool: "bash",
+                        state: { status: "completed", input: {}, output: "tool output" },
+                    },
+                ],
+            },
+        ] as unknown as MessageLike[];
+
+    const appendTurn = (
+        messages: MessageLike[],
+        sessionId: string,
+        suffix: string,
+    ): MessageLike[] =>
+        [
+            ...messages,
+            {
+                info: { id: `user-${suffix}`, role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: `question ${suffix}` }],
+            },
+            {
+                info: { id: `assistant-${suffix}`, role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "thinking", thinking: `fresh ${suffix}`, signature: `sig-${suffix}` },
+                    { type: "text", text: `answer ${suffix}` },
+                ],
+            },
+        ] as unknown as MessageLike[];
+
+    // Mirrors transform.ts: postprocess, then record the served array.
+    const serve = async (
+        sessionId: string,
+        messages: MessageLike[],
+        options: { busting: boolean; boundModel?: boolean },
+    ) => {
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: options.boundModel ?? true,
+                ...(options.busting
+                    ? { pendingMaterializationSessions: new Set([sessionId]) }
+                    : { schedulerDecision: "defer" as const }),
+            }),
+        );
+        if (options.boundModel ?? true) {
+            recordServedDigests(sessionId, digestOpenCodeServedMessages(messages));
+        }
+        return result;
+    };
+
+    it("strips every thinking block after an m0-style change; the next defer pass keeps the shared prefix hash", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-m0";
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+
+        const passA = buildSession(sessionId, { prefix: "re-rendered first user message" });
+        const resultA = await serve(sessionId, passA, { busting: true });
+        expect(resultA.bustedThisPass).toBe(true);
+        expect(resultA.proactiveThinkingStrip).toEqual({
+            firstChangedIndex: 0,
+            messageIds: ["assistant-one", "assistant-two", "assistant-open-tool"],
+        });
+        for (const id of ["assistant-one", "assistant-two", "assistant-open-tool"]) {
+            expect(reasoningCount(findMessage(passA, id))).toBe(0);
+        }
+        // The open tool round keeps its tool call.
+        expect(findMessage(passA, "assistant-open-tool").parts[1]).toMatchObject({
+            type: "tool",
+            callID: "call-open",
+        });
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(
+            new Set([
+                "binding_mismatch:assistant-one",
+                "binding_mismatch:assistant-two",
+                "binding_mismatch:assistant-open-tool",
+            ]),
+        );
+
+        const passB = appendTurn(
+            buildSession(sessionId, { prefix: "re-rendered first user message" }),
+            sessionId,
+            "four",
+        );
+        const resultB = await serve(sessionId, passB, { busting: false });
+        expect(resultB.proactiveThinkingStrip).toBeNull();
+        expect(sha256(passB.slice(0, passA.length))).toBe(sha256(passA));
+        expect(reasoningCount(findMessage(passB, "assistant-four"))).toBe(1);
+    });
+
+    it("replays a strip byte-identically on a reasoning-only assistant with a trailing blank", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-trailing-blank";
+        // The trailing-blank normalization treats a message whose last content is
+        // reasoning differently from one whose reasoning became an empty sentinel,
+        // so the pass that first strips must finalize exactly as a replay does.
+        const build = (prefix: string, withTail: boolean): MessageLike[] => {
+            const messages = buildSession(sessionId, { prefix }).slice(0, 3);
+            messages.splice(1, 1, {
+                info: { id: "assistant-one", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "thinking", thinking: "signed one", signature: "sig-one" },
+                    { type: "text", text: " " },
+                ],
+            } as unknown as MessageLike);
+            return withTail ? appendTurn(messages, sessionId, "four") : messages;
+        };
+        await serve(sessionId, build("original", false), { busting: false });
+        const passA = build("re-rendered", false);
+        const resultA = await serve(sessionId, passA, { busting: true });
+        expect(resultA.proactiveThinkingStrip?.messageIds).toEqual(["assistant-one"]);
+        const passB = build("re-rendered", true);
+        await serve(sessionId, passB, { busting: false });
+        expect(sha256(passB.slice(0, passA.length))).toBe(sha256(passA));
+    });
+
+    it("keeps thinking before the first changed message and strips everything after it", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-mid-history";
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+
+        const passA = buildSession(sessionId, { userTwo: "second question [dropped]" });
+        const resultA = await serve(sessionId, passA, { busting: true });
+        expect(resultA.proactiveThinkingStrip).toEqual({
+            firstChangedIndex: 2,
+            messageIds: ["assistant-two", "assistant-open-tool"],
+        });
+        expect(reasoningCount(findMessage(passA, "assistant-one"))).toBe(1);
+        expect(reasoningCount(findMessage(passA, "assistant-two"))).toBe(0);
+        expect(reasoningCount(findMessage(passA, "assistant-open-tool"))).toBe(0);
+    });
+
+    it("never originates a strip on a defer pass, even when the served bytes changed", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-defer";
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+
+        const deferPass = buildSession(sessionId, { prefix: "changed without a bust" });
+        const before = JSON.stringify(deferPass);
+        const result = await serve(sessionId, deferPass, { busting: false });
+        expect(result.proactiveThinkingStrip).toBeNull();
+        expect(JSON.stringify(deferPass)).toBe(before);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+    });
+
+    it("keeps thinking produced after a strip through defer passes until a later bust edits before it", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-multi-pass";
+        const edited = { prefix: "re-rendered first user message" };
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+        const stripped = await serve(sessionId, buildSession(sessionId, edited), {
+            busting: true,
+        });
+        expect(stripped.proactiveThinkingStrip?.messageIds).toHaveLength(3);
+
+        // Thinking produced after the strip survives two defer passes unchanged.
+        const deferOne = appendTurn(buildSession(sessionId, edited), sessionId, "four");
+        await serve(sessionId, deferOne, { busting: false });
+        const deferTwo = appendTurn(buildSession(sessionId, edited), sessionId, "four");
+        const deferTwoResult = await serve(sessionId, deferTwo, { busting: false });
+        expect(deferTwoResult.proactiveThinkingStrip).toBeNull();
+        expect(reasoningCount(findMessage(deferTwo, "assistant-four"))).toBe(1);
+        expect(sha256(deferTwo)).toBe(sha256(deferOne));
+
+        // A busting pass that changes nothing served before it keeps it too.
+        const quietBust = appendTurn(buildSession(sessionId, edited), sessionId, "four");
+        const quietResult = await serve(sessionId, quietBust, { busting: true });
+        expect(quietResult.proactiveThinkingStrip).toBeNull();
+        expect(sha256(quietBust)).toBe(sha256(deferOne));
+
+        // The next bust that edits before it strips it, and only it is new.
+        const editingBust = appendTurn(
+            buildSession(sessionId, { ...edited, userTwo: "second question [dropped]" }),
+            sessionId,
+            "four",
+        );
+        const editingResult = await serve(sessionId, editingBust, { busting: true });
+        expect(editingResult.proactiveThinkingStrip).toEqual({
+            firstChangedIndex: 2,
+            messageIds: ["assistant-four"],
+        });
+        expect(reasoningCount(findMessage(editingBust, "assistant-four"))).toBe(0);
+    });
+
+    it("leaves sessions on other models byte-identical on a busting pass", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-other-model";
+        // A prior record exists, so only the model gate can keep the thinking.
+        recordServedDigests(sessionId, digestOpenCodeServedMessages(buildSession(sessionId)));
+        const pass = buildSession(sessionId, { prefix: "re-rendered first user message" });
+        const before = JSON.stringify(pass);
+        const result = await serve(sessionId, pass, { busting: true, boundModel: false });
+        expect(result.proactiveThinkingStrip).toBeNull();
+        expect(JSON.stringify(pass)).toBe(before);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+    });
+
+    it("does not strip without a record of the previously served array", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-no-record";
+        const pass = buildSession(sessionId, { prefix: "re-rendered first user message" });
+        const before = JSON.stringify(pass);
+        const result = await serve(sessionId, pass, { busting: true });
+        expect(result.proactiveThinkingStrip).toBeNull();
+        expect(JSON.stringify(pass)).toBe(before);
+    });
+
+    it("strips through Rust-mode host postprocess only on a busting pass and replays it", () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-rust";
+        const postprocess = (messages: MessageLike[], cacheBustingPass: boolean) => {
+            const result = runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                fullFeatureMode: true,
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                cacheBustingPass,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: true, frozen: true },
+            });
+            recordServedDigests(sessionId, digestOpenCodeServedMessages(messages));
+            return result;
+        };
+        const edited = { prefix: "re-rendered first user message" };
+        postprocess(buildSession(sessionId), false);
+
+        const deferChange = buildSession(sessionId, edited);
+        const deferBefore = JSON.stringify(deferChange);
+        expect(postprocess(deferChange, false).proactiveThinkingStrip).toBeNull();
+        expect(JSON.stringify(deferChange)).toBe(deferBefore);
+
+        const busting = buildSession(sessionId, {
+            ...edited,
+            userTwo: "second question [dropped]",
+        });
+        expect(postprocess(busting, true).proactiveThinkingStrip).toEqual({
+            firstChangedIndex: 2,
+            messageIds: ["assistant-two", "assistant-open-tool"],
+        });
+        expect(reasoningCount(findMessage(busting, "assistant-one"))).toBe(1);
+
+        const defer = appendTurn(
+            buildSession(sessionId, { ...edited, userTwo: "second question [dropped]" }),
+            sessionId,
+            "four",
+        );
+        expect(postprocess(defer, false).proactiveThinkingStrip).toBeNull();
+        expect(sha256(defer.slice(0, busting.length))).toBe(sha256(busting));
+
+        // The last-known-good replay applies the same persisted set.
+        const lkgReplay = buildSession(sessionId, {
+            ...edited,
+            userTwo: "second question [dropped]",
+        });
+        replayRustModeBindingMismatchStrips({
+            db,
+            sessionId,
+            messages: lkgReplay,
+            resolvedProviderID: "anthropic",
+        });
+        expect(sha256(lkgReplay)).toBe(sha256(busting));
     });
 });

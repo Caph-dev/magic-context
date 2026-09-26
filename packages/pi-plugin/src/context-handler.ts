@@ -279,7 +279,11 @@ import {
 } from "./pi-pressure";
 import { assertPiRawFallbackFits, PiStorageBusyError } from "./pi-raw-fallback";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
-import { applyPiThinkingBindingRecovery } from "./provider-error-recovery-pi";
+import {
+	applyPiProactiveThinkingStrip,
+	applyPiThinkingBindingRecovery,
+	recordPiServedArrayForThinkingBinding,
+} from "./provider-error-recovery-pi";
 import {
 	convertEntriesToRawMessagePage,
 	convertEntriesToRawMessages,
@@ -2490,14 +2494,16 @@ export function registerPiContextHandler(
 			const lkgInputIdByRef = new Map<unknown, string>();
 			for (const input of lkgPassSnapshot.inputs)
 				lkgInputIdByRef.set(event.messages[input.messageIndex], input.id);
-			const thinkingBindingRecoveryApplied = applyPiThinkingBindingRecovery({
-				db: options.db,
-				sessionId,
-				messages: event.messages as unknown[],
-				entryIds: lkgEntryIds ?? [],
-				provider: lkgProviderKey ?? undefined,
-				model: ctx.model?.id,
-			});
+			// Binding-mismatch strips run on the final array at the end of the pass,
+			// so every stage sees the same thinking on every pass. This map keeps the
+			// input entry ids reachable for messages the pipeline leaves in place.
+			const bindingEntryIdByRef = new Map<unknown, string>();
+			if (lkgEntryIds) {
+				for (let index = 0; index < event.messages.length; index += 1) {
+					const entryId = lkgEntryIds[index];
+					if (entryId) bindingEntryIdByRef.set(event.messages[index], entryId);
+				}
+			}
 			const tMeta = performance.now();
 			const sessionMetaForUsage = getOrCreateSessionMeta(options.db, sessionId);
 			sessionMetaForPass = sessionMetaForUsage;
@@ -3518,6 +3524,56 @@ export function registerPiContextHandler(
 			}
 			logTransformTiming(sessionId, "todoCapture", tTodoCapture);
 
+			// Thinking-binding strips run last, on the array this pass serves, so the
+			// pipeline sees the same thinking on every pass: a stage whose output
+			// depends on whether an assistant carries thinking (a dropped tool arc
+			// kept as a skeleton beside native reasoning, for example) then renders
+			// identically on the pass that first strips a block and on every later
+			// pass that replays the strip. Replays and an armed recovery come first;
+			// a busting pass then removes the thinking its own edit invalidated.
+			const tThinkingBinding = performance.now();
+			const outputEntryIds = resolvePiLkgOutputEntryIds(
+				outputMessages,
+				result.syntheticLeadingCount,
+				(message) =>
+					result.lkgEntryIdByRef.get(message) ??
+					result.postCommitEntryIdByRef.get(message) ??
+					bindingEntryIdByRef.get(message),
+			).map((entryId) => entryId ?? undefined);
+			const thinkingBindingRecoveryApplied = applyPiThinkingBindingRecovery({
+				db: options.db,
+				sessionId,
+				messages: outputMessages as unknown[],
+				entryIds: outputEntryIds,
+				provider: lkgProviderKey ?? undefined,
+				model: ctx.model?.id,
+			});
+			if (!options.compactionOff) {
+				try {
+					applyPiProactiveThinkingStrip({
+						db: options.db,
+						sessionId,
+						messages: outputMessages as unknown[],
+						entryIds: outputEntryIds,
+						provider: lkgProviderKey ?? undefined,
+						model: ctx.model?.id,
+						// The shared bust permission (the same one synthetic todo
+						// injection uses), or a bust the pipeline already made.
+						cacheBustingPass:
+							isCacheBusting ||
+							result.executedWorkThisPass ||
+							result.bustedThisPass,
+						report: (line) => sessionLog(sessionId, line),
+					});
+				} catch (err) {
+					sessionLog(
+						sessionId,
+						`proactive thinking strip failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+			}
+			logTransformTiming(sessionId, "thinkingBinding", tThinkingBinding);
+
 			// Walk Pi's final rendered entry stream once to calculate both nudge-channel
 			// totals. A cache-busting pass replaces the saved baseline; a deferred pass
 			// keeps it and adds only newly appended content and protection-boundary moves.
@@ -3757,6 +3813,12 @@ export function registerPiContextHandler(
 				});
 			}
 			capturePiServedArray(sessionId, outputMessages);
+			recordPiServedArrayForThinkingBinding({
+				sessionId,
+				messages: outputMessages,
+				provider: lkgProviderKey ?? undefined,
+				model: ctx.model?.id,
+			});
 			if (thinkingBindingRecoveryApplied) {
 				try {
 					clearThinkingBindingRecoveryIf(

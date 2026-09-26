@@ -199,6 +199,34 @@ Recommendations 1 and 2 are implemented after this report:
 - **Served bytes.** Bytes change only on sessions using the `anthropic` provider with Fable 5.1 or Opus 5.5, and only after a binding 400 armed the flag. On the first live pass after the arm, every reasoning part still on the wire becomes an empty text sentinel. Later passes (defer included, plus the Rust last-known-good replay) replay that frozen set byte-identically. Sessions that never hit the 400 serve unchanged bytes.
 - **Not covered: Bedrock and Vertex.** The arm and `stripReasoningFromAssistantIds` still require `providerID === "anthropic"`, although the page says cloud platforms enforce the same rule for new accounts.
 
+## Follow-up: proactive strip on busting passes
+
+Owner ruling of 2026-09-26: a pass that already busts the cache removes the thinking its own edit invalidated, instead of sending blocks that older accounts drop silently, `drop_block` drops, and new accounts reject with a 400. Nothing is lost on cost (dropped blocks are not billed), and plain API-key OpenCode and Pi, where MC cannot send `drop_block`, get no failed turn. The reactive recovery above stays as the backstop.
+
+- **Where the change is found.** Each served pass on a prefix-bound model records one digest per served message (OpenCode: role plus parts; Pi: the whole AgentMessage) in process memory (`hooks/magic-context/prefix-bound-thinking.ts`). A busting pass compares the array it is about to serve with that record. The first differing index is the first changed position, whichever lane made the change. Every assistant at or after it that still sends `reasoning`, `thinking` or `redacted_thinking` is frozen into the same `binding_mismatch:` set the recovery uses, then stripped. The open tool round is included and keeps its tool call.
+- **Which passes.** Only passes holding the shared bust permission, or on which a lane already busted: TS `isCacheBustingPass || bustedThisPass` (captured before the recovery can set it), Rust mode the module's HARD, MIGRATE_HARD, EXECUTE or SOFT decision (or a released frozen replay), Pi the same permission synthetic todo injection uses (`isCacheBusting || executedWorkThisPass || bustedThisPass`). A defer pass never originates a strip, even when its bytes changed.
+- **Replay.** Every later pass replays the set at the same point of the pass. TS decides on a detached copy of the finalized array and then finalizes the real array with the extended set, so the stripping pass and a replay run the same finalization (the trailing-blank normalization depends on whether reasoning is present, so stripping after finalization would not replay byte-identically). Rust mode strips last in host postprocess. Pi now runs the whole binding strip (replay, armed recovery, proactive) at the end of the context pass instead of the start, so every pipeline stage sees the same thinking on every pass (a dropped tool arc beside native reasoning is kept as a skeleton, for example). The Rust frozen last-known-good replay and the TS last-known-good replay now also apply the persisted set to the replayed raw tail.
+
+### Served bytes that change, and on which passes
+
+| Lane | Pass | Bytes that change |
+|---|---|---|
+| OpenCode 1/2, TS mode | busting pass whose array differs from the previous serve at index *i*, on Fable 5.1 / Opus 5.5 | every reasoning part of every assistant at index ≥ *i* becomes the empty text sentinel `{"type":"text","text":""}`, which the Anthropic adapter removes before the wire |
+| OpenCode, Rust mode | same, in host postprocess | same |
+| Pi | same, at the end of the context pass | the `thinking` / `redacted_thinking` parts of those assistant entries are removed from `content` |
+| all three | every later pass | the same parts, replayed from the persisted set |
+| TS and Rust last-known-good replays | replayed pass | already-frozen thinking in the replayed tail is stripped (sessions with `binding_mismatch:` entries only) |
+| Pi, sessions already carrying recovery strips | first pass on this build | may change once where a stage renders differently with thinking present, because the strip moved to the end of the pass |
+
+Sessions on every other model are byte-identical: no digest is computed and nothing is stripped. On the bound models, a defer pass and a busting pass that changes nothing before existing thinking serve exactly what they served before.
+
+### Limits
+
+- The record lives in process memory. After a restart, or for a session another process served last, the first busting pass has nothing to compare against and strips nothing; the reactive recovery covers that pass. A record left by another process's older serve can only report an earlier change, so it strips more, never less.
+- Pi strips only entries with a stable branch entry id, as the recovery does. The Pi last-known-good replay on a transient storage failure and the raw fallback do not reapply the set (the store is unreadable or MC's edits are not served at all).
+- Bedrock and Vertex stay uncovered (`providerID === "anthropic"`), as for the recovery.
+- Cost on the bound models: one JSON serialization and SHA-256 per served message per pass, plus, on a busting pass in TS mode, one structured clone and one extra finalization of the array.
+
 ## Not done / caveats
 
 - The `tool_result`-shortening specimen was not captured: the account hit the extra-usage limit. The row is covered only by the page.

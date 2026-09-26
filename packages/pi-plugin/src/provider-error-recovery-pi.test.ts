@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	clearThinkingBindingRecoveryIf,
 	getMergedReasoningStrippedIds,
@@ -6,12 +7,15 @@ import {
 	getThinkingBindingRecoveryTarget,
 	resetEmergencyRecoveryRegistryForTest,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { resetServedDigestsForTest } from "@magic-context/core/hooks/magic-context/prefix-bound-thinking";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import {
+	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
 	handlePiProviderFailure,
+	recordPiServedArrayForThinkingBinding,
 } from "./provider-error-recovery-pi";
 import { createTestDb } from "./test-utils.test";
 
@@ -293,5 +297,209 @@ describe("Pi provider failure recovery", () => {
 				detectedContextLimit: overflow.detectedContextLimit,
 			}),
 		).toBe(64_000);
+	});
+});
+
+// Claude Fable 5.1 and Claude Opus 5.5 bind each thinking block to every byte
+// served before it. A busting pass that changes bytes before existing thinking
+// removes that thinking itself; later passes replay the removal byte-identically.
+describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
+	const ENTRY_IDS = ["u1", "a1", "u2", "a2", "u3", "a3", "tr3"];
+	const sha256 = (value: unknown) =>
+		createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	const thinkingCount = (message: unknown) =>
+		(
+			(message as { content?: unknown }).content as
+				| { type?: string }[]
+				| undefined
+		)?.filter?.((part) => part.type === "thinking").length ?? 0;
+
+	function session(edits: { first?: string; second?: string } = {}): unknown[] {
+		const messages = multiAssistantOpenToolMessages();
+		(messages[0] as { content: string }).content =
+			edits.first ?? "original first message";
+		(messages[2] as { content: string }).content = edits.second ?? "second";
+		return messages;
+	}
+
+	function withFreshTurn(messages: unknown[]): {
+		messages: unknown[];
+		entryIds: string[];
+	} {
+		return {
+			messages: [
+				...messages,
+				{ role: "user", content: "next", timestamp: 8 },
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "fresh", thinkingSignature: "sig-f" },
+						{ type: "text", text: "fresh answer" },
+					],
+					provider: "anthropic",
+					model: "claude-opus-5-5",
+					timestamp: 9,
+				},
+			],
+			entryIds: [...ENTRY_IDS, "u4", "a4"],
+		};
+	}
+
+	// Mirrors the context handler: replay persisted strips, strip what this
+	// pass invalidated, then record the served array.
+	function serve(
+		database: ReturnType<typeof db>,
+		sessionId: string,
+		messages: unknown[],
+		busting: boolean,
+		entryIds: readonly string[] = ENTRY_IDS,
+		model = "claude-opus-5-5",
+	) {
+		applyPiThinkingBindingRecovery({
+			db: database,
+			sessionId,
+			messages,
+			entryIds,
+			provider: "anthropic",
+			model,
+		});
+		const strip = applyPiProactiveThinkingStrip({
+			db: database,
+			sessionId,
+			messages,
+			entryIds,
+			provider: "anthropic",
+			model,
+			cacheBustingPass: busting,
+			report: () => {},
+		});
+		recordPiServedArrayForThinkingBinding({
+			sessionId,
+			messages,
+			provider: "anthropic",
+			model,
+		});
+		return strip;
+	}
+
+	afterEach(() => resetServedDigestsForTest());
+
+	it("strips every block after an m0-style change; the next defer pass keeps the shared prefix hash", () => {
+		const database = db();
+		const sessionId = "pi-proactive-m0";
+		serve(database, sessionId, session(), false);
+
+		const passA = session({ first: "re-rendered first message" });
+		expect(serve(database, sessionId, passA, true)).toEqual({
+			firstChangedIndex: 0,
+			entryIds: ["a1", "a2", "a3"],
+		});
+		expect([1, 3, 5].map((index) => thinkingCount(passA[index]))).toEqual([
+			0, 0, 0,
+		]);
+		// The open tool round keeps its tool call.
+		expect(passA[5]).toMatchObject({
+			content: [{ type: "toolCall", id: "call-open" }],
+		});
+		expect(getMergedReasoningStrippedIds(database, sessionId)).toEqual(
+			new Set([
+				"binding_mismatch:a1",
+				"binding_mismatch:a2",
+				"binding_mismatch:a3",
+			]),
+		);
+
+		const passB = withFreshTurn(
+			session({ first: "re-rendered first message" }),
+		);
+		expect(
+			serve(database, sessionId, passB.messages, false, passB.entryIds),
+		).toBeNull();
+		expect(sha256(passB.messages.slice(0, passA.length))).toBe(sha256(passA));
+		expect(thinkingCount(passB.messages.at(-1))).toBe(1);
+	});
+
+	it("keeps thinking before the first changed message", () => {
+		const database = db();
+		const sessionId = "pi-proactive-mid-history";
+		serve(database, sessionId, session(), false);
+		const pass = session({ second: "second [dropped]" });
+		expect(serve(database, sessionId, pass, true)).toEqual({
+			firstChangedIndex: 2,
+			entryIds: ["a2", "a3"],
+		});
+		expect(thinkingCount(pass[1])).toBe(1);
+	});
+
+	it("never originates a strip on a defer pass", () => {
+		const database = db();
+		const sessionId = "pi-proactive-defer";
+		serve(database, sessionId, session(), false);
+		const pass = session({ first: "changed without a bust" });
+		const before = JSON.stringify(pass);
+		expect(serve(database, sessionId, pass, false)).toBeNull();
+		expect(JSON.stringify(pass)).toBe(before);
+		expect(getMergedReasoningStrippedIds(database, sessionId)).toEqual(
+			new Set(),
+		);
+	});
+
+	it("keeps thinking produced after a strip until a later bust edits before it", () => {
+		const database = db();
+		const sessionId = "pi-proactive-multi-pass";
+		const edited = { first: "re-rendered first message" };
+		serve(database, sessionId, session(), false);
+		serve(database, sessionId, session(edited), true);
+
+		const deferOne = withFreshTurn(session(edited));
+		serve(database, sessionId, deferOne.messages, false, deferOne.entryIds);
+		const deferTwo = withFreshTurn(session(edited));
+		expect(
+			serve(database, sessionId, deferTwo.messages, false, deferTwo.entryIds),
+		).toBeNull();
+		expect(thinkingCount(deferTwo.messages.at(-1))).toBe(1);
+		expect(sha256(deferTwo.messages)).toBe(sha256(deferOne.messages));
+
+		const quietBust = withFreshTurn(session(edited));
+		expect(
+			serve(database, sessionId, quietBust.messages, true, quietBust.entryIds),
+		).toBeNull();
+		expect(thinkingCount(quietBust.messages.at(-1))).toBe(1);
+
+		const editingBust = withFreshTurn(
+			session({ ...edited, second: "second [dropped]" }),
+		);
+		expect(
+			serve(
+				database,
+				sessionId,
+				editingBust.messages,
+				true,
+				editingBust.entryIds,
+			),
+		).toEqual({ firstChangedIndex: 2, entryIds: ["a4"] });
+		expect(thinkingCount(editingBust.messages.at(-1))).toBe(0);
+	});
+
+	it("leaves sessions on other models byte-identical", () => {
+		const database = db();
+		const sessionId = "pi-proactive-other-model";
+		serve(database, sessionId, session(), false, ENTRY_IDS, "claude-opus-4-1");
+		// Seed a record directly, so only the model gate can keep the thinking.
+		recordPiServedArrayForThinkingBinding({
+			sessionId,
+			messages: session(),
+			provider: "anthropic",
+			model: "claude-fable-5-1",
+		});
+		const pass = session({ first: "re-rendered first message" });
+		const before = JSON.stringify(pass);
+		expect(
+			serve(database, sessionId, pass, true, ENTRY_IDS, "claude-opus-4-1"),
+		).toBeNull();
+		expect(JSON.stringify(pass)).toBe(before);
+		expect(getMergedReasoningStrippedIds(database, sessionId)).toEqual(
+			new Set(),
+		);
 	});
 });

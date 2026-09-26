@@ -124,6 +124,7 @@ import { captureLkgSlot, projectLkgEntry, resolveLkgModelKeys } from "./lkg-repl
 import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
+import { digestOpenCodeServedMessages, recordServedDigests } from "./prefix-bound-thinking";
 import {
     createDefaultBoundarySnapshotForTests,
     hasRunnableCompartmentWindow,
@@ -3060,6 +3061,14 @@ export function createTransform(deps: TransformDeps) {
         );
 
         deps.maybeAutoEmbedSession?.(sessionId);
+
+        // The array is final and about to be served. Record it so the next busting
+        // pass can find the first message it changes relative to these bytes.
+        if (isPrefixBoundThinkingModel(modelForBudget?.providerID, modelForBudget?.modelID)) {
+            const tServedDigests = performance.now();
+            recordServedDigests(sessionId, digestOpenCodeServedMessages(messages));
+            logTransformTiming(sessionId, "servedDigests", tServedDigests);
+        }
 
         const bindingRecovery = postTransformResult.thinkingBindingRecovery;
         if (bindingRecovery) {

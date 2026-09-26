@@ -121,6 +121,11 @@ import {
     postprocessReplaySnapshot,
     postprocessTailTags,
 } from "./postprocess-read-cache";
+import {
+    digestOpenCodeServedMessages,
+    firstServedDivergence,
+    getLastServedDigests,
+} from "./prefix-bound-thinking";
 import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
@@ -472,6 +477,115 @@ function freezeAllReasoningForBindingRecovery(args: {
     return { flagTarget: args.flagTarget, messageIds };
 }
 
+/** Thinking removed by a busting pass because the same pass changed bytes before it. */
+export interface ProactiveThinkingStrip {
+    /** Index in the served array of the first message that differs from the previous serve. */
+    firstChangedIndex: number;
+    /** Assistants whose reasoning this pass freezes into the binding-mismatch strip set. */
+    messageIds: string[];
+}
+
+/**
+ * Freeze reasoning that this busting pass invalidates on a prefix-bound model
+ * (Fable 5.1, Opus 5.5).
+ *
+ * `served` is the array exactly as this pass would serve it without the new
+ * strips. It is compared, message by message, with the digests recorded for
+ * the previous serve; every assistant at or after the first differing message
+ * that still sends reasoning is frozen. That includes an open tool round, whose
+ * thinking is just as invalid; its tool call stays. The first changed message
+ * itself is included because the change may sit before its own thinking.
+ *
+ * The ids go into the same binding-mismatch set the reactive recovery uses, so
+ * every later pass (defer passes and last-known-good replays included) removes
+ * the same blocks, and a removed block never comes back. Reasoning produced
+ * after this pass is not in the set and is kept until a later busting pass
+ * changes bytes before it.
+ *
+ * Callers must invoke this only on a pass that already busts the cache: it
+ * never originates a byte change on a defer pass.
+ */
+export function freezeThinkingInvalidatedByThisPass(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    served: MessageLike[];
+    alreadyFrozen: ReadonlySet<string>;
+}): { strip: ProactiveThinkingStrip | null; persistenceFailed: boolean } {
+    const previous = getLastServedDigests(args.sessionId);
+    if (!previous) {
+        sessionLog(
+            args.sessionId,
+            "proactive thinking strip: no record of the previously served array in this process; binding recovery remains the fallback",
+        );
+        return { strip: null, persistenceFailed: false };
+    }
+    const firstChangedIndex = firstServedDivergence(
+        previous,
+        digestOpenCodeServedMessages(args.served),
+    );
+    if (firstChangedIndex < 0) return { strip: null, persistenceFailed: false };
+    const messageIds = findReasoningBearingAssistantIds(
+        args.served.slice(firstChangedIndex),
+    ).filter((id) => !args.alreadyFrozen.has(id));
+    if (messageIds.length === 0) return { strip: null, persistenceFailed: false };
+    if (
+        !addMergedReasoningStrippedIds(
+            args.db,
+            args.sessionId,
+            messageIds.map(thinkingBindingRecoveryFrozenId),
+        )
+    ) {
+        return { strip: null, persistenceFailed: true };
+    }
+    sessionLog(
+        args.sessionId,
+        `proactive thinking strip: first changed served message ${firstChangedIndex} of ${previous.length} previously served; froze reasoning of ${messageIds.length} assistant(s) [${messageIds.join(",")}]`,
+    );
+    return { strip: { firstChangedIndex, messageIds }, persistenceFailed: false };
+}
+
+/**
+ * Run the final representation on a detached copy, so a busting pass can see
+ * the exact array it is about to serve before deciding which reasoning it has
+ * invalidated. Identity-keyed options are remapped onto the copy. Returns null
+ * when the messages cannot be copied.
+ */
+function finalizeDetachedCopy(
+    messages: MessageLike[],
+    resolvedProviderID: string | undefined,
+    options: FinalizeMessageRepresentationOptions,
+): MessageLike[] | null {
+    let copy: MessageLike[];
+    try {
+        copy = structuredClone(messages);
+    } catch {
+        try {
+            copy = JSON.parse(JSON.stringify(messages)) as MessageLike[];
+        } catch {
+            return null;
+        }
+    }
+    const copyByOriginal = new Map<MessageLike, MessageLike>();
+    messages.forEach((message, index) => {
+        const copied = copy[index];
+        if (copied) copyByOriginal.set(message, copied);
+    });
+    const reasoningMutatedMessages: MessageLike[] = [];
+    for (const message of options.reasoningMutatedMessages ?? []) {
+        // A mutated message outside the served array cannot change served bytes.
+        const copied = copyByOriginal.get(message);
+        if (copied) reasoningMutatedMessages.push(copied);
+    }
+    finalizeMessageRepresentation(copy, resolvedProviderID, {
+        ...options,
+        reasoningMutatedMessages,
+        reasoningMutationExemptMessage: options.reasoningMutationExemptMessage
+            ? copyByOriginal.get(options.reasoningMutationExemptMessage)
+            : undefined,
+    });
+    return copy;
+}
+
 /** Reapply durable binding-mismatch strips when a Rust LKG snapshot is replayed. */
 export function replayRustModeBindingMismatchStrips(args: {
     db: ContextDatabase;
@@ -693,16 +807,23 @@ export function runRustModePostprocess(args: {
     compactionOff?: boolean;
     resolvedProviderID?: string;
     thinkingBindingRecoveryEnabledForModel?: boolean;
+    /**
+     * The module's decision busts the cache on this pass (HARD, EXECUTE, SOFT, or
+     * a released frozen replay). Only such a pass may freeze thinking that its
+     * own edit invalidated.
+     */
+    cacheBustingPass?: boolean;
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     trailingBlankNewestAssistantId?: string;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
 }): {
     thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null;
+    proactiveThinkingStrip: ProactiveThinkingStrip | null;
     markerAt: string | null;
 } {
     if (!args.fullFeatureMode || args.compactionOff) {
-        return { thinkingBindingRecovery: null, markerAt: null };
+        return { thinkingBindingRecovery: null, proactiveThinkingStrip: null, markerAt: null };
     }
     // Test doubles and older integrations may return the legacy bare message shape.
     // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
@@ -715,7 +836,7 @@ export function runRustModePostprocess(args: {
                 !isRecord((message as { info?: unknown }).info),
         )
     ) {
-        return { thinkingBindingRecovery: null, markerAt: null };
+        return { thinkingBindingRecovery: null, proactiveThinkingStrip: null, markerAt: null };
     }
     applyRustModeDeferredCompactionMarker({
         ...(args.compactionMarkerStrategy
@@ -860,9 +981,45 @@ export function runRustModePostprocess(args: {
         }
         stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
     }
+    // The binding-mismatch strip above is the last change to the served array,
+    // so the array now is exactly what this pass serves. A busting pass freezes
+    // the reasoning its own edit invalidated and strips it the same way; a later
+    // pass strips the whole set in the one call above, which yields the same
+    // bytes because each message is stripped independently.
+    let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
+    if (
+        modelAcceptsEmptyContent(args.resolvedProviderID) &&
+        args.thinkingBindingRecoveryEnabledForModel === true &&
+        args.cacheBustingPass === true
+    ) {
+        try {
+            const outcome = freezeThinkingInvalidatedByThisPass({
+                db: args.db,
+                sessionId: args.sessionId,
+                served: args.messages,
+                alreadyFrozen: recoveryMessageIds,
+            });
+            if (outcome.strip) {
+                proactiveThinkingStrip = outcome.strip;
+                stripReasoningFromAssistantIds(
+                    args.messages,
+                    args.resolvedProviderID,
+                    new Set(outcome.strip.messageIds),
+                );
+            } else if (outcome.persistenceFailed) {
+                sessionLog(
+                    args.sessionId,
+                    "rust proactive thinking strip: persistence failed; serving the thinking unchanged",
+                );
+            }
+        } catch (error) {
+            sessionLog(args.sessionId, "rust proactive thinking strip failed:", error);
+        }
+    }
     const marker = getPersistedCompactionMarkerState(args.db, args.sessionId);
     return {
         thinkingBindingRecovery,
+        proactiveThinkingStrip,
         markerAt: marker?.targetEndMessageId ?? marker?.boundaryMessageId ?? null,
     };
 }
@@ -1193,7 +1350,12 @@ interface RunPostTransformPhaseArgs {
      * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
-    /** True only when the live request is canonical Anthropic Fable 5.1. */
+    /**
+     * True only when the live request uses a model whose signed thinking is
+     * bound to its prefix (isPrefixBoundThinkingModel: Anthropic Fable 5.1 or
+     * Opus 5.5). Gates both the reactive binding recovery and the proactive
+     * strip of thinking that a busting pass invalidates.
+     */
     thinkingBindingRecoveryEnabledForModel?: boolean;
     /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
@@ -1236,6 +1398,8 @@ export interface PostTransformPhaseResult {
     bustedThisPass: boolean;
     /** Pending flag applied to the live output; the caller clears it only after the live lane succeeds. */
     thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null;
+    /** Thinking this busting pass removed because its own edit invalidated it. */
+    proactiveThinkingStrip: ProactiveThinkingStrip | null;
 }
 
 export interface ConfirmedAbortClient {
@@ -1319,19 +1483,21 @@ export function evaluateEmergencyFailClosed(input: {
     };
 }
 
+export interface FinalizeMessageRepresentationOptions {
+    prependedMessageCount?: number;
+    reasoningMutatedMessages?: Iterable<MessageLike>;
+    reasoningMutationExemptMessage?: MessageLike;
+    mergedReasoningStrippedIds?: ReadonlySet<string>;
+    thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
+    trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
+    skipMergedReasoningStrip?: boolean;
+    skipTrailingWhitespaceStrip?: boolean;
+}
+
 export function finalizeMessageRepresentation(
     messages: MessageLike[],
     resolvedProviderID?: string,
-    options?: {
-        prependedMessageCount?: number;
-        reasoningMutatedMessages?: Iterable<MessageLike>;
-        reasoningMutationExemptMessage?: MessageLike;
-        mergedReasoningStrippedIds?: ReadonlySet<string>;
-        thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
-        trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
-        skipMergedReasoningStrip?: boolean;
-        skipTrailingWhitespaceStrip?: boolean;
-    },
+    options?: FinalizeMessageRepresentationOptions,
 ): { clearedParts: number; mergedReasoningParts: number } {
     let clearedParts = 0;
     if (modelAcceptsEmptyContent(resolvedProviderID)) {
@@ -2814,6 +2980,10 @@ export async function runPostTransformPhase(
         m0RematerializedThisPass ||
         (m0M1InjectedThisPass && historyWasConsumedThisPass) ||
         historyWasConsumedThisPass;
+    // The proactive thinking strip rides the shared bust permission, or a bust a
+    // lane above already made. Captured before the binding recovery below can set
+    // bustedThisPass on a defer pass, so a defer pass never originates a strip.
+    const proactiveThinkingStripPermitted = isCacheBustingPass || bustedThisPass;
 
     // Final representation strips run once, after all topology mutations; execute
     // and defer must serialize identical prefixes. Do not add message, tool-target,
@@ -3040,20 +3210,77 @@ export async function runPostTransformPhase(
     }
 
     logTransformTiming(args.sessionId, "pp.frozenDecisions", tFrozenDecisions);
+    const finalizeOptions: FinalizeMessageRepresentationOptions = {
+        prependedMessageCount,
+        reasoningMutatedMessages,
+        reasoningMutationExemptMessage,
+        mergedReasoningStrippedIds,
+        thinkingBindingRecoveryMessageIds,
+        trailingBlankDecisions,
+        skipMergedReasoningStrip: compactionOff,
+        skipTrailingWhitespaceStrip: compactionOff,
+    };
+
+    // On a prefix-bound model, a busting pass that changes served bytes before
+    // existing signed thinking removes that thinking itself instead of sending
+    // blocks the provider will drop or reject. The decision is taken on a
+    // detached copy of the exact array this pass would serve; the chosen ids
+    // then join the binding-mismatch set, which the real finalization below
+    // strips first. A later pass replays that same set through the same
+    // finalization, so both passes serve identical bytes.
+    let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
+    if (
+        canUseEmptySentinels &&
+        !compactionOff &&
+        args.thinkingBindingRecoveryEnabledForModel === true &&
+        proactiveThinkingStripPermitted
+    ) {
+        const tProactiveStrip = performance.now();
+        try {
+            const served = finalizeDetachedCopy(
+                args.messages,
+                args.resolvedProviderID,
+                finalizeOptions,
+            );
+            if (served) {
+                const outcome = freezeThinkingInvalidatedByThisPass({
+                    db: args.db,
+                    sessionId: args.sessionId,
+                    served,
+                    alreadyFrozen: thinkingBindingRecoveryMessageIds,
+                });
+                if (outcome.strip) {
+                    proactiveThinkingStrip = outcome.strip;
+                    for (const messageId of outcome.strip.messageIds) {
+                        thinkingBindingRecoveryMessageIds.add(messageId);
+                        mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
+                    }
+                    bustedThisPass = true;
+                } else if (outcome.persistenceFailed) {
+                    args.passOutcome?.record("proactive-thinking-strip-persistence-failure");
+                    sessionLog(
+                        args.sessionId,
+                        "proactive thinking strip: persistence failed; serving the thinking unchanged",
+                    );
+                }
+            } else {
+                sessionLog(
+                    args.sessionId,
+                    "proactive thinking strip: could not copy the served array; serving the thinking unchanged",
+                );
+            }
+        } catch (error) {
+            args.passOutcome?.record("proactive-thinking-strip-exception");
+            sessionLog(args.sessionId, "proactive thinking strip failed:", error);
+        }
+        logTransformTiming(args.sessionId, "pp.proactiveThinkingStrip", tProactiveStrip);
+    }
+
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
         args.resolvedProviderID,
-        {
-            prependedMessageCount,
-            reasoningMutatedMessages,
-            reasoningMutationExemptMessage,
-            mergedReasoningStrippedIds,
-            thinkingBindingRecoveryMessageIds,
-            trailingBlankDecisions,
-            skipMergedReasoningStrip: compactionOff,
-            skipTrailingWhitespaceStrip: compactionOff,
-        },
+        finalizeOptions,
     );
 
     sessionLog(
@@ -3253,6 +3480,7 @@ export async function runPostTransformPhase(
         emergency,
         bustedThisPass,
         thinkingBindingRecovery,
+        proactiveThinkingStrip,
     };
 }
 

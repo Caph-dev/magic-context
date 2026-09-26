@@ -16,6 +16,7 @@ import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-repla
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
+import { replayRustModeBindingMismatchStrips } from "../hooks/magic-context/transform-postprocess-phase";
 import { log, sessionLog } from "../shared/logger";
 
 // Error codes that SQLite raises for transient contention — should be retried
@@ -377,6 +378,16 @@ export function createMessagesTransformHandler(args: {
                             entry,
                         });
                         if (replay.ok) {
+                            // The stored prefix already carries the binding-mismatch
+                            // strips; the replayed tail comes from the raw input, so
+                            // apply the persisted set there too. A removed thinking
+                            // block must not return on a replayed pass.
+                            replayRustModeBindingMismatchStrips({
+                                db,
+                                sessionId,
+                                messages: replay.messages as MessageLike[],
+                                resolvedProviderID: keys.providerKey ?? undefined,
+                            });
                             replaceMessagesInPlace(
                                 output,
                                 replay.messages as unknown as MessageWithParts[],
