@@ -339,9 +339,10 @@ function frozenBindingEntryIds(
  * without it as a removal). A session that already carries strips therefore
  * keeps the start-of-pass order ("start") until a pass may change served bytes:
  * a pass with a queued explicit flush, which always holds the shared bust
- * permission, writes the end-order marker and switches. It also switches on any
- * pass where the order cannot matter (none of its stripped entries is on the
- * branch). A session without strips uses the end order from the start.
+ * permission, writes the end-order marker before it serves and switches. A pass
+ * whose stripped entries are all off the branch does not switch: an undo can
+ * bring them back on a later defer pass, which must still render them in the
+ * start order. A session without strips uses the end order from the start.
  *
  * The proactive strip runs only in the end order, because it is decided on the
  * array the pass serves and must replay at that same point.
@@ -366,11 +367,13 @@ export function resolvePiBindingStripOrder(args: {
 		onBranch = true;
 		if (hasThinkingPart(args.messages[index])) carriesThinking = true;
 	}
-	// With the stripped entries present but their thinking already gone, both
-	// orders render alike this pass, and switching would only move the change
-	// to a later pass; wait for a pass that renders the difference itself.
+	// Switch only on a pass that may change bytes and renders the difference
+	// itself: stripped entries on the branch that still carry thinking. With
+	// them off the branch, or their thinking already gone, both orders render
+	// alike now, and switching would move the byte change to a later pass,
+	// which could be a defer pass.
 	const mayChangeOrder =
-		!onBranch || (carriesThinking && args.bustPermittedAtStart);
+		onBranch && carriesThinking && args.bustPermittedAtStart;
 	if (
 		mayChangeOrder &&
 		addMergedReasoningStrippedIds(args.db, args.sessionId, [
