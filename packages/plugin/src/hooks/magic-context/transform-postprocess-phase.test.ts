@@ -68,6 +68,7 @@ import {
 } from "./inject-compartments";
 import {
     digestOpenCodeServedMessages,
+    getLastServedDigests,
     recordServedDigests,
     resetServedDigestsForTest,
 } from "./prefix-bound-thinking";
@@ -9305,5 +9306,119 @@ describe("proactive strip of thinking invalidated by a busting pass", () => {
             resolvedProviderID: "anthropic",
         });
         expect(sha256(lkgReplay)).toBe(sha256(busting));
+    });
+});
+
+// Adversarial reproductions for the proactive strip of thinking a busting pass
+// invalidates. Each test states the property the strip must keep; tests marked
+// `it.failing` reproduce a defect in the current behaviour and turn green when fixed.
+describe("adversarial: proactive thinking strip gate", () => {
+    const sha256 = (value: unknown): string =>
+        createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    const REASONING = new Set(["thinking", "reasoning", "redacted_thinking"]);
+    const reasoningCount = (message: MessageLike): number =>
+        message.parts.filter(
+            (part) =>
+                part !== null &&
+                typeof part === "object" &&
+                REASONING.has(String((part as { type?: unknown }).type)),
+        ).length;
+    const user = (sessionId: string, id: string, text: string) =>
+        ({
+            info: { id, role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text }],
+        }) as unknown as MessageLike;
+    const assistant = (sessionId: string, id: string, text: string) =>
+        ({
+            info: { id, role: "assistant", sessionID: sessionId },
+            parts: [
+                { type: "thinking", thinking: `thought ${id}`, signature: `sig-${id}` },
+                { type: "text", text },
+            ],
+        }) as unknown as MessageLike;
+    const session = (sessionId: string, prefix: string, extraTurns: string[] = []) => [
+        user(sessionId, "user-prefix", prefix),
+        assistant(sessionId, "assistant-one", "answer one"),
+        user(sessionId, "user-two", "second question"),
+        assistant(sessionId, "assistant-two", "answer two"),
+        ...extraTurns.flatMap((suffix) => [
+            user(sessionId, `user-${suffix}`, `question ${suffix}`),
+            assistant(sessionId, `assistant-${suffix}`, `answer ${suffix}`),
+        ]),
+    ];
+    const serve = async (sessionId: string, messages: MessageLike[], busting: boolean) => {
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                ...(busting
+                    ? { pendingMaterializationSessions: new Set([sessionId]) }
+                    : { schedulerDecision: "defer" as const }),
+            }),
+        );
+        // transform.ts records the served array at the end of every pass.
+        recordServedDigests(sessionId, digestOpenCodeServedMessages(messages));
+        return result;
+    };
+
+    // Attack: the in-process record is stale when another process (an OpenCode
+    // server plus a TUI, for example) served the session last. The record then
+    // reports the other process's already-served change as new, and the busting
+    // pass strips thinking that was produced after that change and is still valid.
+    // Expected to fail until a stale record cannot widen the strip.
+    it.failing(
+        "keeps thinking produced after another process's strip when this process's record predates it",
+        async () => {
+            resetServedDigestsForTest();
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = "ses-adv-stale-record";
+
+            // Process A serves the original session and keeps its record.
+            await serve(sessionId, session(sessionId, "original prefix"), false);
+            const recordOfA = getLastServedDigests(sessionId);
+            if (!recordOfA) throw new Error("missing record");
+
+            // Process B (same record to start with) busts at the prefix, strips, and
+            // later serves a defer pass with a fresh turn whose thinking was produced
+            // on top of B's stripped prefix.
+            const bBusting = session(sessionId, "re-rendered prefix");
+            const bResult = await serve(sessionId, bBusting, true);
+            expect(bResult.proactiveThinkingStrip?.messageIds).toEqual([
+                "assistant-one",
+                "assistant-two",
+            ]);
+            const bDefer = session(sessionId, "re-rendered prefix", ["fresh"]);
+            await serve(sessionId, bDefer, false);
+            expect(reasoningCount(findMessage(bDefer, "assistant-fresh"))).toBe(1);
+
+            // Process A takes the next turn with its own stale record. Its busting
+            // pass changes nothing the provider has not already seen.
+            recordServedDigests(sessionId, recordOfA);
+            const aBusting = session(sessionId, "re-rendered prefix", ["fresh"]);
+            const aResult = await serve(sessionId, aBusting, true);
+            // Fails on the delivery: A reports index 0 as changed and strips
+            // assistant-fresh, busting the provider's cached prefix at that message.
+            expect(aResult.proactiveThinkingStrip).toBeNull();
+            expect(sha256(aBusting)).toBe(sha256(bDefer));
+        },
+    );
+
+    // Control for the test above: with a record that matches what the provider
+    // last saw, the same busting pass leaves the served bytes alone.
+    it("serves the other process's bytes unchanged when the record is current", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-adv-current-record";
+        await serve(sessionId, session(sessionId, "original prefix"), false);
+        await serve(sessionId, session(sessionId, "re-rendered prefix"), true);
+        const deferPass = session(sessionId, "re-rendered prefix", ["fresh"]);
+        await serve(sessionId, deferPass, false);
+        const bustingPass = session(sessionId, "re-rendered prefix", ["fresh"]);
+        const result = await serve(sessionId, bustingPass, true);
+        expect(result.proactiveThinkingStrip).toBeNull();
+        expect(sha256(bustingPass)).toBe(sha256(deferPass));
+        expect(reasoningCount(findMessage(bustingPass, "assistant-fresh"))).toBe(1);
     });
 });
