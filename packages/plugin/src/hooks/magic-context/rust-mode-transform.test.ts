@@ -4720,8 +4720,11 @@ describe("Rust mode authority adapter", () => {
                 if (method !== "transform") return { ok: true };
                 if (moduleUnavailable) throw new Error("module unavailable after install failure");
                 rowVersion += 1;
+                // The baseline pass is non-busting so this Fable 5.1 session keeps its
+                // thinking until the reactive recovery under test removes it; a busting
+                // baseline would already strip it proactively.
                 return {
-                    decision: "HARD",
+                    decision: rowVersion === 1 ? "SOFT+" : "HARD",
                     row_version: rowVersion,
                     native_messages: nativeMessages(),
                 };
