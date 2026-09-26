@@ -45,6 +45,7 @@ import {
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
 	getEmergencyInputSample,
+	getMergedReasoningStrippedIds,
 	getOverflowState,
 	recordDetectedContextLimit,
 	recordOverflowDetected,
@@ -7110,6 +7111,111 @@ describe("Pi Channel 1 reminder copy changes", () => {
 				"spent tool outputs (~80k tokens) are reclaimable. Make a ctx_reduce pass now over the outputs you've already used, then continue.",
 			);
 			expect(fresh?.text).not.toContain("natural stopping point");
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+});
+
+// Claude Opus 5.5 binds each thinking block to every byte served before it. The
+// busting pass that renders a drop removes the thinking its edit invalidated,
+// and the next defer pass serves the same prefix bytes.
+describe("Pi proactive strip of invalidated thinking", () => {
+	const opusAssistant = (
+		thinking: string,
+		text: string,
+		timestamp: number,
+	): Record<string, unknown> => ({
+		...assistantMessage(text, timestamp),
+		content: [
+			{ type: "thinking", thinking, thinkingSignature: `sig-${thinking}` },
+			{ type: "text", text },
+		],
+		provider: "anthropic",
+		model: "claude-opus-5-5",
+	});
+	const buildMessages = (withFreshTurn: boolean) => [
+		userMessage("drop this request", 1),
+		opusAssistant("first thought", "first answer", 2),
+		userMessage("second request", 3),
+		opusAssistant("second thought", "second answer", 4),
+		userMessage("third request", 5),
+		...(withFreshTurn
+			? [
+					opusAssistant("third thought", "third answer", 6),
+					userMessage("fourth request", 7),
+				]
+			: []),
+	];
+	const entryIdsFor = (withFreshTurn: boolean) => [
+		"entry-u1",
+		"entry-a1",
+		"entry-u2",
+		"entry-a2",
+		"entry-u3",
+		...(withFreshTurn ? ["entry-a3", "entry-u4"] : []),
+	];
+	const thinkingIn = (message: unknown): number =>
+		(
+			((message as { content?: unknown }).content ?? []) as {
+				type?: string;
+			}[]
+		).filter?.((part) => part.type === "thinking").length ?? 0;
+	const sha256 = (value: unknown) =>
+		createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+	it("strips on the busting pass that renders a drop and replays on the defer pass", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-proactive-thinking";
+		const fake = createFakePi();
+		try {
+			registerPiContextHandler(fake.pi as never, { db, heuristics: {} });
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: unknown[] } | undefined>;
+			const pass = async (withFreshTurn: boolean) => {
+				const messages = buildMessages(withFreshTurn);
+				const result = await handler({ messages: messages as never[] }, {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						entryIdsFor(withFreshTurn),
+						messages as never,
+					),
+					model: { provider: "anthropic", id: "claude-opus-5-5" },
+				} as never);
+				return (result?.messages ?? messages) as unknown[];
+			};
+
+			// The first render busts the cache, so it already strips all thinking.
+			const first = await pass(false);
+			expect(first.map(thinkingIn)).toEqual([0, 0, 0, 0, 0]);
+
+			const dropped = getTagsBySession(db, sessionId).find(
+				(tag) => tag.messageId === "entry-u1:p0",
+			);
+			if (!dropped) throw new Error("missing tag for the first user message");
+			updateTagStatus(db, sessionId, dropped.tagNumber, "dropped");
+			signalPiPendingMaterialization(sessionId);
+			const busting = await pass(false);
+			expect(textOf(busting[0] as never)).toBe(
+				`[dropped §${dropped.tagNumber}§]`,
+			);
+			expect(busting.map(thinkingIn)).toEqual([0, 0, 0, 0, 0]);
+			expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(
+				new Set([
+					"binding_mismatch:entry-a1",
+					"binding_mismatch:entry-a2",
+					"binding_mismatch_order:end",
+				]),
+			);
+
+			const defer = await pass(true);
+			expect(sha256(defer.slice(0, busting.length))).toBe(sha256(busting));
+			// Thinking produced after the strip is kept.
+			expect(thinkingIn(defer[5])).toBe(1);
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);

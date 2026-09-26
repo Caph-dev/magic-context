@@ -433,14 +433,11 @@ export interface ThinkingBindingRecoveryApplication {
  * prefix position, and removing all blocks is always valid. Stripping only one
  * block per failed request would cost one user-visible failure per block.
  *
- * The newest assistant is included even when its tool_use is still waiting
- * for the model to read the tool_result. After a prefix edit that block is
- * invalid too, so keeping it would fail the same request again. Anthropic's
- * own drop_block mode removes every failing block, whichever turn holds it,
- * and the request succeeds, so the API accepts that turn without its thinking.
- * The final request message is the user tool_result, not this assistant, so
- * the rule that a final assistant message must open with thinking does not
- * apply.
+ * The newest assistant is included even when its tool round is still open
+ * (its tool_use waits for the model to read the tool_result). A live probe on
+ * Fable 5.1 and Opus 5.5 accepted that turn with its thinking removed, both with
+ * the prefix unchanged and after an m0 edit, and after an m0 edit Opus 5.5
+ * drops that block by itself (docs/reports/anthropic-open-tool-round-thinking.md).
  *
  * The ids are persisted before any bytes change, so every later pass (defer
  * included) replays the same strips and a removed block never reappears.
@@ -470,6 +467,70 @@ function freezeAllReasoningForBindingRecovery(args: {
     }
     for (const id of newIds) args.recoveredMessageIds.add(id);
     return { flagTarget: args.flagTarget, messageIds };
+}
+
+/** Thinking a busting pass removed on a prefix-bound model (Fable 5.1, Opus 5.5). */
+export interface ProactiveThinkingStrip {
+    /** Assistants whose reasoning this pass froze into the binding-mismatch strip set. */
+    messageIds: string[];
+}
+
+/**
+ * Freeze the reasoning of every assistant still sending it, on a busting pass
+ * of a prefix-bound model (Fable 5.1, Opus 5.5).
+ *
+ * On those models a signed thinking block is valid only while every byte
+ * before it is unchanged, and a busting pass is the pass that changes those
+ * bytes: older accounts then drop the blocks silently, `drop_block` drops
+ * them, and newer accounts reject the request with a 400. The pass therefore
+ * removes all of them itself. The newest assistant of an open tool round is
+ * included, and its tool call stays: a live probe on Fable 5.1 and Opus 5.5
+ * accepted that turn with its thinking removed
+ * (docs/reports/anthropic-open-tool-round-thinking.md).
+ *
+ * The ids are persisted into the binding-mismatch set before the pass serves
+ * any stripped byte, the same contract as the reactive recovery, so every
+ * later pass (defer passes and last-known-good replays included) removes the
+ * same blocks and a removed block never comes back. When the write fails,
+ * nothing is stripped on this pass and nothing is remembered; the reactive
+ * recovery remains the fallback. Reasoning produced after this pass is kept
+ * until the next busting pass.
+ *
+ * Callers must invoke this only on a pass that already busts the cache: it
+ * never originates a byte change on a defer pass.
+ */
+export function freezeReasoningOnBustingPass(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    messages: MessageLike[];
+    alreadyFrozen: ReadonlySet<string>;
+}): { strip: ProactiveThinkingStrip | null; persistenceFailed: boolean } {
+    const messageIds = findReasoningBearingAssistantIds(args.messages).filter(
+        (id) => !args.alreadyFrozen.has(id),
+    );
+    if (messageIds.length === 0) return { strip: null, persistenceFailed: false };
+    let persisted = false;
+    try {
+        persisted = addMergedReasoningStrippedIds(
+            args.db,
+            args.sessionId,
+            messageIds.map(thinkingBindingRecoveryFrozenId),
+        );
+    } catch (error) {
+        sessionLog(args.sessionId, "proactive thinking strip: persistence threw:", error);
+    }
+    if (!persisted) {
+        sessionLog(
+            args.sessionId,
+            "proactive thinking strip: persistence failed; serving the thinking unchanged",
+        );
+        return { strip: null, persistenceFailed: true };
+    }
+    sessionLog(
+        args.sessionId,
+        `proactive thinking strip: busting pass froze reasoning of ${messageIds.length} assistant(s) [${messageIds.join(",")}]`,
+    );
+    return { strip: { messageIds }, persistenceFailed: false };
 }
 
 /** Reapply durable binding-mismatch strips when a Rust LKG snapshot is replayed. */
@@ -693,16 +754,23 @@ export function runRustModePostprocess(args: {
     compactionOff?: boolean;
     resolvedProviderID?: string;
     thinkingBindingRecoveryEnabledForModel?: boolean;
+    /**
+     * The module's decision busts the cache on this pass (HARD, EXECUTE, SOFT, or
+     * a released frozen replay). Only such a pass may freeze thinking that its
+     * own edit invalidated.
+     */
+    cacheBustingPass?: boolean;
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     trailingBlankNewestAssistantId?: string;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
 }): {
     thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null;
+    proactiveThinkingStrip: ProactiveThinkingStrip | null;
     markerAt: string | null;
 } {
     if (!args.fullFeatureMode || args.compactionOff) {
-        return { thinkingBindingRecovery: null, markerAt: null };
+        return { thinkingBindingRecovery: null, proactiveThinkingStrip: null, markerAt: null };
     }
     // Test doubles and older integrations may return the legacy bare message shape.
     // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
@@ -715,7 +783,7 @@ export function runRustModePostprocess(args: {
                 !isRecord((message as { info?: unknown }).info),
         )
     ) {
-        return { thinkingBindingRecovery: null, markerAt: null };
+        return { thinkingBindingRecovery: null, proactiveThinkingStrip: null, markerAt: null };
     }
     applyRustModeDeferredCompactionMarker({
         ...(args.compactionMarkerStrategy
@@ -829,6 +897,7 @@ export function runRustModePostprocess(args: {
 
     const recoveryMessageIds = new Set<string>();
     let thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null = null;
+    let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
     if (modelAcceptsEmptyContent(args.resolvedProviderID)) {
         try {
             for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
@@ -858,11 +927,31 @@ export function runRustModePostprocess(args: {
         } catch (error) {
             sessionLog(args.sessionId, "rust thinking binding recovery failed:", error);
         }
+        // On a busting pass of a prefix-bound model, every remaining assistant
+        // with reasoning is persisted into the binding-mismatch set before any
+        // reasoning is removed. The one strip call below then applies the whole
+        // set, which later passes replay to produce the same output.
+        if (
+            args.thinkingBindingRecoveryEnabledForModel === true &&
+            args.cacheBustingPass === true
+        ) {
+            const outcome = freezeReasoningOnBustingPass({
+                db: args.db,
+                sessionId: args.sessionId,
+                messages: args.messages,
+                alreadyFrozen: recoveryMessageIds,
+            });
+            if (outcome.strip) {
+                proactiveThinkingStrip = outcome.strip;
+                for (const id of outcome.strip.messageIds) recoveryMessageIds.add(id);
+            }
+        }
         stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
     }
     const marker = getPersistedCompactionMarkerState(args.db, args.sessionId);
     return {
         thinkingBindingRecovery,
+        proactiveThinkingStrip,
         markerAt: marker?.targetEndMessageId ?? marker?.boundaryMessageId ?? null,
     };
 }
@@ -1193,7 +1282,12 @@ interface RunPostTransformPhaseArgs {
      * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
-    /** True only when the live request is canonical Anthropic Fable 5.1. */
+    /**
+     * True only when the live request uses a model whose signed thinking is
+     * bound to its prefix (isPrefixBoundThinkingModel: Anthropic Fable 5.1 or
+     * Opus 5.5). Gates both the reactive binding recovery and the proactive
+     * strip of thinking that a busting pass invalidates.
+     */
     thinkingBindingRecoveryEnabledForModel?: boolean;
     /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
@@ -1236,6 +1330,8 @@ export interface PostTransformPhaseResult {
     bustedThisPass: boolean;
     /** Pending flag applied to the live output; the caller clears it only after the live lane succeeds. */
     thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null;
+    /** Thinking this busting pass removed because its own edit invalidated it. */
+    proactiveThinkingStrip: ProactiveThinkingStrip | null;
 }
 
 export interface ConfirmedAbortClient {
@@ -1319,19 +1415,21 @@ export function evaluateEmergencyFailClosed(input: {
     };
 }
 
+export interface FinalizeMessageRepresentationOptions {
+    prependedMessageCount?: number;
+    reasoningMutatedMessages?: Iterable<MessageLike>;
+    reasoningMutationExemptMessage?: MessageLike;
+    mergedReasoningStrippedIds?: ReadonlySet<string>;
+    thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
+    trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
+    skipMergedReasoningStrip?: boolean;
+    skipTrailingWhitespaceStrip?: boolean;
+}
+
 export function finalizeMessageRepresentation(
     messages: MessageLike[],
     resolvedProviderID?: string,
-    options?: {
-        prependedMessageCount?: number;
-        reasoningMutatedMessages?: Iterable<MessageLike>;
-        reasoningMutationExemptMessage?: MessageLike;
-        mergedReasoningStrippedIds?: ReadonlySet<string>;
-        thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
-        trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
-        skipMergedReasoningStrip?: boolean;
-        skipTrailingWhitespaceStrip?: boolean;
-    },
+    options?: FinalizeMessageRepresentationOptions,
 ): { clearedParts: number; mergedReasoningParts: number } {
     let clearedParts = 0;
     if (modelAcceptsEmptyContent(resolvedProviderID)) {
@@ -2814,6 +2912,9 @@ export async function runPostTransformPhase(
         m0RematerializedThisPass ||
         (m0M1InjectedThisPass && historyWasConsumedThisPass) ||
         historyWasConsumedThisPass;
+    // The proactive thinking strip rides the shared bust permission only, so a
+    // defer pass never originates a strip.
+    const proactiveThinkingStripPermitted = isCacheBustingPass;
 
     // Final representation strips run once, after all topology mutations; execute
     // and defer must serialize identical prefixes. Do not add message, tool-target,
@@ -3040,20 +3141,56 @@ export async function runPostTransformPhase(
     }
 
     logTransformTiming(args.sessionId, "pp.frozenDecisions", tFrozenDecisions);
+    const finalizeOptions: FinalizeMessageRepresentationOptions = {
+        prependedMessageCount,
+        reasoningMutatedMessages,
+        reasoningMutationExemptMessage,
+        mergedReasoningStrippedIds,
+        thinkingBindingRecoveryMessageIds,
+        trailingBlankDecisions,
+        skipMergedReasoningStrip: compactionOff,
+        skipTrailingWhitespaceStrip: compactionOff,
+    };
+
+    // On a prefix-bound model, a busting pass removes every signed thinking block
+    // still on the wire, because the pass's own edits invalidate them. The ids
+    // are persisted into the binding-mismatch set before finalization (the final
+    // representation step below), which strips that set first; later passes
+    // replay the same set through the same step and serve identical bytes.
+    //
+    // Subagents are left out, as in Rust mode, where host postprocess does not
+    // run for them.
+    let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
+    if (
+        canUseEmptySentinels &&
+        !compactionOff &&
+        args.fullFeatureMode &&
+        args.thinkingBindingRecoveryEnabledForModel === true &&
+        proactiveThinkingStripPermitted
+    ) {
+        const outcome = freezeReasoningOnBustingPass({
+            db: args.db,
+            sessionId: args.sessionId,
+            messages: args.messages,
+            alreadyFrozen: thinkingBindingRecoveryMessageIds,
+        });
+        if (outcome.strip) {
+            proactiveThinkingStrip = outcome.strip;
+            for (const messageId of outcome.strip.messageIds) {
+                thinkingBindingRecoveryMessageIds.add(messageId);
+                mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
+            }
+            bustedThisPass = true;
+        } else if (outcome.persistenceFailed) {
+            args.passOutcome?.record("proactive-thinking-strip-persistence-failure");
+        }
+    }
+
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
         args.resolvedProviderID,
-        {
-            prependedMessageCount,
-            reasoningMutatedMessages,
-            reasoningMutationExemptMessage,
-            mergedReasoningStrippedIds,
-            thinkingBindingRecoveryMessageIds,
-            trailingBlankDecisions,
-            skipMergedReasoningStrip: compactionOff,
-            skipTrailingWhitespaceStrip: compactionOff,
-        },
+        finalizeOptions,
     );
 
     sessionLog(
@@ -3253,6 +3390,7 @@ export async function runPostTransformPhase(
         emergency,
         bustedThisPass,
         thinkingBindingRecovery,
+        proactiveThinkingStrip,
     };
 }
 

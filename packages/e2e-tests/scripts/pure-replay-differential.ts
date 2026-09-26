@@ -391,9 +391,12 @@ function captureRef(
 				? [
 						"--priced",
 						"--expected-local-budget",
-						neutral || slot === "left" ? "60000" : "38173",
+						// Both refs now carry the Fable 5.1 calibration seed
+						// (proseRatio 1.571778, toolsRatio 1.551639), so the calibrated
+						// expectation applies to either slot; only --neutral removes it.
+						neutral ? "60000" : "38173",
 						"--expected-tool-ratio",
-						neutral || slot === "left" ? "1" : "1.551639",
+						neutral ? "1" : "1.551639",
 					]
 				: []),
 			...(neutral ? ["--neutral"] : []),
@@ -434,9 +437,10 @@ function printRef(result: RefReplay): void {
 function compare(left: RefReplay, right: RefReplay): boolean {
 	if (priced) {
 		if (!left.priced || !right.priced) return false;
-		const hard = neutral
-			? left.priced.hardMessagesSha256 === right.priced.hardMessagesSha256
-			: left.priced.hardHistorySha256 !== right.priced.hardHistorySha256;
+		// Each ref already checked its own HARD history against the expected
+		// allowance; with the same calibration on both sides the HARD wire must match.
+		const hard =
+			left.priced.hardMessagesSha256 === right.priced.hardMessagesSha256;
 		const tail =
 			left.priced.commonHistorySha256 === right.priced.commonHistorySha256;
 		const defers = [left, right].every(

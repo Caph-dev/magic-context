@@ -199,6 +199,48 @@ Recommendations 1 and 2 are implemented after this report:
 - **Served bytes.** Bytes change only on sessions using the `anthropic` provider with Fable 5.1 or Opus 5.5, and only after a binding 400 armed the flag. On the first live pass after the arm, every reasoning part still on the wire becomes an empty text sentinel. Later passes (defer included, plus the Rust last-known-good replay) replay that frozen set byte-identically. Sessions that never hit the 400 serve unchanged bytes.
 - **Not covered: Bedrock and Vertex.** The arm and `stripReasoningFromAssistantIds` still require `providerID === "anthropic"`, although the page says cloud platforms enforce the same rule for new accounts.
 
+## Follow-up: proactive strip on busting passes
+
+Owner ruling of 2026-09-26, simplified after two adversarial gates: on Fable 5.1 and Opus 5.5, a pass that already busts the cache removes **every** signed thinking block still on the wire. The alternative is sending blocks that the provider handles itself after the prefix edit: older accounts drop them silently, `drop_block` drops them, and new accounts reject the request with a 400. Nothing is lost on cost (dropped blocks are not billed), and plain API-key OpenCode and Pi, where MC cannot send `drop_block`, get no failed turn. The reactive recovery above stays as the backstop.
+
+- **Which sessions.** `isPrefixBoundThinkingModel` (`providerID === "anthropic"`, Fable 5.1 or Opus 5.5), main sessions only: subagents are skipped in TS mode, as in Rust mode and Pi.
+- **Which passes.** Only passes holding the shared bust permission:
+  - TS: `isCacheBustingPass`.
+  - Rust mode: the module's HARD, MIGRATE_HARD, EXECUTE or SOFT decision, or a released frozen replay.
+  - Pi: `isCacheBusting || executedWorkThisPass`, the permission synthetic todo injection uses. Pi's `bustedThisPass` is not used, because replaying flushed drop statuses sets it on defer passes too.
+
+  A defer pass never starts a strip, even when its bytes changed.
+- **What.** `reasoning`, `thinking` and `redacted_thinking` of every assistant message on the wire at that pass. The newest assistant of an open tool round is included and keeps its tool call: the live probe in `docs/reports/anthropic-open-tool-round-thinking.md` found that Fable 5.1 and Opus 5.5 both accept that turn with its thinking removed, and Opus 5.5 drops it by itself after an m0 edit. No digest, served-array record or stamp is involved.
+- **Persistence before serve.** The recovery's contract applies: the ids are written to the `binding_mismatch:` frozen set before the stripped array is served. If that write fails, the pass strips nothing and nothing is kept in memory; the reactive recovery covers that pass. Every later pass replays the set at the same point of the pass, so a removed block never comes back, including after a restart or in another process. Thinking produced after a strip is kept until the next busting pass.
+- **Replay point.**
+  - TS: freezes before finalization, which strips the set first. The stripping pass and every replay therefore run the same finalization; this matters because the trailing-blank normalization depends on whether reasoning is present.
+  - Rust mode: freezes and strips last in host postprocess.
+  - Last-known-good replays: the Rust frozen replay and the TS replay apply the persisted set to the replayed raw tail.
+- **Pi strip order.** Pi strips at the end of the context pass, so every stage sees the same thinking on every pass: a dropped tool arc beside native reasoning renders as a skeleton, without it as a removal. Earlier builds stripped at the start.
+  - **Old sessions:** a session that already carries `binding_mismatch:` entries keeps the start-of-pass order, with no proactive strip, until it switches.
+  - **When it switches:** on a pass with a queued explicit flush while its stripped entries still carry thinking in the input, or on any pass where none of its stripped entries is on the branch. The switch writes `binding_mismatch_order:end` into the same ledger; it is a reserved control entry, copied by session clone. Strips written in the end order carry the marker.
+  - **Why not a HARD fold:** it is not used as a switch signal. Its bust is only known once the fold runs inside the pipeline (preflight contention and the served-prefix comparison can still suppress it), after the point where the order must be chosen, and predicting it could switch on a pass that ends up deferring.
+
+### Served bytes that change, and on which passes
+
+| Lane | Pass | Bytes that change |
+|---|---|---|
+| OpenCode 1/2, TS mode (main sessions) | every busting pass on Fable 5.1 / Opus 5.5 whose frozen-set write succeeds | every reasoning part of every assistant on the wire, the open tool round included, becomes the empty text sentinel `{"type":"text","text":""}`, which the Anthropic adapter removes before the wire; tool parts stay |
+| OpenCode, Rust mode | same, in host postprocess | same |
+| Pi (end order, main sessions) | same, at the end of the context pass | the `thinking` / `redacted_thinking` parts of those assistant entries are removed from `content` |
+| all three | every later pass | the same parts, replayed from the persisted set |
+| TS and Rust last-known-good replays | replayed pass | already-persisted thinking in the replayed raw tail is stripped (sessions with `binding_mismatch:` entries only) |
+| Pi, sessions carrying strips from an earlier build | the first pass with a queued explicit flush | the order switches: stages now see the frozen thinking before it is stripped, so a dropped tool arc beside it renders as a skeleton instead of a removal. Defer passes before that serve exactly what the earlier build served |
+
+Sessions on every other model, and subagents, are byte-identical. On the bound models a defer pass serves exactly what the previous pass served for the shared prefix.
+
+### Limits
+
+- Pi strips only entries with a stable branch entry id, as the recovery does. The Pi last-known-good replay on a transient storage failure and the raw fallback do not reapply the set: the store is unreadable, or MC's edits are not served at all.
+- Pi sessions carrying strips from an earlier build that never get a queued explicit flush stay in the start order without the proactive strip; the reactive recovery covers them.
+- Bedrock and Vertex stay uncovered (`providerID === "anthropic"`), as for the recovery.
+- Cost: none on defer passes. On a busting pass, one ledger write when there is new thinking to freeze.
+
 ## Not done / caveats
 
 - The `tool_result`-shortening specimen was not captured: the account hit the extra-usage limit. The row is covered only by the page.

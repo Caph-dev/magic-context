@@ -3695,6 +3695,16 @@ export function createRustModeTransform(
                             frozenReleaseReason = releaseReason;
                         } else {
                             appliedMessages = frozen.messages;
+                            // The stored prefix already carries the binding-mismatch
+                            // strips; the replayed tail comes from the raw input, so
+                            // apply the persisted set there too. A removed thinking
+                            // block must not return on a replayed pass.
+                            replayRustModeBindingMismatchStrips({
+                                db: deps.db,
+                                sessionId,
+                                messages: appliedMessages as MessageLike[],
+                                resolvedProviderID: model?.providerID,
+                            });
                             replayedFrozenRepresentation = true;
                             servedFrom = "lkg_frozen";
                             sessionLog(sessionId, "lkg_frozen_replay_served");
@@ -3728,6 +3738,7 @@ export function createRustModeTransform(
                             model?.providerID,
                             model?.modelID,
                         ),
+                        cacheBustingPass,
                         trailingBlankSourceDecisions,
                         trailingBlankNewestAssistantId:
                             typeof trailingBlankNewestAssistantId === "string"

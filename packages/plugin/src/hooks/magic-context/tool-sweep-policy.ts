@@ -1,6 +1,7 @@
 import {
     addMergedReasoningStrippedIds,
     getMergedReasoningStrippedIds,
+    THINKING_BINDING_STRIP_ORDER_END_MARKER,
 } from "../../features/magic-context/storage-meta-persisted";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
@@ -20,7 +21,10 @@ export const TOOL_SWEEP_SCOPED_MARKER = "@tool-sweep-scoped";
  * filters it by message identity (session clone, in particular) has to copy
  * these through verbatim instead of discarding them as undecodable ids.
  */
-export const RESERVED_LEDGER_CONTROL_ENTRIES: readonly string[] = [TOOL_SWEEP_SCOPED_MARKER];
+export const RESERVED_LEDGER_CONTROL_ENTRIES: readonly string[] = [
+    TOOL_SWEEP_SCOPED_MARKER,
+    THINKING_BINDING_STRIP_ORDER_END_MARKER,
+];
 
 export function isReservedLedgerControlEntry(entry: string): boolean {
     return RESERVED_LEDGER_CONTROL_ENTRIES.includes(entry);
