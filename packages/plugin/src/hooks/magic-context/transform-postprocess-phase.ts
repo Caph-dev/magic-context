@@ -121,14 +121,6 @@ import {
     postprocessReplaySnapshot,
     postprocessTailTags,
 } from "./postprocess-read-cache";
-import {
-    digestOpenCodeServedMessages,
-    firstChangedServedIndex,
-    getTrustedServedDigests,
-    stageProactiveFreeze,
-    stageServedArray,
-    unpersistedFrozenEntries,
-} from "./prefix-bound-thinking";
 import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
@@ -477,125 +469,68 @@ function freezeAllReasoningForBindingRecovery(args: {
     return { flagTarget: args.flagTarget, messageIds };
 }
 
-/** Thinking removed by a busting pass because the same pass changed bytes before it. */
+/** Thinking a busting pass removed on a prefix-bound model (Fable 5.1, Opus 5.5). */
 export interface ProactiveThinkingStrip {
-    /** Index in the served array of the first message that differs from the previous serve. */
-    firstChangedIndex: number;
-    /** Assistants whose reasoning this pass freezes into the binding-mismatch strip set. */
+    /** Assistants whose reasoning this pass froze into the binding-mismatch strip set. */
     messageIds: string[];
 }
 
 /**
- * Freeze reasoning that this busting pass invalidates on a prefix-bound model
- * (Fable 5.1, Opus 5.5).
+ * Freeze the reasoning of every assistant still sending it, on a busting pass
+ * of a prefix-bound model (Fable 5.1, Opus 5.5).
  *
- * `served` is the array exactly as this pass would serve it without the new
- * strips. Its wire-visible messages are compared with the digests of the
- * previous serve; every assistant at or after the first differing message
- * that still sends reasoning is chosen. The first changed message itself is
- * included because the change may sit before its own thinking. So is the
- * newest assistant of an open tool round, whose tool call stays: a live probe
- * on Fable 5.1 and Opus 5.5 accepted that turn with its thinking removed
+ * On those models a signed thinking block is valid only while every byte
+ * before it is unchanged, and a busting pass is the pass that changes those
+ * bytes: older accounts then drop the blocks silently, `drop_block` drops
+ * them, and newer accounts reject the request with a 400. The pass therefore
+ * removes all of them itself. The newest assistant of an open tool round is
+ * included, and its tool call stays: a live probe on Fable 5.1 and Opus 5.5
+ * accepted that turn with its thinking removed
  * (docs/reports/anthropic-open-tool-round-thinking.md).
  *
- * Nothing is chosen when the previous serve is unknown or untrusted: another
- * process or an unrecorded fallback may have served since, and the reactive
- * recovery covers that case.
- *
- * The chosen ids are staged, not persisted: they join the same binding-mismatch
- * set the reactive recovery uses once this pass has been served (see
- * commitServedPass), so a pass that fails after deciding leaves the set as it
- * was. From then on every later pass (defer passes and last-known-good replays
- * included) removes the same blocks, and a removed block never comes back.
- * Reasoning produced after this pass is kept until a later busting pass
- * changes bytes before it.
+ * The ids are persisted into the binding-mismatch set before the pass serves
+ * any stripped byte, the same contract as the reactive recovery, so every
+ * later pass (defer passes and last-known-good replays included) removes the
+ * same blocks and a removed block never comes back. When the write fails,
+ * nothing is stripped on this pass and nothing is remembered; the reactive
+ * recovery remains the fallback. Reasoning produced after this pass is kept
+ * until the next busting pass.
  *
  * Callers must invoke this only on a pass that already busts the cache: it
  * never originates a byte change on a defer pass.
  */
-export function freezeThinkingInvalidatedByThisPass(args: {
+export function freezeReasoningOnBustingPass(args: {
     db: ContextDatabase;
     sessionId: string;
-    served: MessageLike[];
+    messages: MessageLike[];
     alreadyFrozen: ReadonlySet<string>;
-}): ProactiveThinkingStrip | null {
-    const previous = getTrustedServedDigests(args.db, args.sessionId);
-    if (!previous) {
+}): { strip: ProactiveThinkingStrip | null; persistenceFailed: boolean } {
+    const messageIds = findReasoningBearingAssistantIds(args.messages).filter(
+        (id) => !args.alreadyFrozen.has(id),
+    );
+    if (messageIds.length === 0) return { strip: null, persistenceFailed: false };
+    let persisted = false;
+    try {
+        persisted = addMergedReasoningStrippedIds(
+            args.db,
+            args.sessionId,
+            messageIds.map(thinkingBindingRecoveryFrozenId),
+        );
+    } catch (error) {
+        sessionLog(args.sessionId, "proactive thinking strip: persistence threw:", error);
+    }
+    if (!persisted) {
         sessionLog(
             args.sessionId,
-            "proactive thinking strip: previous serve unknown to this process; binding recovery remains the fallback",
+            "proactive thinking strip: persistence failed; serving the thinking unchanged",
         );
-        return null;
+        return { strip: null, persistenceFailed: true };
     }
-    const firstChangedIndex = firstChangedServedIndex(
-        previous,
-        digestOpenCodeServedMessages(args.served),
-        args.served.length,
-    );
-    if (firstChangedIndex < 0) return null;
-    const messageIds = findReasoningBearingAssistantIds(
-        args.served.slice(firstChangedIndex),
-    ).filter((id) => !args.alreadyFrozen.has(id));
-    if (messageIds.length === 0) return null;
-    stageProactiveFreeze(args.db, args.sessionId, messageIds.map(thinkingBindingRecoveryFrozenId));
     sessionLog(
         args.sessionId,
-        `proactive thinking strip: first changed served message ${firstChangedIndex}; stripping reasoning of ${messageIds.length} assistant(s) [${messageIds.join(",")}]`,
+        `proactive thinking strip: busting pass froze reasoning of ${messageIds.length} assistant(s) [${messageIds.join(",")}]`,
     );
-    return { firstChangedIndex, messageIds };
-}
-
-/** Binding-mismatch ids of served strips whose persistence is still pending. */
-function unpersistedBindingMismatchIds(sessionId: string): string[] {
-    const ids: string[] = [];
-    for (const entry of unpersistedFrozenEntries(sessionId)) {
-        if (!entry.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
-        const id = entry.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
-        if (id.length > 0) ids.push(id);
-    }
-    return ids;
-}
-
-/**
- * Run the final representation on a detached copy, so a busting pass can see
- * the exact array it is about to serve before deciding which reasoning it has
- * invalidated. Identity-keyed options are remapped onto the copy. Returns null
- * when the messages cannot be copied.
- */
-function finalizeDetachedCopy(
-    messages: MessageLike[],
-    resolvedProviderID: string | undefined,
-    options: FinalizeMessageRepresentationOptions,
-): MessageLike[] | null {
-    let copy: MessageLike[];
-    try {
-        copy = structuredClone(messages);
-    } catch {
-        try {
-            copy = JSON.parse(JSON.stringify(messages)) as MessageLike[];
-        } catch {
-            return null;
-        }
-    }
-    const copyByOriginal = new Map<MessageLike, MessageLike>();
-    messages.forEach((message, index) => {
-        const copied = copy[index];
-        if (copied) copyByOriginal.set(message, copied);
-    });
-    const reasoningMutatedMessages: MessageLike[] = [];
-    for (const message of options.reasoningMutatedMessages ?? []) {
-        // A mutated message outside the served array cannot change served bytes.
-        const copied = copyByOriginal.get(message);
-        if (copied) reasoningMutatedMessages.push(copied);
-    }
-    finalizeMessageRepresentation(copy, resolvedProviderID, {
-        ...options,
-        reasoningMutatedMessages,
-        reasoningMutationExemptMessage: options.reasoningMutationExemptMessage
-            ? copyByOriginal.get(options.reasoningMutationExemptMessage)
-            : undefined,
-    });
-    return copy;
+    return { strip: { messageIds }, persistenceFailed: false };
 }
 
 /** Reapply durable binding-mismatch strips when a Rust LKG snapshot is replayed. */
@@ -612,7 +547,6 @@ export function replayRustModeBindingMismatchStrips(args: {
         const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
         if (messageId.length > 0) recoveryMessageIds.add(messageId);
     }
-    for (const id of unpersistedBindingMismatchIds(args.sessionId)) recoveryMessageIds.add(id);
     stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
 }
 
@@ -963,15 +897,13 @@ export function runRustModePostprocess(args: {
 
     const recoveryMessageIds = new Set<string>();
     let thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null = null;
+    let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
     if (modelAcceptsEmptyContent(args.resolvedProviderID)) {
         try {
             for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
                 if (!id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
                 const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
                 if (messageId.length > 0) recoveryMessageIds.add(messageId);
-            }
-            for (const id of unpersistedBindingMismatchIds(args.sessionId)) {
-                recoveryMessageIds.add(id);
             }
 
             const flagTarget = args.thinkingBindingRecoveryEnabledForModel
@@ -995,42 +927,26 @@ export function runRustModePostprocess(args: {
         } catch (error) {
             sessionLog(args.sessionId, "rust thinking binding recovery failed:", error);
         }
-        stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
-    }
-    // The binding-mismatch strip above is the last change to the served array,
-    // so the array now is exactly what this pass serves. A busting pass freezes
-    // the reasoning its own edit invalidated and strips it the same way; a later
-    // pass strips the whole set in the one call above, which yields the same
-    // bytes because each message is stripped independently.
-    let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
-    const ledgerEnabled =
-        modelAcceptsEmptyContent(args.resolvedProviderID) &&
-        args.thinkingBindingRecoveryEnabledForModel === true;
-    if (ledgerEnabled && args.cacheBustingPass === true) {
-        try {
-            proactiveThinkingStrip = freezeThinkingInvalidatedByThisPass({
+        // On a busting pass of a prefix-bound model, every remaining assistant
+        // with reasoning is persisted into the binding-mismatch set before any
+        // reasoning is removed. The one strip call below then applies the whole
+        // set, which later passes replay to produce the same output.
+        if (
+            args.thinkingBindingRecoveryEnabledForModel === true &&
+            args.cacheBustingPass === true
+        ) {
+            const outcome = freezeReasoningOnBustingPass({
                 db: args.db,
                 sessionId: args.sessionId,
-                served: args.messages,
+                messages: args.messages,
                 alreadyFrozen: recoveryMessageIds,
             });
-            if (proactiveThinkingStrip) {
-                stripReasoningFromAssistantIds(
-                    args.messages,
-                    args.resolvedProviderID,
-                    new Set(proactiveThinkingStrip.messageIds),
-                );
+            if (outcome.strip) {
+                proactiveThinkingStrip = outcome.strip;
+                for (const id of outcome.strip.messageIds) recoveryMessageIds.add(id);
             }
-        } catch (error) {
-            sessionLog(args.sessionId, "rust proactive thinking strip failed:", error);
         }
-    }
-    if (ledgerEnabled) {
-        try {
-            stageServedArray(args.db, args.sessionId, digestOpenCodeServedMessages(args.messages));
-        } catch (error) {
-            sessionLog(args.sessionId, "rust served-array staging failed:", error);
-        }
+        stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
     }
     const marker = getPersistedCompactionMarkerState(args.db, args.sessionId);
     return {
@@ -2996,10 +2912,9 @@ export async function runPostTransformPhase(
         m0RematerializedThisPass ||
         (m0M1InjectedThisPass && historyWasConsumedThisPass) ||
         historyWasConsumedThisPass;
-    // The proactive thinking strip rides the shared bust permission, or a bust a
-    // lane above already made. Captured before the binding recovery below can set
-    // bustedThisPass on a defer pass, so a defer pass never originates a strip.
-    const proactiveThinkingStripPermitted = isCacheBustingPass || bustedThisPass;
+    // The proactive thinking strip rides the shared bust permission only, so a
+    // defer pass never originates a strip.
+    const proactiveThinkingStripPermitted = isCacheBustingPass;
 
     // Final representation strips run once, after all topology mutations; execute
     // and defer must serialize identical prefixes. Do not add message, tool-target,
@@ -3044,11 +2959,6 @@ export async function runPostTransformPhase(
                     const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
                     if (messageId.length > 0) thinkingBindingRecoveryMessageIds.add(messageId);
                 }
-            }
-            // Served strips whose persistence failed replay exactly as persisted ones.
-            for (const messageId of unpersistedBindingMismatchIds(args.sessionId)) {
-                thinkingBindingRecoveryMessageIds.add(messageId);
-                mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
             }
 
             const flagTarget = args.thinkingBindingRecoveryEnabledForModel
@@ -3242,56 +3152,38 @@ export async function runPostTransformPhase(
         skipTrailingWhitespaceStrip: compactionOff,
     };
 
-    // On a prefix-bound model, a busting pass that changes served bytes before
-    // existing signed thinking removes that thinking itself instead of sending
-    // blocks the provider will drop or reject. The decision is taken on a
-    // detached copy of the exact array this pass would serve; the chosen ids
-    // then join the binding-mismatch set, which the real finalization below
-    // strips first. A later pass replays that same set through the same
-    // finalization, so both passes serve identical bytes.
+    // On a prefix-bound model, a busting pass removes every signed thinking block
+    // still on the wire, because the pass's own edits invalidate them. The ids
+    // are persisted into the binding-mismatch set before finalization (the final
+    // representation step below), which strips that set first; later passes
+    // replay the same set through the same step and serve identical bytes.
     //
     // Subagents are left out, as in Rust mode, where host postprocess does not
-    // run for them: the served-array ledger and the strip follow the primary
-    // session only.
+    // run for them.
     let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
-    const servedLedgerEnabled =
+    if (
         canUseEmptySentinels &&
         !compactionOff &&
         args.fullFeatureMode &&
-        args.thinkingBindingRecoveryEnabledForModel === true;
-    if (servedLedgerEnabled && proactiveThinkingStripPermitted) {
-        const tProactiveStrip = performance.now();
-        try {
-            const served = finalizeDetachedCopy(
-                args.messages,
-                args.resolvedProviderID,
-                finalizeOptions,
-            );
-            if (served) {
-                proactiveThinkingStrip = freezeThinkingInvalidatedByThisPass({
-                    db: args.db,
-                    sessionId: args.sessionId,
-                    served,
-                    alreadyFrozen: thinkingBindingRecoveryMessageIds,
-                });
-                if (proactiveThinkingStrip) {
-                    for (const messageId of proactiveThinkingStrip.messageIds) {
-                        thinkingBindingRecoveryMessageIds.add(messageId);
-                        mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
-                    }
-                    bustedThisPass = true;
-                }
-            } else {
-                sessionLog(
-                    args.sessionId,
-                    "proactive thinking strip: could not copy the served array; serving the thinking unchanged",
-                );
+        args.thinkingBindingRecoveryEnabledForModel === true &&
+        proactiveThinkingStripPermitted
+    ) {
+        const outcome = freezeReasoningOnBustingPass({
+            db: args.db,
+            sessionId: args.sessionId,
+            messages: args.messages,
+            alreadyFrozen: thinkingBindingRecoveryMessageIds,
+        });
+        if (outcome.strip) {
+            proactiveThinkingStrip = outcome.strip;
+            for (const messageId of outcome.strip.messageIds) {
+                thinkingBindingRecoveryMessageIds.add(messageId);
+                mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
             }
-        } catch (error) {
-            args.passOutcome?.record("proactive-thinking-strip-exception");
-            sessionLog(args.sessionId, "proactive thinking strip failed:", error);
+            bustedThisPass = true;
+        } else if (outcome.persistenceFailed) {
+            args.passOutcome?.record("proactive-thinking-strip-persistence-failure");
         }
-        logTransformTiming(args.sessionId, "pp.proactiveThinkingStrip", tProactiveStrip);
     }
 
     const tFinalRepresentation = performance.now();
@@ -3300,15 +3192,6 @@ export async function runPostTransformPhase(
         args.resolvedProviderID,
         finalizeOptions,
     );
-    if (servedLedgerEnabled) {
-        // The array is final. Stage it; the transform commits it (and persists
-        // any strip chosen above) only once the pass has been served.
-        try {
-            stageServedArray(args.db, args.sessionId, digestOpenCodeServedMessages(args.messages));
-        } catch (error) {
-            sessionLog(args.sessionId, "served-array staging failed:", error);
-        }
-    }
 
     sessionLog(
         args.sessionId,

@@ -135,12 +135,6 @@ import {
     resolveOrdinalsForModule,
 } from "./module-wire";
 import { onNoteTrigger } from "./note-nudger";
-import {
-    abandonServedPass,
-    commitServedPass,
-    digestOpenCodeServedMessages,
-    stageServedArray,
-} from "./prefix-bound-thinking";
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
@@ -2127,13 +2121,6 @@ export function createRustModeTransform(
         output: { messages: unknown[] },
         systemPromptTokens: number,
     ): boolean => {
-        // The live array was not served: this pass serves a replay or the raw
-        // input, so no served-array record for the proactive thinking strip holds.
-        try {
-            abandonServedPass(sessionId, deps.db);
-        } catch (error) {
-            sessionLog(sessionId, "served-array record reset failed:", error);
-        }
         const slot = getSlot(sessionId);
         if (!slot) {
             const state = states.get(sessionId);
@@ -3801,22 +3788,6 @@ export function createRustModeTransform(
                 const applyReplaceStartedAt = performance.now();
                 installNativeMessages(output, appliedMessages);
                 logStage(sessionId, "apply", applyReplaceStartedAt, timings);
-                // The array is installed. Commit what host postprocess staged (the
-                // served-array record and any thinking it stripped). A frozen replay
-                // skipped postprocess, so it stages the replayed array here.
-                if (
-                    replayedFrozenRepresentation &&
-                    !sessionMeta.isSubagent &&
-                    model?.providerID === "anthropic" &&
-                    isPrefixBoundThinkingModel(model?.providerID, model?.modelID)
-                ) {
-                    stageServedArray(
-                        deps.db,
-                        sessionId,
-                        digestOpenCodeServedMessages(output.messages as MessageLike[]),
-                    );
-                }
-                commitServedPass(sessionId);
                 if (thinkingBindingRecovery) {
                     const cleared = clearThinkingBindingRecoveryIf(
                         deps.db,

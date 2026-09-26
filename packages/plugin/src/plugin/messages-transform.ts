@@ -14,7 +14,6 @@ import { updateSessionMeta } from "../features/magic-context/storage-meta-sessio
 import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
-import { abandonServedPass } from "../hooks/magic-context/prefix-bound-thinking";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { replayRustModeBindingMismatchStrips } from "../hooks/magic-context/transform-postprocess-phase";
@@ -349,16 +348,6 @@ export function createMessagesTransformHandler(args: {
                     "Emergency recovery transform failed; refusing an unbounded raw fallback",
                     { cause: error },
                 );
-            }
-            if (sessionId) {
-                // Whatever is served below (a last-known-good replay or the raw
-                // input) is not the array the failed pass staged, so the
-                // proactive thinking strip must not trust its served-array record.
-                try {
-                    abandonServedPass(sessionId, openDatabase());
-                } catch (abandonError) {
-                    sessionLog(sessionId, "served-array record reset failed", abandonError);
-                }
             }
             if (args.compactionOff) {
                 // Skip the LKG replay entirely: the contract for this mode is

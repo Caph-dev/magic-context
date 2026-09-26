@@ -124,7 +124,6 @@ import { captureLkgSlot, projectLkgEntry, resolveLkgModelKeys } from "./lkg-repl
 import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
-import { abandonServedPass, beginServedPass, commitServedPass } from "./prefix-bound-thinking";
 import {
     createDefaultBoundarySnapshotForTests,
     hasRunnableCompartmentWindow,
@@ -915,9 +914,6 @@ export function createTransform(deps: TransformDeps) {
                 : { ...params, toastDurationMs: historianRun.toastDurationMs };
         };
         beginLkgPass(sessionId);
-        // A previous pass that never committed its serve leaves no trusted record
-        // for the proactive thinking strip (TS and Rust mode both run through here).
-        beginServedPass(sessionId, deps.db);
         clearOpenCodePendingTransformDecision(sessionId);
         logTransformTiming(sessionId, "findSessionId", startTime, `messages=${messages.length}`);
 
@@ -2840,8 +2836,6 @@ export function createTransform(deps: TransformDeps) {
                     sessionId,
                     `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, recoveryOrigin=${emergencyRecoveryOrigin ?? "unknown"}, finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"}, estimateTrusted=${finalWireEstimate?.trusted ?? false}, syntheticUsage=${usagePercentageSynthetic})`,
                 );
-                // The request was refused, so nothing staged by this pass was served.
-                abandonServedPass(sessionId);
                 return;
             }
         }
@@ -3066,11 +3060,6 @@ export function createTransform(deps: TransformDeps) {
         );
 
         deps.maybeAutoEmbedSession?.(sessionId);
-
-        // The array is final and about to be served. Commit what postprocess
-        // staged: the served-array record the next busting pass compares against,
-        // and the persistence of any thinking this pass stripped.
-        commitServedPass(sessionId);
 
         const bindingRecovery = postTransformResult.thinkingBindingRecovery;
         if (bindingRecovery) {

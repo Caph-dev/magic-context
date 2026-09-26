@@ -169,10 +169,6 @@ import {
 	peekNoteNudgeText,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
-	abandonServedPass,
-	beginServedPass,
-} from "@magic-context/core/hooks/magic-context/prefix-bound-thinking";
-import {
 	getRawHistoryEligibility,
 	hasRunnableCompartmentWindow,
 	type ProtectedTailBoundarySnapshot,
@@ -285,7 +281,6 @@ import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
-	recordPiServedArrayForThinkingBinding,
 	resolvePiBindingStripOrder,
 } from "./provider-error-recovery-pi";
 import {
@@ -2498,10 +2493,6 @@ export function registerPiContextHandler(
 			const lkgInputIdByRef = new Map<unknown, string>();
 			for (const input of lkgPassSnapshot.inputs)
 				lkgInputIdByRef.set(event.messages[input.messageIndex], input.id);
-			// If the previous pass never finished serving its array, there is no
-			// trustworthy record of what the provider received, so the proactive
-			// thinking strip must not compare against one.
-			beginServedPass(sessionId, options.db);
 			// Binding-mismatch strips normally run on the final array at the end of
 			// the pass, so every stage sees the same thinking on every pass. A
 			// session whose strips predate that order keeps stripping here, before
@@ -3584,7 +3575,12 @@ export function registerPiContextHandler(
 							endOfPassOrder: true,
 						})
 					: startOfPassBindingRecovery;
-			if (!options.compactionOff && bindingStripOrder === "end") {
+			// Subagents are left out, as in OpenCode.
+			if (
+				!options.compactionOff &&
+				!sessionMeta.isSubagent &&
+				bindingStripOrder === "end"
+			) {
 				try {
 					applyPiProactiveThinkingStrip({
 						db: options.db,
@@ -3593,12 +3589,12 @@ export function registerPiContextHandler(
 						entryIds: outputEntryIds,
 						provider: lkgProviderKey ?? undefined,
 						model: ctx.model?.id,
-						// The shared bust permission (the same one synthetic todo
-						// injection uses), or a bust the pipeline already made.
-						cacheBustingPass:
-							isCacheBusting ||
-							result.executedWorkThisPass ||
-							result.bustedThisPass,
+						// Same permission as synthetic todo injection:
+						// executedWorkThisPass is true when the pipeline was allowed to
+						// bust the cache (a HARD fold included). bustedThisPass is not
+						// used, because replaying saved drop statuses sets it even on
+						// a defer pass.
+						cacheBustingPass: isCacheBusting || result.executedWorkThisPass,
 						report: (line) => sessionLog(sessionId, line),
 					});
 				} catch (err) {
@@ -3849,13 +3845,6 @@ export function registerPiContextHandler(
 				});
 			}
 			capturePiServedArray(sessionId, outputMessages);
-			recordPiServedArrayForThinkingBinding({
-				db: options.db,
-				sessionId,
-				messages: outputMessages,
-				provider: lkgProviderKey ?? undefined,
-				model: ctx.model?.id,
-			});
 			if (thinkingBindingRecoveryApplied) {
 				try {
 					clearThinkingBindingRecoveryIf(
@@ -3895,19 +3884,6 @@ export function registerPiContextHandler(
 			const message = err instanceof Error ? err.message : String(err);
 			const stack = err instanceof Error ? err.stack : undefined;
 			const transientStorageFailure = isTransientPiStorageError(err);
-			if (sessionIdForError) {
-				// What is served below (a last-known-good replay or the raw input) is
-				// not the array this pass staged, so no served-array record holds. The
-				// store is skipped when it is the thing that failed.
-				try {
-					abandonServedPass(
-						sessionIdForError,
-						transientStorageFailure ? undefined : baseOptions.db,
-					);
-				} catch {
-					// Clearing the in-process record already happened; the stamp is best effort.
-				}
-			}
 			if (
 				transientStorageFailure &&
 				sessionIdForError &&

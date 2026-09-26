@@ -7189,8 +7189,9 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				return (result?.messages ?? messages) as unknown[];
 			};
 
+			// The first render busts the cache, so it already strips all thinking.
 			const first = await pass(false);
-			expect(first.map(thinkingIn)).toEqual([0, 1, 0, 1, 0]);
+			expect(first.map(thinkingIn)).toEqual([0, 0, 0, 0, 0]);
 
 			const dropped = getTagsBySession(db, sessionId).find(
 				(tag) => tag.messageId === "entry-u1:p0",

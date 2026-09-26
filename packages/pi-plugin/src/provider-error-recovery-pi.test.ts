@@ -7,7 +7,6 @@ import {
 	getThinkingBindingRecoveryTarget,
 	resetEmergencyRecoveryRegistryForTest,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { resetServedDigestsForTest } from "@magic-context/core/hooks/magic-context/prefix-bound-thinking";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
@@ -15,7 +14,6 @@ import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
 	handlePiProviderFailure,
-	recordPiServedArrayForThinkingBinding,
 } from "./provider-error-recovery-pi";
 import { createTestDb } from "./test-utils.test";
 
@@ -301,9 +299,10 @@ describe("Pi provider failure recovery", () => {
 });
 
 // Claude Fable 5.1 and Claude Opus 5.5 bind each thinking block to every byte
-// served before it. A busting pass that changes bytes before existing thinking
-// removes that thinking itself; later passes replay the removal byte-identically.
-describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
+// served before it, so a busting pass removes every thinking block still on the
+// wire; later passes replay the removal byte-identically, and a defer pass never
+// starts one.
+describe("Pi proactive strip of thinking on busting passes", () => {
 	const ENTRY_IDS = ["u1", "a1", "u2", "a2", "u3", "a3", "tr3"];
 	const sha256 = (value: unknown) =>
 		createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -314,11 +313,9 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 				| undefined
 		)?.filter?.((part) => part.type === "thinking").length ?? 0;
 
-	function session(edits: { first?: string; second?: string } = {}): unknown[] {
+	function session(first = "original first message"): unknown[] {
 		const messages = multiAssistantOpenToolMessages();
-		(messages[0] as { content: string }).content =
-			edits.first ?? "original first message";
-		(messages[2] as { content: string }).content = edits.second ?? "second";
+		(messages[0] as { content: string }).content = first;
 		return messages;
 	}
 
@@ -345,8 +342,8 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 		};
 	}
 
-	// Mirrors the context handler: replay persisted strips, strip what this
-	// pass invalidated, then record the served array.
+	// Mirrors the end of the context handler: replay persisted strips, then
+	// strip everything left on a busting pass.
 	function serve(
 		database: ReturnType<typeof db>,
 		sessionId: string,
@@ -362,8 +359,9 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 			entryIds,
 			provider: "anthropic",
 			model,
+			endOfPassOrder: true,
 		});
-		const strip = applyPiProactiveThinkingStrip({
+		return applyPiProactiveThinkingStrip({
 			db: database,
 			sessionId,
 			messages,
@@ -373,26 +371,15 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 			cacheBustingPass: busting,
 			report: () => {},
 		});
-		recordPiServedArrayForThinkingBinding({
-			db: database,
-			sessionId,
-			messages,
-			provider: "anthropic",
-			model,
-		});
-		return strip;
 	}
 
-	afterEach(() => resetServedDigestsForTest());
-
-	it("strips every block after an m0-style change; the next defer pass keeps the shared prefix hash", () => {
+	it("strips every block on a busting pass; the next defer pass keeps the shared prefix hash", () => {
 		const database = db();
-		const sessionId = "pi-proactive-m0";
+		const sessionId = "pi-proactive-bust";
 		serve(database, sessionId, session(), false);
 
-		const passA = session({ first: "re-rendered first message" });
+		const passA = session("re-rendered first message");
 		expect(serve(database, sessionId, passA, true)).toEqual({
-			firstChangedIndex: 0,
 			entryIds: ["a1", "a2", "a3"],
 		});
 		expect([1, 3, 5].map((index) => thinkingCount(passA[index]))).toEqual([
@@ -411,9 +398,7 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 			]),
 		);
 
-		const passB = withFreshTurn(
-			session({ first: "re-rendered first message" }),
-		);
+		const passB = withFreshTurn(session("re-rendered first message"));
 		expect(
 			serve(database, sessionId, passB.messages, false, passB.entryIds),
 		).toBeNull();
@@ -421,23 +406,11 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 		expect(thinkingCount(passB.messages.at(-1))).toBe(1);
 	});
 
-	it("keeps thinking before the first changed message", () => {
-		const database = db();
-		const sessionId = "pi-proactive-mid-history";
-		serve(database, sessionId, session(), false);
-		const pass = session({ second: "second [dropped]" });
-		expect(serve(database, sessionId, pass, true)).toEqual({
-			firstChangedIndex: 2,
-			entryIds: ["a2", "a3"],
-		});
-		expect(thinkingCount(pass[1])).toBe(1);
-	});
-
-	it("never originates a strip on a defer pass", () => {
+	it("never strips on a defer pass", () => {
 		const database = db();
 		const sessionId = "pi-proactive-defer";
 		serve(database, sessionId, session(), false);
-		const pass = session({ first: "changed without a bust" });
+		const pass = session("changed without a bust");
 		const before = JSON.stringify(pass);
 		expect(serve(database, sessionId, pass, false)).toBeNull();
 		expect(JSON.stringify(pass)).toBe(before);
@@ -446,56 +419,51 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 		);
 	});
 
-	it("keeps thinking produced after a strip until a later bust edits before it", () => {
+	it("keeps thinking produced after a strip until the next busting pass", () => {
 		const database = db();
 		const sessionId = "pi-proactive-multi-pass";
-		const edited = { first: "re-rendered first message" };
-		serve(database, sessionId, session(), false);
-		serve(database, sessionId, session(edited), true);
+		serve(database, sessionId, session(), true);
 
-		const deferOne = withFreshTurn(session(edited));
+		const deferOne = withFreshTurn(session());
 		serve(database, sessionId, deferOne.messages, false, deferOne.entryIds);
-		const deferTwo = withFreshTurn(session(edited));
+		const deferTwo = withFreshTurn(session());
 		expect(
 			serve(database, sessionId, deferTwo.messages, false, deferTwo.entryIds),
 		).toBeNull();
 		expect(thinkingCount(deferTwo.messages.at(-1))).toBe(1);
 		expect(sha256(deferTwo.messages)).toBe(sha256(deferOne.messages));
 
-		const quietBust = withFreshTurn(session(edited));
+		const nextBust = withFreshTurn(session());
 		expect(
-			serve(database, sessionId, quietBust.messages, true, quietBust.entryIds),
-		).toBeNull();
-		expect(thinkingCount(quietBust.messages.at(-1))).toBe(1);
+			serve(database, sessionId, nextBust.messages, true, nextBust.entryIds),
+		).toEqual({ entryIds: ["a4"] });
+		expect(thinkingCount(nextBust.messages.at(-1))).toBe(0);
+	});
 
-		const editingBust = withFreshTurn(
-			session({ ...edited, second: "second [dropped]" }),
+	it("strips nothing and remembers nothing when the frozen set cannot be written", () => {
+		const database = db();
+		const sessionId = "pi-proactive-persist-failure";
+		serve(database, sessionId, session(), false);
+		database.exec(
+			"CREATE TRIGGER refuse_freeze BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(FAIL, 'transient freeze write failure'); END",
 		);
-		expect(
-			serve(
-				database,
-				sessionId,
-				editingBust.messages,
-				true,
-				editingBust.entryIds,
-			),
-		).toEqual({ firstChangedIndex: 2, entryIds: ["a4"] });
-		expect(thinkingCount(editingBust.messages.at(-1))).toBe(0);
+		const failed = session("re-rendered first message");
+		const before = JSON.stringify(failed);
+		expect(serve(database, sessionId, failed, true)).toBeNull();
+		expect(JSON.stringify(failed)).toBe(before);
+		database.exec("DROP TRIGGER refuse_freeze");
+		const defer = session("re-rendered first message");
+		expect(serve(database, sessionId, defer, false)).toBeNull();
+		expect(JSON.stringify(defer)).toBe(before);
+		expect(getMergedReasoningStrippedIds(database, sessionId)).toEqual(
+			new Set(),
+		);
 	});
 
 	it("leaves sessions on other models byte-identical", () => {
 		const database = db();
 		const sessionId = "pi-proactive-other-model";
-		serve(database, sessionId, session(), false, ENTRY_IDS, "claude-opus-4-1");
-		// Seed a record directly, so only the model gate can keep the thinking.
-		recordPiServedArrayForThinkingBinding({
-			db: database,
-			sessionId,
-			messages: session(),
-			provider: "anthropic",
-			model: "claude-fable-5-1",
-		});
-		const pass = session({ first: "re-rendered first message" });
+		const pass = session("re-rendered first message");
 		const before = JSON.stringify(pass);
 		expect(
 			serve(database, sessionId, pass, true, ENTRY_IDS, "claude-opus-4-1"),

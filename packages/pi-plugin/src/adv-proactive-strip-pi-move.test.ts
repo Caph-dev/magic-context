@@ -103,7 +103,10 @@ describe("Pi binding-strip move: first pass on the new build", () => {
 				event: unknown,
 				ctx: unknown,
 			) => Promise<{ messages: unknown[] } | undefined>;
-			const pass = async (withoutFrozenThinking: boolean) => {
+			const pass = async (
+				withoutFrozenThinking: boolean,
+				modelId = "claude-opus-5-5",
+			) => {
 				const messages = build(withoutFrozenThinking);
 				const result = await handler(
 					{ messages },
@@ -114,7 +117,7 @@ describe("Pi binding-strip move: first pass on the new build", () => {
 							ENTRY_IDS,
 							messages as never,
 						),
-						model: { provider: "anthropic", id: "claude-opus-5-5" },
+						model: { provider: "anthropic", id: modelId },
 					},
 				);
 				return (result?.messages ?? messages) as unknown[];
@@ -122,7 +125,11 @@ describe("Pi binding-strip move: first pass on the new build", () => {
 
 			// Earlier build: a binding 400 froze both assistants, then a busting
 			// pass dropped the tool arc while the frozen thinking was already gone.
-			await pass(false);
+			// The seeding pass is a first render and therefore busts the cache. It
+			// uses a model without prefix-bound thinking, so this build cannot strip
+			// thinking or persist a strip-order marker on it; the earlier build wrote
+			// neither.
+			await pass(false, "claude-opus-4-1");
 			addMergedReasoningStrippedIds(db, sessionId, [
 				"binding_mismatch:entry-a1",
 				"binding_mismatch:entry-a2",
