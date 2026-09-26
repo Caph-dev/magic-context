@@ -11,14 +11,18 @@ import {
 	getThinkingBindingRecoveryTarget,
 	recordOverflowDetected,
 	THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+	THINKING_BINDING_STRIP_ORDER_END_MARKER,
 	thinkingBindingRecoveryFrozenId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { dropSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import {
+	commitServedPass,
 	digestPiServedMessages,
-	firstServedDivergence,
-	getLastServedDigests,
-	recordServedDigests,
+	firstChangedServedIndex,
+	getTrustedServedDigests,
+	stageProactiveFreeze,
+	stageServedArray,
+	unpersistedFrozenEntries,
 } from "@magic-context/core/hooks/magic-context/prefix-bound-thinking";
 import { log } from "@magic-context/core/shared/logger";
 
@@ -191,19 +195,16 @@ export function applyPiThinkingBindingRecovery(args: {
 	provider?: string;
 	model?: string;
 	report?: (message: string) => void;
+	/**
+	 * The session strips thinking after the pipeline stages ran (see
+	 * resolvePiBindingStripOrder). New entries are then written together with
+	 * THINKING_BINDING_STRIP_ORDER_END_MARKER, so later passes keep stripping
+	 * after the stages instead of reverting to stripping before them.
+	 */
+	endOfPassOrder?: boolean;
 }): PiThinkingBindingApplication | null {
 	if (args.provider?.toLowerCase() !== "anthropic") return null;
-	const frozenEntryIds = new Set<string>();
-	for (const frozenId of getMergedReasoningStrippedIds(
-		args.db,
-		args.sessionId,
-	)) {
-		if (!frozenId.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
-		const entryId = frozenId.slice(
-			THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length,
-		);
-		if (entryId.length > 0) frozenEntryIds.add(entryId);
-	}
+	const frozenEntryIds = frozenBindingEntryIds(args.db, args.sessionId);
 
 	const flagTarget = isPrefixBoundThinkingModel(args.provider, args.model)
 		? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
@@ -219,11 +220,12 @@ export function applyPiThinkingBindingRecovery(args: {
 		const newEntryIds = [...entryIds].filter((id) => !frozenEntryIds.has(id));
 		if (
 			newEntryIds.length === 0 ||
-			addMergedReasoningStrippedIds(
-				args.db,
-				args.sessionId,
-				newEntryIds.map(thinkingBindingRecoveryFrozenId),
-			)
+			addMergedReasoningStrippedIds(args.db, args.sessionId, [
+				...newEntryIds.map(thinkingBindingRecoveryFrozenId),
+				...(args.endOfPassOrder
+					? [THINKING_BINDING_STRIP_ORDER_END_MARKER]
+					: []),
+			])
 		) {
 			for (const id of newEntryIds) frozenEntryIds.add(id);
 			applied = { flagTarget, entryIds: [...entryIds] };
@@ -256,16 +258,23 @@ export interface PiProactiveThinkingStrip {
  * (Fable 5.1, Opus 5.5).
  *
  * `messages` is the final array this pass serves, after binding-mismatch strips
- * were replayed on it. It is compared, message by message, with the digests
- * recorded for the previous serve. Every assistant entry at or after the first
- * differing message that still carries thinking is frozen into the same
- * binding-mismatch set the reactive recovery uses, then stripped: after that
- * change the provider would drop or reject those blocks anyway. An open tool
- * round loses its thinking too; its tool call stays. Later passes replay the
- * set through applyPiThinkingBindingRecovery at the same point of the pass, so
- * they serve identical bytes, and a removed block never comes back. Thinking
- * produced after this pass is kept until a later busting pass changes bytes
- * before it.
+ * were replayed on it at the end of the pass. It is compared, message by
+ * message, with the digests of the previous serve; nothing is stripped when
+ * that serve is unknown or untrusted (another process or an unrecorded
+ * fallback served since). Every assistant entry at or after the first
+ * differing message that still carries thinking is stripped: after that change
+ * the provider would drop or reject those blocks anyway. That includes the
+ * newest assistant of an open tool round, whose tool call stays; a live probe
+ * on Fable 5.1 and Opus 5.5 accepted that turn with its thinking removed
+ * (docs/reports/anthropic-open-tool-round-thinking.md).
+ *
+ * The entries are staged and join the binding-mismatch set the reactive
+ * recovery uses only when the pass commits its serve
+ * (recordPiServedArrayForThinkingBinding), so a pass that fails after deciding
+ * leaves the set unchanged. Later passes replay the set through
+ * applyPiThinkingBindingRecovery at the same point of the pass, so they serve
+ * identical bytes, and a removed block never comes back. Thinking produced
+ * after this pass is kept until a later busting pass changes bytes before it.
  *
  * `cacheBustingPass` must be true only on a pass that already busts the cache;
  * a defer pass never originates a strip.
@@ -282,18 +291,19 @@ export function applyPiProactiveThinkingStrip(args: {
 }): PiProactiveThinkingStrip | null {
 	if (!args.cacheBustingPass) return null;
 	if (!isPrefixBoundThinkingModel(args.provider, args.model)) return null;
-	const previous = getLastServedDigests(args.sessionId);
+	const previous = getTrustedServedDigests(args.db, args.sessionId);
 	if (!previous) {
 		reportBindingRecovery(
 			args.sessionId,
 			args.report,
-			"proactive thinking strip: no record of the previously served array in this process; binding recovery remains the fallback",
+			"proactive thinking strip: previous serve unknown to this process; binding recovery remains the fallback",
 		);
 		return null;
 	}
-	const firstChangedIndex = firstServedDivergence(
+	const firstChangedIndex = firstChangedServedIndex(
 		previous,
 		digestPiServedMessages(args.messages),
+		args.messages.length,
 	);
 	if (firstChangedIndex < 0) return null;
 	const entryIds: string[] = [];
@@ -311,36 +321,112 @@ export function applyPiProactiveThinkingStrip(args: {
 		indices.push(index);
 	}
 	if (entryIds.length === 0) return null;
-	if (
-		!addMergedReasoningStrippedIds(
-			args.db,
-			args.sessionId,
-			entryIds.map(thinkingBindingRecoveryFrozenId),
-		)
-	) {
-		reportBindingRecovery(
-			args.sessionId,
-			args.report,
-			"proactive thinking strip: persistence failed; serving the thinking unchanged",
-		);
-		return null;
-	}
+	// These entries are stripped only after the pipeline stages ran, so the
+	// end-order marker is persisted with them; otherwise later passes could
+	// revert to stripping before the stages and render differently.
+	stageProactiveFreeze(args.db, args.sessionId, [
+		...entryIds.map(thinkingBindingRecoveryFrozenId),
+		THINKING_BINDING_STRIP_ORDER_END_MARKER,
+	]);
 	for (const index of indices) stripThinkingParts(args.messages[index]);
 	reportBindingRecovery(
 		args.sessionId,
 		args.report,
-		`proactive thinking strip: first changed served message ${firstChangedIndex} of ${previous.length} previously served; froze thinking of ${entryIds.length} entr${entryIds.length === 1 ? "y" : "ies"} [${entryIds.join(",")}]`,
+		`proactive thinking strip: first changed served message ${firstChangedIndex}; stripping thinking of ${entryIds.length} entr${entryIds.length === 1 ? "y" : "ies"} [${entryIds.join(",")}]`,
 	);
 	return { firstChangedIndex, entryIds };
 }
 
-/** Record the array a successful pass served, for prefix-bound models only. */
+/**
+ * Commit a served pass for prefix-bound models: record the served array the
+ * next busting pass compares against, and persist the thinking this pass
+ * stripped. Call only once the array is handed to Pi.
+ */
 export function recordPiServedArrayForThinkingBinding(args: {
+	db: ContextDatabase;
 	sessionId: string;
 	messages: readonly unknown[];
 	provider?: string;
 	model?: string;
 }): void {
-	if (!isPrefixBoundThinkingModel(args.provider, args.model)) return;
-	recordServedDigests(args.sessionId, digestPiServedMessages(args.messages));
+	if (!isPrefixBoundThinkingModel(args.provider, args.model)) {
+		commitServedPass(args.sessionId);
+		return;
+	}
+	stageServedArray(
+		args.db,
+		args.sessionId,
+		digestPiServedMessages(args.messages),
+	);
+	commitServedPass(args.sessionId);
+}
+
+function frozenBindingEntryIds(
+	db: ContextDatabase,
+	sessionId: string,
+): Set<string> {
+	const ids = new Set<string>();
+	const entries = [
+		...getMergedReasoningStrippedIds(db, sessionId),
+		// Served strips whose persistence failed replay exactly as persisted ones.
+		...unpersistedFrozenEntries(sessionId),
+	];
+	for (const entry of entries) {
+		if (!entry.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+		const entryId = entry.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+		if (entryId.length > 0) ids.add(entryId);
+	}
+	return ids;
+}
+
+/**
+ * Where this pass replays the binding-mismatch strips.
+ *
+ * Builds before this one stripped at the start of the context pass, before any
+ * stage ran, and a stage's output can depend on whether an assistant carries
+ * thinking (a dropped tool arc beside native reasoning renders as a skeleton,
+ * without it as a removal). A session that already carries strips therefore
+ * keeps the start-of-pass order ("start") until a pass may change served bytes:
+ * a pass with a queued explicit flush, which always holds the shared bust
+ * permission, writes the end-order marker and switches. It also switches on any
+ * pass where the order cannot matter (none of its stripped entries is on the
+ * branch). A session without strips uses the end order from the start.
+ *
+ * The proactive strip runs only in the end order, because it is decided on the
+ * array the pass serves and must replay at that same point.
+ */
+export function resolvePiBindingStripOrder(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	messages: readonly unknown[];
+	entryIds: readonly (string | undefined)[];
+	/** Known before any stage runs: this pass is allowed to change served bytes. */
+	bustPermittedAtStart: boolean;
+}): "start" | "end" {
+	const ledger = getMergedReasoningStrippedIds(args.db, args.sessionId);
+	if (ledger.has(THINKING_BINDING_STRIP_ORDER_END_MARKER)) return "end";
+	const frozen = frozenBindingEntryIds(args.db, args.sessionId);
+	if (frozen.size === 0) return "end";
+	let onBranch = false;
+	let carriesThinking = false;
+	for (let index = 0; index < args.messages.length; index += 1) {
+		const entryId = args.entryIds[index];
+		if (!entryId || !frozen.has(entryId)) continue;
+		onBranch = true;
+		if (hasThinkingPart(args.messages[index])) carriesThinking = true;
+	}
+	// With the stripped entries present but their thinking already gone, both
+	// orders render alike this pass, and switching would only move the change
+	// to a later pass; wait for a pass that renders the difference itself.
+	const mayChangeOrder =
+		!onBranch || (carriesThinking && args.bustPermittedAtStart);
+	if (
+		mayChangeOrder &&
+		addMergedReasoningStrippedIds(args.db, args.sessionId, [
+			THINKING_BINDING_STRIP_ORDER_END_MARKER,
+		])
+	) {
+		return "end";
+	}
+	return "start";
 }

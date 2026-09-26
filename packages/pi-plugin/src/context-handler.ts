@@ -169,6 +169,10 @@ import {
 	peekNoteNudgeText,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
+	abandonServedPass,
+	beginServedPass,
+} from "@magic-context/core/hooks/magic-context/prefix-bound-thinking";
+import {
 	getRawHistoryEligibility,
 	hasRunnableCompartmentWindow,
 	type ProtectedTailBoundarySnapshot,
@@ -208,7 +212,6 @@ import {
 } from "@magic-context/core/shared/tag-transcript";
 import { hasTrustedAbsoluteWall } from "@magic-context/core/shared/window-geometry";
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
-
 import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
@@ -283,6 +286,7 @@ import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
 	recordPiServedArrayForThinkingBinding,
+	resolvePiBindingStripOrder,
 } from "./provider-error-recovery-pi";
 import {
 	convertEntriesToRawMessagePage,
@@ -2494,9 +2498,35 @@ export function registerPiContextHandler(
 			const lkgInputIdByRef = new Map<unknown, string>();
 			for (const input of lkgPassSnapshot.inputs)
 				lkgInputIdByRef.set(event.messages[input.messageIndex], input.id);
-			// Binding-mismatch strips run on the final array at the end of the pass,
-			// so every stage sees the same thinking on every pass. This map keeps the
-			// input entry ids reachable for messages the pipeline leaves in place.
+			// If the previous pass never finished serving its array, there is no
+			// trustworthy record of what the provider received, so the proactive
+			// thinking strip must not compare against one.
+			beginServedPass(sessionId, options.db);
+			// Binding-mismatch strips normally run on the final array at the end of
+			// the pass, so every stage sees the same thinking on every pass. A
+			// session whose strips predate that order keeps stripping here, before
+			// any stage, until a pass that may change bytes switches it.
+			const bindingStripOrder = resolvePiBindingStripOrder({
+				db: options.db,
+				sessionId,
+				messages: event.messages as unknown[],
+				entryIds: lkgEntryIds ?? [],
+				bustPermittedAtStart: hasPendingMaterialization(sessionId),
+			});
+			const startOfPassBindingRecovery =
+				bindingStripOrder === "start"
+					? applyPiThinkingBindingRecovery({
+							db: options.db,
+							sessionId,
+							messages: event.messages as unknown[],
+							entryIds: lkgEntryIds ?? [],
+							provider: lkgProviderKey ?? undefined,
+							model: ctx.model?.id,
+						})
+					: null;
+			// Maps each input message object to its branch entry id, so the strip at
+			// the end of the pass can still identify messages the pipeline kept as
+			// the same object.
 			const bindingEntryIdByRef = new Map<unknown, string>();
 			if (lkgEntryIds) {
 				for (let index = 0; index < event.messages.length; index += 1) {
@@ -3531,6 +3561,8 @@ export function registerPiContextHandler(
 			// identically on the pass that first strips a block and on every later
 			// pass that replays the strip. Replays and an armed recovery come first;
 			// a busting pass then removes the thinking its own edit invalidated.
+			// Sessions that still strip before the pipeline stages had their strips
+			// applied at the start of the pass and skip this step.
 			const tThinkingBinding = performance.now();
 			const outputEntryIds = resolvePiLkgOutputEntryIds(
 				outputMessages,
@@ -3540,15 +3572,19 @@ export function registerPiContextHandler(
 					result.postCommitEntryIdByRef.get(message) ??
 					bindingEntryIdByRef.get(message),
 			).map((entryId) => entryId ?? undefined);
-			const thinkingBindingRecoveryApplied = applyPiThinkingBindingRecovery({
-				db: options.db,
-				sessionId,
-				messages: outputMessages as unknown[],
-				entryIds: outputEntryIds,
-				provider: lkgProviderKey ?? undefined,
-				model: ctx.model?.id,
-			});
-			if (!options.compactionOff) {
+			const thinkingBindingRecoveryApplied =
+				bindingStripOrder === "end"
+					? applyPiThinkingBindingRecovery({
+							db: options.db,
+							sessionId,
+							messages: outputMessages as unknown[],
+							entryIds: outputEntryIds,
+							provider: lkgProviderKey ?? undefined,
+							model: ctx.model?.id,
+							endOfPassOrder: true,
+						})
+					: startOfPassBindingRecovery;
+			if (!options.compactionOff && bindingStripOrder === "end") {
 				try {
 					applyPiProactiveThinkingStrip({
 						db: options.db,
@@ -3814,6 +3850,7 @@ export function registerPiContextHandler(
 			}
 			capturePiServedArray(sessionId, outputMessages);
 			recordPiServedArrayForThinkingBinding({
+				db: options.db,
 				sessionId,
 				messages: outputMessages,
 				provider: lkgProviderKey ?? undefined,
@@ -3858,6 +3895,19 @@ export function registerPiContextHandler(
 			const message = err instanceof Error ? err.message : String(err);
 			const stack = err instanceof Error ? err.stack : undefined;
 			const transientStorageFailure = isTransientPiStorageError(err);
+			if (sessionIdForError) {
+				// What is served below (a last-known-good replay or the raw input) is
+				// not the array this pass staged, so no served-array record holds. The
+				// store is skipped when it is the thing that failed.
+				try {
+					abandonServedPass(
+						sessionIdForError,
+						transientStorageFailure ? undefined : baseOptions.db,
+					);
+				} catch {
+					// Clearing the in-process record already happened; the stamp is best effort.
+				}
+			}
 			if (
 				transientStorageFailure &&
 				sessionIdForError &&

@@ -67,8 +67,12 @@ import {
     type M0HardSignals,
 } from "./inject-compartments";
 import {
+    abandonServedPass,
+    beginServedPass,
+    commitServedPass,
     digestOpenCodeServedMessages,
     getLastServedDigests,
+    getTrustedServedDigests,
     recordServedDigests,
     resetServedDigestsForTest,
 } from "./prefix-bound-thinking";
@@ -9226,14 +9230,111 @@ describe("proactive strip of thinking invalidated by a busting pass", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-proactive-other-model";
-        // A prior record exists, so only the model gate can keep the thinking.
-        recordServedDigests(sessionId, digestOpenCodeServedMessages(buildSession(sessionId)));
+        // A trustworthy record of the previous serve exists, so only the model
+        // check can keep this non-bound session's thinking.
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+        expect(getTrustedServedDigests(db, sessionId)).toBeDefined();
         const pass = buildSession(sessionId, { prefix: "re-rendered first user message" });
         const before = JSON.stringify(pass);
         const result = await serve(sessionId, pass, { busting: true, boundModel: false });
         expect(result.proactiveThinkingStrip).toBeNull();
         expect(JSON.stringify(pass)).toBe(before);
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+    });
+
+    it("persists a chosen strip only once the pass has been served", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-persist-after-serve";
+        const edited = { prefix: "re-rendered first user message" };
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+        beginServedPass(sessionId, db);
+
+        // The busting pass decides and applies the strip, then fails before it
+        // is served (no commit): the persisted set must stay as it was.
+        const failed = buildSession(sessionId, edited);
+        const failedResult = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, failed, {
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                pendingMaterializationSessions: new Set([sessionId]),
+            }),
+        );
+        expect(failedResult.proactiveThinkingStrip?.messageIds).toHaveLength(3);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+
+        // The next pass knows the previous serve never landed: no trusted record,
+        // no replay of the abandoned decision.
+        beginServedPass(sessionId, db);
+        expect(getTrustedServedDigests(db, sessionId)).toBeUndefined();
+        const next = buildSession(sessionId, edited);
+        const nextResult = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, next, {
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                pendingMaterializationSessions: new Set([sessionId]),
+            }),
+        );
+        expect(nextResult.proactiveThinkingStrip).toBeNull();
+        expect(reasoningCount(findMessage(next, "assistant-one"))).toBe(1);
+        commitServedPass(sessionId);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+
+        // A strip that was served is persisted at commit.
+        const served = buildSession(sessionId, { ...edited, userTwo: "second [dropped]" });
+        const servedResult = await serve(sessionId, served, { busting: true });
+        expect(servedResult.proactiveThinkingStrip?.messageIds).toEqual([
+            "assistant-two",
+            "assistant-open-tool",
+        ]);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(
+            new Set(["binding_mismatch:assistant-two", "binding_mismatch:assistant-open-tool"]),
+        );
+    });
+
+    it("does not trust a record after a serve this process did not stage", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-abandoned";
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+        expect(getTrustedServedDigests(db, sessionId)).toBeDefined();
+        // Simulate a pass that served the last-known-good replay or the raw input
+        // instead of its own array: its record must not be trusted afterwards.
+        abandonServedPass(sessionId, db);
+        const pass = buildSession(sessionId, { prefix: "re-rendered first user message" });
+        const before = JSON.stringify(pass);
+        const result = await serve(sessionId, pass, { busting: true });
+        expect(result.proactiveThinkingStrip).toBeNull();
+        expect(JSON.stringify(pass)).toBe(before);
+    });
+
+    it("leaves subagent sessions alone, as Rust mode does", async () => {
+        resetServedDigestsForTest();
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-proactive-subagent";
+        const subagentPass = async (messages: MessageLike[], busting: boolean) => {
+            const result = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    resolvedProviderID: "anthropic",
+                    thinkingBindingRecoveryEnabledForModel: true,
+                    fullFeatureMode: false,
+                    ...(busting
+                        ? { pendingMaterializationSessions: new Set([sessionId]) }
+                        : { schedulerDecision: "defer" as const }),
+                }),
+            );
+            commitServedPass(sessionId);
+            return result;
+        };
+        await subagentPass(buildSession(sessionId), false);
+        const pass = buildSession(sessionId, { prefix: "re-rendered first user message" });
+        const result = await subagentPass(pass, true);
+        expect(result.proactiveThinkingStrip).toBeNull();
+        expect(reasoningCount(findMessage(pass, "assistant-one"))).toBe(1);
+        expect(getLastServedDigests(sessionId)).toBeUndefined();
     });
 
     it("does not strip without a record of the previously served array", async () => {
@@ -9366,7 +9467,7 @@ describe("adversarial: proactive thinking strip gate", () => {
     // reports the other process's already-served change as new, and the busting
     // pass strips thinking that was produced after that change and is still valid.
     // Expected to fail until a stale record cannot widen the strip.
-    it.failing("keeps thinking produced after another process's strip when this process's record predates it", async () => {
+    it("keeps thinking produced after another process's strip when this process's record predates it", async () => {
         resetServedDigestsForTest();
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -9453,7 +9554,7 @@ describe("adversarial: proactive thinking strip gate", () => {
     // first thinking block, which is still valid. The real edit is in
     // assistant-step. Expected to fail until wire-invisible sentinels are left
     // out of the digest.
-    it.failing("does not count a wire-invisible sentinel removal as a change before existing thinking", async () => {
+    it("does not count a wire-invisible sentinel removal as a change before existing thinking", async () => {
         resetServedDigestsForTest();
         db = new Database(":memory:");
         initializeDatabase(db);

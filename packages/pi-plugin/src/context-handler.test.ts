@@ -7204,7 +7204,11 @@ describe("Pi proactive strip of invalidated thinking", () => {
 			);
 			expect(busting.map(thinkingIn)).toEqual([0, 0, 0, 0, 0]);
 			expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(
-				new Set(["binding_mismatch:entry-a1", "binding_mismatch:entry-a2"]),
+				new Set([
+					"binding_mismatch:entry-a1",
+					"binding_mismatch:entry-a2",
+					"binding_mismatch_order:end",
+				]),
 			);
 
 			const defer = await pass(true);

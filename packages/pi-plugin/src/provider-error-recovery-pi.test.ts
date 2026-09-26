@@ -374,6 +374,7 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 			report: () => {},
 		});
 		recordPiServedArrayForThinkingBinding({
+			db: database,
 			sessionId,
 			messages,
 			provider: "anthropic",
@@ -406,6 +407,7 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 				"binding_mismatch:a1",
 				"binding_mismatch:a2",
 				"binding_mismatch:a3",
+				"binding_mismatch_order:end",
 			]),
 		);
 
@@ -487,6 +489,7 @@ describe("Pi proactive strip of thinking invalidated by a busting pass", () => {
 		serve(database, sessionId, session(), false, ENTRY_IDS, "claude-opus-4-1");
 		// Seed a record directly, so only the model gate can keep the thinking.
 		recordPiServedArrayForThinkingBinding({
+			db: database,
 			sessionId,
 			messages: session(),
 			provider: "anthropic",

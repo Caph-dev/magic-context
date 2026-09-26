@@ -20,7 +20,10 @@ import {
 	getTagsBySession,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage";
-import { addMergedReasoningStrippedIds } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	addMergedReasoningStrippedIds,
+	getMergedReasoningStrippedIds,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	clearContextHandlerSession,
@@ -87,7 +90,7 @@ describe("Pi binding-strip move: first pass on the new build", () => {
 	// Expected to fail until sessions that already carry frozen thinking strips
 	// keep removing that thinking before the pipeline stages run, and switch to
 	// the end-of-pass order only on a pass that is allowed to change served bytes.
-	it.failing("a defer pass after the upgrade serves the bytes the earlier build served", async () => {
+	it("a defer pass after the upgrade serves the bytes the earlier build served", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-binding-move";
 		const fake = createFakePi();
@@ -151,6 +154,29 @@ describe("Pi binding-strip move: first pass on the new build", () => {
 			// (assistant toolCall with `{"dropped": …}` plus the placeholder result),
 			// which changes the served prefix at index 1 on a defer pass.
 			expect(sha(upgradedDefer)).toBe(sha(earlierDefer));
+			expect(getMergedReasoningStrippedIds(db, sessionId)).not.toContain(
+				"binding_mismatch_order:end",
+			);
+
+			// A queued explicit flush lets this pass change served bytes, so it
+			// switches to stripping after the pipeline stages and records that
+			// order in the ledger for later passes.
+			signalPiPendingMaterialization(sessionId);
+			const switching = await pass(false);
+			expect(getMergedReasoningStrippedIds(db, sessionId)).toContain(
+				"binding_mismatch_order:end",
+			);
+			const thinkingAfterSwitch = switching.some(
+				(message) =>
+					Array.isArray((message as { content?: unknown }).content) &&
+					(message as { content: { type?: string }[] }).content.some((part) =>
+						THINKING.has(String(part.type)),
+					),
+			);
+			expect(thinkingAfterSwitch).toBe(false);
+			// The next (defer) pass serves exactly what the switching pass served.
+			const afterSwitch = await pass(false);
+			expect(sha(afterSwitch)).toBe(sha(switching));
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);

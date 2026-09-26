@@ -2507,6 +2507,14 @@ export function removeStrippedPlaceholderId(
  */
 export const THINKING_BINDING_RECOVERY_ALL_ASSISTANTS = "all_reasoning_bearing_assistants";
 export const THINKING_BINDING_RECOVERY_FROZEN_PREFIX = "binding_mismatch:";
+/**
+ * Ledger control entry (not a message id) recording that a Pi session strips
+ * its binding-mismatch thinking after the context pass's pipeline stages ran.
+ * Sessions whose strips were written by earlier builds, which stripped before
+ * the stages, keep that behaviour until a pass allowed to change served bytes
+ * writes this entry.
+ */
+export const THINKING_BINDING_STRIP_ORDER_END_MARKER = "binding_mismatch_order:end";
 
 export function thinkingBindingRecoveryFrozenId(messageId: string): string {
     return `${THINKING_BINDING_RECOVERY_FROZEN_PREFIX}${messageId}`;
