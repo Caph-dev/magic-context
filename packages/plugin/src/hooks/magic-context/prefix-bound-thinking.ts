@@ -88,10 +88,6 @@ export function recordServedDigests(sessionId: string, digests: readonly string[
     servedDigestsBySession.set(sessionId, [...digests]);
 }
 
-export function forgetServedDigests(sessionId: string): void {
-    servedDigestsBySession.delete(sessionId);
-}
-
 export function resetServedDigestsForTest(): void {
     servedDigestsBySession.clear();
     unserializableCounter = 0;
