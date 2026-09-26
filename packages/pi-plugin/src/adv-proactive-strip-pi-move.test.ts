@@ -84,8 +84,9 @@ const sha = (value: unknown) =>
 	createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
 describe("Pi binding-strip move: first pass on the new build", () => {
-	// Expected to fail until sessions that already carry binding-mismatch strips
-	// keep the start-of-pass order until their next busting pass.
+	// Expected to fail until sessions that already carry frozen thinking strips
+	// keep removing that thinking before the pipeline stages run, and switch to
+	// the end-of-pass order only on a pass that is allowed to change served bytes.
 	it.failing("a defer pass after the upgrade serves the bytes the earlier build served", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-binding-move";
