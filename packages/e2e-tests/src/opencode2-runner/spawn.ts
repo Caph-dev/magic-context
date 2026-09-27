@@ -249,6 +249,11 @@ export interface OpenCode2SpawnOptions {
 	 * the client's discovery file. Only this mode writes that file.
 	 */
 	serviceMode?: boolean;
+	/**
+	 * False leaves the isolated context.db exactly as the test seeded it, for a
+	 * scenario that needs the host itself to meet an older schema.
+	 */
+	prepareContextDatabase?: boolean;
 }
 
 /** Event-driven, bounded startup; no readiness polling. CLI contract: AFT playbook:54-64. */
@@ -261,7 +266,8 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 	const fence = snapshotWriteFence(fixture.referencedDirectories);
 	// Do not open the operator's live database, even for a read-only snapshot.
 	// Check the host's writable descriptors and protected directory metadata instead.
-	prepareContextDatabase(fixture.env.XDG_DATA_HOME!);
+	if (options.prepareContextDatabase !== false)
+		prepareContextDatabase(fixture.env.XDG_DATA_HOME!);
 	if (
 		options.includeMagicContext !== false &&
 		!existsSync(join(PLUGIN, "dist/v2/server.js"))

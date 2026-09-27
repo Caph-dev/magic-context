@@ -25,6 +25,7 @@ import {
 } from "../../features/magic-context/dreamer/task-scheduler";
 import {
     clearHookInitFailure,
+    formatFailClosedBlockingMessage,
     recordHookInitFailure,
 } from "../../features/magic-context/fail-closed-block";
 import {
@@ -41,10 +42,9 @@ import {
 } from "../../features/magic-context/storage";
 import {
     type DatabaseBootTimings,
-    getMigrationOnOpenRefusal,
-    getSchemaFenceRejection,
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
+import { describeStorageUnavailability } from "../../features/magic-context/storage-unavailable-reason";
 import type { Tagger } from "../../features/magic-context/tagger";
 import { getCurrentToolSetHash } from "../../features/magic-context/tool-definition-tokens";
 import type { ContextUsage } from "../../features/magic-context/types";
@@ -244,49 +244,17 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         clearHookInitFailure();
         const opened = deps.openDatabaseForHook ? deps.openDatabaseForHook() : openDatabase();
         if (!opened || !isDatabasePersisted(opened)) {
-            const reason =
+            const reason = describeStorageUnavailability(
                 (opened ? getDatabasePersistenceError(opened) : null) ??
-                "Failed to initialize the persistent SQLite database.";
+                    "Failed to initialize the persistent SQLite database.",
+            );
+            const detail = formatFailClosedBlockingMessage(reason);
             log(
                 "[magic-context] disabling feature because persistent storage is unavailable:",
-                reason,
+                detail,
             );
-            notifyMagicContextDisabled(deps.client, reason);
-            const migration = getMigrationOnOpenRefusal();
-            const blockingProcesses =
-                migration?.blockingProcesses ??
-                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
-                [];
-            const fence = getSchemaFenceRejection();
-            recordHookInitFailure({
-                type: "storage",
-                reason:
-                    migration && (blockingProcesses.length > 0 || migration.unreadableFile)
-                        ? {
-                              kind: "migration_guard",
-                              persistedVersion: migration.persistedVersion,
-                              supportedVersion: migration.supportedVersion,
-                              blockingProcesses,
-                              ...(migration.unreadableFile
-                                  ? { unreadableFile: migration.unreadableFile }
-                                  : {}),
-                              ...(migration.unreadableArm
-                                  ? { unreadableArm: migration.unreadableArm }
-                                  : {}),
-                          }
-                        : fence
-                          ? {
-                                kind: "schema_fence",
-                                persistedVersion: fence.persistedVersion,
-                                supportedVersion: fence.supportedVersion,
-                            }
-                          : {
-                                kind: "storage_failure",
-                                cause: migration?.unreadableFile
-                                    ? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
-                                    : reason,
-                            },
-            });
+            notifyMagicContextDisabled(deps.client, detail);
+            recordHookInitFailure({ type: "storage", reason });
             return null;
         }
         db = opened;

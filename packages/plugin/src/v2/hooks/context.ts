@@ -9,7 +9,12 @@ import { getProtectedTokensTierOverrides } from "../../config/project-security";
 import { summarizeManualDream } from "../../features/magic-context/dreamer/manual-summary";
 import { userMemoryCollectionEnabled } from "../../features/magic-context/dreamer/task-config";
 import { formatUnsupportedDreamTasks } from "../../features/magic-context/dreamer/task-registry";
-import { isFailClosedBlockingError } from "../../features/magic-context/fail-closed-block";
+import {
+    type FailClosedReason,
+    formatFailClosedBlockingMessage,
+    formatFailClosedBlockingSummary,
+    isFailClosedBlockingError,
+} from "../../features/magic-context/fail-closed-block";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { detectOverflow } from "../../features/magic-context/overflow-detection";
 import { createScheduler } from "../../features/magic-context/scheduler";
@@ -19,7 +24,7 @@ import {
     getOverflowState,
     isDatabasePersisted,
     markSessionCleanupPending,
-    openDatabase,
+    type openDatabase,
     recordDetectedContextLimit,
     recordOverflowDetected,
 } from "../../features/magic-context/storage";
@@ -100,6 +105,7 @@ import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
 import { runV2SessionProjectBackfill } from "./session-project-backfill";
+import { createV2StorageGate } from "./storage-gate";
 import {
     createV2RawMessageProvider,
     createV2RawMessageReader,
@@ -462,13 +468,55 @@ export async function registerContext(context: V2Context) {
         directory,
         warn: (message) => console.warn(`[magic-context] config warning: ${message}`),
     });
-    let db: ReturnType<typeof openDatabase> | undefined;
-    try {
-        db = openDatabase() ?? undefined;
-    } catch {
-        // The primary context hook retains the existing fail-closed storage path.
-        // Hidden work remains unavailable for this plugin instance when durable storage cannot open.
-    }
+    // Tools, hidden agents and the dreamer below are wired only when this first
+    // open succeeds. A refused open is retried on later turns through the gate,
+    // which lets turns proceed again once the cause is gone, but that wiring
+    // still needs a host restart.
+    const storage = createV2StorageGate({
+        onUnavailable: (reason) => {
+            const message = formatFailClosedBlockingMessage(reason);
+            console.warn(`[magic-context] v2 storage unavailable: ${message}`);
+            log(`[magic-context] v2 storage unavailable: ${message}`);
+        },
+        onRecovered: () => {
+            const message =
+                "[magic-context] v2 storage recovered: the context database opened on a later attempt, so turns proceed again. Tools, historian and dreamer stay unavailable until OpenCode restarts.";
+            console.warn(message);
+            log(message);
+        },
+    });
+    let db: ReturnType<typeof openDatabase> | undefined = storage.probe();
+    const storageNoticeBySession = new Map<string, string>();
+    // Delivering a synthetic message to an idle OpenCode 2 session starts a turn
+    // of its own. A turn whose newest message is one of these notices has nothing
+    // for the model to answer, so the context hook ends it before the provider.
+    const storageNoticeIds = new Set<string>();
+    /**
+     * Tell the user why a turn is refused for missing storage. The host records a
+     * refused turn as a bare interruption with no text, so without this the turn
+     * just ends in silence. A toast reaches a connected Magic Context TUI on every
+     * refusal. A notice stored in the conversation reaches every client, but it
+     * stays in the history the model later reads, so it is written once per
+     * session and reason rather than on every refused turn.
+     *
+     * The stored notice waits until the refused turn has ended. On OpenCode 2.0.18
+     * a synthetic message sent while the turn is still running is dropped when the
+     * turn is interrupted: its sequence number is used and no row is kept.
+     */
+    const noticeStorageRefusal = (sessionID: string, reason: FailClosedReason): void => {
+        const message = `Magic Context refused this turn before the model call. ${formatFailClosedBlockingSummary(reason)}`;
+        pushNotification("toast", { message, variant: "error" }, sessionID);
+        if (storageNoticeBySession.get(sessionID) === message) return;
+        storageNoticeBySession.set(sessionID, message);
+        void context.session
+            .wait({ sessionID })
+            .then(async () => {
+                storageNoticeIds.add(await deliverSynthetic(context, sessionID, message));
+            })
+            .catch((error: unknown) =>
+                sessionLog(sessionID, "v2 storage refusal notice could not be delivered:", error),
+            );
+    };
     // Rust mode reaches the `ck-mc` module over the same subc client the OpenCode 1
     // lane builds. Building it is inert until a pass actually calls the module, so
     // it is safe to hold one here for the whole process. It is resolved before the
@@ -705,8 +753,7 @@ export async function registerContext(context: V2Context) {
     ): Promise<boolean> => {
         let unsafe = false;
         try {
-            db ??= openDatabase();
-            if (!db || !isDatabasePersisted(db)) throw new Error("context storage is not durable");
+            db = storage.require();
             getOrCreateSessionMeta(db, draft.sessionID);
             const reader = new V2StoreReader(
                 gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
@@ -807,6 +854,7 @@ export async function registerContext(context: V2Context) {
                     rawProviders.delete(sessionID);
                     usage.delete(sessionID);
                     hiddenSessionErrors.delete(sessionID);
+                    storageNoticeBySession.delete(sessionID);
                     liveModels.delete(sessionID);
                     variants.delete(sessionID);
                     agents.delete(sessionID);
@@ -834,8 +882,7 @@ export async function registerContext(context: V2Context) {
         }
     })();
     const materialize = (draft: SessionContext) => {
-        db ??= openDatabase();
-        if (!db || !isDatabasePersisted(db)) throw new Error("context storage is not durable");
+        db = storage.require();
         const state = getOrCreateSessionMeta(db, draft.sessionID);
         return materializeM0({
             db,
@@ -937,6 +984,11 @@ export async function registerContext(context: V2Context) {
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
+        const newest = draft.messages.at(-1)?.id;
+        if (newest && storageNoticeIds.has(newest)) {
+            await refuseBeforeProvider(context.session, draft.sessionID, "storage-notice-turn");
+            return;
+        }
         liveModels.set(draft.sessionID, {
             providerID: draft.model.providerID,
             modelID: draft.model.id,
@@ -961,6 +1013,17 @@ export async function registerContext(context: V2Context) {
             // reduce an over-limit session, and refusing ahead of them would refuse
             // the same stored reading again on every later turn.
             if ((await recordUsage(draft)) && !compactionOff) {
+                const storageReason = storage.current() ? null : storage.reason();
+                if (storageReason) {
+                    noticeStorageRefusal(draft.sessionID, storageReason);
+                    await refuseBeforeProvider(
+                        context.session,
+                        draft.sessionID,
+                        "storage-unavailable",
+                        formatFailClosedBlockingMessage(storageReason),
+                    );
+                    return;
+                }
                 await refuseBeforeProvider(context.session, draft.sessionID, "usage-unavailable");
                 return;
             }
@@ -1373,12 +1436,14 @@ export async function registerContext(context: V2Context) {
             pushNotification("toast", { message: requested.error, variant: "warning" }, sessionId);
             return { ok: false, error: requested.error };
         }
-        db ??= openDatabase();
-        if (!db || !isDatabasePersisted(db)) {
+        try {
+            db = storage.require();
+        } catch {
+            const reason = storage.reason();
             pushNotification(
                 "toast",
                 {
-                    message: "Dreaming is unavailable: context storage is not durable.",
+                    message: `Dreaming is unavailable: ${reason ? formatFailClosedBlockingSummary(reason) : "context storage is not durable."}`,
                     variant: "error",
                 },
                 sessionId,
