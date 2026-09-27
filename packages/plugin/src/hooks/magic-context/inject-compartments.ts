@@ -3576,9 +3576,15 @@ function classifyAbsentBoundary(
         absentBoundaryEpisodeBySession.delete(sessionId);
         if (precedesWindowLoggedBySession.get(sessionId) !== boundary) {
             precedesWindowLoggedBySession.set(sessionId, boundary);
+            // Earlier in the same pass, compartment injection may already have cut
+            // the window through the boundary, and reduction may have removed
+            // messages after it (a message whose only tool calls were dropped
+            // is left empty and removed). A boundary before the first remaining
+            // message therefore does not by itself mean the host's window
+            // started after it, and the line is worded not to suggest that.
             sessionLog(
                 sessionId,
-                `prefix trim: boundary ${boundary} sorts before the first live message ${firstLiveId}; pass=${pass}; nothing to cut, whole window kept`,
+                `prefix trim: boundary ${boundary} precedes the first remaining message ${firstLiveId}; rows between were cut with the summarized history or removed by reduction this pass; pass=${pass}; nothing to cut`,
             );
         }
         return "boundary-precedes-window";

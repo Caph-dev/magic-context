@@ -12,7 +12,7 @@
  * reorder) are the ones an ordinal-based cut got wrong.
  */
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -296,6 +297,41 @@ describe("absent-boundary prefix trim: append-only defer passes keep the priced 
         const second = window(31);
         expect(servePass(db, second, boundary, false).prefixTrimStatus).toBe("refused");
         expectAppendOnlyDefer(first, second);
+    });
+});
+
+describe("absent-boundary prefix trim: the log does not imply the host window started after the boundary", () => {
+    // Production shape: compartment injection already cut the window through the
+    // boundary (row 12), then reduction removed rows 13-14 (tool-only steps whose
+    // calls were dropped), so the first remaining row is 15. OpenCode served 13-14.
+    it("says the rows between were cut or removed this pass, and serves the same rows as before", () => {
+        // The line is logged once per boundary per process; start fresh.
+        resetPrefixTrimFallbackState(SESSION_ID);
+        createOpenCodeStore(range(1, 30).map((index) => regularRow(index)));
+        const db = contextDb();
+        const lines: string[] = [];
+        const spy = spyOn(loggerModule, "sessionLog").mockImplementation((_id, ...values) => {
+            lines.push(values.map(String).join(" "));
+        });
+        try {
+            const live = liveWindow(range(15, 30));
+            const status = injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages: live,
+                preparedPrefix: preparedPrefix(idOf(12)),
+                isCacheBustingPass: true,
+            }).prefixTrimStatus;
+
+            expect(status).toBe("boundary-precedes-window");
+            expect(ids(live)).toEqual([undefined, ...ids(liveWindow(range(15, 30)))]);
+            expect(lines.filter((line) => line.includes("prefix trim:"))).toEqual([
+                `prefix trim: boundary ${idOf(12)} precedes the first remaining message ${idOf(15)}; rows between were cut with the summarized history or removed by reduction this pass; pass=priced; nothing to cut`,
+            ]);
+        } finally {
+            spy.mockRestore();
+        }
     });
 });
 

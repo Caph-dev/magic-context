@@ -111,6 +111,21 @@
             ]
         },
         {
+            "path": "tests/prefix-trim-reduction-gap.test.ts",
+            "tier": "ts-only",
+            "invocation": {
+                "ts": true,
+                "rust": false
+            },
+            "rationale": "the TypeScript prefix-trim log after an OpenCode 1 restart: compartment injection has already cut through the boundary and reduction removed tool-only steps after it; the log line and the compaction marker it reasons about exist only on the OpenCode 1 TypeScript lane",
+            "contract_refs": [
+                "TS-HARNESS"
+            ],
+            "hosts": [
+                "opencode"
+            ]
+        },
+        {
             "path": "tests/final-step-usage.test.ts",
             "tier": "ts-only",
             "invocation": {
