@@ -11,6 +11,9 @@
 # Usage: scripts/backup-live-stores.sh [dest-root]   (default /Volumes/UGREEN/mc-backups)
 # Restore: stop every process holding the store, copy <snapshot>/<name>.db over
 # the live path (remove the live -wal/-shm first), then start one seat.
+# context.db and store.db are one consistency unit: restore both from the same
+# snapshot, together with a ck-mc build that knows the recorded store.db version.
+# ck-mc refuses to open a store.db newer than its own migrations.
 set -euo pipefail
 
 DEST_ROOT="${1:-/Volumes/UGREEN/mc-backups}"
@@ -58,7 +61,16 @@ for src in "${SOURCES[@]}"; do
         echo "  $name: quick_check FAILED: $check" >&2
         exit 1
     fi
-    version="$(sqlite3 "$out" 'SELECT MAX(version) FROM schema_migrations;' 2>/dev/null || echo n/a)"
+    # context.db and opencode.db record their version in schema_migrations; the Rust module's
+    # store.db keeps its own chain in cortexkit_schema_version. Recording the store.db version
+    # lets a restore be matched to a ck-mc build that knows it: a binary older than that
+    # version refuses to open the store.
+    if [ "$name" = "store.db" ]; then
+        version_sql="SELECT MAX(version) FROM cortexkit_schema_version WHERE namespace = 'mc_cache';"
+    else
+        version_sql='SELECT MAX(version) FROM schema_migrations;'
+    fi
+    version="$(sqlite3 "$out" "$version_sql" 2>/dev/null || echo n/a)"
     size_mb=$(( $(stat -f %z "$out") / 1000000 ))
     echo "  $name: ${size_mb} MB, quick_check ok, schema_migrations max=${version}, $(( $(date +%s) - start ))s"
     printf '%s\t%s\tschema=%s\tsha256=%s\n' "$name" "$src" "$version" "$(shasum -a 256 "$out" | cut -d' ' -f1)" >> "$DEST/MANIFEST.tsv"

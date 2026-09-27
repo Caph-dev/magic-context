@@ -146,6 +146,42 @@ describe("createCtxNoteTools", () => {
         expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
     });
 
+    it("names both store versions and the fix when the module refuses a store ahead of it", async () => {
+        const storeAhead = () =>
+            Object.assign(new Error("store_ahead_of_binary"), {
+                code: "store_ahead_of_binary",
+                detail: { reason_code: "store_ahead_of_binary", db_version: 63, binary_max: 62 },
+            });
+        // Both places the module is asked: the authority probe, and the tool call itself.
+        for (const rustToolBackends of [
+            {
+                authorityState: async () => {
+                    throw storeAhead();
+                },
+            },
+            {
+                authorityState: async () => "MODULE" as const,
+                note: async () => {
+                    throw storeAhead();
+                },
+            },
+        ]) {
+            tools = createCtxNoteTools({
+                db,
+                resolveProjectPath: () => "git:project-a",
+                rustToolBackends,
+            });
+            const result = await tools.ctx_note.execute(
+                { action: "write", content: "must not be written" },
+                toolContext(),
+            );
+            expect(result).toBe(
+                "Magic Context refused to start: its store (store.db) is at schema v63 but this ck-mc build only knows up to v62. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)",
+            );
+        }
+        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
+    });
+
     it("does not echo content attached to a read-only module refusal", async () => {
         tools = createCtxNoteTools({
             db,

@@ -84,7 +84,7 @@ use mc_store::{
     StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
     StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
     VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
-    SINGLE_STORE_MARKER_REFUSAL_REASON,
+    SINGLE_STORE_MARKER_REFUSAL_REASON, STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -340,7 +340,51 @@ const STORE_OPEN_FAILURE_REASON_GENERIC: &str = "open_error";
 fn store_open_failure_reason_code(error: &McStoreError) -> &'static str {
     match error {
         McStoreError::SingleStoreMarkerUnsupported { .. } => SINGLE_STORE_MARKER_REFUSAL_REASON,
+        McStoreError::StoreAheadOfBinary { .. } => STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
         _ => STORE_OPEN_FAILURE_REASON_GENERIC,
+    }
+}
+
+/// The two schema versions of a store that a newer ck-mc already migrated past this binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoreAheadVersions {
+    /// The highest migration version recorded in `store.db`.
+    db_version: u32,
+    /// The highest migration version this binary carries.
+    binary_max: u32,
+}
+
+impl StoreAheadVersions {
+    fn of(error: &McStoreError) -> Option<Self> {
+        match error {
+            McStoreError::StoreAheadOfBinary {
+                db_version,
+                binary_max,
+            } => Some(Self {
+                db_version: *db_version,
+                binary_max: *binary_max,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The machine-readable detail every error frame for this refusal carries, so an adapter can
+    /// name both versions without parsing a sentence.
+    fn detail(self) -> Value {
+        json!({
+            "reason_code": STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
+            "db_version": self.db_version,
+            "binary_max": self.binary_max,
+        })
+    }
+
+    /// The sentence a user reads. It mirrors the plugin's MC-C13 rendering so a facade tool and
+    /// a refused turn say the same thing, and it names no path or other engine internal.
+    fn user_message(self) -> String {
+        format!(
+            "Magic Context refused to start: its store (store.db) is at schema v{} but this ck-mc build only knows up to v{}. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)",
+            self.db_version, self.binary_max
+        )
     }
 }
 
@@ -351,6 +395,9 @@ fn store_open_failure_reason_code(error: &McStoreError) -> &'static str {
 struct StoreOpenFailure {
     /// The stable token a reader matches on.
     reason_code: String,
+    /// Present when the open was refused because the store is ahead of this binary. Kept
+    /// structured so every refusal can carry both versions rather than only a sentence.
+    store_ahead: Option<StoreAheadVersions>,
     /// The human sentence, which may name paths, elapsed times and driver text.
     reason: String,
     origin: &'static str,
@@ -385,6 +432,14 @@ enum StoreRefusal {
         origin: &'static str,
         descriptor: String,
     },
+    /// The store was migrated by a newer ck-mc than this one. Terminal like `Failed`, but with
+    /// its own code: the fix is a different binary or a coordinated restore of both databases,
+    /// and an adapter has to be able to tell the user exactly that.
+    StoreAhead {
+        versions: StoreAheadVersions,
+        origin: &'static str,
+        descriptor: String,
+    },
 }
 
 impl StoreRefusal {
@@ -394,12 +449,13 @@ impl StoreRefusal {
             Self::Opening { .. } => "store_opening",
             Self::LeaseWait { .. } => "store_lease_wait",
             Self::Failed { .. } => "store_open_failed",
+            Self::StoreAhead { .. } => STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
         }
     }
 
     /// Whether an identical request sent later can succeed without anyone intervening.
     fn retryable(&self) -> bool {
-        !matches!(self, Self::Failed { .. })
+        !matches!(self, Self::Failed { .. } | Self::StoreAhead { .. })
     }
 
     fn message(&self) -> String {
@@ -430,12 +486,30 @@ impl StoreRefusal {
             } => format!(
                 "storage open failed and is not retried before restart: reason_code={reason_code} reason={reason} descriptor_origin={origin} descriptor={descriptor} ({disposition})"
             ),
+            Self::StoreAhead {
+                versions,
+                origin,
+                descriptor,
+            } => format!(
+                "storage open refused and is not retried before restart: reason_code={STORE_AHEAD_OF_BINARY_REFUSAL_REASON} db_version={} binary_max={} reason={} descriptor_origin={origin} descriptor={descriptor} ({disposition})",
+                versions.db_version,
+                versions.binary_max,
+                mc_store::store_ahead_of_binary_remediation(versions.db_version, versions.binary_max)
+            ),
         }
     }
 
     /// The refusal as an error frame for an internal lane (transform, status, sync, authority),
     /// whose reader is an operator or a log.
     fn into_outcome(self) -> HandlerOutcome {
+        if let Self::StoreAhead { versions, .. } = &self {
+            let detail = versions.detail();
+            return HandlerOutcome::ErrorWithDetail {
+                code: self.code().to_string(),
+                message: self.message(),
+                detail,
+            };
+        }
         HandlerOutcome::Error {
             code: self.code().to_string(),
             message: self.message(),
@@ -444,8 +518,17 @@ impl StoreRefusal {
 
     /// The refusal as an error frame for a facade tool, whose message reaches the user. The text
     /// stays the user-facing sentence — engine internals (paths, lease state, open errors) must
-    /// never surface in tool output — while the code still carries the arm for logs.
+    /// never surface in tool output — while the error code still names which refusal this is, for
+    /// logs. A store that is ahead of this binary gets its own sentence: "retry in a moment" would
+    /// be wrong advice, because no retry fixes it.
     fn into_facade_outcome(self) -> HandlerOutcome {
+        if let Self::StoreAhead { versions, .. } = &self {
+            return HandlerOutcome::ErrorWithDetail {
+                code: self.code().to_string(),
+                message: versions.user_message(),
+                detail: versions.detail(),
+            };
+        }
         HandlerOutcome::Error {
             code: self.code().to_string(),
             message: CONTEXT_SERVICE_UNAVAILABLE_MESSAGE.to_string(),
@@ -521,9 +604,31 @@ impl StoreOpenCoordinator {
     /// Record why the open ended, then release the phase. The order matters: a request that sees
     /// the idle phase must already be able to read the reason.
     fn fail_and_idle(&self, reason_code: &str, reason: String, now_ms: u64) {
+        self.record_failure_and_idle(reason_code, reason, None, now_ms);
+    }
+
+    /// `fail_and_idle` for an open that ended with a store error, keeping the typed parts of the
+    /// error (its reason code and, for a store-ahead refusal, both versions).
+    fn fail_with_error_and_idle(&self, error: &McStoreError, now_ms: u64) {
+        self.record_failure_and_idle(
+            store_open_failure_reason_code(error),
+            error.to_string(),
+            StoreAheadVersions::of(error),
+            now_ms,
+        );
+    }
+
+    fn record_failure_and_idle(
+        &self,
+        reason_code: &str,
+        reason: String,
+        store_ahead: Option<StoreAheadVersions>,
+        now_ms: u64,
+    ) {
         let attempt = self.attempt_snapshot();
         *self.failure.lock().expect("store open failure mutex") = Some(StoreOpenFailure {
             reason_code: reason_code.to_string(),
+            store_ahead,
             reason,
             origin: attempt
                 .as_ref()
@@ -563,6 +668,16 @@ impl StoreOpenCoordinator {
                     .map_or_else(|| "unknown".to_string(), |attempt| attempt.label),
             },
             _ => match self.failure_snapshot() {
+                Some(StoreOpenFailure {
+                    store_ahead: Some(versions),
+                    origin,
+                    descriptor,
+                    ..
+                }) => StoreRefusal::StoreAhead {
+                    versions,
+                    origin,
+                    descriptor,
+                },
                 Some(failure) => StoreRefusal::Failed {
                     reason_code: failure.reason_code,
                     reason: failure.reason,
@@ -586,6 +701,21 @@ impl StoreOpenCoordinator {
                 },
             },
         }
+    }
+
+    /// The refusal for a store that is ahead of this binary, once the open has ended that way.
+    /// `None` in every other state, including while an open is still in flight.
+    fn store_ahead_refusal(&self) -> Option<StoreRefusal> {
+        if self.phase.load(Ordering::Acquire) != STORE_OPEN_IDLE {
+            return None;
+        }
+        let failure = self.failure_snapshot()?;
+        let versions = failure.store_ahead?;
+        Some(StoreRefusal::StoreAhead {
+            versions,
+            origin: failure.origin,
+            descriptor: failure.descriptor,
+        })
     }
 
     fn waiting_report(&self, now_ms: u64) -> Option<HealthReport> {
@@ -615,6 +745,33 @@ impl StoreOpenCoordinator {
             return None;
         }
         let failure = self.failure_snapshot()?;
+        if let Some(versions) = failure.store_ahead {
+            return Some(HealthReport {
+                status: HealthStatus::Failing,
+                detail: Some(format!(
+                    "storage open refused: {STORE_AHEAD_OF_BINARY_REFUSAL_REASON}: db_version={} binary_max={}: {} (descriptor {} from {}); every request refuses with {STORE_AHEAD_OF_BINARY_REFUSAL_REASON} until the module restarts on a matching store",
+                    versions.db_version,
+                    versions.binary_max,
+                    mc_store::store_ahead_of_binary_remediation(
+                        versions.db_version,
+                        versions.binary_max
+                    ),
+                    failure.descriptor,
+                    failure.origin
+                )),
+                metrics: Some(json!({
+                    "lane": TRANSFORM_HEALTH_LANE,
+                    "storage_state": "open_refused_store_ahead",
+                    "storage_open_failure_reason_code": failure.reason_code,
+                    "storage_open_failure_reason": failure.reason,
+                    "store_db_version": versions.db_version,
+                    "binary_max_store_version": versions.binary_max,
+                    "storage_descriptor": failure.descriptor,
+                    "storage_descriptor_origin": failure.origin,
+                    "storage_open_failed_at_ms": failure.at_ms,
+                })),
+            });
+        }
         Some(HealthReport {
             status: HealthStatus::Failing,
             detail: Some(format!(
@@ -4414,11 +4571,7 @@ impl McHandler {
             Err(error) if store_open_error_is_live_lease(&error) => error,
             Err(error) => {
                 tracing::error!("mc-module: store open failed: {error}");
-                coordinator.fail_and_idle(
-                    store_open_failure_reason_code(&error),
-                    error.to_string(),
-                    now_ms().max(0) as u64,
-                );
+                coordinator.fail_with_error_and_idle(&error, now_ms().max(0) as u64);
                 return;
             }
         };
@@ -4498,11 +4651,7 @@ impl McHandler {
                         "mc-module: storage lease wait ended after {:.2}s; store open failed: {error}",
                         started.elapsed().as_secs_f64()
                     );
-                    coordinator.fail_and_idle(
-                        store_open_failure_reason_code(&error),
-                        error.to_string(),
-                        now_ms().max(0) as u64,
-                    );
+                    coordinator.fail_with_error_and_idle(&error, now_ms().max(0) as u64);
                     return;
                 }
             }
@@ -14649,6 +14798,22 @@ impl McHandler {
             .get("method")
             .and_then(Value::as_str)
             .or_else(|| request.get("kind").and_then(Value::as_str));
+        // A store that a newer ck-mc migrated past this binary refuses every request by name,
+        // whatever its lane. Most lanes would refuse anyway because no store handle exists, but
+        // a lane that can answer without the store would otherwise half-work, and each lane
+        // rendering its own "no store" error would hide the one fact the caller needs.
+        if method != Some("echo") {
+            if let Some(refusal) = self.store_open.store_ahead_refusal() {
+                let facade = method.is_none()
+                    && request.get("name").is_some()
+                    && request.get("arguments").is_some();
+                return if facade {
+                    refusal.into_facade_outcome()
+                } else {
+                    refusal.into_outcome()
+                };
+            }
+        }
         if let Some(method) = method {
             return match method {
                 // Proves the store opened end-to-end and, when a session_id is supplied,
@@ -20546,6 +20711,118 @@ mod tests {
         assert_eq!(
             metrics["storage_open_failure_reason_code"],
             STORE_OPEN_FAILURE_REASON_GENERIC
+        );
+    }
+
+    /// The code, message and detail of an error frame that carries machine-readable detail.
+    fn detailed_error_frame(outcome: HandlerOutcome) -> (String, String, Value) {
+        match outcome {
+            HandlerOutcome::ErrorWithDetail {
+                code,
+                message,
+                detail,
+            } => (code, message, detail),
+            other => panic!("expected an error frame with detail, got {other:?}"),
+        }
+    }
+
+    /// A store that a newer ck-mc migrated one version past this binary is refused, and every
+    /// surface names that refusal with both versions: the health lane, the shared refusal seam,
+    /// the transform lane, the historian lane and a facade tool. A lane that answered with a
+    /// generic "no store" error, or answered at all, would be the half-working state the refusal
+    /// exists to prevent.
+    #[tokio::test]
+    async fn a_store_ahead_of_this_binary_is_refused_by_name_on_health_and_every_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let ahead = LATEST_MIGRATION_VERSION + 1;
+        let newer = McStore::open(&descriptor).unwrap();
+        newer.stamp_schema_version_for_test(ahead).unwrap();
+        drop(newer);
+
+        let handler = McHandler::new();
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handler.store_open.failure_snapshot().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an open that cannot succeed must record its reason");
+        assert!(handler.store.get().is_none(), "no store handle may exist");
+
+        let report = <McHandler as ModuleHandler>::health(&handler).await;
+        assert_eq!(report.status, HealthStatus::Failing);
+        let metrics = report
+            .metrics
+            .expect("a refused open must carry health metrics");
+        assert_eq!(metrics["storage_state"], "open_refused_store_ahead");
+        assert_eq!(
+            metrics["storage_open_failure_reason_code"],
+            STORE_AHEAD_OF_BINARY_REFUSAL_REASON
+        );
+        assert_eq!(metrics["store_db_version"], ahead);
+        assert_eq!(
+            metrics["binary_max_store_version"],
+            LATEST_MIGRATION_VERSION
+        );
+        let detail = report
+            .detail
+            .expect("a refused open must carry a health detail");
+        assert!(
+            detail.contains(&format!(
+                "{STORE_AHEAD_OF_BINARY_REFUSAL_REASON}: db_version={ahead} binary_max={LATEST_MIGRATION_VERSION}"
+            )),
+            "health must name the refusal and both versions: {detail}"
+        );
+        assert!(
+            detail.contains("context.db and store.db from the same backup"),
+            "health must carry the remediation: {detail}"
+        );
+
+        let expected_detail = json!({
+            "reason_code": STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
+            "db_version": ahead,
+            "binary_max": LATEST_MIGRATION_VERSION,
+        });
+        let (code, message, frame_detail) = detailed_error_frame(handler.store_refusal());
+        assert_eq!(code, STORE_AHEAD_OF_BINARY_REFUSAL_REASON);
+        assert_eq!(frame_detail, expected_detail);
+        assert!(message.contains("(terminal)"), "{message}");
+
+        // The transform lane, both through its own entry point and through request dispatch.
+        let (transform_code, _, transform_detail) =
+            detailed_error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        assert_eq!(transform_code, STORE_AHEAD_OF_BINARY_REFUSAL_REASON);
+        assert_eq!(transform_detail, expected_detail);
+        let mut dispatched = request(big_messages());
+        dispatched["kind"] = json!("transform");
+        let (dispatched_code, _, _) =
+            detailed_error_frame(handler.dispatch_value(7, dispatched).await);
+        assert_eq!(dispatched_code, STORE_AHEAD_OF_BINARY_REFUSAL_REASON);
+
+        // The historian claim lane.
+        let (historian_code, _, historian_detail) = detailed_error_frame(
+            handler
+                .dispatch_value(7, json!({ "method": "historian.pending", "v": 1 }))
+                .await,
+        );
+        assert_eq!(historian_code, STORE_AHEAD_OF_BINARY_REFUSAL_REASON);
+        assert_eq!(historian_detail, expected_detail);
+
+        // A facade tool, whose message is what the user reads.
+        let (tool_code, tool_message, tool_detail) = detailed_error_frame(
+            call_facade(&handler, "ctx_memory", json!({ "action": "list" })).await,
+        );
+        assert_eq!(tool_code, STORE_AHEAD_OF_BINARY_REFUSAL_REASON);
+        assert_eq!(tool_detail, expected_detail);
+        assert_eq!(
+            tool_message,
+            format!(
+                "Magic Context refused to start: its store (store.db) is at schema v{ahead} but this ck-mc build only knows up to v{LATEST_MIGRATION_VERSION}. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)"
+            )
         );
     }
 

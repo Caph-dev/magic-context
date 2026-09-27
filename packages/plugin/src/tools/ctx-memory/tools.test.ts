@@ -509,6 +509,48 @@ describe("createCtxMemoryTools", () => {
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         });
 
+        it("names both store versions and the fix when the module refuses a store ahead of it", async () => {
+            const storeAhead = () =>
+                Object.assign(new Error("store_ahead_of_binary"), {
+                    code: "store_ahead_of_binary",
+                    detail: {
+                        reason_code: "store_ahead_of_binary",
+                        db_version: 63,
+                        binary_max: 62,
+                    },
+                });
+            const expected =
+                "Magic Context refused to start: its store (store.db) is at schema v63 but this ck-mc build only knows up to v62. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)";
+            // Both places the module is asked: the authority probe, and the tool call itself.
+            for (const rustToolBackends of [
+                {
+                    authorityState: async () => {
+                        throw storeAhead();
+                    },
+                },
+                {
+                    authorityState: async () => "MODULE" as const,
+                    memory: async () => {
+                        throw storeAhead();
+                    },
+                },
+            ]) {
+                const moduleTools = createCtxMemoryTools({
+                    db,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    rustToolBackends,
+                });
+                const result = await moduleTools.ctx_memory.execute(
+                    { action: "write", category: "CONSTRAINTS", content: "must not write" },
+                    toolContext(),
+                );
+                expect(result).toBe(expected);
+            }
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
         it("keeps authority-state probe details in logs and returns capability copy", async () => {
             db.prepare(
                 "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?)",

@@ -44,6 +44,7 @@ import {
     normalizeStoredProjectPath,
     queueMemoryMutation,
 } from "../../features/magic-context/storage";
+import { storeAheadOfBinaryFailure } from "../../hooks/magic-context/store-ahead-refusal";
 import { planRustMemoryRouting, routeHostMemoryIds } from "../../plugin/memory-id-translation";
 import {
     isRustAuthorityDrainingError,
@@ -568,6 +569,11 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             domain: "memories",
                         })) ?? null;
                 } catch (error) {
+                    const storeAhead = storeAheadOfBinaryFailure(error);
+                    if (storeAhead) {
+                        sessionLog(toolContext.sessionID, "ctx_memory store-ahead refusal", error);
+                        return storeAhead.message;
+                    }
                     if (marker) {
                         sessionLog(toolContext.sessionID, "ctx_memory capability refusal", error);
                         return memoryAuthorityRefusal(args);
@@ -650,6 +656,15 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         if (text === null) return memoryAuthorityRefusal(args);
                         return localBlocks.length > 0 ? [text, ...localBlocks].join("\n\n") : text;
                     } catch (error) {
+                        const storeAhead = storeAheadOfBinaryFailure(error);
+                        if (storeAhead) {
+                            sessionLog(
+                                toolContext.sessionID,
+                                "ctx_memory store-ahead refusal",
+                                error,
+                            );
+                            return storeAhead.message;
+                        }
                         if (isRustAuthorityDrainingError(error)) {
                             return memoryAuthorityRefusal(args);
                         }

@@ -22,6 +22,7 @@ import type {
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { isRecord } from "../../shared/record-type-guard";
+import { storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
@@ -644,6 +645,11 @@ export class SubcModuleTransport {
                     return response;
                 } catch (error) {
                     if (args.signal?.aborted) throw args.signal.reason ?? error;
+                    // One typed error for every caller: the transform, the tools and the
+                    // historian lane all have to recognize this refusal, and none of them
+                    // should have to know how the subc client shapes an error frame.
+                    const storeAhead = storeAheadOfBinaryFailure(error);
+                    if (storeAhead) throw storeAhead;
                     if (args.method === "state_sync" && isDeadlineFailure(error)) {
                         const body = isRecord(args.body) ? args.body : {};
                         throw Object.assign(

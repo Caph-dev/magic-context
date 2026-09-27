@@ -27,6 +27,7 @@ import {
     getNoteByIdInScope,
     SESSION_NOTE_CONDITION_ERROR,
 } from "../../features/magic-context/storage-notes";
+import { storeAheadOfBinaryFailure } from "../../hooks/magic-context/store-ahead-refusal";
 import type { RustNoteToolRequest, RustToolBackends } from "../../plugin/rust-tool-backends";
 import {
     isRustAuthorityDrainingError,
@@ -333,6 +334,11 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                         domain: "notes",
                     });
                 } catch (error) {
+                    const storeAhead = storeAheadOfBinaryFailure(error);
+                    if (storeAhead) {
+                        sessionLog(sessionId, "ctx_note store-ahead refusal", error);
+                        return storeAhead.message;
+                    }
                     if (marker) {
                         sessionLog(sessionId, "ctx_note capability refusal", error);
                         return noteAuthorityRefusal(args, action);
@@ -383,6 +389,11 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     if (compilation) return text + conditionCompileReplySuffix(compilation);
                     return text;
                 } catch (error) {
+                    const storeAhead = storeAheadOfBinaryFailure(error);
+                    if (storeAhead) {
+                        sessionLog(sessionId, "ctx_note store-ahead refusal", error);
+                        return storeAhead.message;
+                    }
                     if (isRustAuthorityDrainingError(error)) {
                         return noteAuthorityRefusal(args, action);
                     }
