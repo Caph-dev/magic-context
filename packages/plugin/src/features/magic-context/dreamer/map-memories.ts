@@ -234,7 +234,7 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
         args.db,
         args.holderId,
         args.leaseKey,
-        () => abortController.abort(),
+        (reason) => abortController.abort(new Error(reason)),
         args.leaseAcquisition,
     );
 

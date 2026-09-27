@@ -312,7 +312,7 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         args.db,
         args.holderId,
         args.leaseKey,
-        () => abortController.abort(),
+        (reason) => abortController.abort(new Error(reason)),
         args.leaseAcquisition,
     );
 

@@ -13,11 +13,13 @@ import {
     getUserMemoryCandidates,
     insertUserMemoryCandidates,
 } from "../user-memory/storage-user-memory";
+import { acquireLease } from "./lease";
 
-function freshDb(): Database {
+function freshDb(leaseKey: string): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
+    expect(acquireLease(db, "holder", leaseKey)).toBe(true);
     return db;
 }
 
@@ -60,7 +62,7 @@ afterEach(() => {
 });
 
 test("review-user-memories runs on a carrier host and its promotion reaches the database", async () => {
-    const db = freshDb();
+    const db = freshDb("review-user-memories-carrier");
     insertUserMemoryCandidates(db, [{ content: "User prefers concise updates", sessionId: "s1" }]);
     const { executor, runs } = carrier({
         text: '{"promote":[{"content":"Prefers concise updates","candidate_ids":[1]}],"update_existing":[],"dismiss_existing":[],"consume_candidate_ids":[1]}',
@@ -88,7 +90,7 @@ test("review-user-memories runs on a carrier host and its promotion reaches the 
 });
 
 test("a length-capped review answer is refused and changes nothing", async () => {
-    const db = freshDb();
+    const db = freshDb("review-user-memories-capped");
     insertUserMemoryCandidates(db, [{ content: "User prefers concise updates", sessionId: "s1" }]);
     // A provider that hit the output ceiling mid-object: the prefix would parse
     // as a promotion if anything applied a truncated answer.
@@ -116,7 +118,7 @@ test("a length-capped review answer is refused and changes nothing", async () =>
 });
 
 test("a review answer truncated before its closing brace is refused and changes nothing", async () => {
-    const db = freshDb();
+    const db = freshDb("review-user-memories-truncated");
     insertUserMemoryCandidates(db, [{ content: "User prefers concise updates", sessionId: "s1" }]);
     const { executor } = carrier({
         text: '{"promote":[{"content":"Prefers concise updates","candidate_ids":[1]}],"consume_candidate_ids":[1',
@@ -141,7 +143,7 @@ test("a review answer truncated before its closing brace is refused and changes 
 });
 
 test("an empty carrier answer is refused rather than read as nothing to do", async () => {
-    const db = freshDb();
+    const db = freshDb("review-user-memories-empty");
     insertUserMemoryCandidates(db, [{ content: "User prefers concise updates", sessionId: "s1" }]);
     const { executor } = carrier({ text: null });
 

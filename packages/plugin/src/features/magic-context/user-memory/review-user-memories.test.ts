@@ -4,15 +4,17 @@ import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import { _resetKeepSubagentsForTesting, setKeepSubagents } from "../../../shared/keep-subagents";
 import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
+import { acquireLease } from "../dreamer/lease";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { reviewUserMemories } from "./review-user-memories";
 import { insertUserMemoryCandidates } from "./storage-user-memory";
 
-function freshDb(): Database {
+function freshDb(leaseKey: string): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
+    expect(acquireLease(db, "holder", leaseKey)).toBe(true);
     return db;
 }
 
@@ -23,7 +25,7 @@ afterEach(() => {
 
 describe("reviewUserMemories", () => {
     test("archives but does not delete an unsettled child and logs its sweep handoff", async () => {
-        const db = freshDb();
+        const db = freshDb("review-user-memories");
         insertUserMemoryCandidates(db, [
             { content: "User prefers concise updates", sessionId: "s1" },
         ]);
@@ -87,7 +89,7 @@ describe("reviewUserMemories", () => {
 
     test("keeps a settled privacy child because keep_subagents covers the privacy class", async () => {
         setKeepSubagents(true);
-        const db = freshDb();
+        const db = freshDb("review-user-memories-settled");
         insertUserMemoryCandidates(db, [
             { content: "User prefers concise updates", sessionId: "s1" },
         ]);

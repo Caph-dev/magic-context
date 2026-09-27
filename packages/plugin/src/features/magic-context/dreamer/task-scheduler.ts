@@ -6,7 +6,7 @@ import { nextDueAtMs } from "./cron";
 import {
     acquireLeaseWithAcquisition,
     type LeaseAcquisition,
-    leaseOwnershipMatches,
+    reacquireOwnedLease,
     releaseLease,
 } from "./lease";
 import { getDreamState } from "./storage-dream-state";
@@ -389,10 +389,14 @@ async function runDomainGroup(
         for (const due of [...group].sort((a, b) =>
             compareTaskOrder(a.config.task, b.config.task),
         )) {
-            if (!leaseOwnershipMatches(db, holderId, acquisition.generation, leaseKey)) {
+            // Refresh at each task boundary so setup and gated siblings cannot
+            // consume the next task's entire lease before its heartbeat starts.
+            if (!reacquireOwnedLease(db, holderId, leaseKey, acquisition.generation)) {
                 log(`[dreamer] domain lease lost (${leaseKey}) — stopping remaining task(s)`);
                 break;
             }
+
+            acquisition = { acquiredAt: Date.now(), generation: acquisition.generation };
 
             // Re-evaluate the gate now that we hold the lease: a sibling/other
             // process may have just consumed the work (critical for the global
