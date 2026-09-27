@@ -13,9 +13,11 @@ import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/mod
 import { Database } from "@magic-context/core/shared/sqlite";
 
 import {
+    formatSingleStoreMigrateReport,
     reportAuthorityMarkers,
     reportModuleContextDbPath,
     runDoctorDrainAuthority,
+    runDoctorSingleStoreMigrate,
 } from "./doctor-authority";
 
 function writeSubcConfig(configHome: string, connectionFile: string): void {
@@ -210,6 +212,8 @@ describe("doctor drain-authority on a single-store project", () => {
 describe("doctor per-project single-store report", () => {
     const OUTSIDE_ROOT =
         "module state unavailable outside its project root — writes fenced; run with rust mode or restore subc connectivity";
+    const MISMATCH_PREFIX =
+        "single-store authority mismatch — marked in context.db, but store.db still claims ";
     const UNREACHABLE =
         "module unreachable — writes fenced; run with rust mode or restore subc connectivity";
 
@@ -279,8 +283,33 @@ describe("doctor per-project single-store report", () => {
         // Authority state only for the project the command runs in.
         expect(info).toContain(`  ${ids.b}: memories=MODULE, notes=TS`);
         expect(info.some((line) => line.startsWith(`  ${ids.a}: memories=`))).toBe(false);
-        expect(warn).toEqual([`  ${ids.c}: ${OUTSIDE_ROOT}`]);
+        // b is marked, yet store.db still claims its memories: that is the one mismatch.
+        expect(warn).toEqual([
+            `  ${ids.b}: ${MISMATCH_PREFIX}memories=MODULE; restart the module so it finishes the move`,
+            `  ${ids.c}: ${OUTSIDE_ROOT}`,
+            "  single-store authority mismatches: 1",
+        ]);
         expect(fail).toEqual([]);
+    });
+
+    it("does not count an unmarked project the module owns as a mismatch", async () => {
+        const { ids, info, warn } = await report((db, projects) => {
+            db.prepare("DELETE FROM single_store_projects WHERE project_path = ?").run(projects.b);
+        });
+        expect(info).toContain(`  ${ids.b}: memories=MODULE, notes=TS`);
+        expect(warn).toEqual([`  ${ids.c}: ${OUTSIDE_ROOT}`]);
+    });
+
+    it("reports authority for a marked cwd project that has no authority_managed row", async () => {
+        const { ids, info, warn, calls } = await report(
+            (db, projects) => {
+                db.prepare("DELETE FROM authority_managed WHERE project_path = ?").run(projects.b);
+            },
+            { memories: "TS", notes: "TS" },
+        );
+        expect(info).toContain(`  ${ids.b}: memories=TS, notes=TS`);
+        expect(calls.authorityStatus).toBe(2);
+        expect(warn).toEqual([`  ${ids.c}: ${OUTSIDE_ROOT}`]);
     });
 
     it("flags a marker row written in another context.db and still lists the project", async () => {
@@ -442,5 +471,85 @@ describe("doctor authority subc configuration", () => {
             else process.env.XDG_CONFIG_HOME = originalConfigHome;
             rmSync(root, { recursive: true, force: true });
         }
+    });
+});
+
+describe("doctor single-store migrate", () => {
+    async function migrate(
+        answer: (args: Record<string, unknown>) => Promise<Record<string, unknown>>,
+        options = { dryRun: false, retry: false },
+    ) {
+        const root = mkdtempSync(join(tmpdir(), "mc-doctor-single-store-migrate-"));
+        const originalConfigHome = process.env.XDG_CONFIG_HOME;
+        const requests: Record<string, unknown>[] = [];
+        const spy = spyOn(SubcModuleTransport.prototype, "singleStoreMigrate").mockImplementation(
+            async (args) => {
+                requests.push(args);
+                return answer(args);
+            },
+        );
+        const output = captureConsole();
+        try {
+            process.env.XDG_CONFIG_HOME = join(root, "config");
+            const code = await runDoctorSingleStoreMigrate(root, options);
+            return { code, requests, output: output.output(), root };
+        } finally {
+            output.restore();
+            spy.mockRestore();
+            if (originalConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = originalConfigHome;
+            rmSync(root, { recursive: true, force: true });
+        }
+    }
+
+    it("asks the module to move the cwd project and prints its per-table report", async () => {
+        const { code, requests, output, root } = await migrate(
+            async () => ({
+                status: "migrated",
+                project: "git:x",
+                sessions: 3,
+                tables: {
+                    memories: { source: 40, copied: 31, written: 31, skipped: 9, verified: 40 },
+                },
+                transaction_holds_us: [1200, 3400],
+                max_hold_us: 3400,
+                p99_hold_us: 3400,
+                total_pause_ms: 17,
+                marker_committed: true,
+                neutralized: true,
+            }),
+            { dryRun: true, retry: true },
+        );
+        expect(code).toBe(0);
+        expect(requests).toHaveLength(1);
+        expect(requests[0]).toMatchObject({
+            project: resolveProjectIdentity(root),
+            dry_run: true,
+            retry: true,
+            projectRoot: root,
+        });
+        expect(output).toContain("Single-store move of git:x: migrated (3 sessions)");
+        expect(output).toContain(
+            "  memories: source=40 copied=31 written=31 skipped=9 verified=40 deleted=0 kept=0",
+        );
+        expect(output).toContain("  transactions=2 max_hold_ms=3.4 p99_hold_ms=3.4 pause_ms=17");
+    });
+
+    it("names the module's refusal code and exits non-zero", async () => {
+        const { code, output } = await migrate(async () => {
+            throw Object.assign(new Error("this build still serves every project from store.db"), {
+                code: "single_store_cutover_absent",
+            });
+        });
+        expect(code).toBe(1);
+        expect(output).toContain(
+            "Single-store move refused (single_store_cutover_absent): this build still serves every project from store.db",
+        );
+    });
+
+    it("formats a dry run without claiming a marker", () => {
+        const lines = formatSingleStoreMigrateReport({ status: "dry_run", project: "git:y" });
+        expect(lines[0]).toBe("Single-store move of git:y: dry_run (0 sessions)");
+        expect(lines.some((line) => line.includes("marker written"))).toBe(false);
     });
 });

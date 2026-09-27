@@ -484,6 +484,7 @@ export class SubcModuleTransport {
             | "authority.drain_finish"
             | "mirror.pull"
             | "mirror.marker_status"
+            | "single_store.migrate"
             | "mirror.memory"
             | "memory.identity.ack"
             | "ctx_note"
@@ -731,6 +732,7 @@ export class SubcModuleTransport {
             | "authority.drain_finish"
             | "mirror.pull"
             | "mirror.marker_status"
+            | "single_store.migrate"
             | "mirror.memory"
             | "memory.identity.ack",
         body: Record<string, unknown>,
@@ -885,6 +887,38 @@ export class SubcModuleTransport {
                 ? { context_db_path: response.context_db_path }
                 : {}),
         };
+    }
+
+    /**
+     * Ask the module to move `project`'s rows from its store.db into context.db
+     * (`single_store.migrate`). The move pauses the project's writes for up to two
+     * minutes, so the call waits longer than an ordinary route. A refusal is thrown with
+     * the module's code.
+     */
+    async singleStoreMigrate(args: {
+        project: string;
+        dry_run: boolean;
+        retry: boolean;
+        projectRoot?: string;
+    }): Promise<Record<string, unknown>> {
+        const { projectRoot, ...body } = args;
+        const response = await this.authorityRequest(
+            `single-store-migrate:${args.project}`,
+            projectRoot ?? this.bindRootForAuthority(),
+            "single_store.migrate",
+            body,
+            180_000,
+        );
+        const refusal = isRecord(response.error) ? response.error : response;
+        if (response.ok !== true || !isRecord(response.report)) {
+            const code = typeof refusal.code === "string" ? refusal.code : undefined;
+            const message =
+                typeof refusal.message === "string"
+                    ? refusal.message
+                    : "single_store.migrate returned no report";
+            throw Object.assign(new Error(message), code ? { code } : {});
+        }
+        return response.report;
     }
 
     /**

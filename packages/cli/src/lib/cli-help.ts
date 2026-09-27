@@ -61,6 +61,7 @@ export const DOCTOR_HELP = [
     "",
     "  Subcommands (each accepts --help):",
     "    drain-authority <project>   Drain module memory/note authority back to TypeScript",
+    "    single-store migrate        Move this project's rows into context.db (module-run)",
     "    migrate                     Migrate an OpenCode session to Pi or OMP JSONL",
     "    migrate-session             Re-home an OpenCode session to another directory",
     "    merge-identity              Merge project rows between identities",
@@ -74,6 +75,19 @@ export const DRAIN_AUTHORITY_HELP = [
     "  Usage: magic-context doctor drain-authority <project>",
     "",
     "  Drain the module's memory and note authority for <project> back to TypeScript.",
+    "",
+].join("\n");
+
+export const SINGLE_STORE_MIGRATE_HELP = [
+    "",
+    "  Usage: magic-context doctor single-store migrate [--dry-run] [--retry]",
+    "",
+    "  Ask the module to move the current directory's project from its store.db into",
+    "  context.db. Only a module build that reads moved projects from context.db accepts it.",
+    "",
+    "  Options:",
+    "    --dry-run   Report what would be copied without writing anything",
+    "    --retry     Re-attempt a project whose last move was refused",
     "",
 ].join("\n");
 
@@ -112,6 +126,7 @@ export function subcommandHelp(argv: readonly string[]): string | null {
     if (command !== "doctor") return null;
     const subcommand = rest[0];
     if (subcommand === "drain-authority") return DRAIN_AUTHORITY_HELP;
+    if (subcommand === "single-store") return SINGLE_STORE_MIGRATE_HELP;
     if (subcommand === "merge-identity") return MERGE_IDENTITY_HELP;
     if (subcommand === "list-hidden-sessions") return LIST_HIDDEN_SESSIONS_HELP;
     if (subcommand !== undefined && DOCTOR_SUBCOMMANDS_WITH_OWN_HELP.has(subcommand)) return null;

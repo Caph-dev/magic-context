@@ -71,6 +71,7 @@ function printUsage(): void {
     console.log("    doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows");
     console.log(
         "    doctor drain-authority <project>  Drain module memory/note authority back to TypeScript",
+        "    doctor single-store migrate [--dry-run] [--retry]  Move this project's rows into context.db",
     );
     console.log("    doctor migrate   Migrate OpenCode session to Pi or OMP JSONL");
     console.log("    doctor migrate-session   Re-home an OpenCode session to another directory");
@@ -146,6 +147,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
                     projectRoot,
                     join(getMagicContextStorageDir(), "context.db"),
                 );
+            }
+            if (rest[0] === "single-store") {
+                if (rest[1] !== "migrate") {
+                    console.error(
+                        "Usage: magic-context doctor single-store migrate [--dry-run] [--retry]",
+                    );
+                    return 1;
+                }
+                const { runDoctorSingleStoreMigrate } = await import("./commands/doctor-authority");
+                return runDoctorSingleStoreMigrate(process.cwd(), {
+                    dryRun: rest.includes("--dry-run"),
+                    retry: rest.includes("--retry"),
+                });
             }
             if (rest[0] === "merge-identity") {
                 const { runMergeIdentityCli } = await import("./commands/doctor-merge-identity");

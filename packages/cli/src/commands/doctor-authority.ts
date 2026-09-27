@@ -206,12 +206,16 @@ export async function reportAuthorityMarkers(args: {
         loaded.subc?.connection_file ?? getDefaultSubcConnectionFile(),
     );
     // Authority state comes from the module and is only reachable for the project the
-    // command runs in; the shipped per-marker branches are unchanged.
-    for (const marker of markers) {
-        if (marker.project_path !== currentIdentity) {
-            args.warn(
-                `  ${marker.project_path}: module state unavailable outside its project root — writes fenced; run with rust mode or restore subc connectivity`,
-            );
+    // command runs in. Every listed project is eligible, marked-only ones included.
+    const managed = new Set(markers.map((marker) => marker.project_path));
+    let mismatches = 0;
+    for (const project of projects) {
+        if (project !== currentIdentity) {
+            if (managed.has(project)) {
+                args.warn(
+                    `  ${project}: module state unavailable outside its project root — writes fenced; run with rust mode or restore subc connectivity`,
+                );
+            }
             continue;
         }
         try {
@@ -220,24 +224,130 @@ export async function reportAuthorityMarkers(args: {
                 AUTHORITY_DOMAINS.map((domain) =>
                     module.authorityStatus({
                         context_store_uuid: ensureContextStoreUuid(args.db),
-                        project: marker.project_path,
+                        project,
                         domain,
                     }),
                 ),
             );
+            const states = statuses.map((status) => status.authority?.state ?? "TS");
             args.info(
-                `  ${marker.project_path}: ${statuses
-                    .map(
-                        (status, index) =>
-                            `${AUTHORITY_DOMAINS[index]}=${status.authority?.state ?? "TS"}`,
-                    )
+                `  ${project}: ${states
+                    .map((state, index) => `${AUTHORITY_DOMAINS[index]}=${state}`)
                     .join(", ")}`,
             );
+            // A moved project's rows live in context.db, so store.db must no longer claim
+            // either domain. An unmarked project that the module owns is normal.
+            if (singleStoreRows.has(project) && states.some((state) => state !== "TS")) {
+                mismatches += 1;
+                args.warn(
+                    `  ${project}: single-store authority mismatch — marked in context.db, but store.db still claims ${states
+                        .map((state, index) => `${AUTHORITY_DOMAINS[index]}=${state}`)
+                        .filter((_, index) => states[index] !== "TS")
+                        .join(", ")}; restart the module so it finishes the move`,
+                );
+            }
         } catch {
             args.warn(
-                `  ${marker.project_path}: module unreachable — writes fenced; run with rust mode or restore subc connectivity`,
+                `  ${project}: module unreachable — writes fenced; run with rust mode or restore subc connectivity`,
             );
         }
+    }
+    if (mismatches > 0) {
+        args.warn(`  single-store authority mismatches: ${mismatches}`);
+    }
+}
+
+/** One table's line of a `single_store.migrate` report. */
+interface MigrateTableCounts {
+    source?: number;
+    copied?: number;
+    written?: number;
+    skipped?: number;
+    verified?: number;
+    deleted?: number;
+    kept?: number;
+}
+
+/** What the module reports for one `single_store.migrate` run. */
+export interface SingleStoreMigrateReport {
+    status?: string;
+    project?: string;
+    tables?: Record<string, MigrateTableCounts>;
+    transaction_holds_us?: number[];
+    max_hold_us?: number;
+    p99_hold_us?: number;
+    total_pause_ms?: number;
+    sessions?: number;
+    marker_committed?: boolean;
+    neutralized?: boolean;
+}
+
+/** Print a `single_store.migrate` report, one line per table. */
+export function formatSingleStoreMigrateReport(report: SingleStoreMigrateReport): string[] {
+    const lines = [
+        `Single-store move of ${report.project ?? "?"}: ${report.status ?? "?"} (${report.sessions ?? 0} sessions)`,
+    ];
+    for (const [table, counts] of Object.entries(report.tables ?? {})) {
+        lines.push(
+            `  ${table}: source=${counts.source ?? 0} copied=${counts.copied ?? 0} written=${counts.written ?? 0} skipped=${counts.skipped ?? 0} verified=${counts.verified ?? 0} deleted=${counts.deleted ?? 0} kept=${counts.kept ?? 0}`,
+        );
+    }
+    lines.push(
+        `  transactions=${report.transaction_holds_us?.length ?? 0} max_hold_ms=${((report.max_hold_us ?? 0) / 1000).toFixed(1)} p99_hold_ms=${((report.p99_hold_us ?? 0) / 1000).toFixed(1)} pause_ms=${report.total_pause_ms ?? 0}`,
+    );
+    if (report.status === "migrated") {
+        lines.push(
+            `  marker written: ${report.marker_committed === true}; store.db handed back: ${report.neutralized === true}`,
+        );
+    }
+    return lines;
+}
+
+/**
+ * `magic-context doctor single-store migrate [--dry-run] [--retry]`: ask the module to move
+ * the current directory's project into context.db. The module does the copy; this only
+ * names the project and prints what it reports.
+ */
+export async function runDoctorSingleStoreMigrate(
+    projectRoot: string,
+    options: { dryRun: boolean; retry: boolean },
+): Promise<number> {
+    let project: string;
+    try {
+        project = resolveProjectIdentity(projectRoot);
+    } catch (error) {
+        console.error(
+            `Cannot resolve the project identity of ${projectRoot}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return 1;
+    }
+    const loaded = loadPluginConfig(projectRoot);
+    const transport = new SubcModuleTransport(
+        loaded.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+    );
+    try {
+        const report = await transport.singleStoreMigrate({
+            project,
+            dry_run: options.dryRun,
+            retry: options.retry,
+            projectRoot,
+        });
+        for (const line of formatSingleStoreMigrateReport(report)) console.log(line);
+        return 0;
+    } catch (error) {
+        const code =
+            error &&
+            typeof error === "object" &&
+            typeof (error as { code?: unknown }).code === "string"
+                ? (error as { code: string }).code
+                : undefined;
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(
+            code
+                ? `Single-store move refused (${code}): ${message}`
+                : `Single-store move failed: ${message}`,
+        );
+        return 1;
     }
 }
 
