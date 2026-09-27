@@ -230,6 +230,9 @@ pub struct TableCounts {
     /// `context.db` rows with no source that were kept because they belong to history
     /// `store.db` still has unchanged.
     pub kept: usize,
+    /// `context.db` events left untouched because the compartment they point at exists in
+    /// neither store, so they cannot belong to any live compartment.
+    pub orphans_kept: usize,
 }
 
 /// What a run did.
@@ -1288,6 +1291,11 @@ enum CompartmentFate {
     Superseded,
     /// Neither can be shown.
     Unknown,
+    /// The row points at a compartment id that no longer exists in `context.db`. Compartment
+    /// ids are never reused (AUTOINCREMENT), and `store.db` keys compartments by sequence,
+    /// so no compartment in either store can be the one the row meant: it is history left
+    /// behind by an earlier rewrite, not a row the move could misattribute.
+    Orphan,
 }
 
 fn compartment_fate(
@@ -1329,7 +1337,7 @@ fn event_fate(
         )
         .optional()?;
     let Some((owner, sequence)) = row else {
-        return Ok(CompartmentFate::Unknown);
+        return Ok(CompartmentFate::Orphan);
     };
     if owner != session_id {
         return Ok(CompartmentFate::Unknown);
@@ -1358,7 +1366,7 @@ fn candidate_fate(
         let context = context_compartment(conn, session_id, sequence)?.map(|(_, values)| values);
         match compartment_fate(session, context.as_ref(), sequence) {
             CompartmentFate::Superseded => return Ok(CompartmentFate::Superseded),
-            CompartmentFate::Unknown => fate = CompartmentFate::Unknown,
+            CompartmentFate::Unknown | CompartmentFate::Orphan => fate = CompartmentFate::Unknown,
             CompartmentFate::Unchanged => {}
         }
     }
@@ -1590,7 +1598,7 @@ fn plan(conn: &Connection, model: &Model) -> Result<Plan, MigrateRefusal> {
                     session: session_id.clone(),
                     id: *id,
                 }),
-                CompartmentFate::Unknown => {
+                CompartmentFate::Unknown | CompartmentFate::Orphan => {
                     return Err(unclassified(session_id, "user_memory_candidates", *id))
                 }
             }
@@ -1620,6 +1628,10 @@ fn plan(conn: &Connection, model: &Model) -> Result<Plan, MigrateRefusal> {
                     session: session_id.clone(),
                     id: *id,
                 }),
+                // Left in place, neither copied nor deleted, and counted.
+                CompartmentFate::Orphan => {
+                    counts.get_mut("compartment_events").unwrap().orphans_kept += 1;
+                }
                 CompartmentFate::Unknown => {
                     return Err(unclassified(session_id, "compartment_events", *id))
                 }

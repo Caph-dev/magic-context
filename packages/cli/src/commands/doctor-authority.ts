@@ -266,6 +266,8 @@ interface MigrateTableCounts {
     verified?: number;
     deleted?: number;
     kept?: number;
+    /** Events left in place because their compartment exists in neither store. */
+    orphans_kept?: number;
 }
 
 /** What the module reports for one `single_store.migrate` run. */
@@ -289,7 +291,7 @@ export function formatSingleStoreMigrateReport(report: SingleStoreMigrateReport)
     ];
     for (const [table, counts] of Object.entries(report.tables ?? {})) {
         lines.push(
-            `  ${table}: source=${counts.source ?? 0} copied=${counts.copied ?? 0} written=${counts.written ?? 0} skipped=${counts.skipped ?? 0} verified=${counts.verified ?? 0} deleted=${counts.deleted ?? 0} kept=${counts.kept ?? 0}`,
+            `  ${table}: source=${counts.source ?? 0} copied=${counts.copied ?? 0} written=${counts.written ?? 0} skipped=${counts.skipped ?? 0} verified=${counts.verified ?? 0} deleted=${counts.deleted ?? 0} kept=${counts.kept ?? 0}${counts.orphans_kept ? ` orphans_kept=${counts.orphans_kept}` : ""}`,
         );
     }
     lines.push(

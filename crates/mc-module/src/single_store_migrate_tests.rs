@@ -1295,6 +1295,98 @@ fn a_history_row_that_cannot_be_classified_stops_the_move() {
     assert!(!marker_present(&fixture.context(), P));
 }
 
+/// An event pointing at a compartment id that exists in neither store (the host deleted
+/// the compartment long ago) is an orphan: the move keeps it where it is, counts it, and
+/// completes. An event pointing at a live compartment of another session could still be
+/// misattributed, so that one keeps refusing.
+#[test]
+fn an_event_whose_compartment_exists_in_neither_store_is_kept_as_an_orphan() {
+    let fixture = fresh();
+    let context = fixture.context_conn();
+    let dangling: i64 = context
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) + 1000 FROM compartments",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    context
+        .execute(
+            "INSERT INTO compartment_events(session_id, compartment_id, kind, fields_json, created_at)
+             VALUES ('ses-p1', ?1, 'orphaned', '{\"a\":1}', 5)",
+            params![dangling],
+        )
+        .unwrap();
+    let orphan_id = context.last_insert_rowid();
+    let orphan_row = |conn: &Connection| -> Option<(String, i64, String, String, i64)> {
+        conn.query_row(
+            "SELECT session_id, compartment_id, kind, fields_json, created_at
+               FROM compartment_events WHERE id = ?1",
+            params![orphan_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .unwrap()
+    };
+    let before = orphan_row(&context);
+    assert!(before.is_some());
+
+    let store = fixture.open_store();
+    let report = run(&store, &request(P), &fixture.options(), &mut NoObserver).unwrap();
+    assert_eq!(report.status, "migrated");
+    assert_eq!(report.tables["compartment_events"].orphans_kept, 1);
+    assert!(marker_present(&fixture.context(), P));
+    assert_eq!(orphan_row(&fixture.context_conn()), before);
+    // No compartment ever takes the dangling id, so the orphan stays unattached.
+    let attached: i64 = fixture
+        .context_conn()
+        .query_row(
+            "SELECT COUNT(*) FROM compartments WHERE id = ?1",
+            params![dangling],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attached, 0);
+
+    let again = run(&store, &request(P), &fixture.options(), &mut NoObserver).unwrap();
+    assert_eq!(again.status, "already_marked");
+    assert_eq!(orphan_row(&fixture.context_conn()), before);
+}
+
+#[test]
+fn an_event_pointing_at_another_sessions_live_compartment_still_stops_the_move() {
+    let fixture = fresh();
+    let context = fixture.context_conn();
+    context
+        .execute(
+            "INSERT INTO compartments(session_id, sequence, start_message, end_message, title,
+                                      content, importance, legacy, created_at, harness)
+             VALUES ('ses-elsewhere', 1, 1, 2, 't', 'c', 50, 0, 1, 'opencode')",
+            [],
+        )
+        .unwrap();
+    let foreign = context.last_insert_rowid();
+    context
+        .execute(
+            "INSERT INTO compartment_events(session_id, compartment_id, kind, fields_json, created_at)
+             VALUES ('ses-p1', ?1, 'misfiled', '{}', 1)",
+            params![foreign],
+        )
+        .unwrap();
+    let store = fixture.open_store();
+    let refusal = run(&store, &request(P), &fixture.options(), &mut NoObserver).unwrap_err();
+    assert_eq!(refusal.code, UNCLASSIFIED_ROWS);
+    assert!(!marker_present(&fixture.context(), P));
+}
+
 fn fresh() -> Fixture {
     fixture()
 }

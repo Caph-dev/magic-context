@@ -510,6 +510,7 @@ describe("doctor single-store migrate", () => {
                 sessions: 3,
                 tables: {
                     memories: { source: 40, copied: 31, written: 31, skipped: 9, verified: 40 },
+                    compartment_events: { source: 5, copied: 5, verified: 5, orphans_kept: 2 },
                 },
                 transaction_holds_us: [1200, 3400],
                 max_hold_us: 3400,
@@ -530,7 +531,10 @@ describe("doctor single-store migrate", () => {
         });
         expect(output).toContain("Single-store move of git:x: migrated (3 sessions)");
         expect(output).toContain(
-            "  memories: source=40 copied=31 written=31 skipped=9 verified=40 deleted=0 kept=0",
+            "  memories: source=40 copied=31 written=31 skipped=9 verified=40 deleted=0 kept=0\n",
+        );
+        expect(output).toContain(
+            "  compartment_events: source=5 copied=5 written=0 skipped=0 verified=5 deleted=0 kept=0 orphans_kept=2",
         );
         expect(output).toContain("  transactions=2 max_hold_ms=3.4 p99_hold_ms=3.4 pause_ms=17");
     });
