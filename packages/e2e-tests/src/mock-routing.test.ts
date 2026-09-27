@@ -37,6 +37,27 @@ describe("mock child-agent routing", () => {
     }
   });
 
+  it("pins an agent to its own named mock model and rejects any other", () => {
+    expect(
+      pinMockAgents({ historian: {} }, "mock/main", "opencode", { historian: "mock/historian" }),
+    ).toEqual({
+      historian: { opencode: { model: "mock/historian" } },
+      dreamer: { opencode: { model: "mock/main" }, disable: true },
+    });
+    expect(
+      pinMockAgents({ historian: { opencode: { model: "mock/historian" } } }, "mock/main", "opencode", {
+        historian: "mock/historian",
+      }),
+    ).toMatchObject({ historian: { opencode: { model: "mock/historian" } } });
+    // Naming a separate historian model does not open the historian to the host
+    // model or to anything else.
+    for (const historian of [{ model: "mock/main" }, { opencode: { model: "anthropic/real" } }]) {
+      expect(() =>
+        pinMockAgents({ historian }, "mock/main", "opencode", { historian: "mock/historian" }),
+      ).toThrow("must use mock model mock/historian");
+    }
+  });
+
   it("rejects a real provider endpoint even when a mock model name is used", () => {
     expect(() =>
       assertMockEndpoint("https://api.anthropic.com/v1", "http://127.0.0.1:1234"),

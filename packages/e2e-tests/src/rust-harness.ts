@@ -47,6 +47,15 @@ export interface RustTestHarnessOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /**
+     * Give the historian its own mock model with this context window instead of
+     * the session model. A scenario that shrinks `modelContextLimit` to build
+     * pressure quickly needs this: the module refuses a historian prompt that does
+     * not fit the historian model's window, and it counts a prompt for a model it has
+     * no tokenizer calibration for (every mock model) at twice its local size. Default: the historian uses the
+     * session model and its window.
+     */
+    historianModelContextLimit?: number;
     /** Default response used when the mock queue is empty. */
     mockDefault?: MockResponse;
     /** Mock provider id exposed to OpenCode. Defaults to "mock-anthropic". */
@@ -110,6 +119,9 @@ export interface SdkClient {
     };
 }
 
+/** The historian's own mock model, registered when `historianModelContextLimit` is set. */
+const HISTORIAN_MOCK_MODEL_ID = "mock-historian";
+
 const DEFAULT_MOCK_RESPONSE: MockResponse = {
     text: "ok",
     usage: {
@@ -164,6 +176,7 @@ export class RustTestHarness {
     private clientInstance: SdkClient;
     private contextDbCached: Database | null = null;
     private modelContextLimit: number | undefined;
+    private readonly historianModelContextLimit: number | undefined;
     private mockDefault: MockResponse;
     private readonly mockBaseURL: string;
     private readonly providerID: string;
@@ -182,6 +195,7 @@ export class RustTestHarness {
         client: SdkClient;
         logPath: string;
         modelContextLimit: number | undefined;
+        historianModelContextLimit: number | undefined;
         mockDefault: MockResponse;
         providerID: string;
         providerAPI: "@ai-sdk/anthropic" | "@ai-sdk/openai";
@@ -197,6 +211,7 @@ export class RustTestHarness {
         this.clientInstance = args.client;
         this.logPath = args.logPath;
         this.modelContextLimit = args.modelContextLimit;
+        this.historianModelContextLimit = args.historianModelContextLimit;
         this.mockDefault = args.mockDefault;
         this.providerID = args.providerID;
         this.providerAPI = args.providerAPI;
@@ -308,6 +323,7 @@ export class RustTestHarness {
             client,
             logPath,
             modelContextLimit: options.modelContextLimit,
+            historianModelContextLimit: options.historianModelContextLimit,
             mockDefault,
             providerID: options.providerID ?? "mock-anthropic",
             providerAPI: options.providerAPI ?? "@ai-sdk/anthropic",
@@ -331,6 +347,11 @@ export class RustTestHarness {
     }): Promise<SpawnedOpencode> {
         const providerID = args.options.providerID ?? "mock-anthropic";
         const modelID = args.options.modelID ?? "mock-sonnet";
+        const historianModel =
+            args.options.historianModelContextLimit === undefined
+                ? undefined
+                : { id: HISTORIAN_MOCK_MODEL_ID, contextLimit: args.options.historianModelContextLimit };
+        const historianModelID = historianModel?.id ?? modelID;
         return spawnOpencode({
             mockProviderURL: args.mockURL,
             mockProviderID: providerID,
@@ -338,11 +359,12 @@ export class RustTestHarness {
             mockModelID: modelID,
             existingEnv: args.env,
             modelContextLimit: args.options.modelContextLimit,
+            historianMockModel: historianModel,
             openCodeConfigExtra: args.options.openCodeConfigExtra,
             magicContextConfig: RustTestHarness.pinPluginRunner(
                 {
                     ...(args.options.startHistorianProducer ?? true
-                        ? { historian: { opencode: { model: `${providerID}/${modelID}` } } }
+                        ? { historian: { opencode: { model: `${providerID}/${historianModelID}` } } }
                         : {}),
                     ...(args.options.magicContextConfig ?? {}),
                 },
@@ -407,6 +429,7 @@ export class RustTestHarness {
             logPath: this.logPath,
             options: {
                 modelContextLimit: this.modelContextLimit,
+                historianModelContextLimit: this.historianModelContextLimit,
                 magicContextConfig: opts.magicContextConfig,
                 startHistorianProducer: this.historianProducerAvailable,
                 historianRunner: this.historianRunner,

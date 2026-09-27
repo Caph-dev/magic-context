@@ -241,6 +241,13 @@ export interface OpenCode2SpawnOptions {
 	includeMagicContext?: boolean;
 	modelContextLimit?: number;
 	modelOutputLimit?: number;
+	/**
+	 * Register a second mock model and pin the historian to it, so a scenario can
+	 * keep a small window on the session model while the historian gets a window
+	 * large enough to hold its prompt, as it does for real users. Its output limit
+	 * follows `modelOutputLimit`. Default: the historian uses the session model.
+	 */
+	historianModel?: { id: string; contextLimit: number };
 	compactionAuto?: boolean;
 	existingIsolation?: OpenCode2Isolation;
 	existingMock?: { mock: MockProvider; baseURL: string };
@@ -291,6 +298,7 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 	const modelIDs = new Set([
 		defaultModelID,
 		...(options.additionalModelIDs ?? []),
+		...(options.historianModel ? [options.historianModel.id] : []),
 	]);
 	writeFileSync(
 		join(fixture.cwd, "opencode.json"),
@@ -316,7 +324,10 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 									// 2.0.5 required() is unchanged, but 16k minus a 32k output
 									// makes the first-request ceiling negative. Ordinary turns
 									// stay large; fold scenarios pass 16k/1024 explicitly.
-									context: options.modelContextLimit ?? 200_000,
+									context:
+										id === options.historianModel?.id
+											? options.historianModel.contextLimit
+											: (options.modelContextLimit ?? 200_000),
 									output: options.modelOutputLimit ?? 32768,
 								},
 							},
@@ -342,6 +353,9 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 						`${providerID}/${defaultModelID}`,
 						// Both OpenCode host generations use the `agents.*.opencode` config block.
 						"opencode",
+						options.historianModel
+							? { historian: `${providerID}/${options.historianModel.id}` }
+							: {},
 					),
 				},
 				null,

@@ -13,15 +13,21 @@ function modelHarnessFor(host: "opencode" | "opencode2" | "pi" | "omp"): "openco
   return host === "opencode2" ? "opencode" : host;
 }
 
-/** Keep child agents on the same explicitly registered mock model as their host. */
+/**
+ * Keep child agents on an explicitly registered mock model: the host's own model,
+ * or the one `agentModels` names for that agent. A caller that names a separate
+ * agent model must register it on the same mock provider as the host model.
+ */
 export function pinMockAgents(
   overrides: Record<string, unknown> = {},
-  model: string,
+  hostModel: string,
   host: "opencode" | "opencode2" | "pi" | "omp" = "opencode",
+  agentModels: { historian?: string; dreamer?: string } = {},
 ): Record<string, unknown> {
   const harness = modelHarnessFor(host);
   const result = { ...overrides };
-  for (const name of ["historian", "dreamer"]) {
+  for (const name of ["historian", "dreamer"] as const) {
+    const model = agentModels[name] ?? hostModel;
     const supplied = overrides[name];
     const agent =
       supplied && typeof supplied === "object" ? (supplied as Record<string, unknown>) : {};
