@@ -212,6 +212,10 @@ describe.skipIf(!prereqs.ok)(
                 // never reaches the plugin.
                 modelContextLimit: 24_000,
                 modelOutputLimit: 1_024,
+                // The historian gets its own 128k mock model: the 24k session window
+                // cannot hold a historian prompt, and the module refuses one that
+                // does not fit the historian model's window.
+                historianModel: { id: "mock-historian", contextLimit: 128_000 },
                 magicContextConfig: {
                     transform_mode: "rust",
                     subc: { connection_file: subc.connectionFile },
@@ -220,7 +224,7 @@ describe.skipIf(!prereqs.ok)(
                     // The historian model has to sit in the harness sub-block: the
                     // shared resolver reads `historian.<harness>`, and the v2 lane
                     // resolves with "opencode".
-                    historian: { opencode: { model: "openai/mock-model" } },
+                    historian: { opencode: { model: "openai/mock-historian" } },
                     execute_threshold_percentage: 40,
                     history_budget_percentage: 0.15,
                 },

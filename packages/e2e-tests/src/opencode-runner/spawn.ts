@@ -108,6 +108,13 @@ export interface SpawnOptions {
     omitConfigDirCompaction?: boolean;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /**
+     * Register a second model on the mock provider and pin the historian to it,
+     * so a scenario can keep a small window on the session model while the
+     * historian gets a window large enough to hold its prompt, as it does for
+     * real users. Default: the historian uses the session model.
+     */
+    historianMockModel?: { id: string; contextLimit: number };
     /** Pre-create the isolated Magic Context DB unless the test expects the plugin to stay disabled. */
     prepareContextDatabase?: boolean;
     /** Expected Magic Context state after startup; readiness waits for this state. Defaults to enabled. */
@@ -288,9 +295,22 @@ function writeConfigs(
     const mockProviderID = opts.mockProviderID ?? "mock-anthropic";
     const mockProviderAPI = opts.mockProviderAPI ?? "@ai-sdk/anthropic";
     const mockModelID = opts.mockModelID ?? "mock-sonnet";
+    const mockModel = (modelID: string, contextLimit: number): Record<string, unknown> => ({
+        id: modelID,
+        name: `Mock ${modelID}`,
+        cost: { input: 0, output: 0 },
+        limit: { context: contextLimit, output: 8192 },
+        modalities: {
+            input: ["text", "image", "pdf"],
+            output: ["text"],
+        },
+        options: {},
+    });
+    const historianModel = opts.historianMockModel;
     const providerConfig = (
         api: "@ai-sdk/anthropic" | "@ai-sdk/openai",
         modelID: string,
+        withHistorianModel = false,
     ): Record<string, unknown> => ({
         api,
         name: api === "@ai-sdk/openai" ? "Mock OpenAI Responses" : "Mock Anthropic",
@@ -301,17 +321,10 @@ function writeConfigs(
             baseURL: mockProviderURL,
         },
         models: {
-            [modelID]: {
-                id: modelID,
-                name: `Mock ${modelID}`,
-                cost: { input: 0, output: 0 },
-                limit: { context: opts.modelContextLimit ?? 200000, output: 8192 },
-                modalities: {
-                    input: ["text", "image", "pdf"],
-                    output: ["text"],
-                },
-                options: {},
-            },
+            [modelID]: mockModel(modelID, opts.modelContextLimit ?? 200000),
+            ...(withHistorianModel && historianModel
+                ? { [historianModel.id]: mockModel(historianModel.id, historianModel.contextLimit) }
+                : {}),
         },
     });
 
@@ -325,7 +338,7 @@ function writeConfigs(
         // detector disables itself and the plugin becomes a no-op.
         compaction: { auto: false, prune: false },
         provider: {
-            [mockProviderID]: providerConfig(mockProviderAPI, mockModelID),
+            [mockProviderID]: providerConfig(mockProviderAPI, mockModelID, true),
             ...(mockProviderAPI === "@ai-sdk/openai"
                 ? {
                       "mock-anthropic-setup": providerConfig(
@@ -362,7 +375,12 @@ function writeConfigs(
         execute_threshold_percentage: 40,
         history_budget_percentage: 0.15,
         dreamer: { disable: true },
-        ...pinMockAgents(opts.magicContextConfig, `${mockProviderID}/${mockModelID}`),
+        ...pinMockAgents(
+            opts.magicContextConfig,
+            `${mockProviderID}/${mockModelID}`,
+            "opencode",
+            historianModel ? { historian: `${mockProviderID}/${historianModel.id}` } : {},
+        ),
     };
     if (opts.userSubcConnectionFile) {
         magicContext.subc = { connection_file: opts.userSubcConnectionFile };
