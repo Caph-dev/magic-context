@@ -23,6 +23,9 @@ import {
 	getMemoryVerifications,
 } from "../../../plugin/src/features/magic-context/memory";
 import { acquireLease } from "../../../plugin/src/features/magic-context/dreamer/lease";
+import { leaseKeyFor } from "../../../plugin/src/features/magic-context/dreamer/task-registry";
+import { createDreamTaskExecutor } from "../../../plugin/src/features/magic-context/dreamer/task-executor";
+import { getDreamRuns } from "../../../plugin/src/features/magic-context/dreamer/storage-dream-runs";
 import {
 	mapMemories,
 	MAP_BATCH_FLOOR_MS,
@@ -111,6 +114,13 @@ export default {
 				let handle: any = null;
 				let settled = false;
 				try {
+                    if (command.agent === "step-cap-runner") {
+                        insertMemory(db, { projectPath: root, category: "ARCHITECTURE", content: "A fixture memory to curate." });
+                        const execute = createDreamTaskExecutor({ sessionDirectory: root, parentSessionId: command.parent, hiddenCompletionExecutor: executor, openOpenCodeDb: () => null });
+                        const result = await execute({ task: "curate", schedule: "0 4 * * 0", model: "openai/mock-model", timeoutMinutes: 5 }, { db, projectIdentity: root, holderId: "step-cap-proof", leaseKey: leaseKeyFor("curate", root) });
+                        writeFileSync(join(root, `dream-loop-result-${command.seq}.json`), JSON.stringify({ result, runs: getDreamRuns(db, root) }));
+                        continue;
+                    }
 					if (command.agent === "map-runner") {
 						const memory = insertMemory(db, {
 							projectPath: root,

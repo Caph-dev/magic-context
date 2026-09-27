@@ -1000,6 +1000,14 @@
             ]
         },
         {
+            "path": "tests/opencode2/hidden-step-limit.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Real OpenCode 2 host mock drives the Dreamer tool loop to its step cap and verifies the persisted failure classification",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/opencode2/marker-s3-runtime.test.ts",
             "tier": "excluded",
             "invocation": {

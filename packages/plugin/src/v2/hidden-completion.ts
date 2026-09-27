@@ -16,6 +16,7 @@ import {
     HIDDEN_CURATE_AGENT,
     HIDDEN_DREAMER_AGENT,
     HIDDEN_HISTORIAN_AGENT,
+    HiddenAgentStepLimit,
     type HiddenChildAttempt,
     type HiddenChildHook,
     hiddenAgentFor,
@@ -530,6 +531,7 @@ async function sleepUntilPoll(signal: AbortSignal | undefined, deadline: number)
 async function awaitAssistantRow(
     openReader: () => HiddenChildRows & { close?: () => void },
     readSessionError: () => Promise<unknown>,
+    stepLimit: () => HiddenAgentStepLimit | undefined,
     childID: string,
     afterSeq: number,
     deadline: number,
@@ -542,6 +544,8 @@ async function awaitAssistantRow(
         }));
         const newAssistant = assistant && assistant.seq > afterSeq ? assistant : undefined;
         const newIdle = idle && idle.seq > afterSeq ? idle : undefined;
+        const capped = stepLimit();
+        if (capped) throw capped;
         if (newIdle && (!newAssistant || newIdle.seq > newAssistant.seq)) {
             const outcome = newIdle.data.outcome;
             if (outcome === "failed" || outcome === "interrupted") {
@@ -551,7 +555,11 @@ async function awaitAssistantRow(
                     `terminal_row=${errorText(newIdle)}`,
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
-                throw new HiddenProviderError(details.join("; "));
+                throw sessionError === undefined
+                    ? new Error(
+                          `Hidden completion failed without a provider error: ${details.join("; ")}`,
+                      )
+                    : new HiddenProviderError(details.join("; "));
             }
             if (outcome === "succeeded" && newAssistant) return newAssistant;
         }
@@ -564,7 +572,11 @@ async function awaitAssistantRow(
                     `terminal_row=${errorText(newAssistant)}`,
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
-                throw new HiddenProviderError(details.join("; "));
+                throw sessionError === undefined
+                    ? new Error(
+                          `Hidden completion failed without a provider error: ${details.join("; ")}`,
+                      )
+                    : new HiddenProviderError(details.join("; "));
             }
             if (newAssistant.data.error !== undefined) {
                 throw new HiddenProviderError(errorText(newAssistant.data.error), {
@@ -995,6 +1007,7 @@ export async function createV2HiddenCompletionExecutor(
                                 return undefined;
                             }
                         },
+                        () => attempt.stepLimit,
                         run.child.id,
                         baseline,
                         deadline,
@@ -1057,7 +1070,8 @@ export async function createV2HiddenCompletionExecutor(
                 };
                 // Recorded for `keep_subagents` retention: this child now holds a settled run.
                 if (!run.child.ever_settled) run.child = store.markEverSettled(run.child);
-            } catch (error) {
+            } catch (caught) {
+                const error = attempt.stepLimit ?? caught;
                 run.failed = true;
                 if (!(error instanceof HiddenProviderError)) {
                     run.unsettledFailure = true;
@@ -1070,12 +1084,21 @@ export async function createV2HiddenCompletionExecutor(
                     !run.retired
                 ) {
                     await interruptAndRetire(run, "prompt-timeout");
-                } else if (error instanceof HiddenProviderError && error.settled && !run.retired) {
+                } else if (
+                    (error instanceof HiddenAgentStepLimit ||
+                        (error instanceof HiddenProviderError && error.settled)) &&
+                    !run.retired
+                ) {
                     // Stop the child before the marker is released in finally: once the marker is
                     // gone, any further host step on this child (a scheduled retry, for example)
                     // has no registered request and HiddenChildHook.apply refuses it into the
                     // host's drain loop. Retiring it means the next run starts on a clean child.
-                    await interruptAndRetire(run, "hidden-run-provider-error");
+                    await interruptAndRetire(
+                        run,
+                        error instanceof HiddenAgentStepLimit
+                            ? "hidden-run-step-limit"
+                            : "hidden-run-provider-error",
+                    );
                 }
                 throw error;
             } finally {

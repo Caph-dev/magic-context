@@ -33,6 +33,11 @@ export const USER_FACING_FAILURES = {
         sentence: "Memory maintenance could not reach its model.",
         action: "Check the model connection, then run /ctx-dream again.",
     },
+    dream_step_limit: {
+        code: "MC-D10",
+        sentence: "Memory maintenance stopped at its hidden agent step limit.",
+        action: "This task needs less work per run; changing the model connection will not help.",
+    },
     dream_empty_completion: {
         code: "MC-D03",
         sentence: "Memory maintenance received no usable response.",
@@ -279,6 +284,7 @@ export function capabilityRefusalCode(capability: CapabilityRefusal): string {
 const DREAM_FAILURE_KEYS = {
     provider_timeout: "dream_provider_timeout",
     provider_error: "dream_provider_error",
+    step_limit: "dream_step_limit",
     empty_completion: "dream_empty_completion",
     no_models: "dream_no_models",
     child_aborted: "dream_child_aborted",

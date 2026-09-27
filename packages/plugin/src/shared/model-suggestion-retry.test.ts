@@ -1,6 +1,8 @@
 import { describe, expect, mock, test } from "bun:test";
 
+import { HiddenAgentStepLimit } from "../v2/hooks/hidden-child";
 import {
+    getPromptFailureDetail,
     promptSyncWithModelSuggestionRetry,
     promptSyncWithValidatedOutputRetry,
 } from "./model-suggestion-retry";
@@ -393,6 +395,28 @@ describe("promptSyncWithModelSuggestionRetry", () => {
 });
 
 describe("promptSyncWithValidatedOutputRetry", () => {
+    test("records a step cap as step_limit without a provider error", async () => {
+        const prompt = mock(async () => {
+            throw new HiddenAgentStepLimit("dreamer-retrospective", 40);
+        });
+        const client = createClient(prompt);
+        let caught: unknown;
+        try {
+            await promptSyncWithValidatedOutputRetry(client, createArgs(), {
+                fetchOutput: async () => "unused",
+                validateOutput: (output) => output,
+            });
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(HiddenAgentStepLimit);
+        expect(getPromptFailureDetail(caught)).toMatchObject({
+            failureClass: "step_limit",
+            providerError: null,
+        });
+        expect(prompt).toHaveBeenCalledTimes(1);
+    });
+
     test("surfaces a host-recorded assistant refusal even when the row has no text", async () => {
         const client = createClient(mock(async () => ({})));
         const refusal =
