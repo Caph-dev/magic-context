@@ -1387,6 +1387,30 @@ fn an_event_pointing_at_another_sessions_live_compartment_still_stops_the_move()
     assert!(!marker_present(&fixture.context(), P));
 }
 
+/// Workspace members read each other's shared memories under one memory revision, which
+/// cannot span two files, so a project whose workspace has an unmoved member is refused
+/// before anything is written, dry run included.
+#[test]
+fn a_project_sharing_a_workspace_with_an_unmoved_member_is_refused() {
+    let fixture = fresh();
+    fixture
+        .store_conn()
+        .execute_batch(
+            "INSERT INTO mc_workspaces(id, name) VALUES (1, 'team');
+             INSERT INTO mc_workspace_members(workspace_id, project_path, display_name, display_path)
+             VALUES (1, 'git:project-p', 'p', '/work/project-p'),
+                    (1, 'git:project-q', 'q', '/work/project-q');",
+        )
+        .unwrap();
+    assert_refused_without_writes(&fixture, WORKSPACE_PARTIAL);
+    let store = fixture.open_store();
+    let mut dry = request(P);
+    dry.dry_run = true;
+    let refusal = run(&store, &dry, &fixture.options(), &mut NoObserver).unwrap_err();
+    assert_eq!(refusal.code, WORKSPACE_PARTIAL);
+    assert!(refusal.detail.contains(Q), "{refusal}");
+}
+
 fn fresh() -> Fixture {
     fixture()
 }

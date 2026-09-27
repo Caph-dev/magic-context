@@ -56,6 +56,10 @@ pub const AUTHORITY_NOT_MODULE: &str = "single_store_authority_not_module";
 /// A `context.db` event or user-memory candidate of the project has no `store.db`
 /// counterpart and cannot be proven either current or superseded.
 pub const UNCLASSIFIED_ROWS: &str = "single_store_unclassified_rows";
+/// The project shares a workspace with a member that has not moved. A workspace's members
+/// render each other's shared memories and track one memory revision across all of them,
+/// which cannot span two files, so members move together.
+pub const WORKSPACE_PARTIAL: &str = "single_store_workspace_partial";
 
 /// The harnesses whose host keeps a moved project's rows embedded. A session under any
 /// other harness would leave its memories unembedded after the move.
@@ -2321,6 +2325,24 @@ pub fn run(
                 format!(
                     "{project}'s {domain} authority is {}, not MODULE, so store.db is not its source of truth",
                     state.as_deref().unwrap_or("absent")
+                ),
+            ));
+        }
+    }
+    if let Some(membership) = store.resolve_workspace_membership(project)? {
+        let (conn, _) = host.connection_and_fence();
+        let mut unmoved = Vec::new();
+        for member in &membership.union_identities {
+            if member != project && !is_marked(conn, member)? {
+                unmoved.push(member.clone());
+            }
+        }
+        if !unmoved.is_empty() {
+            return Err(MigrateRefusal::new(
+                WORKSPACE_PARTIAL,
+                format!(
+                    "{project} shares a workspace with {} that has not moved into context.db; a workspace's members move together",
+                    unmoved.join(", ")
                 ),
             ));
         }
