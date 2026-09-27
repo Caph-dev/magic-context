@@ -145,6 +145,7 @@ import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
 import type { MessageLike } from "./transform-operations";
+import type { FrozenReleaseLastServed } from "./transform-postprocess-phase";
 import {
     applyRustModeDeferredCompactionMarker,
     replayRustModeBindingMismatchStrips,
@@ -438,6 +439,13 @@ interface RustSessionState extends ModuleStateSyncState {
     muralCache: { key: string; value: MuralWireOptions } | null;
     authorityMemorySyncSkipLogged?: boolean;
     lkgCaptureSequence: number;
+    /**
+     * Capture sequence of the snapshot prepared from the array the previous pass
+     * served, or null when that pass served something it did not capture (a
+     * last-known-good replay after a module error or park, raw input, or a
+     * declined capture). A slot with this sequence is provably the last-served array.
+     */
+    lkgLastServedCaptureSequence: number | null;
     lkgLastCapturedRowVersion: number;
     lkgSyncCaptureRequired: boolean;
     lkgAcceptedCapture?: {
@@ -1111,6 +1119,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             muralCache: null,
             authorityMemorySyncSkipLogged: false,
             lkgCaptureSequence: 0,
+            lkgLastServedCaptureSequence: null,
             lkgLastCapturedRowVersion: 0,
             lkgSyncCaptureRequired: false,
             lkgRepresentationFrozen: false,
@@ -1519,6 +1528,17 @@ function syntheticTodoAnchorFromNative(messages: readonly unknown[]): {
         return { callId: part.callID, messageId, stateJson };
     }
     return null;
+}
+
+/** The array a last-known-good snapshot recorded as served, or null when unreadable. */
+function parseLastServedSnapshot(jsonPrefix: string | undefined): unknown[] | null {
+    if (!jsonPrefix) return null;
+    try {
+        const parsed: unknown = JSON.parse(jsonPrefix);
+        return Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
 }
 
 function mirrorRustSyntheticTodoAnchor(args: {
@@ -2225,6 +2245,10 @@ export function createRustModeTransform(
             return false;
         }
         replaceMessagesInPlace(output, replay.messages);
+        // This serve adds a raw tail the slot does not hold, so the slot stops being
+        // the last-served array even if this pass captured one before failing.
+        const replayState = states.get(sessionId);
+        if (replayState) replayState.lkgLastServedCaptureSequence = null;
         sessionLog(sessionId, "lkg_replay_served");
         return true;
     };
@@ -2345,6 +2369,10 @@ export function createRustModeTransform(
         const passStartedAt = performance.now();
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
+        // Only the path that captures the array it serves sets this again, so every
+        // other way out of this pass leaves the next pass unable to trust the slot.
+        const lastServedCaptureSequence = state.lkgLastServedCaptureSequence;
+        state.lkgLastServedCaptureSequence = null;
         const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(messages);
         const trailingBlankNewestAssistantId = [...messages]
             .reverse()
@@ -3621,6 +3649,14 @@ export function createRustModeTransform(
                 // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
                 // so the previous last-known-good (LKG) snapshot is already stale.
                 decisionUpper === "SOFT";
+            // The module's own permission. A released frozen replay below also makes the
+            // pass priced, but it changes bytes only from the first message the freeze
+            // served raw, so it is not a permission to rewrite from the start.
+            const moduleDecisionBusts = cacheBustingPass;
+            let frozenReleaseLastServed: FrozenReleaseLastServed = {
+                messages: null,
+                proven: false,
+            };
             if (!todoProbeRequired && cacheBustingPass) {
                 timings.todoUnprobedBust += 1;
                 sessionLog(
@@ -3671,6 +3707,15 @@ export function createRustModeTransform(
                         state.lkgFrozenAtInputCount = inputCount;
                     }
                     const keys = resolveLkgModelKeys(messages);
+                    // Read before the replay: a replay that fails validation drops the slot.
+                    const lastServedSlot = getSlot(sessionId);
+                    const lastServedSnapshot = (): FrozenReleaseLastServed => ({
+                        messages: parseLastServedSnapshot(lastServedSlot?.jsonPrefix),
+                        proven:
+                            lastServedSlot !== undefined &&
+                            lastServedCaptureSequence !== null &&
+                            lastServedSlot.captureSequence === lastServedCaptureSequence,
+                    });
                     const frozen = replayLkg({
                         sessionId,
                         messages,
@@ -3680,6 +3725,7 @@ export function createRustModeTransform(
                     if (!frozen.ok) {
                         cacheBustingPass = true;
                         frozenReleaseReason = frozen.reason;
+                        frozenReleaseLastServed = lastServedSnapshot();
                     } else {
                         frozenHealthyPassesAfterApply = state.lkgFrozenHealthyPasses + 1;
                         const rawTailGrowth = Math.max(0, inputCount - state.lkgFrozenAtInputCount);
@@ -3693,6 +3739,7 @@ export function createRustModeTransform(
                         if (releaseReason) {
                             cacheBustingPass = true;
                             frozenReleaseReason = releaseReason;
+                            frozenReleaseLastServed = lastServedSnapshot();
                         } else {
                             appliedMessages = frozen.messages;
                             // The stored prefix already carries the binding-mismatch
@@ -3738,7 +3785,8 @@ export function createRustModeTransform(
                             model?.providerID,
                             model?.modelID,
                         ),
-                        cacheBustingPass,
+                        cacheBustingPass: moduleDecisionBusts,
+                        ...(frozenReleaseReason ? { frozenReleaseLastServed } : {}),
                         trailingBlankSourceDecisions,
                         trailingBlankNewestAssistantId:
                             typeof trailingBlankNewestAssistantId === "string"
@@ -3821,6 +3869,7 @@ export function createRustModeTransform(
                     rowVersion,
                 );
                 let captureMode = "async";
+                if (capturePlan) state.lkgLastServedCaptureSequence = capturePlan.captureSequence;
                 const captureFailed = (mode: "async" | "sync", error: unknown): void => {
                     if (
                         states.get(sessionId) !== state ||

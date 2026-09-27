@@ -7642,3 +7642,196 @@ it("unknown calibrated raw fallback refuses a locally fitting request and admits
         }
     }
 });
+
+describe("proactive thinking strip on a released frozen replay", () => {
+    const PREFIX_BOUND_MODEL = { providerID: "anthropic", modelID: "claude-opus-5-5" };
+
+    function user(sessionId: string, id: string, text: string): MessageLike {
+        return {
+            info: { id, role: "user", sessionID: sessionId, model: { ...PREFIX_BOUND_MODEL } },
+            parts: [{ type: "text", text }],
+        } as MessageLike;
+    }
+
+    function thinkingAssistant(sessionId: string, id: string): MessageLike {
+        return {
+            info: { id, role: "assistant", sessionID: sessionId },
+            parts: [
+                {
+                    type: "reasoning",
+                    text: `thinking of ${id}`,
+                    metadata: { anthropic: { signature: `signature-${id}` } },
+                },
+                { type: "text", text: `answer of ${id}` },
+            ],
+        } as MessageLike;
+    }
+
+    function hasReasoning(messages: unknown[], id: string): boolean {
+        const message = messages.find(
+            (candidate) => (candidate as MessageLike).info.id === id,
+        ) as MessageLike;
+        return message.parts.some((part) => (part as { type?: string }).type === "reasoning");
+    }
+
+    /**
+     * Drive a prefix-bound Rust session through a HARD pass, an error pass that
+     * freezes the last-known-good replay, and frozen defers. The module then keeps
+     * deferring (`SOFT+`), so the only thing that can make the release pass priced
+     * is the release itself.
+     */
+    async function frozenSession(label: string) {
+        const sessionId = `rust-release-strip-${label}-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 200_000, "anthropic/claude-opus-5-5");
+        let pass = 0;
+        let decision = "SOFT+";
+        let moduleOutput: (input: MessageLike[]) => unknown[] = (input) => structuredClone(input);
+        let lastInput: MessageLike[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                if (pass === 2) throw new Error("daemon unavailable");
+                return {
+                    decision: pass === 1 ? "HARD" : decision,
+                    served_from: "transform",
+                    row_version: pass,
+                    native_messages: moduleOutput(lastInput),
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.liveModelBySession?.set(sessionId, { ...PREFIX_BOUND_MODEL });
+        deps.getModelKey = () => "anthropic/claude-opus-5-5";
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const run = async (input: MessageLike[]) => {
+            lastInput = input;
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            return output.messages;
+        };
+
+        await run([user(sessionId, "m1", "question")]);
+        const frozenInput = [
+            user(sessionId, "m1", "question"),
+            thinkingAssistant(sessionId, "a1"),
+            user(sessionId, "m2", "follow-up"),
+        ];
+        await run(frozenInput);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        const frozenServed = structuredClone(await run(frozenInput));
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        expect(hasReasoning(frozenServed, "a1")).toBe(true);
+        return {
+            sessionId,
+            transform,
+            run,
+            frozenInput,
+            frozenServed,
+            setDecision: (value: string) => {
+                decision = value;
+            },
+            setModuleOutput: (value: (input: MessageLike[]) => unknown[]) => {
+                moduleOutput = value;
+            },
+        };
+    }
+
+    function sessionLines(logSpy: ReturnType<typeof spyOn>, sessionId: string): string[] {
+        return logSpy.mock.calls
+            .filter(([loggedSession]) => loggedSession === sessionId)
+            .map(([, message]) => String(message));
+    }
+
+    it("serves byte-identical bytes when a healthy_pass_limit release changes nothing", async () => {
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const session = await frozenSession("healthy");
+            // The pass above was the first healthy frozen defer; the eighth releases.
+            let served: unknown[] = session.frozenServed;
+            for (let healthyPass = 2; healthyPass <= 8; healthyPass += 1) {
+                served = await session.run(session.frozenInput);
+            }
+            expect(session.transform.getState(session.sessionId).lkgRepresentationFrozen).toBe(
+                false,
+            );
+            const lines = sessionLines(logSpy, session.sessionId);
+            expect(lines).toContain("lkg_frozen_replay_released reason=healthy_pass_limit");
+            expect(JSON.stringify(served)).toBe(JSON.stringify(session.frozenServed));
+            expect(lines.some((line) => line.includes("proactive thinking strip"))).toBe(false);
+
+            // Control: a pass the module prices itself still strips, so the fixture
+            // reaches the strip and the release above was held by the predicate.
+            session.setDecision("SOFT");
+            const softServed = await session.run(session.frozenInput);
+            expect(hasReasoning(softServed, "a1")).toBe(false);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it("serves byte-identical bytes when a reasoning-run release changes nothing", async () => {
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const session = await frozenSession("reasoning-run");
+            // Two adjacent assistants that each open with thinking form one Anthropic
+            // run with a second thinking block, which the frozen replay refuses.
+            const releaseInput = [
+                ...session.frozenInput,
+                thinkingAssistant(session.sessionId, "a2"),
+                thinkingAssistant(session.sessionId, "a3"),
+            ];
+            const served = await session.run(releaseInput);
+            const lines = sessionLines(logSpy, session.sessionId);
+            expect(lines).toContain(
+                "lkg_frozen_replay_released reason=lkg_anthropic_reasoning_run_invalid",
+            );
+            expect(JSON.stringify(served.slice(0, session.frozenServed.length))).toBe(
+                JSON.stringify(session.frozenServed),
+            );
+            expect(hasReasoning(served, "a1")).toBe(true);
+            expect(hasReasoning(served, "a2")).toBe(true);
+            expect(lines.some((line) => line.includes("proactive thinking strip"))).toBe(false);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it("strips only thinking after the first message a release changes", async () => {
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const session = await frozenSession("tagged-tail");
+            // The released module output tags the message the freeze served raw, the
+            // shape both production specimens showed.
+            session.setModuleOutput((input) =>
+                structuredClone(input).map((message) =>
+                    message.info.id === "m2"
+                        ? { ...message, parts: [{ type: "text", text: "§2§ follow-up" }] }
+                        : message,
+                ),
+            );
+            const releaseInput = [
+                ...session.frozenInput,
+                thinkingAssistant(session.sessionId, "a2"),
+                thinkingAssistant(session.sessionId, "a3"),
+            ];
+            const served = await session.run(releaseInput);
+            expect(
+                sessionLines(logSpy, session.sessionId).some((line) =>
+                    line.includes("reason=lkg_anthropic_reasoning_run_invalid"),
+                ),
+            ).toBe(true);
+            // a1 sits before the changed message: its bytes and prefix are unchanged.
+            expect(JSON.stringify(served.slice(0, 2))).toBe(
+                JSON.stringify(session.frozenServed.slice(0, 2)),
+            );
+            expect(hasReasoning(served, "a2")).toBe(false);
+            expect(hasReasoning(served, "a3")).toBe(false);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+});
