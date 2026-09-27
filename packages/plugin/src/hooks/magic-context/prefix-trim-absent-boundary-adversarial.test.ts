@@ -12,7 +12,7 @@
  * reorder) are the ones an ordinal-based cut got wrong.
  */
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -296,6 +297,67 @@ describe("absent-boundary prefix trim: append-only defer passes keep the priced 
         const second = window(31);
         expect(servePass(db, second, boundary, false).prefixTrimStatus).toBe("refused");
         expectAppendOnlyDefer(first, second);
+    });
+});
+
+describe("absent-boundary prefix trim: the log says where the rows after the boundary went", () => {
+    // Production shape: compartment injection already cut the window through the
+    // boundary (row 12), then reduction removed rows 13-14 (tool-only steps whose
+    // calls were dropped), so the first live row is 15. OpenCode served 13-14.
+    function passWithHostWindow(hostWindowIds: readonly string[] | undefined) {
+        // The line is logged once per boundary per process; each case starts fresh.
+        resetPrefixTrimFallbackState(SESSION_ID);
+        createOpenCodeStore(range(1, 30).map((index) => regularRow(index)));
+        const db = contextDb();
+        const lines: string[] = [];
+        const spy = spyOn(loggerModule, "sessionLog").mockImplementation((_id, ...values) => {
+            lines.push(values.map(String).join(" "));
+        });
+        try {
+            const live = liveWindow(range(15, 30));
+            const status = injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages: live,
+                preparedPrefix: preparedPrefix(idOf(12)),
+                isCacheBustingPass: true,
+                prefixTrimHostWindow: hostWindowIds
+                    ? { messageIds: hostWindowIds, firstIdAfterCompartmentCut: idOf(13) }
+                    : undefined,
+            }).prefixTrimStatus;
+            return {
+                status,
+                ids: ids(live),
+                lines: lines.filter((line) => line.includes("prefix trim:")),
+            };
+        } finally {
+            spy.mockRestore();
+        }
+    }
+
+    it("names rows the host served and reduction removed, instead of implying the host window started after the boundary", () => {
+        const recorded = passWithHostWindow(range(5, 30).map(idOf));
+        const unrecorded = passWithHostWindow(undefined);
+
+        // Only the log differs: same status, same served rows.
+        expect(recorded.status).toBe("boundary-precedes-window");
+        expect(unrecorded.status).toBe("boundary-precedes-window");
+        expect(recorded.ids).toEqual(unrecorded.ids);
+
+        expect(recorded.lines).toEqual([
+            `prefix trim: boundary ${idOf(12)} was in the host window and already cut this pass; first live message ${idOf(15)}; host rows between them: 2 removed by reduction (${idOf(13)},${idOf(14)}), 0 cut with the compartment boundary (); pass=priced; nothing to cut`,
+        ]);
+        expect(unrecorded.lines).toEqual([
+            `prefix trim: boundary ${idOf(12)} sorts before the first live message ${idOf(15)}; pass=priced; nothing to cut, whole window kept`,
+        ]);
+    });
+
+    it("keeps the window-starts-after-boundary wording when the host window did not contain the boundary", () => {
+        const { lines } = passWithHostWindow(range(15, 30).map(idOf));
+        expect(lines).toEqual([
+            `prefix trim: boundary ${idOf(12)} sorts before the first live message ${idOf(15)}; pass=priced; nothing to cut, whole window kept`,
+        ]);
     });
 });
 

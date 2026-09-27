@@ -115,7 +115,9 @@ import {
     findHostCompactionWindow,
     type HostCompactionWindow,
     mustMaterialize,
+    type PrefixTrimHostWindow,
     type PreparedCompartmentInjection,
+    persistedMessageIds,
     prepareCompartmentInjection,
     selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
@@ -2039,8 +2041,10 @@ export function createTransform(deps: TransformDeps) {
         // render, no raw-tail trim, no boundary splice, no marker write.
         // Memory/docs surfaces materialize independently through the
         // zero-compartment m[0]/m[1] path in postprocess.
+        let prefixTrimHostWindow: PrefixTrimHostWindow | undefined;
         if (fullFeatureMode && !compactionOff) {
             const tInj = performance.now();
+            const hostWindowIds = persistedMessageIds(messages);
             pendingCompartmentInjection = prepareCompartmentInjection(
                 db,
                 sessionId,
@@ -2050,6 +2054,14 @@ export function createTransform(deps: TransformDeps) {
                 deps.memoryConfig?.injectionBudgetTokens,
                 deps.experimentalTemporalAwareness,
             );
+            prefixTrimHostWindow = {
+                messageIds: hostWindowIds,
+                firstIdAfterCompartmentCut:
+                    messages
+                        .map((message) => message.info.id)
+                        .find((id): id is string => typeof id === "string" && id.length > 0) ??
+                    null,
+            };
             if (messagesBeforeInitialPrepare) {
                 const skippedVisibleMessages =
                     pendingCompartmentInjection?.skippedVisibleMessages ?? 0;
@@ -2646,6 +2658,7 @@ export function createTransform(deps: TransformDeps) {
             emergencyCeilingTokens,
             pendingCompartmentInjection,
             prefixTrimSourceOrder,
+            prefixTrimHostWindow,
             hiddenMessagesAtCompactionSeam,
             trimmedMessagesAtCompactionBoundary,
             didMutateFromFlushedStatuses,

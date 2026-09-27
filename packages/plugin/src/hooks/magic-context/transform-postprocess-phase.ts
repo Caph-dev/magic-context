@@ -109,6 +109,7 @@ import {
     type M0M1State,
     type MaterializeDecision,
     mustMaterialize,
+    type PrefixTrimHostWindow,
     type PrefixTrimSourceOrder,
     type PreparedCompartmentInjection,
     prepareCachedM0M1Replay,
@@ -1365,6 +1366,8 @@ interface RunPostTransformPhaseArgs {
     pendingCompartmentInjection: PreparedCompartmentInjection | null;
     /** Save host-order IDs before tag replay or tool pruning can remove the message that marks the prefix-trimming boundary. */
     prefixTrimSourceOrder?: PrefixTrimSourceOrder;
+    /** Host window as supplied this pass; only explains an absent prefix-trim boundary in the log. */
+    prefixTrimHostWindow?: PrefixTrimHostWindow;
     /**
      * Messages trimmed while this transform rebuilds history. OpenCode rebuilds
      * the next request from the boundary written later in this pass, so some rows
@@ -2494,6 +2497,7 @@ export async function runPostTransformPhase(
                 isCacheBustingPass,
                 preparedPrefix,
                 prefixTrimSourceOrder: args.prefixTrimSourceOrder,
+                prefixTrimHostWindow: args.prefixTrimHostWindow,
                 allowFreshContentionFallback: forceMaterialization || emergencyDropEligible,
                 hardSignals: args.m0M1.hardSignals,
                 muralEnabled: args.m0M1.muralEnabled,
