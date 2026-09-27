@@ -63,8 +63,8 @@ interface RunResult {
     finishedAt: number;
 }
 
-// Far above the tens of milliseconds a mock-backed turn takes, and far below the stall the
-// report describes, so a delayed event path fails this rather than passing slowly.
+// A mock-backed turn takes tens of milliseconds. Five seconds leaves ample room for a loaded
+// machine yet still fails promptly if the host's event path stalls behind a hidden child.
 const TURN_BUDGET_MS = 5_000;
 
 test("OpenCode 2 hidden historian survives a retried and a terminal provider failure without refusing a host drain", async () => {
