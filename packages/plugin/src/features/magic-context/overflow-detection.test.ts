@@ -81,7 +81,12 @@ describe("overflow-detection / detectOverflow", () => {
         ],
         ["zai", "model_context_window_exceeded", undefined, undefined],
         ["lemonade", "Context size has been exceeded", undefined, undefined],
-        ["ninfer", "AI_APICallError: prepared prompt exceeds Engine max_context 262144", 262144, "unknown"],
+        [
+            "ninfer",
+            "AI_APICallError: prepared prompt exceeds Engine max_context 262144",
+            262144,
+            "unknown",
+        ],
     ])("%s pattern matches overflow", (_provider, message, expectedLimit, expectedProvenance) => {
         const detection = detectOverflow(message);
         expect(detection.isOverflow).toBe(true);
