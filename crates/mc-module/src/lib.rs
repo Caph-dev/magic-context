@@ -49,6 +49,7 @@ pub mod route_targets;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
+pub mod single_store_migrate;
 mod state_sync_timing;
 mod tail_hygiene;
 pub mod transform;
@@ -3701,6 +3702,10 @@ pub struct McHandler {
     /// test reads its own fixture without touching process environment.
     #[cfg(test)]
     context_db_path_override: Mutex<Option<PathBuf>>,
+    /// Test-only: let `single_store.migrate` run as though this build could serve a moved
+    /// project.
+    #[cfg(test)]
+    single_store_assume_cutover: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     reduction_injection: Mutex<HashMap<String, Vec<ReductionDecision>>>,
     /// Test-only interleave seam: runs once between the request's transform and the
@@ -4333,6 +4338,8 @@ impl McHandler {
             #[cfg(test)]
             context_db_path_override: Mutex::new(None),
             #[cfg(test)]
+            single_store_assume_cutover: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             reduction_injection: Mutex::new(HashMap::new()),
             #[cfg(test)]
             between_transform_and_prepare: Mutex::new(None),
@@ -4605,7 +4612,30 @@ impl McHandler {
 
     async fn open_store_once(descriptor: &StorageDescriptor) -> Result<McStore, McStoreError> {
         let descriptor = descriptor.clone();
-        match tokio::task::spawn_blocking(move || McStore::open(&descriptor)).await {
+        match tokio::task::spawn_blocking(move || {
+            let store = McStore::open(&descriptor)?;
+            // Every fold publish and facade write waits while its project is being copied
+            // into context.db, so the copy never misses one.
+            store.set_project_write_gate(Arc::new(single_store_migrate::CopyWriteGate::for_store(
+                &store,
+            )));
+            // A build that serves moved projects finishes any move a crash interrupted
+            // between its context.db marker and its store.db neutralisation.
+            if mc_store::SINGLE_STORE_CAPABLE {
+                if let Err(refusal) = single_store_migrate::complete_pending_neutralisations(
+                    &store,
+                    &host_store::resolve_context_db_path(),
+                    &single_store_migrate::build_version(),
+                ) {
+                    tracing::warn!(
+                        "mc-module: could not finish pending single-store moves: {refusal}"
+                    );
+                }
+            }
+            Ok(store)
+        })
+        .await
+        {
             Ok(result) => result,
             Err(error) => panic!("store open worker failed: {error}"),
         }
@@ -4701,6 +4731,8 @@ impl McHandler {
             guidance_now_ms: Mutex::new(None),
             #[cfg(test)]
             context_db_path_override: Mutex::new(None),
+            #[cfg(test)]
+            single_store_assume_cutover: std::sync::atomic::AtomicBool::new(false),
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
             transform_historian_followup_budget: Mutex::new(None),
@@ -8136,6 +8168,19 @@ impl McHandler {
             }
             None => None,
         };
+        // The compartment page is what the host mirrors from; while the session's project
+        // is being copied into context.db the answer would race the copy, so it is refused
+        // with a code the host retries.
+        if include_compartments_after_seq.is_some()
+            && single_store_migrate::session_copy_in_progress(store, &session_id)
+        {
+            return HandlerOutcome::Error {
+                code: single_store_migrate::COPY_IN_PROGRESS.to_string(),
+                message: format!(
+                    "session {session_id}'s project is being copied into context.db; retry shortly"
+                ),
+            };
+        }
         let sample_wrapup_latch = || {
             self.wrapup_sessions
                 .lock()
@@ -9551,6 +9596,60 @@ impl McHandler {
         }
     }
 
+    /// Move one project's rows from store.db into context.db (`single_store.migrate`).
+    ///
+    /// Runs on a blocking thread: a copy holds the project for up to two minutes.
+    async fn handle_single_store_migrate_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get().cloned() else {
+            return self.store_refusal();
+        };
+        let Some(project) = request
+            .get("project")
+            .and_then(Value::as_str)
+            .filter(|project| !project.is_empty())
+        else {
+            return invalid_params_error("single_store.migrate requires project");
+        };
+        let flag = |name: &str| request.get(name).and_then(Value::as_bool).unwrap_or(false);
+        let migrate = single_store_migrate::MigrateRequest {
+            project: project.to_string(),
+            dry_run: flag("dry_run"),
+            retry: flag("retry"),
+        };
+        #[allow(unused_mut)]
+        let mut options = single_store_migrate::MigrateOptions::new(self.context_db_path());
+        #[cfg(test)]
+        {
+            options.assume_cutover = self
+                .single_store_assume_cutover
+                .load(std::sync::atomic::Ordering::Relaxed);
+        }
+        let outcome = tokio::task::spawn_blocking(move || {
+            single_store_migrate::run(
+                &store,
+                &migrate,
+                &options,
+                &mut single_store_migrate::NoObserver,
+            )
+        })
+        .await;
+        match outcome {
+            Ok(Ok(report)) => respond(json!({ "ok": true, "report": report.to_value() })),
+            Ok(Err(refusal)) => HandlerOutcome::Error {
+                code: refusal.code.clone(),
+                message: if refusal.retryable {
+                    format!("{} (retryable)", refusal.detail)
+                } else {
+                    refusal.detail
+                },
+            },
+            Err(error) => HandlerOutcome::Error {
+                code: "single_store_migrate_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     /// Answer whether `project` may use the store.db mirror, without touching either
     /// database beyond the marker read. The plugin asks this before it starts a drain,
     /// a reconcile reset or a pull, so a refusal lands before any of their writes.
@@ -9589,6 +9688,18 @@ impl McHandler {
             Ok(markers) => markers,
             Err(outcome) => return outcome,
         };
+        // A project being copied into context.db is not paged: the page would race the
+        // copy. The host ignores a failed pull and retries on a later pass.
+        if let Some(project) =
+            project.filter(|project| single_store_migrate::copy_in_progress(store, project))
+        {
+            return HandlerOutcome::Error {
+                code: single_store_migrate::COPY_IN_PROGRESS.to_string(),
+                message: format!(
+                    "project {project} is being copied into context.db; retry shortly"
+                ),
+            };
+        }
         let cursor = request.get("cursor").and_then(Value::as_i64).unwrap_or(0);
         let limit = request.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
         let live_only = request
@@ -14692,6 +14803,7 @@ impl McHandler {
                 | "authority.drain_finish" => self.handle_authority_drain_value(&request, method),
                 "mirror.pull" => self.handle_mirror_pull_value(&request),
                 "mirror.marker_status" => self.handle_mirror_marker_status_value(&request),
+                "single_store.migrate" => self.handle_single_store_migrate_value(&request).await,
                 "mirror.memory" => self.handle_mirror_memory_value(&request),
                 "memory.identity.ack" => self.handle_memory_identity_ack_value(&request),
                 "guidance.get" => self.handle_guidance_value(channel, &request),
@@ -31399,6 +31511,93 @@ mod tests {
                 request[key] = value.clone();
             }
             handler.dispatch_value(7, request).await
+        }
+
+        fn error_code(outcome: HandlerOutcome) -> String {
+            match outcome {
+                HandlerOutcome::Error { code, .. } => code,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn single_store_migrate_is_refused_while_this_build_cannot_serve_a_moved_project() {
+            let fixture = fixture();
+            let outcome = fixture
+                .handler
+                .dispatch_value(7, json!({ "method": "single_store.migrate", "project": A }))
+                .await;
+            assert_eq!(error_code(outcome), single_store_migrate::CUTOVER_ABSENT);
+            let marked: i64 = Connection::open(&fixture.context_db)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM single_store_projects", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(marked, 0);
+        }
+
+        #[tokio::test]
+        async fn single_store_migrate_reaches_the_marker_gate_when_the_cutover_is_present() {
+            let fixture = fixture();
+            fixture
+                .handler
+                .single_store_assume_cutover
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // The fixture file records no applied migrations, so the gate refuses it; the
+            // point is that the route got past the cutover check to the copy's own gate.
+            let outcome = fixture
+                .handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "single_store.migrate", "project": A, "dry_run": true }),
+                )
+                .await;
+            assert_eq!(
+                error_code(outcome),
+                single_store_migrate::MARKER_WRITE_REFUSED
+            );
+            let missing = fixture
+                .handler
+                .dispatch_value(7, json!({ "method": "single_store.migrate" }))
+                .await;
+            assert!(matches!(missing, HandlerOutcome::Error { .. }));
+        }
+
+        #[tokio::test]
+        async fn a_pull_for_a_project_being_copied_is_refused_as_retryable() {
+            let fixture = fixture();
+            let hold = single_store_migrate::hold_for_test(&fixture.store, A, &["ses-a"]);
+            let outcome = pull(
+                &fixture.handler,
+                json!({ "domain": "memories", "cursor": 0, "limit": 10, "project": A }),
+            )
+            .await;
+            assert_eq!(error_code(outcome), single_store_migrate::COPY_IN_PROGRESS);
+            // Another project on the same files is served.
+            let _ = page(
+                pull(
+                    &fixture.handler,
+                    json!({ "domain": "memories", "cursor": 0, "limit": 10, "project": B }),
+                )
+                .await,
+            );
+            assert!(single_store_migrate::session_copy_in_progress(
+                &fixture.store,
+                "ses-a"
+            ));
+            drop(hold);
+            assert!(!single_store_migrate::session_copy_in_progress(
+                &fixture.store,
+                "ses-a"
+            ));
+            let _ = page(
+                pull(
+                    &fixture.handler,
+                    json!({ "domain": "memories", "cursor": 0, "limit": 10, "project": A }),
+                )
+                .await,
+            );
         }
 
         fn page(outcome: HandlerOutcome) -> Value {

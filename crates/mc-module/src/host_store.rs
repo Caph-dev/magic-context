@@ -382,7 +382,7 @@ pub fn busy_refusal_count() -> u64 {
 }
 
 /// Count a lost busy timeout on its way out of a public entry point.
-fn counted<T>(result: Result<T, HostStoreError>) -> Result<T, HostStoreError> {
+pub(crate) fn counted<T>(result: Result<T, HostStoreError>) -> Result<T, HostStoreError> {
     if let Err(HostStoreError::Busy { .. }) = &result {
         BUSY_REFUSALS.fetch_add(1, Ordering::Relaxed);
     }
@@ -454,7 +454,7 @@ fn fingerprinted_tables() -> impl Iterator<Item = &'static &'static str> {
         .chain(std::iter::once(&MARKER_TABLE))
 }
 
-fn expected_fingerprint(table: &str) -> Option<&'static str> {
+pub(crate) fn expected_fingerprint(table: &str) -> Option<&'static str> {
     DOMAIN_TABLE_FINGERPRINTS
         .iter()
         .find(|(name, _)| *name == table)
@@ -475,7 +475,7 @@ fn normalize_schema_sql(sql: &str) -> String {
 /// which is the surface a migration can change under the module: a trigger-only migration
 /// on a domain table is the demonstrated shape, and a columns-only fingerprint would miss
 /// it entirely.
-fn read_table_fingerprint(
+pub(crate) fn read_table_fingerprint(
     conn: &Connection,
     table: &str,
 ) -> Result<Option<String>, rusqlite::Error> {
@@ -576,7 +576,7 @@ impl FenceState {
 
     /// The fence for one table. A table whose surface still hashes to the value this
     /// binary was built against is the table these writers know, at any migration lane.
-    fn check_table(&self, table: &str) -> Result<(), HostStoreError> {
+    pub(crate) fn check_table(&self, table: &str) -> Result<(), HostStoreError> {
         let Some(found) = self.fingerprints.get(table) else {
             return Err(HostStoreError::TableMissing {
                 table: table.to_string(),
@@ -839,6 +839,12 @@ impl HostStore {
         &self.fence
     }
 
+    /// The open connection and the fence it was opened against, for a writer in this
+    /// crate that runs its own privileged transactions.
+    pub(crate) fn connection_and_fence(&mut self) -> (&mut Connection, &FenceState) {
+        (&mut self.conn, &self.fence)
+    }
+
     /// Override the per-chunk row budget. Tests drive the chunker with a small budget so
     /// a two-compartment fixture still produces several chunks.
     pub fn set_chunk_budget(&mut self, rows: usize) {
@@ -937,8 +943,31 @@ fn with_privileged_transaction<T>(
     scope_project: &str,
     writes: impl FnOnce(&Transaction<'_>) -> Result<T, HostStoreError>,
 ) -> Result<(T, i64), HostStoreError> {
-    let started_at = Instant::now();
+    with_scoped_privileged_transaction(conn, fence, tables, scope_project, None, writes)
+}
+
+/// [`with_privileged_transaction`], optionally also confined to a set of sessions.
+///
+/// With `scope_sessions` set, every row this transaction inserts, updates or deletes in a
+/// [`SESSION_SCOPED_TABLES`] table must belong to one of those sessions, and any write to
+/// `user_memories` is refused outright; both roll the transaction back with
+/// [`HostStoreError::ScopeViolation`]. The session-keyed tables carry no `project_path`, so
+/// this is what keeps a write declared for one project out of another project's sessions.
+/// `user_memories` is shared by every project and the module never writes it, so no
+/// declared scope can cover it.
+///
+/// The returned duration runs from the moment the write lock was taken, not from the
+/// request for it, so it measures how long other writers were kept out.
+pub(crate) fn with_scoped_privileged_transaction<T>(
+    conn: &mut Connection,
+    fence: &FenceState,
+    tables: &[&str],
+    scope_project: &str,
+    scope_sessions: Option<&std::collections::BTreeSet<String>>,
+    writes: impl FnOnce(&Transaction<'_>) -> Result<T, HostStoreError>,
+) -> Result<(T, i64), HostStoreError> {
     let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let started_at = Instant::now();
 
     // Recheck inside the transaction, not only at open. A host migration can land
     // between opening the file and writing to it, and a stale open-time answer would let
@@ -953,6 +982,9 @@ fn with_privileged_transaction<T>(
     // transaction, so a rollback removes them and the explicit drop below removes them
     // before a commit. No other connection ever sees them.
     install_scope_triggers(&transaction, scope_project)?;
+    if let Some(sessions) = scope_sessions {
+        install_session_scope(&transaction, sessions)?;
+    }
 
     transaction.execute(
         "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1)
@@ -978,6 +1010,9 @@ fn with_privileged_transaction<T>(
         writes(&transaction).map_err(|error| scope_violation_from(error, scope_project))?;
 
     drop_scope_triggers(&transaction)?;
+    if scope_sessions.is_some() {
+        drop_session_scope(&transaction)?;
+    }
     transaction.execute(
         "UPDATE context_privilege_state SET enabled = 0 WHERE id = 1",
         [],
@@ -1061,6 +1096,99 @@ fn drop_scope_triggers(tx: &Transaction<'_>) -> Result<(), HostStoreError> {
             ));
         }
     }
+    tx.execute_batch(&sql)?;
+    Ok(())
+}
+
+/// The session-keyed domain tables: no `project_path`, so a declared session set is what
+/// scopes their writes.
+pub const SESSION_SCOPED_TABLES: &[&str] = &[
+    "compartments",
+    "compartment_events",
+    "session_facts",
+    "user_memory_candidates",
+];
+
+const SESSION_SCOPE_TABLE: &str = "temp.mc_single_store_scope_sessions";
+
+/// Fill a connection-local table with the declared sessions and create one trigger per
+/// session-keyed table and operation that aborts a row change for any other session, plus
+/// triggers that abort every write to `user_memories`.
+///
+/// The sessions are bound as parameters into a TEMP table rather than spliced into the
+/// trigger text, so a session id is never parsed as SQL.
+fn install_session_scope(
+    tx: &Transaction<'_>,
+    sessions: &std::collections::BTreeSet<String>,
+) -> Result<(), HostStoreError> {
+    tx.execute_batch(&format!(
+        "CREATE TEMP TABLE IF NOT EXISTS mc_single_store_scope_sessions(
+             session_id TEXT PRIMARY KEY
+         );
+         DELETE FROM {SESSION_SCOPE_TABLE};"
+    ))?;
+    {
+        let mut insert = tx.prepare(&format!(
+            "INSERT OR IGNORE INTO {SESSION_SCOPE_TABLE}(session_id) VALUES (?1)"
+        ))?;
+        for session in sessions {
+            insert.execute(params![session])?;
+        }
+    }
+    let outside = |row: &str| {
+        format!("({row}.session_id NOT IN (SELECT session_id FROM {SESSION_SCOPE_TABLE}))")
+    };
+    let mut sql = String::new();
+    for table in SESSION_SCOPED_TABLES {
+        for (operation, predicate) in [
+            ("INSERT", outside("NEW")),
+            ("DELETE", outside("OLD")),
+            (
+                "UPDATE",
+                format!("{} OR {}", outside("OLD"), outside("NEW")),
+            ),
+        ] {
+            let message = sql_text_literal(&format!(
+                "{SCOPE_VIOLATION_CODE}: {operation} on {table} outside the declared sessions"
+            ));
+            sql.push_str(&format!(
+                "CREATE TEMP TRIGGER {SCOPE_TRIGGER_PREFIX}session_{table}_{op}
+                 BEFORE {operation} ON main.{table}
+                 WHEN {predicate}
+                 BEGIN SELECT RAISE(ABORT, {message}); END;\n",
+                op = operation.to_ascii_lowercase(),
+            ));
+        }
+    }
+    for operation in ["INSERT", "UPDATE", "DELETE"] {
+        let message = sql_text_literal(&format!(
+            "{SCOPE_VIOLATION_CODE}: {operation} on user_memories, which the module never writes"
+        ));
+        sql.push_str(&format!(
+            "CREATE TEMP TRIGGER {SCOPE_TRIGGER_PREFIX}session_user_memories_{op}
+             BEFORE {operation} ON main.user_memories
+             BEGIN SELECT RAISE(ABORT, {message}); END;\n",
+            op = operation.to_ascii_lowercase(),
+        ));
+    }
+    tx.execute_batch(&sql)?;
+    Ok(())
+}
+
+/// Remove what [`install_session_scope`] created.
+fn drop_session_scope(tx: &Transaction<'_>) -> Result<(), HostStoreError> {
+    let mut sql = String::new();
+    for table in SESSION_SCOPED_TABLES
+        .iter()
+        .chain(std::iter::once(&"user_memories"))
+    {
+        for op in ["insert", "delete", "update"] {
+            sql.push_str(&format!(
+                "DROP TRIGGER IF EXISTS temp.{SCOPE_TRIGGER_PREFIX}session_{table}_{op};\n"
+            ));
+        }
+    }
+    sql.push_str(&format!("DROP TABLE IF EXISTS {SESSION_SCOPE_TABLE};\n"));
     tx.execute_batch(&sql)?;
     Ok(())
 }
@@ -1559,7 +1687,7 @@ fn insert_user_memories(tx: &Transaction<'_>, publish: &FoldPublish) -> Result<(
 /// mark is what asks: the host's backfill drains every memory above `embedded_memory_id`
 /// up to `written_memory_id`. A per-project mark rather than a per-row column keeps the
 /// memories table byte-identical between the two writers.
-fn raise_embedding_watermark(
+pub(crate) fn raise_embedding_watermark(
     tx: &Transaction<'_>,
     project_path: &str,
     memory_id: i64,
