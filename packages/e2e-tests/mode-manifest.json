@@ -18,6 +18,21 @@
             ]
         },
         {
+            "path": "tests/issue-538-engine-wall.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "issue 538 reproduction: an engine that rejects oversized prompts before any model call, on a real OpenCode 1 host; run by hand, outside the mode lanes",
+            "contract_refs": [
+                "FOLD-UNDER-PRESSURE"
+            ],
+            "hosts": [
+                "opencode"
+            ]
+        },
+        {
             "path": "tests/cache-invariants.test.ts",
             "tier": "both-modes",
             "invocation": {
