@@ -12,6 +12,7 @@ import {
 import { inspectLivePiProcesses } from "../../../plugin/src/shared/rpc-utils";
 import { Database as ContextDatabase } from "../../../plugin/src/shared/sqlite";
 import { V2_STORAGE_REOPEN_INTERVAL_MS } from "../../../plugin/src/v2/hooks/storage-gate";
+import { STORAGE_NOTICE_PREFIX } from "../../../plugin/src/v2/hooks/storage-notice";
 import {
 	isolation,
 	spawnOpencode2,
@@ -80,7 +81,8 @@ test("OpenCode 2 names a migration refused by an older live host, then recovers 
 		existingIsolation: fixture,
 		prepareContextDatabase: false,
 		magicContextConfig: {
-			historian: { disable: true },
+			execute_threshold_tokens: { default: 20_000 },
+			historian: { two_pass: false },
 			dreamer: { disable: true },
 			memory: { enabled: false },
 		},
@@ -107,16 +109,22 @@ test("OpenCode 2 names a migration refused by an older live host, then recovers 
 			model: { providerID: "openai", id: "mock-model" },
 		});
 		await waitForPluginActive(client, host.cwd);
-		const turn = async (text: string) => {
-			await client.session.prompt({ sessionID: session.id, text });
-			await client.session
+		const settle = () =>
+			client.session
 				.wait(
 					{ sessionID: session.id },
 					{ signal: AbortSignal.timeout(30_000) },
 				)
 				.catch(() => undefined);
-			await Bun.sleep(200);
+		const turn = async (text: string) => {
+			await client.session.prompt({ sessionID: session.id, text });
+			await settle();
+			// A notice stored after the turn starts a short turn of its own; let it end
+			// before the next prompt.
+			await Bun.sleep(300);
+			await settle();
 		};
+		let historianCalls = 0;
 		const rows = () => {
 			const db = new Database(
 				join(fixture.env.XDG_DATA_HOME!, "opencode", fixture.env.OPENCODE_DB!),
@@ -187,14 +195,113 @@ test("OpenCode 2 names a migration refused by an older live host, then recovers 
 
 		expect(requestsWith("TURN-AFTER-BLOCKER-STOPPED")).toBeGreaterThan(0);
 		expect(persistedVersion()).toBe(LATEST_SUPPORTED_VERSION);
-		expect(await logOnceContains("v2 storage recovered")).toContain(
-			"v2 storage recovered",
+		const recoveredLog = await logOnceContains("v2 storage recovered");
+		expect(recoveredLog).toContain(
+			"The historian and dreamer are running again.",
+		);
+		expect(recoveredLog).toContain(
+			"Restart OpenCode to enable Magic Context's tools.",
 		);
 		expect(JSON.stringify(rows())).toContain("REPLY-AFTER-RECOVERY");
-		expect(rows().at(-1)).toEqual({
-			type: "idle",
-			data: expect.objectContaining({ outcome: "succeeded" }),
+		const noticeRows = () =>
+			rows().filter(
+				(row) =>
+					row.type === "synthetic" &&
+					String(row.data.text).startsWith(STORAGE_NOTICE_PREFIX),
+			);
+		const recoveryDeadline = Date.now() + 10_000;
+		while (noticeRows().length < 2 && Date.now() < recoveryDeadline)
+			await Bun.sleep(100);
+		// One refusal notice and one recovery notice, both kept in the conversation.
+		expect(noticeRows()).toHaveLength(2);
+
+		// A priced pass (over the execute threshold) and the defer pass after it,
+		// with both notices in the transcript. The notices are never served, and the
+		// defer pass sends the priced pass's bytes unchanged as its prefix.
+		host.mock.addMatcher((body) => {
+			const range = JSON.stringify(body).match(/Messages (\d+)-(\d+):/);
+			if (!range) return null;
+			historianCalls++;
+			return {
+				text: `<compartment start="${range[1]}" end="${range[2]}" title="Recovered history"><p1>The turns after recovery record durable history.</p1></compartment>`,
+				usage: { input_tokens: 100, output_tokens: 40 },
+			};
 		});
+		host.mock.setDefault({
+			text: "pressure reply",
+			usage: { input_tokens: 30_000, output_tokens: 10 },
+		});
+		await turn(`PRESSURE-TURN ${"recovered history ".repeat(60)}`);
+		host.mock.setDefault({
+			text: "priced reply",
+			usage: { input_tokens: 1_000, output_tokens: 10 },
+		});
+		await turn(`PRICED-TURN ${"recovered history ".repeat(60)}`);
+		host.mock.setDefault({
+			text: "defer reply",
+			usage: { input_tokens: 1_000, output_tokens: 10 },
+		});
+		await turn(`DEFER-TURN ${"recovered history ".repeat(60)}`);
+
+		const decisions = await logOnceContains("inputTokens=1000 ");
+		const schedulerLine = (inputTokens: number) =>
+			decisions
+				.split("\n")
+				.find(
+					(line) =>
+						line.includes(`[${session.id}]`) &&
+						line.includes("transform scheduler:") &&
+						line.includes(`inputTokens=${inputTokens} `),
+				);
+		expect(schedulerLine(30_000)).toContain("decision=execute");
+		expect(schedulerLine(1_000)).toContain("decision=defer");
+		const served = (marker: string) => {
+			const matching = host.mock.requests().filter((request) => {
+				const text = JSON.stringify(request.body);
+				const input = (request.body as { input?: unknown[] }).input ?? [];
+				return (
+					!/Messages \d+-\d+:/.test(text) &&
+					JSON.stringify(input.at(-1) ?? null).includes(marker)
+				);
+			});
+			const request = matching.at(-1);
+			if (!request) throw new Error(`no served request for ${marker}`);
+			return request.body as { input: unknown[]; instructions?: unknown };
+		};
+		const priced = served("PRICED-TURN");
+		const deferred = served("DEFER-TURN");
+		expect(deferred.instructions).toEqual(priced.instructions);
+		expect(deferred.input.slice(0, priced.input.length)).toEqual(priced.input);
+		for (const request of host.mock.requests())
+			expect(JSON.stringify(request.body)).not.toContain(STORAGE_NOTICE_PREFIX);
+		// Still exactly two notices: the recovery notice is delivered once.
+		expect(noticeRows()).toHaveLength(2);
+
+		// The historian runs after recovery without a restart.
+		const compartments = () => {
+			const db = new ContextDatabase(dbPath);
+			try {
+				return (
+					db
+						.prepare(
+							"SELECT COUNT(*) AS count FROM compartments WHERE session_id = ?",
+						)
+						.get(session.id) as { count: number }
+				).count;
+			} finally {
+				db.close();
+			}
+		};
+		await client.session.command({
+			sessionID: session.id,
+			name: "ctx-wrapup",
+			text: "2",
+		});
+		const historianDeadline = Date.now() + 60_000;
+		while (compartments() === 0 && Date.now() < historianDeadline)
+			await Bun.sleep(200);
+		expect(historianCalls).toBeGreaterThan(0);
+		expect(compartments()).toBeGreaterThan(0);
 	} finally {
 		blocker.kill();
 		await host.stop();

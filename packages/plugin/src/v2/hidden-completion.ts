@@ -591,6 +591,39 @@ async function awaitAssistantRow(
     }
 }
 
+/** What the OpenCode 2 hidden executor can do; fixed for this host. */
+export const V2_HIDDEN_EXECUTOR_CAPABILITIES: HiddenCompletionExecutor["capabilities"] = {
+    tools: true,
+    harness: "opencode2",
+};
+
+/**
+ * An executor that forwards to whichever executor `current` returns and refuses
+ * while there is none. Holders registered once at setup (RPC handlers and
+ * commands) get this after a refused storage open, so the executor wired on the
+ * first successful open later reaches them without a restart.
+ */
+export function createLateHiddenExecutor(
+    current: () => HiddenCompletionExecutor | undefined,
+): HiddenCompletionExecutor {
+    const wired = (): HiddenCompletionExecutor => {
+        const executor = current();
+        if (executor) return executor;
+        throw new Error(
+            "Magic Context hidden work is unavailable until the context database opens.",
+        );
+    };
+    return {
+        get capabilities() {
+            return current()?.capabilities ?? V2_HIDDEN_EXECUTOR_CAPABILITIES;
+        },
+        open: (run) => wired().open(run),
+        attempt: (handle, request) => wired().attempt(handle, request),
+        collect: (handle, limit) => wired().collect(handle, limit),
+        close: (handle, settlement) => wired().close(handle, settlement),
+    };
+}
+
 export async function createV2HiddenCompletionExecutor(
     host: HiddenChildHost,
     options: V2HiddenCompletionOptions,
@@ -804,7 +837,7 @@ export async function createV2HiddenCompletionExecutor(
     };
 
     return {
-        capabilities: { tools: true, harness: "opencode2" },
+        capabilities: V2_HIDDEN_EXECUTOR_CAPABILITIES,
         async open(identity) {
             const role = roleFor(identity);
             const releaseRole = await acquireRole(role);

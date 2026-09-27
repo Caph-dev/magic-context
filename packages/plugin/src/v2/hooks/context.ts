@@ -35,6 +35,7 @@ import {
     getCurrentToolSetHash,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
+import type { HiddenCompletionExecutor } from "../../hooks/magic-context/compartment-runner-types";
 import { resolveCtxReduceAvailabilityFromMessages } from "../../hooks/magic-context/ctx-reduce-availability";
 import {
     deriveHistorianChunkTokens,
@@ -89,7 +90,7 @@ import { hostMediaAsset, hostUsesMediaAssets, rememberHostMedia } from "../fold/
 import { v2CompactionMarkerStrategy } from "../fold/markers";
 import { FoldOwner, foldDigest } from "../fold/owner";
 import { restoreRow } from "../fold/restore";
-import { createV2HiddenCompletionExecutor } from "../hidden-completion";
+import { createLateHiddenExecutor, createV2HiddenCompletionExecutor } from "../hidden-completion";
 import { type HostServiceOwner, removeHostSession } from "../host-service";
 import { gaDatabasePath, V2StoreReader } from "../store-reader";
 import { deliverPendingChannel2, deliverSynthetic, isAdmittedSynthetic } from "./channel2";
@@ -106,6 +107,12 @@ import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
 import { runV2SessionProjectBackfill } from "./session-project-backfill";
 import { createV2StorageGate } from "./storage-gate";
+import {
+    dropStorageNotices,
+    formatStorageRecoveryNotice,
+    formatStorageRefusalNotice,
+    hasStorageNoticeShape,
+} from "./storage-notice";
 import {
     createV2RawMessageProvider,
     createV2RawMessageReader,
@@ -468,54 +475,51 @@ export async function registerContext(context: V2Context) {
         directory,
         warn: (message) => console.warn(`[magic-context] config warning: ${message}`),
     });
-    // Tools, hidden agents and the dreamer below are wired only when this first
-    // open succeeds. A refused open is retried on later turns through the gate,
-    // which lets turns proceed again once the cause is gone, but that wiring
-    // still needs a host restart.
+    // Tools are registered only when this first open succeeds: registering them
+    // later would change the tool list mid-session, so they need a restart. A
+    // refused open is retried on later turns through the gate, and the first
+    // successful retry wires the historian and the dreamer then (see
+    // recoverHiddenWork below), so those come back without a restart.
     const storage = createV2StorageGate({
         onUnavailable: (reason) => {
             const message = formatFailClosedBlockingMessage(reason);
             console.warn(`[magic-context] v2 storage unavailable: ${message}`);
             log(`[magic-context] v2 storage unavailable: ${message}`);
         },
-        onRecovered: () => {
-            const message =
-                "[magic-context] v2 storage recovered: the context database opened on a later attempt, so turns proceed again. Tools, historian and dreamer stay unavailable until OpenCode restarts.";
-            console.warn(message);
-            log(message);
-        },
     });
     let db: ReturnType<typeof openDatabase> | undefined = storage.probe();
+    const storageOpenedAtBoot = db !== undefined;
+    let storageRecoveryAnnounced = false;
     const storageNoticeBySession = new Map<string, string>();
-    // Delivering a synthetic message to an idle OpenCode 2 session starts a turn
-    // of its own. A turn whose newest message is one of these notices has nothing
-    // for the model to answer, so the context hook ends it before the provider.
-    const storageNoticeIds = new Set<string>();
+    /**
+     * Store a storage notice in the conversation once the current turn has ended.
+     * On OpenCode 2.0.18 a synthetic message sent while the turn is still running
+     * is dropped when the turn is interrupted: its sequence number is used and no
+     * row is kept. The notice never reaches the model: the context hook drops it
+     * from every request, and a turn that the notice itself starts is ended before
+     * the provider.
+     */
+    const storeStorageNotice = (sessionID: string, text: string, what: string): void => {
+        void context.session
+            .wait({ sessionID })
+            .then(() => deliverSynthetic(context, sessionID, text))
+            .catch((error: unknown) =>
+                sessionLog(sessionID, `v2 storage ${what} notice could not be delivered:`, error),
+            );
+    };
     /**
      * Tell the user why a turn is refused for missing storage. The host records a
      * refused turn as a bare interruption with no text, so without this the turn
      * just ends in silence. A toast reaches a connected Magic Context TUI on every
-     * refusal. A notice stored in the conversation reaches every client, but it
-     * stays in the history the model later reads, so it is written once per
+     * refusal; the stored notice reaches every client and is written once per
      * session and reason rather than on every refused turn.
-     *
-     * The stored notice waits until the refused turn has ended. On OpenCode 2.0.18
-     * a synthetic message sent while the turn is still running is dropped when the
-     * turn is interrupted: its sequence number is used and no row is kept.
      */
     const noticeStorageRefusal = (sessionID: string, reason: FailClosedReason): void => {
-        const message = `Magic Context refused this turn before the model call. ${formatFailClosedBlockingSummary(reason)}`;
+        const message = formatStorageRefusalNotice(reason);
         pushNotification("toast", { message, variant: "error" }, sessionID);
         if (storageNoticeBySession.get(sessionID) === message) return;
         storageNoticeBySession.set(sessionID, message);
-        void context.session
-            .wait({ sessionID })
-            .then(async () => {
-                storageNoticeIds.add(await deliverSynthetic(context, sessionID, message));
-            })
-            .catch((error: unknown) =>
-                sessionLog(sessionID, "v2 storage refusal notice could not be delivered:", error),
-            );
+        storeStorageNotice(sessionID, message, "refusal");
     };
     // Rust mode reaches the `ck-mc` module over the same subc client the OpenCode 1
     // lane builds. Building it is inert until a pass actually calls the module, so
@@ -586,68 +590,93 @@ export async function registerContext(context: V2Context) {
     const hiddenChildHook = new HiddenChildHook();
     await registerHiddenChildAgents(context.agent);
     let hiddenAgentsReady: Promise<void> | undefined;
-    const hiddenCompletionExecutor =
-        db && isDatabasePersisted(db)
-            ? await createV2HiddenCompletionExecutor(
-                  {
-                      ...context.session,
-                      get: async (input) => {
-                          const session = await context.session.get(input);
-                          const error = hiddenSessionErrors.get(input.sessionID);
-                          return error === undefined ? session : { ...session, error };
-                      },
-                      terminalError: async (input) => {
-                          const deadline = Date.now() + HIDDEN_SESSION_ERROR_GRACE_MS;
-                          do {
-                              const error = hiddenSessionErrors.get(input.sessionID);
-                              if (error !== undefined) return error;
-                              await new Promise((resolve) => setTimeout(resolve, 5));
-                          } while (Date.now() < deadline);
-                          return undefined;
-                      },
-                      prompt: async (input) => {
-                          hiddenSessionErrors.delete(input.sessionID);
-                          return context.session.prompt(input);
-                      },
-                      // The injected session surface stops short of deletion, so retiring a hidden
-                      // child reaches the host's delete route directly — through the registration
-                      // the child recorded when it was created, never through whichever service
-                      // happens to be registered now.
-                      remove: (input: { sessionID: string; owner?: HostServiceOwner }) =>
-                          removeHostSession(input.sessionID, input.owner),
-                  },
-                  {
-                      db,
-                      projectIdentity: resolveProjectIdentity(directory) ?? directory,
-                      hook: hiddenChildHook,
-                      keepSubagents: config.keep_subagents === true,
-                      ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
-                      modelCatalog: () => Promise.resolve(context.model.list()),
-                      openReader: () =>
-                          new V2StoreReader(
-                              gaDatabasePath(
-                                  getDataDir(),
-                                  process.env.OPENCODE_CHANNEL ?? "latest",
-                              ),
-                          ),
-                  },
-              )
-            : undefined;
+    const createHiddenExecutor = (database: NonNullable<typeof db>) =>
+        createV2HiddenCompletionExecutor(
+            {
+                ...context.session,
+                get: async (input) => {
+                    const session = await context.session.get(input);
+                    const error = hiddenSessionErrors.get(input.sessionID);
+                    return error === undefined ? session : { ...session, error };
+                },
+                terminalError: async (input) => {
+                    const deadline = Date.now() + HIDDEN_SESSION_ERROR_GRACE_MS;
+                    do {
+                        const error = hiddenSessionErrors.get(input.sessionID);
+                        if (error !== undefined) return error;
+                        await new Promise((resolve) => setTimeout(resolve, 5));
+                    } while (Date.now() < deadline);
+                    return undefined;
+                },
+                prompt: async (input) => {
+                    hiddenSessionErrors.delete(input.sessionID);
+                    return context.session.prompt(input);
+                },
+                // The injected session surface stops short of deletion, so retiring a hidden
+                // child reaches the host's delete route directly — through the registration
+                // the child recorded when it was created, never through whichever service
+                // happens to be registered now.
+                remove: (input: { sessionID: string; owner?: HostServiceOwner }) =>
+                    removeHostSession(input.sessionID, input.owner),
+            },
+            {
+                db: database,
+                projectIdentity: resolveProjectIdentity(directory) ?? directory,
+                hook: hiddenChildHook,
+                keepSubagents: config.keep_subagents === true,
+                ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
+                modelCatalog: () => Promise.resolve(context.model.list()),
+                openReader: () =>
+                    new V2StoreReader(
+                        gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
+                    ),
+            },
+        );
     const dreamerAtBoot = config.dreamer;
-    const dreamTrigger =
-        hiddenCompletionExecutor && dreamerAtBoot && !dreamerAtBoot.disable
+    const startDreamer = (executor: HiddenCompletionExecutor) =>
+        dreamerAtBoot && !dreamerAtBoot.disable
             ? startDreamTrigger(context, {
                   config: dreamerAtBoot,
                   sample: () => {
                       const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
                       return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
                   },
-                  executor: hiddenCompletionExecutor,
+                  executor,
                   projectIdentity: () => resolveProjectIdentity(directory) ?? directory,
                   language: config.language,
                   mural: config.mural,
               })
             : undefined;
+    // Both stay undefined after a refused start until recoverHiddenWork wires them.
+    let hiddenCompletionExecutor: HiddenCompletionExecutor | undefined =
+        db && isDatabasePersisted(db) ? await createHiddenExecutor(db) : undefined;
+    let dreamTrigger = hiddenCompletionExecutor
+        ? startDreamer(hiddenCompletionExecutor)
+        : undefined;
+    // RPC handlers and commands are registered once at setup; after a refused
+    // start they hold this stand-in, which reaches the executor recoverHiddenWork
+    // wires later.
+    const lateHiddenExecutor = createLateHiddenExecutor(() => hiddenCompletionExecutor);
+    let hiddenWorkRecovery: Promise<boolean> | undefined;
+    /**
+     * Wire the historian's executor and the dreamer on the first successful open
+     * after a refused start, once per process. Both are internal to this plugin,
+     * so unlike tools they can start mid-session. Returns whether they are wired.
+     */
+    const recoverHiddenWork = (database: NonNullable<typeof db>): Promise<boolean> =>
+        (hiddenWorkRecovery ??= (async () => {
+            try {
+                hiddenCompletionExecutor ??= await createHiddenExecutor(database);
+                dreamTrigger ??= startDreamer(hiddenCompletionExecutor);
+                return true;
+            } catch (error) {
+                log(
+                    "[magic-context] v2 historian and dreamer could not start after recovery:",
+                    error,
+                );
+                return false;
+            }
+        })());
     const sampleHistorian = () => {
         const fresh = historianRunConfig(config, liveConfigReader.poll().effective);
         const models = resolveHistorianModel(fresh, "opencode");
@@ -984,11 +1013,23 @@ export async function registerContext(context: V2Context) {
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
-        const newest = draft.messages.at(-1)?.id;
-        if (newest && storageNoticeIds.has(newest)) {
+        const isMagicContextSynthetic = (id: string) =>
+            isAdmittedSynthetic(context, draft.sessionID, id);
+        // Storing a notice in an idle OpenCode 2 session starts a turn of its own.
+        // Such a turn has nothing for the model to answer, so it ends here.
+        const newest = draft.messages.at(-1);
+        if (
+            newest &&
+            hasStorageNoticeShape(newest) &&
+            (await isMagicContextSynthetic(newest.id as string))
+        ) {
             await refuseBeforeProvider(context.session, draft.sessionID, "storage-notice-turn");
             return;
         }
+        // Storage notices are for the user and never reach the model. Dropping them
+        // on every pass, from the first one that could contain them, keeps the
+        // served bytes the same whether or not a session ever had one.
+        await dropStorageNotices(draft.messages, isMagicContextSynthetic);
         liveModels.set(draft.sessionID, {
             providerID: draft.model.providerID,
             modelID: draft.model.id,
@@ -1028,6 +1069,15 @@ export async function registerContext(context: V2Context) {
                 return;
             }
             if (!db) return;
+            if (!storageOpenedAtBoot && !storageRecoveryAnnounced) {
+                storageRecoveryAnnounced = true;
+                const recovered = await recoverHiddenWork(db);
+                const message = formatStorageRecoveryNotice(recovered);
+                console.warn(`[magic-context] v2 storage recovered: ${message}`);
+                log(`[magic-context] v2 storage recovered: ${message}`);
+                pushNotification("toast", { message, variant: "info" }, draft.sessionID);
+                storeStorageNotice(draft.sessionID, message, "recovery");
+            }
             // OpenCode 2 exposes system and message transformation through one
             // context hook, with the system handler running first below. Rebase
             // before it so a converted session initializes the new host's prompt
@@ -1412,7 +1462,9 @@ export async function registerContext(context: V2Context) {
         client: undefined,
         liveSessionState: rpcLiveSessionState,
         rustModeModuleClient,
-        hiddenCompletionExecutor,
+        hiddenCompletionExecutor: storageOpenedAtBoot
+            ? hiddenCompletionExecutor
+            : lateHiddenExecutor,
         storageDir,
     });
     // The v2 TUI reaches manual dreaming through RPC because this host has no

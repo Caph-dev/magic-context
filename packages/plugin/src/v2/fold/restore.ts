@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { isStorageNoticeText } from "../hooks/storage-notice";
 import type { V2Message } from "../hooks/types";
 import type { StoreRow } from "../store-reader";
 
@@ -146,6 +147,10 @@ export function restoreRow(
     // own window, and an id-less row is never tagged or dropped as history.
     if (row.type === "system")
         return [{ role: "system", content: [{ type: "text", text: data.text ?? "" }] }];
+    // Magic Context's own storage notices are for the user and are dropped from
+    // every request the context hook serves, so a restored copy is dropped too, and
+    // boundary lookups see the row as one the request never carries.
+    if (row.type === "synthetic" && isStorageNoticeText(data.text)) return [];
     if (["synthetic", "skill"].includes(row.type))
         return [make("user", [{ type: "text", text: data.text ?? "" }])];
     if (row.type === "location-switched")
