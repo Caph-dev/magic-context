@@ -749,7 +749,7 @@ impl StoreOpenCoordinator {
             return Some(HealthReport {
                 status: HealthStatus::Failing,
                 detail: Some(format!(
-                    "storage open refused: {STORE_AHEAD_OF_BINARY_REFUSAL_REASON}: store.db is at schema v{} and this ck-mc build knows up to v{}; {} (descriptor {} from {}); every request refuses with {STORE_AHEAD_OF_BINARY_REFUSAL_REASON} until the module restarts on a matching store",
+                    "storage open refused: {STORE_AHEAD_OF_BINARY_REFUSAL_REASON}: db_version={} binary_max={}: {} (descriptor {} from {}); every request refuses with {STORE_AHEAD_OF_BINARY_REFUSAL_REASON} until the module restarts on a matching store",
                     versions.db_version,
                     versions.binary_max,
                     mc_store::store_ahead_of_binary_remediation(
@@ -20772,9 +20772,9 @@ mod tests {
             .detail
             .expect("a refused open must carry a health detail");
         assert!(
-            detail.contains(STORE_AHEAD_OF_BINARY_REFUSAL_REASON)
-                && detail.contains(&format!("schema v{ahead}"))
-                && detail.contains(&format!("knows up to v{LATEST_MIGRATION_VERSION}")),
+            detail.contains(&format!(
+                "{STORE_AHEAD_OF_BINARY_REFUSAL_REASON}: db_version={ahead} binary_max={LATEST_MIGRATION_VERSION}"
+            )),
             "health must name the refusal and both versions: {detail}"
         );
         assert!(

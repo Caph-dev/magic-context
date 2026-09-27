@@ -203,9 +203,9 @@ async fn a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform() {
     assert_eq!(health["status"], "failing", "{health}");
     let detail = health["detail"].as_str().unwrap_or_default();
     assert!(
-        detail.contains(STORE_AHEAD_OF_BINARY_REFUSAL_REASON)
-            && detail.contains(&format!("schema v{ahead}"))
-            && detail.contains(&format!("knows up to v{LATEST_MIGRATION_VERSION}")),
+        detail.contains(&format!(
+            "{STORE_AHEAD_OF_BINARY_REFUSAL_REASON}: db_version={ahead} binary_max={LATEST_MIGRATION_VERSION}"
+        )),
         "ck health must name the refusal and both versions: {health}"
     );
     assert!(
