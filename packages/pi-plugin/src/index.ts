@@ -62,8 +62,6 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	applySqliteTuningPragmas,
-	getMigrationOnOpenRefusal,
-	getSchemaFenceRejection,
 	openDatabaseAsync,
 	setSqlitePragmaConfig,
 } from "@magic-context/core/features/magic-context/storage-db";
@@ -71,6 +69,7 @@ import {
 	clearDetectedContextLimit,
 	getOverflowState,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { describeStorageUnavailability } from "@magic-context/core/features/magic-context/storage-unavailable-reason";
 import { runDeferredV22Backfill } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
 import { setCtxReduceRegisteredGlobally } from "@magic-context/core/hooks/magic-context/ctx-reduce-availability";
 import {
@@ -1027,36 +1026,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			return null;
 		}
 	};
-	const unavailableReason = (): FailClosedReason => {
-		const migration = getMigrationOnOpenRefusal();
-		const blockingProcesses =
-			migration?.blockingProcesses ??
-			migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
-			[];
-		const fence = getSchemaFenceRejection();
-		if (migration && blockingProcesses.length > 0) {
-			return {
-				kind: "migration_guard",
-				persistedVersion: migration.persistedVersion,
-				supportedVersion: migration.supportedVersion,
-				blockingProcesses,
-			};
-		}
-		if (fence) {
-			return {
-				kind: "schema_fence",
-				persistedVersion: fence.persistedVersion,
-				supportedVersion: fence.supportedVersion,
-			};
-		}
-		return {
-			kind: "storage_failure",
-			cause: migration?.unreadableFile
-				? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
-				: (openFailureCause ??
-					`storage unavailable at ${dbPath} (cache schema newer than this binary, or open failed)`),
-		};
-	};
+	const unavailableReason = (): FailClosedReason =>
+		describeStorageUnavailability(
+			openFailureCause ??
+				`storage unavailable at ${dbPath} (cache schema newer than this binary, or open failed)`,
+		);
 
 	const bootResult = await bootPiRuntimeWithDeadline<
 		ContextDatabase,

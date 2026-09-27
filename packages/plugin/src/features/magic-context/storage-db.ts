@@ -21,6 +21,7 @@ import { log } from "../../shared/logger";
 import {
     classifyProcessKind,
     inspectLivePiProcesses,
+    isOwnRpcServerRecord,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
@@ -576,6 +577,10 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             if (junk) return junk;
             continue;
         }
+        // This process's own RPC server runs this build, so it can never be a host
+        // still holding an older one. Skipped before the liveness check so the file
+        // is neither reported as a blocker nor deleted as stale.
+        if (isOwnRpcServerRecord(record)) continue;
         const liveness = isPidAlive(record.pid);
         if (liveness === "dead") {
             staleFiles.push(portFile);

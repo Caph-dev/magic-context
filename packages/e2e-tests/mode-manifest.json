@@ -1245,6 +1245,22 @@
             ]
         },
         {
+            "path": "tests/opencode2/storage-refusal-reason.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "OpenCode 2 turn refused because a live older host blocks the context.db migration must name that host in the Magic Context log and the conversation, and the next turn after the blocker stops must migrate and get a reply without a host restart; it runs only in the dedicated v2 lane",
+            "contract_refs": [
+                "S2-MIGRATION",
+                "OC2-S1"
+            ],
+            "hosts": [
+                "opencode2"
+            ]
+        },
+        {
             "path": "tests/overflow-recovery.test.ts",
             "tier": "both-modes",
             "invocation": {

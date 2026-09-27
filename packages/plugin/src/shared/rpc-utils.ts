@@ -38,6 +38,34 @@ export interface RpcPortFileRecord {
 }
 
 /**
+ * RPC server instances started by this process. The storage migration guard reads
+ * the same discovery files to find live hosts that may still run an older build;
+ * a server this process started runs this process's own build, so its discovery
+ * file must never count as such a host. Without this, a process that was refused
+ * once and retries after its own RPC server has started would find itself as the
+ * blocker and refuse forever.
+ */
+const ownRpcServerInstanceIds = new Set<string>();
+
+export function registerOwnRpcServerInstance(instanceId: string): () => void {
+    ownRpcServerInstanceIds.add(instanceId);
+    return () => {
+        ownRpcServerInstanceIds.delete(instanceId);
+    };
+}
+
+/** Whether a discovery record belongs to an RPC server started by this process. */
+export function isOwnRpcServerRecord(
+    record: Pick<RpcPortFileRecord, "pid" | "instance_id">,
+): boolean {
+    return (
+        record.pid === process.pid &&
+        record.instance_id !== undefined &&
+        ownRpcServerInstanceIds.has(record.instance_id)
+    );
+}
+
+/**
  * Stable hash for a project directory — scopes RPC port files per-project
  * so multiple OpenCode instances don't collide.
  */
