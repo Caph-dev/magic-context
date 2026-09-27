@@ -96,7 +96,7 @@ For each check: stage the file, mutate it, run the tests, restore with `git chec
 | # | Mutation | Red | Stayed green |
 |---|---|---|---|
 | M1 | `proactiveStripStartIndex` returns 0 on any release (master behaviour) | the delivery's 3 release tests; gate: control, replay chain; both P1 `it.failing` (the body now passes) | the permission tests, P2 `it.failing` |
-| M2 | Recovery-set strip moved back after the comparison | gate replay chain only (prefix hash before `m4`, line 431) | the delivery's 3 tests, all other gate tests |
+| M2 | Recovery-set strip moved back after the comparison | gate replay chain only (the `sha(release2.slice(0, m4Index))` prefix-hash assertion) | the delivery's 3 tests, all other gate tests |
 | M3 | Slot read moved after `replayLkg` | the delivery's "strips only thinking after the first message a release changes"; gate: control, replay chain, P2 `it.failing` | the other release tests |
 | M4 | Heal UPDATE unscoped | the delivery's heal test; gate: "a host-owned note heals…", "every row the authority triggers guard is skipped…" | "…still refused", "…without the ownership tables…" |
 | M5 | The "no such table" fallback removed | gate: "a database without the ownership tables heals every parked row as before" | all others |
