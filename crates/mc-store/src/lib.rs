@@ -14,6 +14,9 @@
 #![forbid(unsafe_code)]
 
 mod historian_claim;
+mod single_store_domain;
+
+pub use single_store_domain::SingleStoreDomain;
 
 pub use historian_claim::{
     historian_lease_ms, HistorianClaim, HistorianClaimOutcome, HistorianClaimRefusal,
@@ -6053,6 +6056,12 @@ pub enum McStoreError {
     SingleStoreMarkerUnsupported {
         marker: SingleStoreMarker,
     },
+    /// A marked project's rows could not be read from `context.db`. Never answered from
+    /// `store.db` instead: its copy of a marked project is retained history, not current.
+    SingleStoreDomain {
+        code: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -6117,6 +6126,7 @@ impl std::fmt::Display for McStoreError {
                 f,
                 "{domain} facade route {route_project_root} is authority-managed as {authority_project}, but the write used {write_project}"
             ),
+            McStoreError::SingleStoreDomain { code, detail } => write!(f, "{code}: {detail}"),
             McStoreError::UnhydratedBlockIdentities { session_id, stored } => write!(
                 f,
                 "session {session_id} commit carries no block identities but {stored} are stored; \
@@ -7627,6 +7637,9 @@ pub struct McStore {
     /// facade call, so the module can hold a project still while it copies that project's
     /// rows into context.db. Unset means no gate.
     project_write_gate: Mutex<Option<Arc<dyn ProjectWriteGate>>>,
+    /// Answers domain reads for projects whose rows moved into context.db. Unset means
+    /// every project is read from this store.
+    single_store_domain: Mutex<Option<Arc<dyn SingleStoreDomain>>>,
     #[cfg(any(test, feature = "test-support"))]
     abandon_historian_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
@@ -7973,6 +7986,7 @@ impl McStore {
             facade_authority_scope,
             facade_mutation_lock: Mutex::new(()),
             project_write_gate: Mutex::new(None),
+            single_store_domain: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
@@ -8055,6 +8069,67 @@ impl McStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()?;
         Some(gate.enter(project))
+    }
+
+    /// Install the reader that answers domain reads for projects moved into context.db.
+    pub fn set_single_store_domain(&self, domain: Arc<dyn SingleStoreDomain>) {
+        *self
+            .single_store_domain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(domain);
+    }
+
+    fn single_store_domain(&self) -> Option<Arc<dyn SingleStoreDomain>> {
+        self.single_store_domain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The context.db reader, when `project` has moved there.
+    fn marked_project_domain(
+        &self,
+        project: &str,
+    ) -> Result<Option<Arc<dyn SingleStoreDomain>>, McStoreError> {
+        let Some(domain) = self.single_store_domain() else {
+            return Ok(None);
+        };
+        Ok(domain.is_marked(project)?.then_some(domain))
+    }
+
+    /// The context.db reader, when the project `session_id` belongs to has moved there.
+    fn marked_session_domain(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Arc<dyn SingleStoreDomain>>, McStoreError> {
+        let Some(domain) = self.single_store_domain() else {
+            return Ok(None);
+        };
+        let store_projects = self.store_projects_for_session(session_id)?;
+        Ok(domain
+            .marked_project_for_session(session_id, &store_projects)?
+            .map(|_| domain))
+    }
+
+    /// The projects this store binds `session_id` to through its transform roots: the
+    /// session-to-project half of a project's session set that store.db can answer.
+    fn store_projects_for_session(&self, session_id: &str) -> Result<Vec<String>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare_cached(
+                    "SELECT DISTINCT binding.project
+                       FROM mc_transform_session_roots AS roots
+                       JOIN mc_authority_route_bindings AS binding
+                         ON binding.route_project_root = roots.project_root
+                      WHERE roots.session_id = ?1
+                      ORDER BY binding.project",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .map_err(Into::into)
     }
 
     /// The project a facade route root is bound to, or the root itself when it has no
@@ -14675,6 +14750,9 @@ impl McStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<HistorianEventCandidate>, McStoreError> {
+        if let Some(domain) = self.marked_session_domain(session_id)? {
+            return domain.load_compartment_events(session_id);
+        }
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT kind, at_compartment, compartment_id, fields_json, created_at, harness
@@ -14699,6 +14777,9 @@ impl McStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<HistorianPrimerCandidate>, McStoreError> {
+        if let Some(domain) = self.marked_session_domain(session_id)? {
+            return domain.load_primer_candidates(session_id);
+        }
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT project_path, session_id, question, source_compartment_start,
@@ -14728,6 +14809,9 @@ impl McStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<HistorianUserMemoryCandidate>, McStoreError> {
+        if let Some(domain) = self.marked_session_domain(session_id)? {
+            return domain.load_user_memory_candidates(session_id);
+        }
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT content, session_id, source_compartment_start,
@@ -14760,6 +14844,9 @@ impl McStore {
         project_path: &str,
         now_ms: i64,
     ) -> Result<Vec<StoredMemory>, McStoreError> {
+        if let Some(domain) = self.marked_project_domain(project_path)? {
+            return domain.load_active_memories(project_path, now_ms);
+        }
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, host_row_id, project_path, category, content, importance, status, expires_at,

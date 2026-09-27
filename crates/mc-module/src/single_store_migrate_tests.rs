@@ -10,14 +10,14 @@ use std::path::Path;
 
 const SCHEMA_SNAPSHOT: &str = include_str!("../tests/fixtures/context-db-schema.sql");
 
-const P: &str = "git:project-p";
-const Q: &str = "git:project-q";
+pub(crate) const P: &str = "git:project-p";
+pub(crate) const Q: &str = "git:project-q";
 const UUID: &str = "uuid-fixture";
 const P_ROOT: &str = "/work/project-p";
-const LARGE_SESSION: &str = "ses-p3-large";
+pub(crate) const LARGE_SESSION: &str = "ses-p3-large";
 const LARGE_SESSION_COMPARTMENTS: i64 = 300;
 
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub dir: tempfile::TempDir,
 }
 
@@ -55,7 +55,7 @@ impl Fixture {
     }
 }
 
-pub(super) fn request(project: &str) -> MigrateRequest {
+pub(crate) fn request(project: &str) -> MigrateRequest {
     MigrateRequest {
         project: project.to_string(),
         dry_run: false,
@@ -69,7 +69,7 @@ fn hash(content: &str) -> String {
 
 /// Run `body` with the context.db privilege bracket set, the way a host writes rows of a
 /// managed project.
-fn privileged(conn: &Connection, body: impl FnOnce(&Connection)) {
+pub(crate) fn privileged(conn: &Connection, body: impl FnOnce(&Connection)) {
     conn.execute(
         "UPDATE context_privilege_state SET enabled = 1 WHERE id = 1",
         [],
@@ -264,7 +264,7 @@ fn session_project(context: &Connection, session: &str, project: &str, harness: 
 /// (smart, a surfaced one, and a session note seeded from a project-less context note
 /// with no identity row), three sessions of compartments (one over the 256-row chunk),
 /// events, primers and user-memory candidates. Q: a small sibling already mirrored.
-pub(super) fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let fixture = Fixture { dir };
     build_context(&fixture.context());
@@ -395,7 +395,7 @@ pub(super) fn fixture() -> Fixture {
 
 /// Every row of `table` matching `filter` (bound to `args`), all columns, ordered by id,
 /// as one string per row.
-pub(super) fn dump(conn: &Connection, table: &str, filter: &str, args: &[SqlValue]) -> Vec<String> {
+pub(crate) fn dump(conn: &Connection, table: &str, filter: &str, args: &[SqlValue]) -> Vec<String> {
     let sql = format!("SELECT * FROM {table} WHERE {filter} ORDER BY 1");
     let mut statement = conn.prepare(&sql).unwrap();
     let width = statement.column_count();
@@ -413,7 +413,7 @@ pub(super) fn dump(conn: &Connection, table: &str, filter: &str, args: &[SqlValu
 }
 
 /// Everything in context.db that belongs to `project` or its `sessions`.
-pub(super) fn project_state(conn: &Connection, project: &str, sessions: &[&str]) -> Vec<String> {
+pub(crate) fn project_state(conn: &Connection, project: &str, sessions: &[&str]) -> Vec<String> {
     let p = [text(project)];
     let mut state = Vec::new();
     for (table, filter) in [
@@ -448,7 +448,7 @@ pub(super) fn project_state(conn: &Connection, project: &str, sessions: &[&str])
     state
 }
 
-pub(super) fn authority_states(store: &Connection, project: &str) -> Vec<(String, String)> {
+pub(crate) fn authority_states(store: &Connection, project: &str) -> Vec<(String, String)> {
     let mut statement = store
         .prepare("SELECT domain, state FROM mc_authority WHERE project = ?1 ORDER BY domain")
         .unwrap();
@@ -695,7 +695,7 @@ type InsideHook<'a> = Box<dyn FnMut(&Transaction<'_>, usize, bool) + 'a>;
 
 /// An observer assembled from closures.
 #[derive(Default)]
-pub(super) struct Hooks<'a> {
+pub(crate) struct Hooks<'a> {
     pub before_first_chunk: Option<Box<dyn FnMut() + 'a>>,
     pub between: Option<BetweenHook<'a>>,
     pub inside: Option<InsideHook<'a>>,
@@ -731,7 +731,7 @@ impl MigrateObserver for Hooks<'_> {
     }
 }
 
-fn marker_present(context: &Path, project: &str) -> bool {
+pub(crate) fn marker_present(context: &Path, project: &str) -> bool {
     Connection::open(context)
         .unwrap()
         .query_row(

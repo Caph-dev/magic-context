@@ -50,6 +50,7 @@ pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
 pub mod single_store_migrate;
+pub mod single_store_reads;
 mod state_sync_timing;
 mod tail_hygiene;
 pub mod transform;
@@ -4619,6 +4620,15 @@ impl McHandler {
             store.set_project_write_gate(Arc::new(single_store_migrate::CopyWriteGate::for_store(
                 &store,
             )));
+            // A project moved into context.db is read from there. Unit tests never point
+            // the reader at the environment's context.db; they install one on a fixture.
+            if !cfg!(test) {
+                store.set_single_store_domain(Arc::new(
+                    single_store_reads::ContextDomainReader::new(
+                        host_store::resolve_context_db_path(),
+                    ),
+                ));
+            }
             // A build that serves moved projects finishes any move a crash interrupted
             // between its context.db marker and its store.db neutralisation.
             if mc_store::SINGLE_STORE_CAPABLE {

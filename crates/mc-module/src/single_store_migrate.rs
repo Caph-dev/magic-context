@@ -2532,4 +2532,4 @@ pub fn complete_pending_neutralisations(
 
 #[cfg(test)]
 #[path = "single_store_migrate_tests.rs"]
-mod tests;
+pub(crate) mod tests;

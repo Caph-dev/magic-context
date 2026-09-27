@@ -707,7 +707,11 @@ pub struct FenceState {
 }
 
 impl FenceState {
-    fn read(conn: &Connection, path: &Path, built_version: i64) -> Result<Self, HostStoreError> {
+    pub(crate) fn read(
+        conn: &Connection,
+        path: &Path,
+        built_version: i64,
+    ) -> Result<Self, HostStoreError> {
         let persisted_version =
             read_persisted_fence(conn)?.ok_or_else(|| HostStoreError::FenceMissing {
                 path: path.display().to_string(),
