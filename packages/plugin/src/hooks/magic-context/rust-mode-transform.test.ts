@@ -5145,6 +5145,75 @@ describe("Rust mode authority adapter", () => {
         }
     });
 
+    it("refuses every turn loudly when the module's store is ahead of it, without parking or falling back", async () => {
+        const sessionId = `rust-store-ahead-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let moduleCalls = 0;
+        let toastCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async () => {
+                moduleCalls += 1;
+                throw Object.assign(new Error("storage open refused"), {
+                    code: "store_ahead_of_binary",
+                    detail: {
+                        reason_code: "store_ahead_of_binary",
+                        db_version: 63,
+                        binary_max: 62,
+                    },
+                });
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+                moduleClient,
+                notifyParked: () => {
+                    toastCalls += 1;
+                },
+            });
+            // Four passes is more than RUST_FAILURE_PARK_THRESHOLD, the number of consecutive
+            // failures that would park an ordinary failing session into fallback serving. A
+            // refused store must keep failing visibly instead.
+            for (let pass = 0; pass < 4; pass += 1) {
+                const input = makeMessages(sessionId);
+                const callsBefore = moduleCalls;
+                const failure = transform
+                    .run(
+                        sessionId,
+                        input,
+                        { messages: input as unknown[] },
+                        makeMeta(db, sessionId),
+                    )
+                    .then(
+                        () => null,
+                        (error: unknown) => error,
+                    );
+                const error = await failure;
+                expect(error).toBeInstanceOf(EmergencyFailClosedError);
+                expect((error as Error).message).toBe(
+                    "Magic Context refused to start: its store (store.db) is at schema v63 but this ck-mc build only knows up to v62. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)",
+                );
+                expect(moduleCalls).toBeGreaterThan(callsBefore);
+            }
+            expect(transform.getState(sessionId).parked).toBe(false);
+            expect(toastCalls).toBe(0);
+            const messages = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => String(message));
+            expect(
+                messages.some((message) =>
+                    message.startsWith("mc_rust_store_ahead_refusal db_version=63 binary_max=62"),
+                ),
+            ).toBe(true);
+            expect(messages.some((message) => message.includes("lkg_replay_served"))).toBe(false);
+            expect(messages.some((message) => message.includes("served_from=raw"))).toBe(false);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {
         const sessionId = `rust-failure-${Date.now()}`;
         sessions.push(sessionId);

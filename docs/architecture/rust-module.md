@@ -40,6 +40,8 @@ When a module pass fails:
 - After three consecutive failures (`RUST_FAILURE_PARK_THRESHOLD`), the session is **parked**: the user sees the engine-reconnecting notice, and passes serve LKG or raw without calling the module. A parked session retries the module every fifth pass, or on every pass once usage reaches 90%. A non-retryable state-sync failure parks immediately.
 - **Freeze.** A served fallback is kept frozen across the following defer passes so the session does not bust the cache twice (LKG, then module, then LKG again) for one blip. The freeze is released when an authorized cache-busting pass adopts module output, when the LKG replay no longer validates, after eight healthy module passes, or after sixteen new raw messages.
 
+A module that refuses its store because the store is ahead of it (see [Rollback](#rollback)) is not treated as a module failure. The pass neither replays LKG nor serves raw, and the session is not parked. The turn is refused with the store-ahead message (`MC-C13`), and the next turn asks the module again. With compaction off, fail-closed refusals are inert by design, so the turn passes through unmanaged and the refusal appears only in the log.
+
 `rust-refusal-recovery.ts` handles a refused turn. It arms a per-session watcher that probes module health every 2 s for up to 5 minutes and, once the module answers and persisted history still ends at the refused user message (an unfinished assistant reply to it still counts), sends a synthetic continue prompt so the turn resumes. It stands down when compaction is off or when a provider-proven emergency is in force.
 
 ## Module store and authority handoff
@@ -49,6 +51,21 @@ The module keeps its own store, `store.db`, in the same data directory as `conte
 Memories and notes are project-scoped data that both engines can write, so exactly one engine owns each pool at a time. `context-authority.ts` tracks an authority state per project and domain (`memories`, `notes`): `TS`, `PREPARING`, `MODULE`, `DRAINING`. Moving to `MODULE` seeds the module from the host; while `MODULE` holds, the module is the writer and the host pulls a changefeed ("mirror") back into `context.db` so dashboards, search and other hosts still see current rows. The Rust transform pass is the mirror cadence: each pass drains at most 20 pages of up to 1,000 rows (`TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET`), overlapping pulls are coalesced, and an incomplete drain continues on the next pass. Mirror writes are guarded by the host row's own `updated_at` and `classified_at` so a stale module snapshot cannot roll back a newer host state. Draining back to `TS` runs through the module's `authority.drain.*` steps; the CLI exposes `doctor drain-authority <project>` for the same.
 
 Agent-visible memory ids on host-backed harnesses are host (`context.db`) ids. The module records the host id for each of its memories (`host_row_id`), `memory-id-translation.ts` classifies an id at the tool boundary (own mirrored row → module, a foreign workspace-shared row → host, a row whose mirror is still pending → retry advice, otherwise unknown), and `m[0]`/`m[1]` render host ids. Claude Code sessions keep module ids.
+
+### Rollback
+
+A ck-mc rollback is the previous binary **together with** `context.db` and `store.db` restored from the same backup. `scripts/backup-live-stores.sh` snapshots both in one run for this purpose.
+
+Rolling back only the binary across a store migration is refused. `McStore::open` compares the highest version recorded in `store.db` with the newest migration the binary carries. When the store is ahead, the open fails with `McStoreError::StoreAheadOfBinary { db_version, binary_max }` before it reads or writes a row. Older builds logged this case and continued. That half-worked: migration 53 moved note ownership into triggers that read a row an older binary never fills, so note inserts and deletes failed later without naming the cause.
+
+The refusal is terminal until the module restarts on a store it knows:
+
+- `ck health magic-context` reports `failing`, with `storage_state: open_refused_store_ahead`, both versions (`store_db_version`, `binary_max_store_version`) and the remediation.
+- Every request lane except `echo` answers with a `store_ahead_of_binary` error frame. Its detail is `{reason_code, db_version, binary_max}`.
+- Facade tools answer with the user-facing sentence: "Magic Context refused to start: its store (store.db) is at schema vN but this ck-mc build only knows up to vM. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)".
+- The OpenCode plugin maps the code to `StoreAheadOfBinaryError`. A transform refuses the turn with the same sentence, and `ctx_memory` and `ctx_note` return it as their reply.
+
+A store that is older than the binary still migrates forward on open, and a store at the binary's own version opens as before.
 
 ## Tool facades
 

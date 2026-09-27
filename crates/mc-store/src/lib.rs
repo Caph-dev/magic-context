@@ -24533,8 +24533,9 @@ mod tests {
         // The store-ahead policy leaves v53's durable triggers intact instead of replaying the
         // old definitions. An older writer still opens and registers its UDFs, but because it
         // cannot populate mc_privilege_state, ownership-sensitive note writes fail closed. This
-        // known rollback limitation is why v53 requires a coordinated module bounce, and why
-        // McStore::open now refuses a store-ahead open instead of serving it.
+        // known rollback limitation is why v53 requires a coordinated module bounce. It is also
+        // why McStore::open now refuses a store-ahead open: an older binary would otherwise
+        // serve the store with note writes that fail.
         let rollback_error = rollback
             .with_conn(|conn| {
                 conn.execute(

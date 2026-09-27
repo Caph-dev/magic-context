@@ -199,6 +199,12 @@ export const USER_FACING_FAILURES = {
         sentence: "Magic Context is temporarily unavailable.",
         action: "Retry in a moment.",
     },
+    store_ahead_of_binary: {
+        code: "MC-C13",
+        sentence:
+            "Magic Context refused to start: its store (store.db) was migrated by a newer ck-mc build than the one running.",
+        action: "Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup.",
+    },
     compaction_marker_missing: {
         code: "MC-C11",
         sentence:

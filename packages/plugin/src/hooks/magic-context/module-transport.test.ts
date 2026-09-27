@@ -22,7 +22,9 @@ import {
     type RouteTarget,
     SERVER_PROOF_DOMAIN,
     StaleRouteHandleError,
+    SubcCallError,
     type SubcClient,
+    SubcError,
 } from "@cortexkit/subc-client";
 
 import {
@@ -30,6 +32,7 @@ import {
     SubcModuleTransport,
     transformColdStartExecuteTimeoutMs,
 } from "./module-transport";
+import { StoreAheadOfBinaryError } from "./store-ahead-refusal";
 
 function decodedBody(body: unknown): unknown {
     return body instanceof Uint8Array ? JSON.parse(Buffer.from(body).toString("utf8")) : body;
@@ -313,6 +316,55 @@ describe("SubcModuleTransport", () => {
         ).resolves.toEqual({ result: { reconnected: true } });
         expect(connectionCount).toBe(2);
         expect(firstCloseCount).toBe(1);
+    });
+
+    it("turns a store-ahead error frame into one typed refusal and does not retry it", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let requestCount = 0;
+        const client = {
+            routeOpen: async () => route,
+            request: async () => {
+                requestCount += 1;
+                throw new SubcCallError(
+                    "terminal",
+                    "storage open refused",
+                    "store_ahead_of_binary",
+                    new SubcError("storage open refused", "store_ahead_of_binary", {
+                        reason_code: "store_ahead_of_binary",
+                        db_version: 63,
+                        binary_max: 62,
+                    }),
+                );
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            internals.client = client;
+            return client;
+        };
+
+        const failure = await transport
+            .call({
+                sessionId: "session-store-ahead",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            })
+            .then(
+                () => null,
+                (error: unknown) => error,
+            );
+        expect(failure).toBeInstanceOf(StoreAheadOfBinaryError);
+        expect((failure as StoreAheadOfBinaryError).versions).toEqual({
+            dbVersion: 63,
+            binaryMax: 62,
+        });
+        expect(requestCount).toBe(1);
     });
 
     it("returns a typed generation change instead of retrying a sensitive body", async () => {

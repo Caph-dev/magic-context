@@ -139,6 +139,7 @@ import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { STORE_AHEAD_OF_BINARY_CODE, storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
@@ -4155,6 +4156,23 @@ export function createRustModeTransform(
             }
             finishPass(true);
         } catch (error) {
+            const storeAhead = storeAheadOfBinaryFailure(error);
+            if (storeAhead) {
+                // The module refuses every request until ck-mc is updated or both databases
+                // are restored from one backup. Replaying the last-known-good answer or the raw
+                // prompt would keep the session running without memory, notes or compression
+                // while the user is never told why. Parking would stop calling the module and
+                // show only the reconnecting notice. So this turn fails visibly with the reason
+                // and the fix, and the next turn asks the module again.
+                decision = "error";
+                materializeReason = STORE_AHEAD_OF_BINARY_CODE;
+                sessionLog(
+                    sessionId,
+                    `mc_rust_store_ahead_refusal db_version=${storeAhead.versions?.dbVersion ?? "unknown"} binary_max=${storeAhead.versions?.binaryMax ?? "unknown"}`,
+                );
+                finishPass(false, false);
+                throw new EmergencyFailClosedError(storeAhead.message, { cause: storeAhead });
+            }
             if (
                 error instanceof Error &&
                 error.message.startsWith("rust transform wire invariant failed")

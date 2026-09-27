@@ -518,9 +518,9 @@ impl StoreRefusal {
 
     /// The refusal as an error frame for a facade tool, whose message reaches the user. The text
     /// stays the user-facing sentence — engine internals (paths, lease state, open errors) must
-    /// never surface in tool output — while the code still carries the arm for logs. A store that
-    /// is ahead of this binary gets its own sentence: "retry in a moment" would be wrong advice,
-    /// because no retry fixes it.
+    /// never surface in tool output — while the error code still names which refusal this is, for
+    /// logs. A store that is ahead of this binary gets its own sentence: "retry in a moment" would
+    /// be wrong advice, because no retry fixes it.
     fn into_facade_outcome(self) -> HandlerOutcome {
         if let Self::StoreAhead { versions, .. } = &self {
             return HandlerOutcome::ErrorWithDetail {
