@@ -18,6 +18,7 @@
  *   A. Host (and Magic Context) believe the model has a larger window than the
  *      engine serves; the engine's rejection text is not a known overflow text.
  *   B. Same window mismatch; the rejection text is llama.cpp's overflow text.
+ *   E. Same mismatch; ninfer's prepared-prompt rejection arms recovery.
  *   C. The configured window equals the engine wall; usage is reported normally
  *      until the wall.
  *   D. As A, with a short cache TTL and an idle past it after the first
@@ -314,6 +315,26 @@ describe("issue 538: engine rejects oversized prompts before any model call", ()
             expect(turns.some((turn) => turn.detectedContextLimit === WALL_TOKENS)).toBe(true);
             expect(turns.some((turn) => turn.overflowDetected > 0)).toBe(true);
             // The next pass is bumped to 95% and recovers: its request is served.
+            const next = turns.find((turn) => turn.turn === (wallTurn ?? 0) + 1);
+            expect(next?.bumpedTo95).toBe(1);
+            expect(next?.rejected).toBe(false);
+        },
+        900_000,
+    );
+
+    it(
+        "E: ninfer prepared-prompt overflow arms emergency recovery",
+        async () => {
+            const { turns } = await runCase({
+                label: "E",
+                modelContextLimit: 200_000,
+                wallErrorMessage: () =>
+                    "AI_APICallError: prepared prompt exceeds Engine max_context 262144",
+            });
+            const wallTurn = firstRejected(turns);
+            expect(wallTurn).toBeDefined();
+            expect(turns.some((turn) => turn.detectedContextLimit === 262144)).toBe(true);
+            expect(turns.some((turn) => turn.overflowDetected > 0)).toBe(true);
             const next = turns.find((turn) => turn.turn === (wallTurn ?? 0) + 1);
             expect(next?.bumpedTo95).toBe(1);
             expect(next?.rejected).toBe(false);

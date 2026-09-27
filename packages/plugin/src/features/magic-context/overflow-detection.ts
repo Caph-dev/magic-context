@@ -48,6 +48,8 @@ export const OVERFLOW_PATTERNS: ReadonlyArray<RegExp> = [
     /too large for model with \d+ maximum context length/i, // Mistral
     /model_context_window_exceeded/i, // z.ai non-standard finish_reason
     /context size has been exceeded/i, // Lemonade / llama-cpp wrappers
+    /prepared prompt exceeds engine max_context/i, // Matches local-engine errors phrased as “prepared prompt exceeds engine max_context”.
+    /prompt exceeds (?:the )?.{0,32}\bmax_context\b/i, // Other local engines
 ];
 
 /**
@@ -88,6 +90,8 @@ const LIMIT_EXTRACTION_PATTERNS: ReadonlyArray<LimitExtractionPattern> = [
         pattern: />\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b/i,
         provenance: "prompt_only",
     }, // Anthropic reports the accepted input ceiling, not input plus output.
+    { pattern: /prepared prompt exceeds engine max_context\s+(\d+)/i, provenance: "unknown" }, // This format reports the engine's max_context limit after the message.
+    { pattern: /prompt exceeds (?:the )?.{0,32}\bmax_context\s+(\d+)/i, provenance: "unknown" }, // Other local engines
     { pattern: /max(?:imum)?.*context.*?(\d+)/i, provenance: "unknown" }, // generic fallback
 ];
 
