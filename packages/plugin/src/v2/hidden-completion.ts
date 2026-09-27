@@ -403,21 +403,6 @@ function assistantOutcome(row: StoreRow<"assistant"> | undefined): AssistantOutc
         : undefined;
 }
 
-/**
- * OpenCode 2.0.5 settled provider failures with `finish: "error"`. Some converted 2.0.12 stores
- * carry the terminal outcome on the assistant row instead; native 2.0.12 idle rows are handled by
- * the poller. Either assistant shape proves the child is idle and safe to reuse.
- */
-function settledProviderError(row: StoreRow<"assistant"> | undefined): boolean {
-    const outcome = assistantOutcome(row);
-    return (
-        row !== undefined &&
-        ((row.data.error !== undefined && typeof row.data.finish === "string") ||
-            outcome === "failed" ||
-            outcome === "interrupted")
-    );
-}
-
 function successfulReusableAssistant(row: StoreRow<"assistant"> | undefined): boolean {
     return (
         row !== undefined &&
@@ -728,6 +713,40 @@ export async function createV2HiddenCompletionExecutor(
         if (!keptUnderRetention(child)) scheduleRemoval(child);
     };
 
+    const createChild = async (
+        identity: HiddenRunIdentity,
+        role: HiddenChildRole,
+        model: Model,
+    ): Promise<PersistedHiddenChild> => {
+        const title = roleTitle(role);
+        const created = await host.create({
+            title,
+            agent: hiddenToolLoop(identity) ? hiddenAgentFor(identity) : roleAgent(role),
+            model: {
+                providerID: model.providerID,
+                id: model.modelID,
+                ...(model.variant ? { variant: model.variant } : {}),
+            },
+            location: { directory: identity.directory },
+            metadata: { magic_context: "hidden-run", role },
+        });
+        if (!created.id) throw new Error("OpenCode 2 did not return a child session id");
+        const owner = resolveOwner();
+        const child: PersistedHiddenChild = {
+            id: created.id,
+            role,
+            generation,
+            title,
+            model,
+            created_at: Date.now(),
+            title_reasserted: false,
+            ...(owner === undefined ? {} : { owner }),
+        };
+        store.put(child);
+        options.hook.registerChild(child.id);
+        return child;
+    };
+
     // Boot sweep. Anything left over from an earlier process — including the backlog built up
     // before retirement deleted anything — is drained here, spaced like every other removal.
     // Children the current setting keeps are skipped; turning `keep_subagents` off later lets the
@@ -871,49 +890,18 @@ export async function createV2HiddenCompletionExecutor(
                         (latest.assistant === undefined || latest.idle.seq > latest.assistant.seq);
                     const idleOutcome = idleIsNewest ? latest.idle?.data.outcome : undefined;
                     const reusable =
-                        idleOutcome === "failed" ||
-                        idleOutcome === "interrupted" ||
-                        ((idleOutcome === undefined || idleOutcome === "succeeded") &&
-                            (successfulReusableAssistant(latest.assistant) ||
-                                settledProviderError(latest.assistant)));
+                        (idleOutcome === undefined || idleOutcome === "succeeded") &&
+                        successfulReusableAssistant(latest.assistant);
                     if (!reusable) {
                         retireChild(active, "newest-assistant-not-reusable");
                         active = undefined;
                     }
                 }
                 if (!active) {
-                    const title = roleTitle(role);
-                    const created = await host.create({
-                        title,
-                        agent: hiddenToolLoop(identity)
-                            ? hiddenAgentFor(identity)
-                            : roleAgent(role),
-                        model: {
-                            providerID: head.providerID,
-                            id: head.modelID,
-                            ...(head.variant ? { variant: head.variant } : {}),
-                        },
-                        location: { directory: identity.directory },
-                        metadata: { magic_context: "hidden-run", role },
-                    });
-                    if (!created.id)
-                        throw new Error("OpenCode 2 did not return a child session id");
                     // Bind the child to the host that is creating it, now, while that host is
                     // demonstrably this process. Deleting it later goes through this binding and
                     // nothing else.
-                    const owner = resolveOwner();
-                    active = {
-                        id: created.id,
-                        role,
-                        generation,
-                        title,
-                        model: head,
-                        created_at: Date.now(),
-                        title_reasserted: false,
-                        ...(owner === undefined ? {} : { owner }),
-                    };
-                    store.put(active);
-                    options.hook.registerChild(active.id);
+                    active = await createChild(identity, role, head);
                 }
                 openedChild = active;
                 const handle = { id: active.id, childSessionId: active.id };
@@ -944,6 +932,17 @@ export async function createV2HiddenCompletionExecutor(
             }
 
             const requested = await validateVariant(requestModel(request, run.child.model));
+            if (run.retired) {
+                // Fallback retries share the original handle. A terminal provider failure has
+                // already retired its child, so give the retry a fresh carrier instead of
+                // prompting a session that is queued for deletion.
+                run.child = await createChild(run.identity, run.role, requested);
+                run.failed = false;
+                run.unsettledFailure = false;
+                run.retired = false;
+                handle.id = run.child.id;
+                handle.childSessionId = run.child.id;
+            }
             await switchChildModel(run, requested);
             const baseline = withReader(options.openReader, (reader) =>
                 reader.latestSequence(run.child.id),

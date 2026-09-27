@@ -365,6 +365,22 @@ async function setup(
                 JSON.stringify({ version: 1, active: {}, retired_children: children }),
             );
         },
+        seedActive(child: ReturnType<typeof retiredChild> & { ever_settled?: boolean }) {
+            const active = structuredClone(child) as Record<string, unknown>;
+            delete active.retired_at;
+            delete active.reason;
+            db.prepare(
+                `INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            ).run(
+                hiddenChildrenMetaKey("/project"),
+                JSON.stringify({
+                    version: 1,
+                    active: { [child.role]: active },
+                    retired_children: [],
+                }),
+            );
+        },
         setFailPrompt(value: boolean) {
             failPrompt = value;
         },
@@ -590,6 +606,25 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
+    test("reopens a fresh child when a fallback retries a retired run", async () => {
+        const state = await setup();
+        try {
+            state.setProviderError({ message: "Go usage limit exceeded" });
+            const handle = await state.executor.open(run);
+            await expect(state.executor.attempt(handle, request("cheap"))).rejects.toThrow(
+                "Hidden completion provider error: ",
+            );
+
+            state.setProviderError(undefined);
+            await state.executor.attempt(handle, request("fallback"));
+            expect(handle.id).toBe("child-2");
+            expect(state.creates[1]?.model).toEqual({ providerID: "mock", id: "fallback" });
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
+
     test("fails an outcome-only failed assistant in one poll with persisted host detail", async () => {
         const state = await setup();
         try {
@@ -657,20 +692,25 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
-    test("a restarted executor retires a child whose newest assistant is a settled provider error", async () => {
+    test("a restarted executor retires a persisted provider-error child from an older version", async () => {
         const state = await setup();
         try {
-            state.setProviderError({ message: "The usage limit has been reached" });
-            const handle = await state.executor.open(run);
-            await expect(state.executor.attempt(handle, request())).rejects.toThrow();
-            await close(state.executor, handle, false);
-            state.setProviderError(undefined);
+            const legacy = retiredChild("legacy-child", 1);
+            state.seedActive(legacy);
+            state.rows.append("legacy-child", "", {
+                error: { message: "The usage limit has been reached" },
+                usage: false,
+                finish: "error",
+            });
             const restarted = await state.create();
             const next = await restarted.open(run);
-            expect(next.id).toBe("child-2");
+            expect(next.id).toBe("child-1");
             await restarted.attempt(next, request());
             await close(restarted, next, true);
-            expect(state.creates).toHaveLength(2);
+            expect(state.creates).toHaveLength(1);
+            expect(state.meta().retired_children).toMatchObject([
+                { id: "legacy-child", reason: "newest-assistant-not-reusable" },
+            ]);
         } finally {
             state.db.close();
         }
