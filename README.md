@@ -424,6 +424,22 @@ Omit `--once` for the built-in one-minute loop, or invoke `--once` from cron/lau
 
 `--send` switches from JSON-line dry-run output to the `prefrontal-core` module's `agent.deliver` subc operation. It sends a high-urgency registry peer message to `agent_b613e5cf2ee55b8c` from the rendered name `mc-cache-bust-sentinel` by default; the request also stamps the sender as session `health-sentinel-mc` on harness `magic-context`. Use `--wake-agent-id` or `--wake-from-agent` to select another target or rendered sender name. Delivered and queued dispositions are counted as accepted, while a repeated committed order for the same delivery id is counted as deduplicated; sender refusals are counted without retrying the delivery id, and malformed replies or idempotency conflicts fail the run. Use `--connection-file`, `--wake-module-id`, `--wake-agent-id`, `--wake-from-agent`, `--state-file`, `--db`, or `--rust-store` only when the corresponding runtime location is non-default.
 
+### Dreamer and historian failure sentinel
+
+`packages/plugin/scripts/subagent-failure-sentinel.ts` reads completed `subagent_invocations` from `context.db` with a read-only SQLite connection and a three-second busy timeout. It treats `failed` and `timed_out` as failures; `empty` and `aborted` are separate counts. It reports a previously unseen (subagent, task, normalised error) class over seven days, a task with at least eight runs and a failure share of at least 25% over 24 hours, or a class whose count doubled against the preceding 24 hours. Errors have volatile IDs, numbers, durations, and paths folded into stable classes. Each five-minute run scans at most 501 new and 5,001 recent history rows (including boundary probes); incomplete history suppresses rules whose full window cannot be assessed. Its only local write is the watermark/dedup file `subagent-failure-sentinel-state.json` in the Magic Context storage directory. The watermark resumes by `(ended_at, id)`; a wake is suppressed for six hours unless its class count grows by 50%. It logs run start and summary, including rows examined and whether the scan was bounded. One wake per run lists each rule, task, class, class count, failure share, example error, newest session ID, and empty/aborted counts.
+
+A dry run uses `bun packages/plugin/scripts/subagent-failure-sentinel.ts --once`; use `--db` and `--state-file` to select a fixture database and state file. Without `--once` it loops every minute. The launchd template `packages/plugin/scripts/launchd/com.cortexkit.magic-context.subagent-failure-sentinel.plist` runs every five minutes with `--once --send`, `RunAtLoad=false`, and separate JSONL/stdout and stderr logs. `--send` uses the same high-urgency `prefrontal-core` `agent.deliver` peer message to the Magic Context head as the cache-bust sentinel. To install and activate it on macOS, run **from the repository root** (this does not happen automatically):
+
+```sh
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/cortexkit"
+sed -e "s|__BUN_PATH__|$(command -v bun)|g" \
+    -e "s|__REPO_ROOT__|$(pwd -P)|g" \
+    -e "s|__LOG_DIR__|$HOME/Library/Logs/cortexkit|g" \
+    packages/plugin/scripts/launchd/com.cortexkit.magic-context.subagent-failure-sentinel.plist \
+    > "$HOME/Library/LaunchAgents/com.cortexkit.magic-context.subagent-failure-sentinel.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.cortexkit.magic-context.subagent-failure-sentinel.plist"
+```
+
 ---
 ## Contributing
 
