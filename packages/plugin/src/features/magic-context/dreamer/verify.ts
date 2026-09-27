@@ -185,7 +185,7 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
         args.db,
         args.holderId,
         args.leaseKey,
-        () => abortController.abort(),
+        (reason) => abortController.abort(new Error(reason)),
         args.leaseAcquisition,
     );
 

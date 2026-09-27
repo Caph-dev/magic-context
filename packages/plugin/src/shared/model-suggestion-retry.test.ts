@@ -160,6 +160,18 @@ describe("promptSyncWithModelSuggestionRetry", () => {
         expect(prompt).toHaveBeenCalledTimes(0);
     });
 
+    test("pre-aborted lease signal carries its loss reason into the prompt error", async () => {
+        const controller = new AbortController();
+        controller.abort(new Error("lease_lost: taken by holder-b"));
+        const prompt = mock(async () => {});
+        await expect(
+            promptSyncWithModelSuggestionRetry(createClient(prompt), createArgs(), {
+                signal: controller.signal,
+            }),
+        ).rejects.toThrow("prompt aborted by external signal: lease_lost: taken by holder-b");
+        expect(prompt).not.toHaveBeenCalled();
+    });
+
     test("AbortError name short-circuits", async () => {
         const abortError = new Error("aborted by provider");
         abortError.name = "AbortError";
@@ -282,10 +294,10 @@ describe("promptSyncWithModelSuggestionRetry", () => {
         const abort = mock(async () => ({}));
         const client = createClient(prompt as never, abort);
 
-        setTimeout(() => controller.abort(), 10);
+        setTimeout(() => controller.abort(new Error("lease_lost: taken by holder-b")), 10);
         await expect(
             promptSyncWithModelSuggestionRetry(client, createArgs(), { signal: controller.signal }),
-        ).rejects.toThrow(/aborted by external signal/);
+        ).rejects.toThrow("prompt aborted by external signal: lease_lost: taken by holder-b");
         expect(abort).toHaveBeenCalledTimes(1);
         expect((abort.mock.calls[0]?.[0] as { path: { id: string } }).path.id).toBe("ses-test");
     });

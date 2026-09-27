@@ -137,9 +137,9 @@ export async function evaluateSmartNotes(
         args.db,
         args.holderId,
         args.leaseKey,
-        () => {
+        (reason) => {
             leaseLost = true;
-            leaseAbortController.abort(new Error("Dream lease lost during smart notes"));
+            leaseAbortController.abort(new Error(reason));
             log("[dreamer] smart notes: lease lost — aborting");
             args.onLeaseLost?.("smart notes");
         },

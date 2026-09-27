@@ -206,6 +206,11 @@ export function parseModelSuggestion(error: unknown): ModelSuggestionInfo | null
     };
 }
 
+function externalAbortMessage(signal: AbortSignal): string {
+    const reason = signal.reason;
+    return `prompt aborted by external signal${reason instanceof Error && /^lease_(?:lost|expired):/.test(reason.message) ? `: ${reason.message}` : ""}`;
+}
+
 async function promptWithTimeout(
     client: Client,
     args: PromptArgs,
@@ -220,7 +225,7 @@ async function promptWithTimeout(
     // and avoids one wasted upstream `client.session.prompt` round-trip
     // before `isNonRetryable` catches the cancellation at the chain loop.
     if (signal?.aborted) {
-        throw new Error("prompt aborted by external signal");
+        throw new Error(externalAbortMessage(signal));
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -244,7 +249,7 @@ async function promptWithTimeout(
             if (!transport || transport.childSessionId) {
                 await abortChildRun(client, transport?.childSessionId ?? args.path.id);
             }
-            throw new Error("prompt aborted by external signal");
+            throw new Error(externalAbortMessage(signal));
         }
         if (controller.signal.aborted) {
             // Our timeout fired. Same problem: abort the server-side run loop, not
@@ -268,7 +273,7 @@ async function promptWithTimeout(
         }
         throw new Error(
             signal?.aborted
-                ? "prompt aborted by external signal"
+                ? externalAbortMessage(signal)
                 : `prompt timed out after ${timeoutMs}ms`,
         );
     }
