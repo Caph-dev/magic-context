@@ -941,8 +941,6 @@ export interface M0M1RenderOptions {
     preparedPrefix?: InjectM0M1Result;
     /** Preserve the original host message order so prefix trimming can still identify the boundary after replay or pruning removes rows. */
     prefixTrimSourceOrder?: PrefixTrimSourceOrder;
-    /** Host window as supplied this pass; only explains an absent boundary in the log. */
-    prefixTrimHostWindow?: PrefixTrimHostWindow;
     /** Persisted pair captured before a fallible preflight. Contention may recover
      * from it, but must not adopt a newer row written while the preflight ran. */
     contentionFallbackPrefix?: InjectM0M1Result;
@@ -1019,35 +1017,6 @@ export type PrefixTrimStatus =
     | "applied"
     | "boundary-precedes-window"
     | "refused";
-
-/**
- * What the host supplied this pass, recorded only to explain a prefix-trim
- * boundary that is missing from the live array. Never used to decide what is
- * cut or served.
- */
-export interface PrefixTrimHostWindow {
-    /** Persisted message IDs in host order, before this pass cut or reduced anything. */
-    messageIds: readonly string[];
-    /**
-     * First persisted ID left after compartment injection cut the window, or null
-     * when nothing was left. Rows between the boundary and this one went with that
-     * cut; rows after it that are gone from the live array were removed by
-     * reduction (dropped tool calls, emptied messages).
-     */
-    firstIdAfterCompartmentCut: string | null;
-}
-
-/** Persisted IDs of a message array, in order, skipping host-rendered system rows. */
-export function persistedMessageIds(messages: readonly MessageLike[]): string[] {
-    const ids: string[] = [];
-    for (const message of messages) {
-        const id = message.info.id;
-        if (typeof id !== "string" || id.length === 0) continue;
-        if (isHostRenderedSystemMessage(message)) continue;
-        ids.push(id);
-    }
-    return ids;
-}
 
 export interface PrefixTrimSourceOrder {
     /** Stable IDs in the exact order supplied by the host before this transform mutates the array. */
@@ -3594,41 +3563,6 @@ function boundaryPrecedesWindow(sessionId: string, boundary: string, firstLiveId
     return precedes;
 }
 
-/**
- * When the host supplied the boundary this pass, say where the rows between it
- * and the first live message went. Returns null when the host window did not
- * contain the boundary (or was not recorded): then the host window itself may
- * start after the boundary, which the caller reports as such.
- */
-function describeBoundaryCutInHostWindow(
-    hostWindow: PrefixTrimHostWindow | undefined,
-    sessionId: string,
-    boundary: string,
-    firstLiveId: string,
-): string | null {
-    if (!hostWindow) return null;
-    const ids = hostWindow.messageIds;
-    let boundaryIndex = ids.indexOf(boundary);
-    if (boundaryIndex < 0) {
-        boundaryIndex = ids.indexOf(resolveHostServedBoundaryId(sessionId, boundary));
-    }
-    const firstLiveIndex = ids.indexOf(firstLiveId);
-    if (boundaryIndex < 0 || firstLiveIndex <= boundaryIndex) return null;
-    // Rows before the first survivor of the compartment cut went with that cut;
-    // the rest were in the array afterwards and were removed by reduction.
-    const survivor = hostWindow.firstIdAfterCompartmentCut;
-    const survivorIndex = survivor === null ? ids.length : ids.indexOf(survivor);
-    const split = Math.min(
-        Math.max(survivorIndex < 0 ? boundaryIndex + 1 : survivorIndex, boundaryIndex + 1),
-        firstLiveIndex,
-    );
-    const cut = ids.slice(boundaryIndex + 1, split);
-    const reduced = ids.slice(split, firstLiveIndex);
-    const list = (rows: readonly string[]) =>
-        rows.length > 5 ? `${rows.slice(0, 5).join(",")},+${rows.length - 5}` : rows.join(",");
-    return `host rows between them: ${reduced.length} removed by reduction (${list(reduced)}), ${cut.length} cut with the compartment boundary (${list(cut)})`;
-}
-
 /** Classify and log a boundary missing from the live array. Never mutates messages. */
 function classifyAbsentBoundary(
     options: M0M1RenderOptions,
@@ -3642,17 +3576,15 @@ function classifyAbsentBoundary(
         absentBoundaryEpisodeBySession.delete(sessionId);
         if (precedesWindowLoggedBySession.get(sessionId) !== boundary) {
             precedesWindowLoggedBySession.set(sessionId, boundary);
-            const inHostWindow = describeBoundaryCutInHostWindow(
-                options.prefixTrimHostWindow,
-                sessionId,
-                boundary,
-                firstLiveId,
-            );
+            // Earlier in the same pass, compartment injection may already have cut
+            // the window through the boundary, and reduction may have removed
+            // messages after it (a message whose only tool calls were dropped
+            // is left empty and removed). A boundary before the first remaining
+            // message therefore does not by itself mean the host's window
+            // started after it, and the line is worded not to suggest that.
             sessionLog(
                 sessionId,
-                inHostWindow
-                    ? `prefix trim: boundary ${boundary} was in the host window and already cut this pass; first live message ${firstLiveId}; ${inHostWindow}; pass=${pass}; nothing to cut`
-                    : `prefix trim: boundary ${boundary} sorts before the first live message ${firstLiveId}; pass=${pass}; nothing to cut, whole window kept`,
+                `prefix trim: boundary ${boundary} precedes the first remaining message ${firstLiveId}; rows between were cut with the summarized history or removed by reduction this pass; pass=${pass}; nothing to cut`,
             );
         }
         return "boundary-precedes-window";

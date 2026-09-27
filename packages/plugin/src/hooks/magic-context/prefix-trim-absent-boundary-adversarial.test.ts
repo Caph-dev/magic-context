@@ -300,12 +300,12 @@ describe("absent-boundary prefix trim: append-only defer passes keep the priced 
     });
 });
 
-describe("absent-boundary prefix trim: the log says where the rows after the boundary went", () => {
+describe("absent-boundary prefix trim: the log does not imply the host window started after the boundary", () => {
     // Production shape: compartment injection already cut the window through the
     // boundary (row 12), then reduction removed rows 13-14 (tool-only steps whose
-    // calls were dropped), so the first live row is 15. OpenCode served 13-14.
-    function passWithHostWindow(hostWindowIds: readonly string[] | undefined) {
-        // The line is logged once per boundary per process; each case starts fresh.
+    // calls were dropped), so the first remaining row is 15. OpenCode served 13-14.
+    it("says the rows between were cut or removed this pass, and serves the same rows as before", () => {
+        // The line is logged once per boundary per process; start fresh.
         resetPrefixTrimFallbackState(SESSION_ID);
         createOpenCodeStore(range(1, 30).map((index) => regularRow(index)));
         const db = contextDb();
@@ -322,42 +322,16 @@ describe("absent-boundary prefix trim: the log says where the rows after the bou
                 messages: live,
                 preparedPrefix: preparedPrefix(idOf(12)),
                 isCacheBustingPass: true,
-                prefixTrimHostWindow: hostWindowIds
-                    ? { messageIds: hostWindowIds, firstIdAfterCompartmentCut: idOf(13) }
-                    : undefined,
             }).prefixTrimStatus;
-            return {
-                status,
-                ids: ids(live),
-                lines: lines.filter((line) => line.includes("prefix trim:")),
-            };
+
+            expect(status).toBe("boundary-precedes-window");
+            expect(ids(live)).toEqual([undefined, ...ids(liveWindow(range(15, 30)))]);
+            expect(lines.filter((line) => line.includes("prefix trim:"))).toEqual([
+                `prefix trim: boundary ${idOf(12)} precedes the first remaining message ${idOf(15)}; rows between were cut with the summarized history or removed by reduction this pass; pass=priced; nothing to cut`,
+            ]);
         } finally {
             spy.mockRestore();
         }
-    }
-
-    it("names rows the host served and reduction removed, instead of implying the host window started after the boundary", () => {
-        const recorded = passWithHostWindow(range(5, 30).map(idOf));
-        const unrecorded = passWithHostWindow(undefined);
-
-        // Only the log differs: same status, same served rows.
-        expect(recorded.status).toBe("boundary-precedes-window");
-        expect(unrecorded.status).toBe("boundary-precedes-window");
-        expect(recorded.ids).toEqual(unrecorded.ids);
-
-        expect(recorded.lines).toEqual([
-            `prefix trim: boundary ${idOf(12)} was in the host window and already cut this pass; first live message ${idOf(15)}; host rows between them: 2 removed by reduction (${idOf(13)},${idOf(14)}), 0 cut with the compartment boundary (); pass=priced; nothing to cut`,
-        ]);
-        expect(unrecorded.lines).toEqual([
-            `prefix trim: boundary ${idOf(12)} sorts before the first live message ${idOf(15)}; pass=priced; nothing to cut, whole window kept`,
-        ]);
-    });
-
-    it("keeps the window-starts-after-boundary wording when the host window did not contain the boundary", () => {
-        const { lines } = passWithHostWindow(range(15, 30).map(idOf));
-        expect(lines).toEqual([
-            `prefix trim: boundary ${idOf(12)} sorts before the first live message ${idOf(15)}; pass=priced; nothing to cut, whole window kept`,
-        ]);
     });
 });
 

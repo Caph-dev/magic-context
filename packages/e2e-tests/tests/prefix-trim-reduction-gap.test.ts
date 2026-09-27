@@ -11,17 +11,18 @@
  * first pass after a restart, compartment injection cuts the window through B,
  * then drop replay empties the tool-only steps after B and removes them, so the
  * first message left is the first step that still has content. The prefix trim
- * then finds B absent and, before this fix, logged only
- * "boundary B sorts before the first live message F", which reads as if
- * OpenCode's window started after B and the steps between were lost. They were
- * served to Magic Context and removed on purpose.
+ * then finds B absent. It used to log "boundary B sorts before the first live
+ * message F ... whole window kept", which read as if OpenCode's window started
+ * after B and the steps between were lost. They were served to Magic Context
+ * and removed on purpose, and the line now says they were cut or removed this
+ * pass.
  *
  * The test builds that state directly: one turn with a small tool step (B), a
  * large tool step (the gap) and a text step (F); a compartment ending at B; the
  * gap step's tool tag recorded as fully dropped; the cached m[0] cleared so the
  * next pass materializes a baseline at B; then a restart. It asserts that the
- * gap step is in OpenCode's store, absent from the provider request, and that
- * the log names it as removed by reduction from a window that held B.
+ * gap step is in OpenCode's store and absent from the provider request, and
+ * that the log line says the rows between were cut or removed this pass.
  */
 
 import { afterAll, beforeAll, expect, it } from "bun:test";
@@ -91,7 +92,7 @@ function partTypes(sessionId: string, messageId: string): string[] {
     }
 }
 
-it("reports tool-only steps after the boundary as removed by reduction, not as missing from the host window", async () => {
+it("reports tool-only steps after the boundary as cut or removed this pass, not as missing from the host window", async () => {
     const toolNamed = (body: Record<string, unknown>, name: string) =>
         (Array.isArray(body.tools) ? body.tools : [])
             .map((tool) => (tool as { name?: unknown }).name)
@@ -217,10 +218,8 @@ it("reports tool-only steps after the boundary as removed by reduction, not as m
 
     expect(trimLines).toHaveLength(1);
     const line = trimLines[0];
-    expect(line).toContain(`boundary ${boundary.id} was in the host window and already cut this pass`);
-    expect(line).toContain(`first live message ${firstLive.id}`);
     expect(line).toContain(
-        `host rows between them: 1 removed by reduction (${gap.id}), 0 cut with the compartment boundary ()`,
+        `prefix trim: boundary ${boundary.id} precedes the first remaining message ${firstLive.id}; rows between were cut with the summarized history or removed by reduction this pass;`,
     );
     expect(line).not.toContain("sorts before the first live message");
 
