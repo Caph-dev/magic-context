@@ -5,6 +5,7 @@
 
 use super::*;
 use rusqlite::Connection;
+use serde_json::json;
 use std::path::Path;
 
 const SCHEMA_SNAPSHOT: &str = include_str!("../tests/fixtures/context-db-schema.sql");
@@ -1168,7 +1169,9 @@ fn a_mixed_history_session_keeps_its_current_ts_rows_and_drops_only_superseded_o
     let fixture = fresh();
     let context = fixture.context_conn();
     // The host already has ses-p2's compartments as the TS historian wrote them, except
-    // compartment 3, which the module later rewrote.
+    // compartment 3, which the module later rewrote. The host recorded the boundaries on
+    // its own scale (message ids, ordinals one higher), so even the unchanged ones differ
+    // from the store's rows in their coordinates.
     let mut ids = BTreeMap::new();
     for sequence in 1..=3i64 {
         let title = if sequence == 3 {
@@ -1184,10 +1187,10 @@ fn a_mixed_history_session_keeps_its_current_ts_rows_and_drops_only_superseded_o
                  VALUES ('ses-p2', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 50, 0, ?8, 'opencode')",
                 params![
                     sequence,
-                    sequence * 10,
-                    sequence * 10 + 9,
-                    format!("m{}", sequence * 10),
-                    format!("m{}", sequence * 10 + 9),
+                    sequence * 10 + 1,
+                    sequence * 10 + 10,
+                    format!("host-msg-{}", sequence * 10),
+                    format!("host-msg-{}", sequence * 10 + 9),
                     title,
                     format!("{title} body"),
                     3_000 + sequence
@@ -1705,4 +1708,182 @@ fn a_chunk_that_cannot_get_the_lock_in_time_stops_the_run_and_keeps_earlier_chun
     );
     let report = run(&store, &request(P), &fixture.options(), &mut NoObserver).unwrap();
     assert_eq!(report.status, "migrated");
+}
+
+// ── Real-store drill ───────────────────────────────────────────────────────
+
+/// Run the move against a copied real store pair. Ignored by default; it needs a
+/// directory holding writable copies of a `store.db` and a `context.db` at lane 93, and it
+/// refuses any directory outside the temp root:
+///
+/// ```text
+/// MC_SINGLE_STORE_DRILL_DIR=$TMPDIR/magic-context/b2/drill \
+///   cargo test --locked -p mc-module --lib single_store_migrate::tests::real_store_drill \
+///   -- --ignored --nocapture
+/// ```
+///
+/// For every project with an `authority_managed` row it runs a dry run, then the move,
+/// then the move again, printing one JSON line per step.
+#[test]
+#[ignore = "drill on copied real stores; needs MC_SINGLE_STORE_DRILL_DIR"]
+fn real_store_drill() {
+    let Ok(dir) = std::env::var("MC_SINGLE_STORE_DRILL_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir).canonicalize().unwrap();
+    let temp_root = std::env::temp_dir().canonicalize().unwrap();
+    assert!(
+        dir.starts_with(&temp_root),
+        "the drill runs only on copies under {}",
+        temp_root.display()
+    );
+    let context = dir.join("context.db");
+    // Every table the marker-write gate checks carries the fingerprint this build expects
+    // on the real, long-upgraded file.
+    {
+        let mut host = HostStore::open(&context).unwrap();
+        let (conn, fence) = host.connection_and_fence();
+        for table in [BRACKET_TABLE, MARKER_TABLE]
+            .iter()
+            .chain(COPY_DOMAIN_TABLES.iter())
+        {
+            fence
+                .check_table(table)
+                .unwrap_or_else(|error| panic!("{table}: {error}"));
+            println!("DRILL-GATE {table} ok");
+        }
+        check_auxiliary_fingerprints(conn).unwrap();
+        println!("DRILL-GATE authority_managed ok");
+        println!("DRILL-GATE mirror_identity ok");
+        check_marker_gate(conn, fence).unwrap();
+    }
+    let store =
+        McStore::open_with_capability_for_test(&crate::test_support::descriptor(&dir), true)
+            .unwrap();
+    store.set_project_write_gate(std::sync::Arc::new(CopyWriteGate::for_store(&store)));
+    let projects: Vec<String> = Connection::open(&context)
+        .unwrap()
+        .prepare("SELECT project_path FROM authority_managed ORDER BY project_path")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut options = MigrateOptions::new(context.clone());
+    options.assume_cutover = true;
+    let step = |project: &str, name: &str, request: MigrateRequest| {
+        let started = Instant::now();
+        let outcome = run(&store, &request, &options, &mut NoObserver);
+        let line = match outcome {
+            Ok(report) => json!({
+                "project": project, "step": name, "ok": true,
+                "wall_ms": started.elapsed().as_millis() as u64,
+                "report": report.to_value(),
+            }),
+            Err(refusal) => json!({
+                "project": project, "step": name, "ok": false,
+                "wall_ms": started.elapsed().as_millis() as u64,
+                "code": refusal.code, "detail": refusal.detail,
+            }),
+        };
+        println!("DRILL {line}");
+        line
+    };
+    for project in &projects {
+        let dry = step(
+            project,
+            "dry_run",
+            MigrateRequest {
+                project: project.clone(),
+                dry_run: true,
+                retry: false,
+            },
+        );
+        if dry["ok"] != json!(true) {
+            continue;
+        }
+        let first = step(project, "run", request(project));
+        if first["ok"] != json!(true) {
+            continue;
+        }
+        step(project, "rerun", request(project));
+    }
+}
+
+#[test]
+fn auxiliary_fingerprints_match_the_committed_schema_snapshot() {
+    let fixture = fixture();
+    let conn = fixture.context_conn();
+    let mut drift = Vec::new();
+    for (table, expected) in COPY_AUXILIARY_FINGERPRINTS {
+        let found = host_store::read_table_fingerprint(&conn, table)
+            .unwrap()
+            .unwrap();
+        if found != *expected {
+            drift.push(format!("    (\"{table}\", \"{found}\"),"));
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "COPY_AUXILIARY_FINGERPRINTS is stale. Replace the drifted entries with:\n{}",
+        drift.join("\n")
+    );
+}
+
+/// The store can hold two notes that read the same (one seeded twice). Each gets its own
+/// context row; a context row already mapped to one of them is not claimed by the other.
+#[test]
+fn two_identical_store_notes_each_keep_their_own_context_row() {
+    let fixture = fixture();
+    let store_conn = fixture.store_conn();
+    let first = store_note(
+        &store_conn,
+        P,
+        "smart",
+        Some("ses-p1"),
+        "twice",
+        "active",
+        None,
+    );
+    let second = store_note(
+        &store_conn,
+        P,
+        "smart",
+        Some("ses-p1"),
+        "twice",
+        "active",
+        None,
+    );
+    let context = fixture.context_conn();
+    privileged(&context, |conn| {
+        conn.execute(
+            "INSERT INTO notes(type, status, content, session_id, project_path, created_at, updated_at)
+             VALUES ('smart', 'active', 'twice', 'ses-p1', ?1, 2000, 2001)",
+            params![P],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id)
+             VALUES ('notes', ?1, ?2, ?3)",
+            params![P, second, id],
+        )
+        .unwrap();
+    });
+    let store = fixture.open_store();
+    let report = run(&store, &request(P), &fixture.options(), &mut NoObserver).unwrap();
+    assert_eq!(report.status, "migrated");
+    let mapped: Vec<i64> = fixture
+        .context_conn()
+        .prepare(
+            "SELECT i.module_row_id FROM notes n JOIN mirror_identity i
+                ON i.domain = 'notes' AND i.context_row_id = n.id
+              WHERE n.content = 'twice' ORDER BY i.module_row_id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(mapped, vec![first, second]);
 }

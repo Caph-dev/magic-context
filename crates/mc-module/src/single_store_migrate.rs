@@ -69,11 +69,11 @@ pub const MAX_COPY_PAUSE: Duration = Duration::from_secs(120);
 pub const COPY_AUXILIARY_FINGERPRINTS: &[(&str, &str)] = &[
     (
         "authority_managed",
-        "c8acb621551eecca51c3908af8b58b4e7452ba86bfca2b5fb6187e61c2c23754",
+        "d4d8338d8424f7551d3ad13b0a42e03e1c96d06e69ea68e3d4fab31010f1e30e",
     ),
     (
         "mirror_identity",
-        "036bb1afd6e3da674d94162b3c86283651a0319e8e3fae35f4f80fc0fe98ae9f",
+        "62545ecd2573557d682faac1e4b90d2ab05acf88b4dd1a5091c4f89d116c1ffd",
     ),
 ];
 
@@ -552,9 +552,14 @@ const COMPARTMENT_COLUMNS: &[&str] = &[
     "harness",
     "rebase_status",
 ];
-/// Compared fields that describe what a compartment says, used to decide whether the
-/// module rewrote it (harness and rebase status are labels, not content).
-const COMPARTMENT_CONTENT_FIELDS: usize = 16;
+/// The compared fields that say what a compartment is about: title, body, the four
+/// tiers, importance, episode type and the legacy flag. They decide whether the module
+/// rewrote a compartment. The message coordinates are left out on purpose: a session the
+/// host summarised before rust mode took over keeps the same compartments, but the
+/// module records their boundaries as block ids (`msg_…#0`) on its own ordinal scale,
+/// while the host recorded message ids. That is one compartment written two ways, not a
+/// rewrite. The creation time, harness and rebase status are labels, not content.
+const COMPARTMENT_CONTENT_FIELDS: std::ops::RangeInclusive<usize> = 6..=14;
 
 const EVENT_COLUMNS: &[&str] = &[
     "session_id",
@@ -998,6 +1003,17 @@ fn identity_row(
     .optional()
 }
 
+/// Whether no `mirror_identity` row claims context row `id` yet. A row already mapped to
+/// another store row is never matched again by the fallbacks below: the store can hold
+/// two rows that read the same (a note seeded twice, say), and each needs its own twin.
+fn unclaimed(conn: &Connection, domain: &str, id: i64) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM mirror_identity WHERE domain = ?1 AND context_row_id = ?2)",
+        params![domain, id],
+        |row| row.get(0),
+    )
+}
+
 /// Resolve a memory the way the mirror does: identity row, then the context id the row
 /// was seeded from (same file only), then a unique match on the natural key.
 fn resolve_memory(
@@ -1038,7 +1054,9 @@ fn resolve_memory(
                 )
                 .optional()?;
             if let Some(id) = found {
-                return Ok(Mapping::Found(id));
+                if unclaimed(conn, "memories", id)? {
+                    return Ok(Mapping::Found(id));
+                }
             }
         }
     }
@@ -1055,7 +1073,9 @@ fn resolve_memory(
             })?
             .collect::<Result<Vec<_>, _>>()?;
         if let [only] = candidates.as_slice() {
-            return Ok(Mapping::Found(*only));
+            if unclaimed(conn, "memories", *only)? {
+                return Ok(Mapping::Found(*only));
+            }
         }
     }
     Ok(Mapping::Missing { stale_identity })
@@ -1114,7 +1134,10 @@ fn resolve_note(
                 params![source_row, note.values[0]],
                 |row| row.get(0),
             )?;
-            if same_type && note_in_scope(conn, model, source_row)? == Some(true) {
+            if same_type
+                && note_in_scope(conn, model, source_row)? == Some(true)
+                && unclaimed(conn, "notes", source_row)?
+            {
                 return Ok(Mapping::Found(source_row));
             }
         }
@@ -1134,7 +1157,7 @@ fn resolve_note(
             .collect::<Result<Vec<_>, _>>()?;
         let mut in_scope = Vec::new();
         for id in candidates {
-            if note_in_scope(conn, model, id)? == Some(true) {
+            if note_in_scope(conn, model, id)? == Some(true) && unclaimed(conn, "notes", id)? {
                 in_scope.push(id);
             }
         }
@@ -1277,7 +1300,7 @@ fn compartment_fate(
     };
     match (session.compartment(sequence), context_values) {
         (Some(store), Some(context)) => {
-            if store[..COMPARTMENT_CONTENT_FIELDS] == context[..COMPARTMENT_CONTENT_FIELDS] {
+            if store[COMPARTMENT_CONTENT_FIELDS] == context[COMPARTMENT_CONTENT_FIELDS] {
                 CompartmentFate::Unchanged
             } else {
                 CompartmentFate::Superseded
