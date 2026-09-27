@@ -1628,6 +1628,9 @@ fn a_seat_writing_the_sibling_throughout_the_move_is_never_refused() {
                 }
                 Err(error) => panic!("seat write failed: {error}"),
             }
+            // A seat writes when its session does something, not in a tight loop; a
+            // writer that never pauses would starve every other writer of the lock.
+            std::thread::sleep(Duration::from_millis(2));
         }
         (writes, busy)
     });
