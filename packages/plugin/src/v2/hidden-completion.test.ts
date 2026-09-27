@@ -540,36 +540,51 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
-    test("keeps the child when a run fails only on settled provider errors", async () => {
+    test("does not reuse a child after a settled provider error", async () => {
         const state = await setup();
         try {
             state.setProviderError({ message: "Go usage limit exceeded" });
             for (let i = 0; i < 5; i++) {
                 const handle = await state.executor.open(run);
-                expect(handle.id).toBe("child-1");
+                expect(handle.id).toBe(`child-${i + 1}`);
                 await expect(state.executor.attempt(handle, request("cheap"))).rejects.toThrow(
                     "Hidden completion provider error: ",
                 );
-                await expect(state.executor.attempt(handle, request("fallback"))).rejects.toThrow(
-                    "Go usage limit exceeded",
-                );
-                // The historian caller reports promptSettled=false after any failed attempt.
                 await close(state.executor, handle, false);
             }
             state.setProviderError(undefined);
             const recovered = await state.executor.open(run);
-            expect(recovered.id).toBe("child-1");
+            expect(recovered.id).toBe("child-6");
             await state.executor.attempt(recovered, request());
             await close(state.executor, recovered, true);
-            expect(state.creates).toHaveLength(1);
-            const meta = JSON.parse(
-                (
-                    state.db
-                        .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
-                        .get(hiddenChildrenMetaKey("/project")) as { value: string }
-                ).value,
+            expect(state.creates).toHaveLength(6);
+            expect(state.meta().retired_children).toHaveLength(5);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("retires a child immediately after a settled provider failure", async () => {
+        const state = await setup();
+        try {
+            state.setProviderError({ message: "Go usage limit exceeded" });
+            const handle = await state.executor.open(run);
+            await expect(state.executor.attempt(handle, request())).rejects.toThrow(
+                "Hidden completion provider error: ",
             );
-            expect(meta.retired_children).toHaveLength(0);
+            await close(state.executor, handle, false);
+
+            // A failed hidden child must not remain available for OpenCode's late drain.
+            expect(state.interrupts).toEqual(["child-1"]);
+            expect(state.meta().retired_children).toMatchObject([
+                { id: "child-1", reason: "hidden-run-provider-error" },
+            ]);
+
+            state.setProviderError(undefined);
+            const recovered = await state.executor.open(run);
+            expect(recovered.id).toBe("child-2");
+            await state.executor.attempt(recovered, request());
+            await close(state.executor, recovered, true);
         } finally {
             state.db.close();
         }
@@ -614,7 +629,7 @@ describe("OpenCode 2 hidden child completion", () => {
             state.setTerminalOutcome(undefined);
             state.setTerminalRowType("assistant");
             const recovered = await state.executor.open(run);
-            expect(recovered.id).toBe(handle.id);
+            expect(recovered.id).toBe("child-2");
             await state.executor.attempt(recovered, request());
             await close(state.executor, recovered, true);
         } finally {
@@ -642,7 +657,7 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
-    test("a restarted executor reuses a child whose newest assistant is a settled provider error", async () => {
+    test("a restarted executor retires a child whose newest assistant is a settled provider error", async () => {
         const state = await setup();
         try {
             state.setProviderError({ message: "The usage limit has been reached" });
@@ -652,10 +667,10 @@ describe("OpenCode 2 hidden child completion", () => {
             state.setProviderError(undefined);
             const restarted = await state.create();
             const next = await restarted.open(run);
-            expect(next.id).toBe("child-1");
+            expect(next.id).toBe("child-2");
             await restarted.attempt(next, request());
             await close(restarted, next, true);
-            expect(state.creates).toHaveLength(1);
+            expect(state.creates).toHaveLength(2);
         } finally {
             state.db.close();
         }

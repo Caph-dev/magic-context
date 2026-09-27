@@ -471,13 +471,17 @@ function assistantText(row: StoreRow<"assistant">): string | null {
 
 /**
  * A terminal provider or model-resolution failure persisted by the host, as opposed to an unsettled
- * dispatch error, timeout, or abort. Only this class keeps the now-idle child alive, so reuse does
- * not depend on wording that a later editor could accidentally change.
+ * dispatch error, timeout, or abort. The type keeps lifecycle handling independent of provider
+ * wording; terminal provider failures are quarantined by retiring the child before its attempt
+ * marker is released.
  */
 export class HiddenProviderError extends Error {
-    constructor(detail: string) {
+    readonly settled: boolean;
+
+    constructor(detail: string, options: { settled?: boolean } = {}) {
         super(`Hidden completion provider error: ${detail}`);
         this.name = "HiddenProviderError";
+        this.settled = options.settled ?? true;
     }
 }
 
@@ -578,7 +582,9 @@ async function awaitAssistantRow(
                 throw new HiddenProviderError(details.join("; "));
             }
             if (newAssistant.data.error !== undefined) {
-                throw new HiddenProviderError(errorText(newAssistant.data.error));
+                throw new HiddenProviderError(errorText(newAssistant.data.error), {
+                    settled: typeof newAssistant.data.finish === "string",
+                });
             }
             if (typeof newAssistant.data.finish === "string" || outcome === "succeeded") {
                 return newAssistant;
@@ -1065,6 +1071,16 @@ export async function createV2HiddenCompletionExecutor(
                     !run.retired
                 ) {
                     await interruptAndRetire(run, "prompt-timeout");
+                } else if (
+                    error instanceof HiddenProviderError &&
+                    error.settled &&
+                    !run.retired
+                ) {
+                    // OpenCode can perform a late drain after a provider failure. Once the marker
+                    // is released, that drain has no registered hidden request and fails closed in
+                    // HiddenChildHook.apply, which can wedge the host's event/WebSocket path. Stop
+                    // and retire the poisoned child before releasing the marker in finally.
+                    await interruptAndRetire(run, "hidden-run-provider-error");
                 }
                 throw error;
             } finally {
@@ -1083,12 +1099,10 @@ export async function createV2HiddenCompletionExecutor(
             const run = runs.get(handle);
             if (!run) return;
             try {
-                // A run that failed only on settled provider errors keeps its child: retiring it would
-                // create a new session per failed run (with a pool at its quota, one per historian
-                // trigger, indefinitely). The caller reports promptSettled=false after any failed
-                // attempt, so it cannot tell this case apart; the run's own record of every failure
-                // being a persisted provider error row (the child is idle) is what decides.
-                const reusable = run.failed && !run.unsettledFailure;
+                // Settled provider failures are retired in attempt() before the marker is released.
+                // Keep this guard for callers that close an unsuccessful run without an attempt
+                // error, but never make a retired child reusable through close().
+                const reusable = !run.retired && run.failed && !run.unsettledFailure;
                 if (hiddenToolLoop(run.identity)) {
                     retire(
                         run,

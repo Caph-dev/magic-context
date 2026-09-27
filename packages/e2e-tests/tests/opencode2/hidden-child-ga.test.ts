@@ -60,7 +60,7 @@ async function eventually(check: () => boolean, timeoutMs = 20_000): Promise<voi
     }
 }
 
-test("OpenCode 2 hidden historian keeps one cheap-model child across provider errors and deletes the children it retires", async () => {
+test("OpenCode 2 hidden historian retires a child after a provider error and deletes it", async () => {
     const bundleDir = mkdtempSync(join(tmpdir(), "mc-hidden-child-ga-"));
     const build = await Bun.build({
         entrypoints: [join(import.meta.dir, "hidden-child-ga-probe.ts")],
@@ -215,16 +215,18 @@ test("OpenCode 2 hidden historian keeps one cheap-model child across provider er
         expect(failed.error).toContain("outcome=failed");
         expect(failed.error).toContain("session_error=unavailable");
 
+        const storePath = gaDatabasePath(host.env.XDG_DATA_HOME!, "latest", host.env);
+        await eventually(() => !storedSession(storePath, first.childID).exists);
+
         host.mock.setDefault({
             text: "fresh child completion",
             usage: { input_tokens: 202, output_tokens: 22 },
         });
         const third = await command(4);
         expect(third.ok).toBe(true);
-        // A provider that answered with an error left the child idle and its context is rebuilt
-        // from scratch on every hidden prompt, so the next run takes the same session instead of
-        // adding another hidden session to the user's list.
-        expect(third.childID).toBe(first.childID);
+        // A provider failure quarantines the child before its marker is released. The next run
+        // therefore gets a clean hidden session instead of allowing a late drain to touch it.
+        expect(third.childID).not.toBe(first.childID);
         expect(third.completion?.usage).toMatchObject({ input: 202, output: 22 });
         const rootsAfterProviderError = await client.session.list({
             directory: host.cwd,
@@ -234,13 +236,12 @@ test("OpenCode 2 hidden historian keeps one cheap-model child across provider er
             rootsAfterProviderError.data
                 .filter((session) => session.metadata?.magic_context === "hidden-run")
                 .map((session) => session.id),
-        ).toEqual([first.childID]);
+        ).toEqual([third.childID]);
 
         // A run arriving as if a newer host build had booted retires the previous generation's
         // child, which must take the child's session with it rather than leaving it behind.
-        const storePath = gaDatabasePath(host.env.XDG_DATA_HOME!, "latest", host.env);
-        expect(storedSession(storePath, first.childID).exists).toBe(true);
-        expect(storedSession(storePath, first.childID).messages).toBeGreaterThan(0);
+        expect(storedSession(storePath, third.childID).exists).toBe(true);
+        expect(storedSession(storePath, third.childID).messages).toBeGreaterThan(0);
         // An unrelated service registered on another channel must never be probed: its store is a
         // different database, so its 404 would mean "never had it" rather than "already gone"
         // (issue 492 finding 5). This decoy records every request it receives.
@@ -267,12 +268,12 @@ test("OpenCode 2 hidden historian keeps one cheap-model child across provider er
 
         const regenerated = await command(5, { generation: "ga-proof-generation-2" });
         expect(regenerated.ok).toBe(true);
-        expect(regenerated.childID).not.toBe(first.childID);
-        await eventually(() => !storedSession(storePath, first.childID).exists);
+        expect(regenerated.childID).not.toBe(third.childID);
+        await eventually(() => !storedSession(storePath, third.childID).exists);
         decoy.stop(true);
         expect(decoyRequests).toEqual([]);
         // session_message cascades off the session row, so nothing is left orphaned behind it.
-        expect(storedSession(storePath, first.childID).messages).toBe(0);
+        expect(storedSession(storePath, third.childID).messages).toBe(0);
         const rootsAfterRetirement = await client.session.list({
             directory: host.cwd,
             parentID: null,
