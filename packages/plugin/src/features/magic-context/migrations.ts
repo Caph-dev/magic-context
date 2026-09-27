@@ -186,7 +186,13 @@ function authorityPrivilegeCheck(): string {
     return "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
 }
 
-function managedAuthorityNoteRow(row: "OLD" | "NEW"): string {
+/**
+ * SQL predicate that is true when a `notes` row belongs to a project whose notes the
+ * Rust module owns. `row` names the row being tested: `OLD`/`NEW` inside the
+ * authority triggers, or the table name when an ordinary statement must skip the
+ * rows those triggers would refuse.
+ */
+export function managedAuthorityNoteRow(row: "OLD" | "NEW" | "notes"): string {
     return `(
         EXISTS (SELECT 1 FROM authority_managed WHERE project_path = ${row}.project_path)
         OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = ${row}.project_path)

@@ -1,5 +1,6 @@
 import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
+import { managedAuthorityNoteRow } from "./migrations";
 
 export type NoteType = "session" | "smart";
 export type NoteStatus = "active" | "pending" | "ready" | "dismissed";
@@ -228,10 +229,31 @@ function noteCheckColumnsExist(db: Database): boolean {
     }
 }
 
+const PENDING_SESSION_NOTE_HEAL =
+    "UPDATE notes SET status = 'active', surface_condition = NULL WHERE type = 'session' AND status = 'pending' AND surface_condition IS NOT NULL";
+
+/**
+ * Return session notes that an older update parked as pending with a condition
+ * to active. Runs on every note read.
+ *
+ * Rows of a project whose notes the Rust module owns are skipped. In that
+ * table they are a read model the module mirrors from its own store; the module
+ * heals the same rows when its store opens and mirrors the result back, and the
+ * notes authority triggers abort any unprivileged write to them. Touching one
+ * here made every note read fail while the mirror still held an unhealed row,
+ * including the note-nudge check a Rust-mode transform pass runs.
+ */
 function healPendingSessionNotes(db: Database): void {
-    db.prepare(
-        "UPDATE notes SET status = 'active', surface_condition = NULL WHERE type = 'session' AND status = 'pending' AND surface_condition IS NOT NULL",
-    ).run();
+    try {
+        db.prepare(
+            `${PENDING_SESSION_NOTE_HEAL} AND NOT ${managedAuthorityNoteRow("notes")}`,
+        ).run();
+    } catch (error) {
+        // A database without the authority tables has no module-owned rows and
+        // no authority triggers, so every row is ours to heal.
+        if (!(error instanceof Error) || !error.message.includes("no such table")) throw error;
+        db.prepare(PENDING_SESSION_NOTE_HEAL).run();
+    }
 }
 
 export const SESSION_NOTE_CONDITION_ERROR =
