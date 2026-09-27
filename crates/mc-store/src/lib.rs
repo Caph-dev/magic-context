@@ -3062,6 +3062,53 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE mc_historian_pending_run ADD COLUMN reported_at_ms INTEGER;
     ",
     },
+    Migration {
+        version: 61,
+        // Progress of the one-time move of a project's rows from this store into the host's
+        // context.db (`single_store.migrate`).
+        //
+        // The completion fact is the marker row in context.db, written in the same commit as
+        // the last copied rows; this row is only a resume hint and an audit trail. `phase`
+        // walks copying -> marked -> neutralized, or stops at refused, which a later run
+        // re-attempts only when the operator asks for a retry. `cursor_json` records what the
+        // last committed chunk covered, and the refusal columns keep the stable code a
+        // refused run reported so a re-run without a retry can repeat it without copying.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_single_store_migrations (
+            project              TEXT PRIMARY KEY,
+            context_store_uuid   TEXT NOT NULL,
+            phase                TEXT NOT NULL
+                CHECK (phase IN ('copying', 'refused', 'marked', 'neutralized')),
+            copy_generation      INTEGER NOT NULL DEFAULT 0,
+            cursor_json          TEXT NOT NULL DEFAULT '{}',
+            started_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL,
+            marker_committed_at  INTEGER,
+            refusal_code         TEXT,
+            refusal_detail       TEXT
+        );
+    ",
+    },
+    Migration {
+        // 61 and 62 ship in one build, so any store reaches them in numeric order.
+        version: 62,
+        // A fold publish for a project whose rows live in context.db, recorded before its
+        // context.db chunks run.
+        //
+        // Those chunks are separate transactions on another file, so a failure or a crash
+        // between them would otherwise lose the fold: the store keeps no domain rows for such
+        // a project, and nothing else remembers what the fold was going to write. The row is
+        // written in the same store commit as the fold's cache state and deleted once every
+        // chunk has committed; while it exists, the next pass for the session re-issues it
+        // before starting any new fold.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_single_store_pending_publish (
+            session_id    TEXT PRIMARY KEY,
+            publish_json  TEXT NOT NULL,
+            created_at    INTEGER NOT NULL
+        );
+    ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -3098,6 +3145,9 @@ pub const SINGLE_STORE_CAPABLE: bool = false;
 /// The migration that introduced the single-store marker columns. Named so the step-through test
 /// reads as one fact rather than two bare numbers.
 pub const SINGLE_STORE_MARKER_MIGRATION_VERSION: u32 = 58;
+
+/// The migration that adds the move's progress table; the pending-publish table follows it.
+pub const SINGLE_STORE_MIGRATIONS_VERSION: u32 = 61;
 
 /// The stable token a refusal carries when the store is in single-store mode and this binary is
 /// not. Health surfaces and logs are matched against this exact string, so it names the one
@@ -3136,6 +3186,97 @@ impl SingleStoreMarker {
             self.build_label()
         )
     }
+}
+
+/// A project's progress through the one-time move into context.db (`mc_single_store_migrations`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SingleStoreMigrationRow {
+    pub project: String,
+    pub context_store_uuid: String,
+    /// `copying`, `refused`, `marked` or `neutralized`.
+    pub phase: String,
+    /// How many runs have started a copy for this project, so two runs' log lines can be
+    /// told apart.
+    pub copy_generation: i64,
+    /// What the last committed chunk covered, as JSON.
+    pub cursor_json: String,
+    pub started_at: i64,
+    pub updated_at: i64,
+    pub marker_committed_at: Option<i64>,
+    pub refusal_code: Option<String>,
+    pub refusal_detail: Option<String>,
+}
+
+const SINGLE_STORE_MIGRATION_SELECT: &str =
+    "SELECT project, context_store_uuid, phase, copy_generation, cursor_json,
+        started_at, updated_at, marker_committed_at, refusal_code, refusal_detail
+   FROM mc_single_store_migrations";
+
+fn single_store_migration_from_sql(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SingleStoreMigrationRow> {
+    Ok(SingleStoreMigrationRow {
+        project: row.get(0)?,
+        context_store_uuid: row.get(1)?,
+        phase: row.get(2)?,
+        copy_generation: row.get(3)?,
+        cursor_json: row.get(4)?,
+        started_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        marker_committed_at: row.get(7)?,
+        refusal_code: row.get(8)?,
+        refusal_detail: row.get(9)?,
+    })
+}
+
+/// One source row, as column name to stored value.
+pub type SingleStoreSourceRow = BTreeMap<String, SqlValue>;
+
+/// Everything the store holds for one project that the move into context.db copies.
+///
+/// Session-keyed maps only carry sessions that have at least one row in that table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SingleStoreSource {
+    pub memories: Vec<SingleStoreSourceRow>,
+    pub notes: Vec<SingleStoreSourceRow>,
+    pub primer_candidates: Vec<SingleStoreSourceRow>,
+    pub compartments: BTreeMap<String, Vec<SingleStoreSourceRow>>,
+    pub compartment_events: BTreeMap<String, Vec<SingleStoreSourceRow>>,
+    pub user_memory_candidates: BTreeMap<String, Vec<SingleStoreSourceRow>>,
+}
+
+fn read_source_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    key: &str,
+) -> rusqlite::Result<Vec<SingleStoreSourceRow>> {
+    let mut statement = conn.prepare(sql)?;
+    let names: Vec<String> = statement
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let rows = statement
+        .query_map(params![key], |row| {
+            let mut values = SingleStoreSourceRow::new();
+            for (index, name) in names.iter().enumerate() {
+                values.insert(name.clone(), row.get::<_, SqlValue>(index)?);
+            }
+            Ok(values)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// What a project write gate hands back: held for the duration of one write.
+pub type ProjectWriteGuard = Box<dyn std::any::Any + Send>;
+
+/// A per-project gate around the store's fold publishes and facade writes.
+///
+/// The module implements it to pause one project's writes while it copies that project's
+/// rows into context.db. `enter` may block; it returns once the write may proceed.
+pub trait ProjectWriteGate: Send + Sync {
+    fn enter(&self, project: &str) -> ProjectWriteGuard;
 }
 
 /// Read the single-store marker from the privilege singleton row.
@@ -7482,6 +7623,10 @@ pub struct McStore {
     /// separate lock serializes scopes so one request cannot lend its authority to another.
     facade_authority_scope: Arc<Mutex<Option<FacadeAuthorityScope>>>,
     facade_mutation_lock: Mutex<()>,
+    /// Held around every write this store makes for one project on behalf of a fold or a
+    /// facade call, so the module can hold a project still while it copies that project's
+    /// rows into context.db. Unset means no gate.
+    project_write_gate: Mutex<Option<Arc<dyn ProjectWriteGate>>>,
     #[cfg(any(test, feature = "test-support"))]
     abandon_historian_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
@@ -7827,6 +7972,7 @@ impl McStore {
             note_caller_project,
             facade_authority_scope,
             facade_mutation_lock: Mutex::new(()),
+            project_write_gate: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
@@ -7885,6 +8031,276 @@ impl McStore {
                     params![set_at_ms, set_by],
                 )?;
                 Ok(())
+            })
+            .map_err(Into::into)
+    }
+
+    /// Install the gate every per-project fold publish and facade write passes through.
+    ///
+    /// The module installs one gate at startup; replacing it is allowed so tests can install
+    /// their own. Writes already inside the previous gate keep the guard they took.
+    pub fn set_project_write_gate(&self, gate: Arc<dyn ProjectWriteGate>) {
+        *self
+            .project_write_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+    }
+
+    /// Enter the project write gate for `project`, if one is installed. The returned guard
+    /// is held for the whole write; dropping it lets a waiting copy proceed.
+    fn enter_project_write_gate(&self, project: &str) -> Option<ProjectWriteGuard> {
+        let gate = self
+            .project_write_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        Some(gate.enter(project))
+    }
+
+    /// The project a facade route root is bound to, or the root itself when it has no
+    /// binding (a legacy route whose rows were written under the root spelling).
+    fn project_for_route_root(&self, route_project_root: &str) -> String {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project FROM mc_authority_route_bindings WHERE route_project_root = ?1",
+                    params![route_project_root],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| route_project_root.to_string())
+    }
+
+    /// This store's progress row for moving `project` into context.db, if a move was ever
+    /// started.
+    pub fn single_store_migration(
+        &self,
+        project: &str,
+    ) -> Result<Option<SingleStoreMigrationRow>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    &format!("{SINGLE_STORE_MIGRATION_SELECT} WHERE project = ?1"),
+                    params![project],
+                    single_store_migration_from_sql,
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Every progress row, ordered by project.
+    pub fn single_store_migrations(&self) -> Result<Vec<SingleStoreMigrationRow>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                let mut statement =
+                    conn.prepare(&format!("{SINGLE_STORE_MIGRATION_SELECT} ORDER BY project"))?;
+                let rows = statement
+                    .query_map([], single_store_migration_from_sql)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .map_err(Into::into)
+    }
+
+    /// Write `row` as the project's progress row, replacing any earlier one.
+    pub fn record_single_store_migration(
+        &self,
+        row: &SingleStoreMigrationRow,
+    ) -> Result<(), McStoreError> {
+        self.inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_single_store_migrations(
+                         project, context_store_uuid, phase, copy_generation, cursor_json,
+                         started_at, updated_at, marker_committed_at, refusal_code, refusal_detail
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(project) DO UPDATE SET
+                         context_store_uuid = excluded.context_store_uuid,
+                         phase = excluded.phase,
+                         copy_generation = excluded.copy_generation,
+                         cursor_json = excluded.cursor_json,
+                         started_at = excluded.started_at,
+                         updated_at = excluded.updated_at,
+                         marker_committed_at = excluded.marker_committed_at,
+                         refusal_code = excluded.refusal_code,
+                         refusal_detail = excluded.refusal_detail",
+                    params![
+                        row.project,
+                        row.context_store_uuid,
+                        row.phase,
+                        row.copy_generation,
+                        row.cursor_json,
+                        row.started_at,
+                        row.updated_at,
+                        row.marker_committed_at,
+                        row.refusal_code,
+                        row.refusal_detail,
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(Into::into)
+    }
+
+    /// The sessions this store has seen transform under a route root bound to `project`.
+    ///
+    /// This is the store's half of a project's session set; the other half is the host's
+    /// `session_projects` rows, which only context.db has. Project identity is compared byte
+    /// for byte.
+    pub fn single_store_bound_sessions(
+        &self,
+        project: &str,
+    ) -> Result<BTreeSet<String>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT DISTINCT roots.session_id
+                       FROM mc_transform_session_roots AS roots
+                       JOIN mc_authority_route_bindings AS binding
+                         ON binding.route_project_root = roots.project_root
+                      WHERE binding.project = ?1",
+                )?;
+                let rows = statement
+                    .query_map(params![project], |row| row.get::<_, String>(0))?
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                Ok(rows)
+            })
+            .map_err(Into::into)
+    }
+
+    /// Read every row this store holds for `project` that the move copies, in one read
+    /// transaction so the copy starts from a single consistent snapshot.
+    ///
+    /// Project-keyed tables (memories, notes, primer candidates) are read by `project_path`.
+    /// Session-keyed tables carry no project, so they are read for `sessions`, the project's
+    /// session set the caller has already built. Rows come back as column name to value, in
+    /// a stable order: by id, or by sequence for compartments.
+    pub fn single_store_source(
+        &self,
+        project: &str,
+        sessions: &BTreeSet<String>,
+    ) -> Result<SingleStoreSource, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                let memories = read_source_rows(
+                    &tx,
+                    "SELECT * FROM mc_memories WHERE project_path = ?1 ORDER BY id",
+                    project,
+                )?;
+                let notes = read_source_rows(
+                    &tx,
+                    "SELECT * FROM mc_notes WHERE project_path = ?1 ORDER BY id",
+                    project,
+                )?;
+                let primer_candidates = read_source_rows(
+                    &tx,
+                    "SELECT * FROM mc_primer_candidates WHERE project_path = ?1 ORDER BY id",
+                    project,
+                )?;
+                let mut compartments = BTreeMap::new();
+                let mut compartment_events = BTreeMap::new();
+                let mut user_memory_candidates = BTreeMap::new();
+                for session in sessions {
+                    let rows = read_source_rows(
+                        &tx,
+                        "SELECT * FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence",
+                        session,
+                    )?;
+                    if !rows.is_empty() {
+                        compartments.insert(session.clone(), rows);
+                    }
+                    let rows = read_source_rows(
+                        &tx,
+                        "SELECT * FROM mc_compartment_events WHERE session_id = ?1 ORDER BY id",
+                        session,
+                    )?;
+                    if !rows.is_empty() {
+                        compartment_events.insert(session.clone(), rows);
+                    }
+                    let rows = read_source_rows(
+                        &tx,
+                        "SELECT * FROM mc_user_memory_candidates WHERE session_id = ?1 ORDER BY id",
+                        session,
+                    )?;
+                    if !rows.is_empty() {
+                        user_memory_candidates.insert(session.clone(), rows);
+                    }
+                }
+                tx.finish()?;
+                Ok(SingleStoreSource {
+                    memories,
+                    notes,
+                    primer_candidates,
+                    compartments,
+                    compartment_events,
+                    user_memory_candidates,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Hand `project`'s memories and notes back to TypeScript authority after their rows
+    /// were moved into context.db, in one store transaction.
+    ///
+    /// Both domains move together: each `mc_authority` row for the project that is not
+    /// already `TS` becomes `TS` with its generation bumped and its coordinator lease and
+    /// token cleared. The drain's own finish cannot be reused, because it requires a
+    /// completed drain. The same commit records the progress row as `neutralized` and sets
+    /// the store-wide single-store marker, so a build that cannot serve moved projects
+    /// refuses this store rather than serving the rows left behind here.
+    ///
+    /// Repeating it is harmless: rows already `TS` are left alone and the marker keeps its
+    /// first stamp.
+    pub fn neutralize_single_store_project(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        set_by: &str,
+        now_ms: i64,
+    ) -> Result<usize, McStoreError> {
+        self.inner
+            .with_conn_fenced(|tx| {
+                let flipped = tx.execute(
+                    "UPDATE mc_authority
+                        SET state = 'TS', generation = generation + 1,
+                            coordinator_lease = NULL, lease_expires_at = NULL,
+                            coordinator_token = NULL
+                      WHERE context_store_uuid = ?1 AND project = ?2
+                        AND domain IN ('memories', 'notes') AND state != 'TS'",
+                    params![context_store_uuid, project],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_single_store_migrations(
+                         project, context_store_uuid, phase, started_at, updated_at,
+                         marker_committed_at
+                     ) VALUES (?1, ?2, 'neutralized', ?3, ?3, ?3)
+                     ON CONFLICT(project) DO UPDATE SET
+                         phase = 'neutralized',
+                         updated_at = excluded.updated_at,
+                         marker_committed_at = COALESCE(
+                             mc_single_store_migrations.marker_committed_at,
+                             excluded.marker_committed_at),
+                         refusal_code = NULL,
+                         refusal_detail = NULL",
+                    params![project, context_store_uuid, now_ms],
+                )?;
+                tx.execute(
+                    "UPDATE mc_privilege_state
+                        SET single_store = 1,
+                            single_store_set_at_ms = COALESCE(single_store_set_at_ms, ?1),
+                            single_store_set_by = CASE
+                                WHEN single_store = 1 AND single_store_set_by != ''
+                                    THEN single_store_set_by
+                                ELSE ?2 END
+                      WHERE id = 1",
+                    params![now_ms, set_by],
+                )?;
+                Ok(flipped)
             })
             .map_err(Into::into)
     }
@@ -7959,6 +8375,9 @@ impl McStore {
         command_id: Option<&str>,
         mutation: impl FnOnce(&FacadeMutationTxn<'_>) -> Result<Vec<u8>, String>,
     ) -> Result<FacadeMutationOutcome, McStoreError> {
+        // Taken before the process-wide facade lock, so a project held still by a copy does
+        // not also stall every other project's facade writes.
+        let _project_gate = self.enter_project_write_gate(caller_project);
         let _mutation_guard = self
             .facade_mutation_lock
             .lock()
@@ -8065,6 +8484,8 @@ impl McStore {
         domain: &str,
         mutation: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
+        let _project_gate =
+            self.enter_project_write_gate(&self.project_for_route_root(route_project_root));
         let _mutation_guard = self
             .facade_mutation_lock
             .lock()
@@ -13764,6 +14185,7 @@ impl McStore {
         &self,
         request: HistorianPublishRequest<'_>,
     ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        let _project_gate = self.enter_project_write_gate(request.project_path);
         let session_id = request.session_id;
         let expected_row_version = request.expected_row_version;
         let predicate = request.predicate;
@@ -24491,6 +24913,210 @@ mod tests {
                 .len(),
             "two migrations must never claim the same version"
         );
+    }
+
+    /// Step a populated store across the two single-store move tables (61, 62): both land
+    /// empty, nothing already stored changes, and the move's store half works on the result.
+    #[test]
+    fn the_single_store_move_tables_land_empty_on_a_populated_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let first_new = SINGLE_STORE_MIGRATIONS_VERSION;
+        assert_eq!(
+            (first_new, first_new + 1),
+            (61, 62),
+            "the progress and pending-publish tables are 61 and 62"
+        );
+        assert_eq!(LATEST_MIGRATION_VERSION, 62);
+
+        let before: Vec<Migration> = MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|migration| migration.version < first_new)
+            .collect();
+        let earlier = open_sqlite(&descriptor).unwrap();
+        earlier
+            .with_conn(|conn| {
+                for name in [
+                    "mc_note_caller_project",
+                    "mc_facade_authority_domain",
+                    "mc_facade_authority_route",
+                ] {
+                    conn.create_scalar_function(name, 0, FunctionFlags::SQLITE_UTF8, |_context| {
+                        Ok(String::new())
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let outcome = earlier.migrate(NS, &before).unwrap();
+        assert_eq!(outcome.recorded, first_new - 1);
+        let table_exists = |store: &SqliteStore, name: &str| -> bool {
+            store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                        params![name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap()
+                == 1
+        };
+        assert!(!table_exists(&earlier, "mc_single_store_migrations"));
+        assert!(!table_exists(&earlier, "mc_single_store_pending_publish"));
+
+        earlier
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO mc_memories
+                       (id, project_path, category, content, normalized_hash, importance,
+                        scope, shareable, status, first_seen_at, created_at, updated_at,
+                        last_seen_at)
+                     VALUES (7, 'populated-project', 'ARCHITECTURE', 'kept', 'h7', 3,
+                             'project', 1, 'active', 0, 0, 0, 0);
+                     INSERT INTO mc_compartments(session_id, sequence, start_message, end_message,
+                                                 title, content)
+                     VALUES ('ses-populated', 1, 1, 4, 'kept title', 'kept body');
+                     INSERT INTO mc_authority(context_store_uuid, project, domain, state, generation)
+                     VALUES ('uuid-a', 'populated-project', 'memories', 'MODULE', 5),
+                            ('uuid-a', 'populated-project', 'notes', 'MODULE', 3),
+                            ('uuid-a', 'other-project', 'memories', 'MODULE', 9);",
+                )
+            })
+            .unwrap();
+        drop(earlier);
+
+        let migrated = McStore::open_with_capability_for_test(&descriptor, true).unwrap();
+        assert_eq!(
+            migrated.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION
+        );
+        assert!(table_exists(&migrated.inner, "mc_single_store_migrations"));
+        assert!(table_exists(
+            &migrated.inner,
+            "mc_single_store_pending_publish"
+        ));
+        let counts = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT (SELECT COUNT(*) FROM mc_single_store_migrations),
+                            (SELECT COUNT(*) FROM mc_single_store_pending_publish),
+                            (SELECT content FROM mc_memories WHERE id = 7),
+                            (SELECT content FROM mc_compartments WHERE session_id = 'ses-populated')",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(counts, (0, 0, "kept".to_string(), "kept body".to_string()));
+        assert_eq!(
+            migrated
+                .single_store_migration("populated-project")
+                .unwrap(),
+            None
+        );
+
+        // The progress row round-trips.
+        let row = SingleStoreMigrationRow {
+            project: "populated-project".to_string(),
+            context_store_uuid: "uuid-a".to_string(),
+            phase: "refused".to_string(),
+            copy_generation: 2,
+            cursor_json: "{\"table\":\"memories\"}".to_string(),
+            started_at: 10,
+            updated_at: 11,
+            marker_committed_at: None,
+            refusal_code: Some("single_store_verify_mismatch".to_string()),
+            refusal_detail: Some("memories 7 content".to_string()),
+        };
+        migrated.record_single_store_migration(&row).unwrap();
+        assert_eq!(
+            migrated
+                .single_store_migration("populated-project")
+                .unwrap(),
+            Some(row.clone())
+        );
+
+        // Neutralising hands the project's memories and notes to TypeScript authority, leaves
+        // the other project unchanged, and stamps the store-wide marker once.
+        assert_eq!(
+            migrated
+                .neutralize_single_store_project("uuid-a", "populated-project", "build-1", 50)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            migrated
+                .neutralize_single_store_project("uuid-a", "populated-project", "build-2", 60)
+                .unwrap(),
+            0,
+            "a repeat flips nothing"
+        );
+        let states = migrated
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT project, domain, state, generation FROM mc_authority
+                      ORDER BY project, domain",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "other-project".into(),
+                    "memories".into(),
+                    "MODULE".into(),
+                    9
+                ),
+                (
+                    "populated-project".into(),
+                    "memories".into(),
+                    "TS".into(),
+                    6
+                ),
+                ("populated-project".into(), "notes".into(), "TS".into(), 4),
+            ]
+        );
+        let neutralized = migrated
+            .single_store_migration("populated-project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(neutralized.phase, "neutralized");
+        assert_eq!(neutralized.refusal_code, None);
+        assert_eq!(
+            migrated.single_store_marker().unwrap(),
+            Some(SingleStoreMarker {
+                set_at_ms: Some(50),
+                set_by: "build-1".to_string()
+            })
+        );
+        drop(migrated);
+        assert!(matches!(
+            McStore::open_with_capability_for_test(&descriptor, false),
+            Err(McStoreError::SingleStoreMarkerUnsupported { .. })
+        ));
     }
 
     fn privilege_state_columns(store: &SqliteStore) -> Vec<String> {
