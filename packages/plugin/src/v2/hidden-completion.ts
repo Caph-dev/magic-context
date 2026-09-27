@@ -1070,15 +1070,11 @@ export async function createV2HiddenCompletionExecutor(
                     !run.retired
                 ) {
                     await interruptAndRetire(run, "prompt-timeout");
-                } else if (
-                    error instanceof HiddenProviderError &&
-                    error.settled &&
-                    !run.retired
-                ) {
-                    // OpenCode can perform a late drain after a provider failure. Once the marker
-                    // is released, that drain has no registered hidden request and fails closed in
-                    // HiddenChildHook.apply, which can wedge the host's event/WebSocket path. Stop
-                    // and retire the poisoned child before releasing the marker in finally.
+                } else if (error instanceof HiddenProviderError && error.settled && !run.retired) {
+                    // Stop the child before the marker is released in finally: once the marker is
+                    // gone, any further host step on this child (a scheduled retry, for example)
+                    // has no registered request and HiddenChildHook.apply refuses it into the
+                    // host's drain loop. Retiring it means the next run starts on a clean child.
                     await interruptAndRetire(run, "hidden-run-provider-error");
                 }
                 throw error;

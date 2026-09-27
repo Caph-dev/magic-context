@@ -590,7 +590,8 @@ describe("OpenCode 2 hidden child completion", () => {
             );
             await close(state.executor, handle, false);
 
-            // A failed hidden child must not remain available for OpenCode's late drain.
+            // After a provider failure the child is stopped and retired, so a pending host step
+            // (such as a scheduled retry) cannot run on it after the run's marker is released.
             expect(state.interrupts).toEqual(["child-1"]);
             expect(state.meta().retired_children).toMatchObject([
                 { id: "child-1", reason: "hidden-run-provider-error" },
@@ -620,6 +621,35 @@ describe("OpenCode 2 hidden child completion", () => {
             expect(handle.id).toBe("child-2");
             expect(state.creates[1]?.model).toEqual({ providerID: "mock", id: "fallback" });
             await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("interrupts and retires a failed child while its attempt marker is still registered", async () => {
+        const state = await setup();
+        try {
+            const events: string[] = [];
+            const release = state.hook.releaseAttempt.bind(state.hook);
+            state.hook.releaseAttempt = (marker: string) => {
+                const retired = state.meta().retired_children.map((child) => child.id);
+                events.push(`release retired=${retired.join(",")}`);
+                release(marker);
+            };
+            const interrupt = state.host.interrupt.bind(state.host);
+            state.host.interrupt = async (input) => {
+                events.push(`interrupt ${input.sessionID}`);
+                return interrupt(input);
+            };
+            state.setProviderError({ message: "Go usage limit exceeded" });
+            const handle = await state.executor.open(run);
+            await expect(state.executor.attempt(handle, request())).rejects.toThrow(
+                "Hidden completion provider error: ",
+            );
+            // Until the marker is released the hook still recognises this run's prompt, so
+            // stopping the child first leaves no window in which a host step on it is refused.
+            expect(events).toEqual(["interrupt child-1", "release retired=child-1"]);
+            await close(state.executor, handle, false);
         } finally {
             state.db.close();
         }
@@ -1138,6 +1168,40 @@ describe("OpenCode 2 hidden child completion", () => {
                 { id: "child-1", reason: "hidden-run-failed" },
             ]);
             expect(state.meta().retired_children[0]?.ever_settled).toBeUndefined();
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("keep_subagents keeps a child retired for a provider error once it holds a settled run", async () => {
+        const state = await setup("host-generation-1", { remove: true, keepSubagents: true });
+        try {
+            // A dreamer child is kept only for a settled run, so this isolates that rule from
+            // the historian role, which the setting keeps regardless.
+            const settled = await state.executor.open(dreamerRun);
+            await state.executor.attempt(settled, request());
+            await close(state.executor, settled, true);
+            state.setProviderError({ message: "Go usage limit exceeded" });
+            const reused = await state.executor.open(dreamerRun);
+            expect(reused.id).toBe("child-1");
+            await expect(state.executor.attempt(reused, request())).rejects.toThrow(
+                "Hidden completion provider error: ",
+            );
+            await close(state.executor, reused, false);
+
+            const fresh = await state.executor.open(dreamerRun);
+            expect(fresh.id).toBe("child-2");
+            await expect(state.executor.attempt(fresh, request())).rejects.toThrow(
+                "Hidden completion provider error: ",
+            );
+            await close(state.executor, fresh, false);
+
+            await eventually(() => state.removed.includes("child-2"));
+            await settleRemovals();
+            expect(state.removed).toEqual(["child-2"]);
+            expect(state.meta().retired_children).toMatchObject([
+                { id: "child-1", reason: "hidden-run-provider-error", ever_settled: true },
+            ]);
         } finally {
             state.db.close();
         }

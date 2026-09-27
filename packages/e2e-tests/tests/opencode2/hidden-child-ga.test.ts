@@ -224,8 +224,9 @@ test("OpenCode 2 hidden historian retires a child after a provider error and del
         });
         const third = await command(4);
         expect(third.ok).toBe(true);
-        // A provider failure quarantines the child before its marker is released. The next run
-        // therefore gets a clean hidden session instead of allowing a late drain to touch it.
+        // A provider failure stops and retires the child before the run's prompt marker is
+        // released, so no later host step on that child can run unregistered; the next run
+        // therefore gets a clean hidden session.
         expect(third.childID).not.toBe(first.childID);
         expect(third.completion?.usage).toMatchObject({ input: 202, output: 22 });
         const rootsAfterProviderError = await client.session.list({

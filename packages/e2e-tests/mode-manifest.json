@@ -954,6 +954,22 @@
             ]
         },
         {
+            "path": "tests/opencode2/hidden-child-terminal-failure.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "Real GA hidden historian: a retryable provider error on a reused child is retried by the host without the hidden-child hook refusing the retry, a terminal provider error retires the child so the next run gets a clean one, and a concurrent user session keeps taking turns throughout; runs in the dedicated v2 lane",
+            "contract_refs": [
+                "R44",
+                "R44b"
+            ],
+            "hosts": [
+                "opencode2"
+            ]
+        },
+        {
             "path": "tests/opencode2/hidden-child-unbound.test.ts",
             "tier": "excluded",
             "invocation": {

@@ -243,21 +243,31 @@ export class HiddenChildHook {
         if (!selected.shaped) {
             draft.messages = [{ role: "user", content: calibratedParts(selected) }];
         } else {
-            const first = draft.messages[0];
-            const firstText = first && newestUserText({ ...draft, messages: [first] });
-            const normalized =
-                firstText === undefined ? undefined : stripWellFormedLeadingTagPrefix(firstText);
-            if (normalized !== selected.marker) {
+            // A reused historian child still holds the rows of its earlier runs, so on a
+            // later step of this run (for example the host retrying a provider error)
+            // this run's marker is not the first message. This run starts at its own
+            // marker: everything before it belongs to earlier runs and is dropped.
+            let start = -1;
+            draft.messages.forEach((message, index) => {
+                const text = newestUserText({ ...draft, messages: [message] });
+                if (text !== undefined && stripWellFormedLeadingTagPrefix(text) === selected.marker)
+                    start = index;
+            });
+            const first = draft.messages[start];
+            if (!first) {
                 throw new HiddenCompletionRefusal(
                     "hidden_prompt_unrecognized",
-                    "Hidden child history does not begin with this run's registered marker",
+                    "Hidden child history does not contain this run's registered marker",
                     true,
                 );
             }
             // The host saves the placeholder user prompt rather than the calibrated
             // text sent on step one. Replace only that placeholder, preserving all
-            // assistant tool calls and tool results.
-            draft.messages[0] = { ...first, content: calibratedParts(selected) };
+            // assistant tool calls and tool results after it.
+            draft.messages = [
+                { ...first, content: calibratedParts(selected) },
+                ...draft.messages.slice(start + 1),
+            ];
         }
         // Replaced wholesale, never merged: the carrier sends exactly the
         // authored options and never inherits the host's own generation defaults.

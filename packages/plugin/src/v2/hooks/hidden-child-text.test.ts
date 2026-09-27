@@ -195,3 +195,47 @@ it("refuses a tool loop that exceeds its task's step budget", () => {
     };
     expect(() => hook.apply(over)).toThrow("exceeded its 40-step limit");
 });
+
+it("accepts the host's retry of a run on a reused child and sends only that run's rows", () => {
+    // A historian child is reused across runs, so its history starts with an earlier run's
+    // marker. When the host retries a provider error it runs the context hook again with that
+    // whole history; the retry belongs to the current run and must not be refused.
+    const hook = new HiddenChildHook();
+    const identity = {
+        parentSessionId: "ses-parent",
+        directory: "/tmp",
+        agent: "historian",
+        kind: "historian" as const,
+        system: "sys",
+        timeoutMs: 1000,
+    };
+    hook.registerAttempt("mc:hidden:second", {
+        childSessionId: "ses-child",
+        identity,
+        request: { body: { parts: [{ type: "text", text: "calibrated second" }] } },
+        shaped: false,
+    });
+    const earlierRun = [
+        { role: "user", content: [{ type: "text", text: "mc:hidden:first" }] },
+        { role: "assistant", content: [{ type: "text", text: "first summary" }] },
+    ] as SessionContext["messages"];
+    const marker = {
+        role: "user",
+        content: [{ type: "text", text: "mc:hidden:second" }],
+    } as SessionContext["messages"][number];
+    const step = () => ({
+        ...draft(marker),
+        sessionID: "ses-child",
+        messages: [...earlierRun, marker],
+    });
+    const first = step();
+    expect(hook.apply(first)).toBe(true);
+    const retry = step();
+    expect(hook.apply(retry)).toBe(true);
+    expect(retry.messages).toEqual([
+        { role: "user", content: [{ type: "text", text: "calibrated second" }] },
+    ]);
+    // A history that never carried this run's marker is still refused.
+    const foreign = { ...step(), messages: [...earlierRun] };
+    expect(() => hook.apply(foreign)).toThrow("hidden_prompt_unrecognized");
+});
