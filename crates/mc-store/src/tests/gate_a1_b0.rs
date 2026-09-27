@@ -238,9 +238,11 @@ fn gate_a_store_that_applied_58_first_never_gets_57() {
 }
 
 /// A store carrying the current chain, met by a binary whose chain stops at 56:
-/// the migrator reports the store as ahead (which is what emits the store-ahead
-/// line on the open path) and the rows the older binary does know how to read
-/// are still readable.
+/// the migrator reports the store as ahead without touching it, and the rows are
+/// intact at that level. This exercises the migrator alone. `McStore::open` reads
+/// the same report and refuses the store with `StoreAheadOfBinary`, so a real
+/// binary of this shape never serves it; see
+/// `a_store_one_version_ahead_is_refused_by_name_without_reading_or_writing_it`.
 #[test]
 fn gate_a_store_at_the_current_ceiling_is_served_by_a_binary_whose_chain_stops_at_56() {
     let dir = tempfile::tempdir().unwrap();

@@ -2572,10 +2572,12 @@ const MIGRATIONS: &[Migration] = &[
         // changed only inside the writer transaction: SQLite permits one writer at a time, and
         // uncommitted scope values are invisible to every other connection.
         //
-        // McStore::open intentionally logs and accepts a store-ahead outcome for rollback
-        // binaries. This migration removes no table or column needed by rollback binaries and
-        // keeps legacy UDF registration in McStore::open; an older binary does not replay
-        // v24/v33 over these rebuilt, same-named triggers.
+        // Binaries older than this migration logged and accepted a store-ahead outcome, so one
+        // could still open a store that carries it. This migration removes no table or column
+        // those binaries need and keeps legacy UDF registration in McStore::open; an older
+        // binary does not replay v24/v33 over these rebuilt, same-named triggers. It cannot fill
+        // mc_privilege_state, though, so its ownership-checked note writes fail. That is why
+        // current binaries refuse a store-ahead open instead of accepting it.
         statements: r#"
         CREATE TABLE IF NOT EXISTS mc_privilege_state (
             id                      INTEGER PRIMARY KEY CHECK (id = 1),
@@ -3104,6 +3106,28 @@ pub const SINGLE_STORE_MARKER_MIGRATION_VERSION: u32 = 58;
 /// situation rather than describing it: an operator who greps for it finds every occurrence, and
 /// a generic "open failed" cannot be mistaken for it.
 pub const SINGLE_STORE_MARKER_REFUSAL_REASON: &str = "single_store_marker";
+
+/// The stable token a refusal carries when `store.db` records a schema version newer than the
+/// newest migration this binary carries: a newer ck-mc has already migrated the store, and this
+/// older one is being run against it.
+///
+/// Health surfaces, the module's error frames and the plugin's user-facing refusal all match on
+/// this exact string, so one grep finds every place the situation is reported.
+pub const STORE_AHEAD_OF_BINARY_REFUSAL_REASON: &str = "store_ahead_of_binary";
+
+/// The sentence that tells an operator how to recover from a store that is ahead of the binary.
+///
+/// Shared by every surface that reports the refusal so they cannot drift into giving different
+/// advice. The supported rollback restores both databases from one backup together with the
+/// older binary; restoring the binary alone leaves `store.db` at the newer schema and is refused
+/// again on the next start.
+pub fn store_ahead_of_binary_remediation(db_version: u32, binary_max: u32) -> String {
+    format!(
+        "store.db schema is v{db_version} but this ck-mc build only knows up to v{binary_max}; \
+         update ck-mc to a build that knows v{db_version}, or roll back by restoring ck-mc \
+         together with context.db and store.db from the same backup"
+    )
+}
 
 /// What the store records when its project rows were moved into the host's database.
 ///
@@ -5912,6 +5936,20 @@ pub enum McStoreError {
     SingleStoreMarkerUnsupported {
         marker: SingleStoreMarker,
     },
+    /// `store.db` records a schema version newer than the newest migration this binary carries.
+    ///
+    /// Terminal on purpose. A newer build has migrated the store, and the invariants its
+    /// migrations added (triggers that read rows this binary never fills, columns it never
+    /// writes) cannot be kept by this binary. Serving anyway half-works: some reads succeed while
+    /// some writes fail later with errors that do not name the cause. The open therefore refuses
+    /// before it reads or writes a row. The fixes are a build that knows `db_version`, or the
+    /// older binary together with `context.db` and `store.db` restored from the same backup.
+    StoreAheadOfBinary {
+        /// The highest migration version recorded in the store.
+        db_version: u32,
+        /// The highest migration version this binary carries.
+        binary_max: u32,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -5955,6 +5993,14 @@ impl std::fmt::Display for McStoreError {
                 f,
                 "{SINGLE_STORE_MARKER_REFUSAL_REASON}: {}",
                 marker.remediation()
+            ),
+            McStoreError::StoreAheadOfBinary {
+                db_version,
+                binary_max,
+            } => write!(
+                f,
+                "{STORE_AHEAD_OF_BINARY_REFUSAL_REASON}: db_version={db_version} binary_max={binary_max}: {}",
+                store_ahead_of_binary_remediation(*db_version, *binary_max)
             ),
             McStoreError::NoteOwnershipMismatch { id, project } => {
                 write!(f, "note {id} is not owned by project {project}")
@@ -7785,6 +7831,24 @@ impl McStore {
             )
         })?;
         let migration = inner.migrate(NS, MIGRATIONS)?;
+        // A store written by a longer chain than this binary carries is refused here, before the
+        // repair below or anything else reads or writes a row. On such a store the migrator has
+        // applied nothing and only read the recorded version, so returning now leaves the file
+        // exactly as the newer build left it.
+        //
+        // This used to log and continue so an older ck-mc stayed placeable on a newer store. That
+        // half-worked: v53 moved note ownership into triggers that read a row an older binary
+        // never fills, so note inserts and deletes failed later with an error that did not name
+        // the version skew. The supported rollback is the older binary together with context.db
+        // and store.db from the same backup, which never presents a newer store to it.
+        if migration.store_ahead() {
+            let error = McStoreError::StoreAheadOfBinary {
+                db_version: migration.recorded,
+                binary_max: migration.chain_max,
+            };
+            tracing::error!("mc-store: refusing to open: {error}");
+            return Err(error);
+        }
         // Older note updates could park session notes with conditions that no evaluator claims.
         // Restore their session visibility without changing project-scoped smart notes.
         inner.with_conn(|conn| {
@@ -7795,17 +7859,6 @@ impl McStore {
             )?;
             Ok(())
         })?;
-        if migration.store_ahead() {
-            // A store written by a longer chain than this binary carries is the
-            // rollback shape (#7804 keeps an older ck-mc placeable on purpose), so
-            // startup continues; the line exists so a rolled-back module that later
-            // fails a query on a column it does not know is attributable to the
-            // version skew rather than to data corruption.
-            tracing::warn!(
-                "mc-store: store schema v{} is ahead of this binary's chain v{} (older binary on a newer store); continuing without migrating",
-                migration.recorded, migration.chain_max
-            );
-        }
         // After migrating, before anything reads or writes rows: a store whose project rows live
         // elsewhere must not be served by a binary that would read the copies left behind here.
         if !single_store_capable {
@@ -8408,6 +8461,25 @@ impl McStore {
                     params![NS],
                     |row| row.get::<_, u32>(0),
                 )
+            })
+            .map_err(Into::into)
+    }
+
+    /// Record `version` as applied in this store's migration chain without running anything.
+    ///
+    /// Test-only. It reproduces what a newer ck-mc leaves behind after migrating the store: a
+    /// recorded version past this binary's newest migration. Closing the handle and opening the
+    /// store again then presents this binary with a store that is ahead of it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stamp_schema_version_for_test(&self, version: u32) -> Result<(), McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, version],
+                )?;
+                Ok(())
             })
             .map_err(Into::into)
     }
@@ -24461,7 +24533,8 @@ mod tests {
         // The store-ahead policy leaves v53's durable triggers intact instead of replaying the
         // old definitions. An older writer still opens and registers its UDFs, but because it
         // cannot populate mc_privilege_state, ownership-sensitive note writes fail closed. This
-        // known rollback limitation is why v53 requires a coordinated module bounce.
+        // known rollback limitation is why v53 requires a coordinated module bounce, and why
+        // McStore::open now refuses a store-ahead open instead of serving it.
         let rollback_error = rollback
             .with_conn(|conn| {
                 conn.execute(
@@ -24740,6 +24813,170 @@ mod tests {
                 set_at_ms: Some(1_758_000_000_000),
                 set_by: SET_BY.to_string(),
             })
+        );
+    }
+
+    /// A store that a newer ck-mc migrated one version past this binary's chain is refused by
+    /// name, with both versions, and the refused open changes nothing on disk.
+    ///
+    /// The store is seeded with a parked session note, which a successful open repairs with an
+    /// UPDATE. That makes the byte comparison meaningful: if the open went on past the version
+    /// check, the repair would change the file. The end of the test is the control: once the
+    /// newer stamp is removed, the same file opens and the repair runs.
+    #[test]
+    fn a_store_one_version_ahead_is_refused_by_name_without_reading_or_writing_it() {
+        // Spelled out for the same reason as the single-store token above: operators, logs and
+        // the plugin's refusal match this exact string.
+        assert_eq!(
+            STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
+            "store_ahead_of_binary"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let db_path = dir.path().join("store.db");
+        let wal_path = dir.path().join("store.db-wal");
+        let ahead = LATEST_MIGRATION_VERSION + 1;
+
+        let current = McStore::open(&descriptor).unwrap();
+        let note = current
+            .insert_note(NoteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: "ses",
+                content: "parked session note",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        current
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE mc_notes SET status = 'pending', surface_condition = 'orphan' WHERE id = ?1",
+                    [note.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        current.stamp_schema_version_for_test(ahead).unwrap();
+        // Closing the last connection checkpoints the WAL into the main file, so the bytes read
+        // below are the whole store.
+        drop(current);
+
+        let read_files = || {
+            (
+                std::fs::read(&db_path).unwrap(),
+                std::fs::read(&wal_path).ok().filter(|wal| !wal.is_empty()),
+            )
+        };
+        let before = read_files();
+
+        let Err(refusal) = McStore::open(&descriptor) else {
+            panic!("a store ahead of this binary must not open");
+        };
+        assert!(
+            matches!(
+                refusal,
+                McStoreError::StoreAheadOfBinary { db_version, binary_max }
+                    if db_version == ahead && binary_max == LATEST_MIGRATION_VERSION
+            ),
+            "expected the store-ahead refusal naming both versions, got {refusal:?}"
+        );
+        let rendered = refusal.to_string();
+        assert!(
+            rendered.starts_with(&format!(
+                "{STORE_AHEAD_OF_BINARY_REFUSAL_REASON}: db_version={ahead} binary_max={LATEST_MIGRATION_VERSION}"
+            )),
+            "the refusal must name itself and both versions: {rendered}"
+        );
+        assert!(
+            rendered.contains("update ck-mc")
+                && rendered.contains("context.db and store.db from the same backup"),
+            "the refusal must say how to recover: {rendered}"
+        );
+
+        assert_eq!(
+            read_files(),
+            before,
+            "a refused open must leave store.db and its WAL byte-identical"
+        );
+        // A second refused open is refused the same way: nothing the first one did made the
+        // store acceptable.
+        assert!(matches!(
+            McStore::open(&descriptor),
+            Err(McStoreError::StoreAheadOfBinary { .. })
+        ));
+
+        // Control: the same file without the newer stamp opens, and the repair the refusal
+        // withheld now runs.
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        let parked: String = raw
+            .query_row(
+                "SELECT status FROM mc_notes WHERE id = ?1",
+                [note.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parked, "pending",
+            "the refused open must not repair the note"
+        );
+        raw.execute(
+            "DELETE FROM cortexkit_schema_version WHERE namespace = ?1 AND version = ?2",
+            params![NS, ahead],
+        )
+        .unwrap();
+        drop(raw);
+        let reopened = McStore::open(&descriptor).unwrap();
+        assert_eq!(
+            reopened
+                .get_note_by_id("git:proj", "ses", note.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+    }
+
+    /// A store at this binary's newest version, and one a version behind it, both still open;
+    /// the older one is migrated forward. Only a store ahead of the binary is refused.
+    #[test]
+    fn equal_and_older_stores_still_open_and_the_older_one_migrates_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let older = open_sqlite(&descriptor).unwrap();
+        older
+            .with_conn(|conn| {
+                for name in [
+                    "mc_note_caller_project",
+                    "mc_facade_authority_domain",
+                    "mc_facade_authority_route",
+                ] {
+                    conn.create_scalar_function(name, 0, FunctionFlags::SQLITE_UTF8, |_context| {
+                        Ok(String::new())
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let behind = older
+            .migrate(NS, &MIGRATIONS[..MIGRATIONS.len() - 1])
+            .unwrap();
+        assert_eq!(behind.recorded, LATEST_MIGRATION_VERSION - 1);
+        drop(older);
+
+        let migrated = McStore::open(&descriptor).unwrap();
+        assert_eq!(
+            migrated.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION
+        );
+        drop(migrated);
+
+        let equal = McStore::open(&descriptor).unwrap();
+        assert_eq!(
+            equal.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION
         );
     }
 
