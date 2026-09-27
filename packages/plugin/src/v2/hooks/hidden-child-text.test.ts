@@ -1,5 +1,10 @@
 import { describe, expect, it, test } from "bun:test";
-import { HiddenChildHook, hiddenAgentFor, newestUserText } from "./hidden-child";
+import {
+    HiddenAgentStepLimit,
+    HiddenChildHook,
+    hiddenAgentFor,
+    newestUserText,
+} from "./hidden-child";
 import type { SessionContext } from "./types";
 
 function draft(message: SessionContext["messages"][number]): SessionContext {
@@ -169,19 +174,20 @@ it("keeps accumulated tool results on the second step and releases the session b
 
 it("refuses a tool loop that exceeds its task's step budget", () => {
     const hook = new HiddenChildHook();
-    hook.registerAttempt("mc:hidden:limit", {
+    const attempt = {
         childSessionId: "ses-child",
         identity: {
             directory: "/tmp",
             agent: "dreamer-retrospective",
-            kind: "dreamer-task",
+            kind: "dreamer-task" as const,
             system: "sys",
             timeoutMs: 1000,
             title: "retrospective",
         },
         request: { body: { parts: [{ type: "text", text: "calibrated" }] } },
         shaped: false,
-    });
+    };
+    hook.registerAttempt("mc:hidden:limit", attempt);
     for (let step = 1; step <= 40; step++) {
         const candidate = {
             ...draft({ role: "user", content: [{ type: "text", text: "mc:hidden:limit" }] }),
@@ -193,7 +199,12 @@ it("refuses a tool loop that exceeds its task's step budget", () => {
         ...draft({ role: "user", content: [{ type: "text", text: "mc:hidden:limit" }] }),
         sessionID: "ses-child",
     };
-    expect(() => hook.apply(over)).toThrow("exceeded its 40-step limit");
+    expect(() => hook.apply(over)).toThrow(HiddenAgentStepLimit);
+    expect(attempt.stepLimit).toMatchObject({
+        name: "HiddenAgentStepLimit",
+        agent: "dreamer-retrospective",
+        cap: 40,
+    });
 });
 
 it("accepts the host's retry of a run on a reused child and sends only that run's rows", () => {

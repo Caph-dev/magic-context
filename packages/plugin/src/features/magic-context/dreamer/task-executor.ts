@@ -189,6 +189,16 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
 
     const described = describeError(error);
     const message = described.brief;
+    if (error instanceof Error && error.name === "HiddenAgentStepLimit") {
+        return {
+            failure_class: "step_limit",
+            model_attempted: null,
+            models_tried: [],
+            provider_error: null,
+            timeout_ms: null,
+            child_session_id: null,
+        };
+    }
     const providerFailure =
         error instanceof HiddenCompletionRefusal ||
         (error instanceof Error && error.name === "DreamerProviderOutputFailureError");

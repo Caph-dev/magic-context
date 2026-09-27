@@ -78,12 +78,25 @@ export async function registerHiddenChildAgents(
     });
 }
 
+export class HiddenAgentStepLimit extends Error {
+    readonly agent: string;
+    readonly cap: number;
+
+    constructor(agent: string, cap: number) {
+        super(`Hidden agent ${agent} exceeded its ${cap}-step limit`);
+        this.name = "HiddenAgentStepLimit";
+        this.agent = agent;
+        this.cap = cap;
+    }
+}
+
 export interface HiddenChildAttempt {
     childSessionId: string;
     identity: HiddenRunIdentity;
     request: PromptArgs;
     shaped: boolean;
     steps?: number;
+    stepLimit?: HiddenAgentStepLimit;
     observedMessages?: SessionContext["messages"];
     marker?: string;
 }
@@ -232,7 +245,8 @@ export class HiddenChildHook {
         const steps = (selected.steps ?? 0) + 1;
         const cap = AGENT_STEPS[selected.identity.agent];
         if (cap !== undefined && steps > cap) {
-            throw new Error(`Hidden agent exceeded its ${cap}-step limit`);
+            selected.stepLimit = new HiddenAgentStepLimit(selected.identity.agent, cap);
+            throw selected.stepLimit;
         }
         selected.steps = steps;
         const system =

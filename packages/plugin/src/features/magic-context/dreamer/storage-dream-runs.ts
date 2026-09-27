@@ -5,6 +5,7 @@ import type { DreamTaskRunBacklog } from "./task-registry";
 export type DreamRunFailureClass =
     | "provider_timeout"
     | "provider_error"
+    | "step_limit"
     | "empty_completion"
     | "no_models"
     | "child_aborted"
