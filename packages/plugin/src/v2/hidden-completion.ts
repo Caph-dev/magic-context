@@ -403,21 +403,6 @@ function assistantOutcome(row: StoreRow<"assistant"> | undefined): AssistantOutc
         : undefined;
 }
 
-/**
- * OpenCode 2.0.5 settled provider failures with `finish: "error"`. Some converted 2.0.12 stores
- * carry the terminal outcome on the assistant row instead; native 2.0.12 idle rows are handled by
- * the poller. Either assistant shape proves the child is idle and safe to reuse.
- */
-function settledProviderError(row: StoreRow<"assistant"> | undefined): boolean {
-    const outcome = assistantOutcome(row);
-    return (
-        row !== undefined &&
-        ((row.data.error !== undefined && typeof row.data.finish === "string") ||
-            outcome === "failed" ||
-            outcome === "interrupted")
-    );
-}
-
 function successfulReusableAssistant(row: StoreRow<"assistant"> | undefined): boolean {
     return (
         row !== undefined &&
@@ -471,13 +456,17 @@ function assistantText(row: StoreRow<"assistant">): string | null {
 
 /**
  * A terminal provider or model-resolution failure persisted by the host, as opposed to an unsettled
- * dispatch error, timeout, or abort. Only this class keeps the now-idle child alive, so reuse does
- * not depend on wording that a later editor could accidentally change.
+ * dispatch error, timeout, or abort. The type keeps lifecycle handling independent of provider
+ * wording; terminal provider failures are quarantined by retiring the child before its attempt
+ * marker is released.
  */
 export class HiddenProviderError extends Error {
-    constructor(detail: string) {
+    readonly settled: boolean;
+
+    constructor(detail: string, options: { settled?: boolean } = {}) {
         super(`Hidden completion provider error: ${detail}`);
         this.name = "HiddenProviderError";
+        this.settled = options.settled ?? true;
     }
 }
 
@@ -578,7 +567,9 @@ async function awaitAssistantRow(
                 throw new HiddenProviderError(details.join("; "));
             }
             if (newAssistant.data.error !== undefined) {
-                throw new HiddenProviderError(errorText(newAssistant.data.error));
+                throw new HiddenProviderError(errorText(newAssistant.data.error), {
+                    settled: typeof newAssistant.data.finish === "string",
+                });
             }
             if (typeof newAssistant.data.finish === "string" || outcome === "succeeded") {
                 return newAssistant;
@@ -720,6 +711,40 @@ export async function createV2HiddenCompletionExecutor(
     const retireChild = (child: PersistedHiddenChild, reason: string): void => {
         store.retire(child, reason);
         if (!keptUnderRetention(child)) scheduleRemoval(child);
+    };
+
+    const createChild = async (
+        identity: HiddenRunIdentity,
+        role: HiddenChildRole,
+        model: Model,
+    ): Promise<PersistedHiddenChild> => {
+        const title = roleTitle(role);
+        const created = await host.create({
+            title,
+            agent: hiddenToolLoop(identity) ? hiddenAgentFor(identity) : roleAgent(role),
+            model: {
+                providerID: model.providerID,
+                id: model.modelID,
+                ...(model.variant ? { variant: model.variant } : {}),
+            },
+            location: { directory: identity.directory },
+            metadata: { magic_context: "hidden-run", role },
+        });
+        if (!created.id) throw new Error("OpenCode 2 did not return a child session id");
+        const owner = resolveOwner();
+        const child: PersistedHiddenChild = {
+            id: created.id,
+            role,
+            generation,
+            title,
+            model,
+            created_at: Date.now(),
+            title_reasserted: false,
+            ...(owner === undefined ? {} : { owner }),
+        };
+        store.put(child);
+        options.hook.registerChild(child.id);
+        return child;
     };
 
     // Boot sweep. Anything left over from an earlier process — including the backlog built up
@@ -865,49 +890,18 @@ export async function createV2HiddenCompletionExecutor(
                         (latest.assistant === undefined || latest.idle.seq > latest.assistant.seq);
                     const idleOutcome = idleIsNewest ? latest.idle?.data.outcome : undefined;
                     const reusable =
-                        idleOutcome === "failed" ||
-                        idleOutcome === "interrupted" ||
-                        ((idleOutcome === undefined || idleOutcome === "succeeded") &&
-                            (successfulReusableAssistant(latest.assistant) ||
-                                settledProviderError(latest.assistant)));
+                        (idleOutcome === undefined || idleOutcome === "succeeded") &&
+                        successfulReusableAssistant(latest.assistant);
                     if (!reusable) {
                         retireChild(active, "newest-assistant-not-reusable");
                         active = undefined;
                     }
                 }
                 if (!active) {
-                    const title = roleTitle(role);
-                    const created = await host.create({
-                        title,
-                        agent: hiddenToolLoop(identity)
-                            ? hiddenAgentFor(identity)
-                            : roleAgent(role),
-                        model: {
-                            providerID: head.providerID,
-                            id: head.modelID,
-                            ...(head.variant ? { variant: head.variant } : {}),
-                        },
-                        location: { directory: identity.directory },
-                        metadata: { magic_context: "hidden-run", role },
-                    });
-                    if (!created.id)
-                        throw new Error("OpenCode 2 did not return a child session id");
                     // Bind the child to the host that is creating it, now, while that host is
                     // demonstrably this process. Deleting it later goes through this binding and
                     // nothing else.
-                    const owner = resolveOwner();
-                    active = {
-                        id: created.id,
-                        role,
-                        generation,
-                        title,
-                        model: head,
-                        created_at: Date.now(),
-                        title_reasserted: false,
-                        ...(owner === undefined ? {} : { owner }),
-                    };
-                    store.put(active);
-                    options.hook.registerChild(active.id);
+                    active = await createChild(identity, role, head);
                 }
                 openedChild = active;
                 const handle = { id: active.id, childSessionId: active.id };
@@ -938,6 +932,17 @@ export async function createV2HiddenCompletionExecutor(
             }
 
             const requested = await validateVariant(requestModel(request, run.child.model));
+            if (run.retired) {
+                // Fallback retries share the original handle. A terminal provider failure has
+                // already retired its child, so give the retry a fresh carrier instead of
+                // prompting a session that is queued for deletion.
+                run.child = await createChild(run.identity, run.role, requested);
+                run.failed = false;
+                run.unsettledFailure = false;
+                run.retired = false;
+                handle.id = run.child.id;
+                handle.childSessionId = run.child.id;
+            }
             await switchChildModel(run, requested);
             const baseline = withReader(options.openReader, (reader) =>
                 reader.latestSequence(run.child.id),
@@ -1065,6 +1070,16 @@ export async function createV2HiddenCompletionExecutor(
                     !run.retired
                 ) {
                     await interruptAndRetire(run, "prompt-timeout");
+                } else if (
+                    error instanceof HiddenProviderError &&
+                    error.settled &&
+                    !run.retired
+                ) {
+                    // OpenCode can perform a late drain after a provider failure. Once the marker
+                    // is released, that drain has no registered hidden request and fails closed in
+                    // HiddenChildHook.apply, which can wedge the host's event/WebSocket path. Stop
+                    // and retire the poisoned child before releasing the marker in finally.
+                    await interruptAndRetire(run, "hidden-run-provider-error");
                 }
                 throw error;
             } finally {
@@ -1083,12 +1098,10 @@ export async function createV2HiddenCompletionExecutor(
             const run = runs.get(handle);
             if (!run) return;
             try {
-                // A run that failed only on settled provider errors keeps its child: retiring it would
-                // create a new session per failed run (with a pool at its quota, one per historian
-                // trigger, indefinitely). The caller reports promptSettled=false after any failed
-                // attempt, so it cannot tell this case apart; the run's own record of every failure
-                // being a persisted provider error row (the child is idle) is what decides.
-                const reusable = run.failed && !run.unsettledFailure;
+                // Settled provider failures are retired in attempt() before the marker is released.
+                // Keep this guard for callers that close an unsuccessful run without an attempt
+                // error, but never make a retired child reusable through close().
+                const reusable = !run.retired && run.failed && !run.unsettledFailure;
                 if (hiddenToolLoop(run.identity)) {
                     retire(
                         run,
