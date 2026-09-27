@@ -266,6 +266,29 @@ describe("Pi provider failure recovery", () => {
 		expect(JSON.stringify(replay)).toBe(acceptedBytes);
 	});
 
+	it("recognises ninfer's prepared-prompt overflow and rejects unrelated errors", () => {
+		const database = db();
+		const sessionId = "pi-ninfer-overflow";
+		const event = handlePiProviderFailure({
+			db: database,
+			sessionId,
+			message: {
+				role: "assistant",
+				provider: "ninfer",
+				model: "qwen3.8-27b",
+				errorMessage: "AI_APICallError: prepared prompt exceeds Engine max_context 262144",
+			},
+		});
+		expect(event).toMatchObject({ kind: "overflow", reportedLimit: 262144 });
+		for (const errorMessage of ["Rate limit exceeded", "Invalid API key"]) {
+			expect(handlePiProviderFailure({
+				db: database,
+				sessionId: `${sessionId}-${errorMessage}`,
+				message: { role: "assistant", errorMessage },
+			})).toEqual({ kind: "none" });
+		}
+	});
+
 	it("persists a provider overflow limit that the next Pi pass consumes", () => {
 		const database = db();
 		const sessionId = "pi-provider-overflow-limit";

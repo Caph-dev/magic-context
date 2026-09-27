@@ -312,6 +312,9 @@ const overflowInputs: Array<[string, unknown]> = [
     ["mistral", "Prompt too large for model with 32768 maximum context length"],
     ["zai", "model_context_window_exceeded"],
     ["lemonade", "Context size has been exceeded"],
+    ["ninfer", "AI_APICallError: prepared prompt exceeds Engine max_context 262144"],
+    ["rate-limit", "Rate limit exceeded"],
+    ["auth", "Invalid API key"],
     ["nested-provider-error", { error: { message: "Input token count 200000 exceeds the maximum of 128000" } }],
     ["top-level-message", { message: "prompt is too long" }],
     ["response-body", { responseBody: "413 payload too large" }],
@@ -336,6 +339,7 @@ const overflow_cases = overflowInputs.map(([label, input]) => {
 const limitMessages = [
     ["maximum prompt length", "the maximum prompt length is 256000 tokens"],
     ["maximum context length", "maximum context length is 32768 tokens"],
+    ["ninfer max context", "AI_APICallError: prepared prompt exceeds Engine max_context 262144"],
     ["maximum model length", "maximum model length is 8192 tokens"],
     ["context length is only", "context length is only 4096 tokens"],
     ["exceeds limit", "Prompt exceeds the limit of 64000 tokens"],
