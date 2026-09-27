@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.36"
+version = "0.20.37"
 dependencies = [
  "base64",
  "cortexkit-log 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.21.16"
+version = "0.22.0"
 dependencies = [
  "cortexkit-log 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "cortexkit-paths",
