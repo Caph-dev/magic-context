@@ -535,53 +535,110 @@ export function freezeReasoningOnBustingPass(args: {
 }
 
 /**
- * Where the proactive thinking strip may start on this pass, or null when it
- * may not run. A module bust permits the whole array. A pass that only releases
- * a frozen replay permits the array from its first changed message; with no
- * change, or no record of what was served, it permits nothing.
+ * What a frozen-replay release knows about the array the session last served:
+ * the last-known-good snapshot's array (null when there is none), and whether
+ * the previous pass captured exactly the array it served into that snapshot.
  */
-function proactiveStripStartIndex(args: {
-    messages: MessageLike[];
-    cacheBustingPass?: boolean;
-    frozenReleaseLastServed?: readonly unknown[] | null;
-}): number | null {
-    if (args.cacheBustingPass === true) return 0;
-    if (!args.frozenReleaseLastServed) return null;
-    return firstServedDivergenceIndex(args.messages, args.frozenReleaseLastServed);
+export interface FrozenReleaseLastServed {
+    messages: readonly unknown[] | null;
+    proven: boolean;
 }
 
 /**
- * A message's id, role, and parts (the parts are what reach the provider) in a
- * form that ignores object key order.
+ * Where the proactive thinking strip may start on this pass, or null when it
+ * may not run.
+ *
+ * A module bust permits the whole array. A pass that only releases a frozen
+ * replay permits the array from its first changed message. When the snapshot is
+ * provably what the previous pass served, no change means nothing is stripped.
+ *
+ * When it is not (the previous pass served a last-known-good replay after a
+ * module error or park, which appends a raw tail the snapshot does not hold,
+ * or the capture was lost), the snapshot vouches only for its own length: the
+ * strip starts at the first change inside it or at its end, and with no
+ * snapshot at all it starts at 0. Over-stripping costs a bust, while keeping a
+ * thinking block behind changed bytes costs a 400 on newer accounts and a
+ * silently dropped block on older ones, so the unknown side strips.
  */
-function servedMessageKey(message: unknown): string {
+function proactiveStripStartIndex(args: {
+    messages: MessageLike[];
+    resolvedProviderID?: string;
+    cacheBustingPass?: boolean;
+    frozenReleaseLastServed?: FrozenReleaseLastServed;
+}): number | null {
+    if (args.cacheBustingPass === true) return 0;
+    const lastServed = args.frozenReleaseLastServed;
+    if (!lastServed) return null;
+    if (!lastServed.messages) return 0;
+    const divergence = firstServedDivergenceIndex(args.messages, lastServed.messages, {
+        providerID: args.resolvedProviderID,
+    });
+    if (lastServed.proven) return divergence;
+    return divergence ?? lastServed.messages.length;
+}
+
+/**
+ * True for a part OpenCode's Anthropic adapter removes before the request is
+ * sent: an empty text or reasoning part (see `modelAcceptsEmptyContent`). The
+ * host's own empty sentinels rely on the same filter.
+ */
+function isPartDroppedBeforeWire(part: unknown, providerID: string | undefined): boolean {
+    if (!modelAcceptsEmptyContent(providerID) || !isRecord(part)) return false;
+    return (part.type === "text" || part.type === "reasoning") && part.text === "";
+}
+
+/**
+ * The fields of a message that decide its provider bytes, in a form that
+ * ignores object key order.
+ *
+ * Besides the parts, this keeps the id and role, and the assistant fields
+ * OpenCode reads when it builds the request: `error` (it skips an assistant
+ * that errored for any reason other than an abort) and `providerID`/`modelID`
+ * (it drops the reasoning metadata of an assistant produced by another model).
+ * Parts the adapter drops before the wire are left out, so adding or removing
+ * one is not a change.
+ */
+function servedMessageKey(message: unknown, providerID: string | undefined): string {
     const record = isRecord(message) ? message : {};
     const info = isRecord(record.info) ? record.info : {};
+    const parts = Array.isArray(record.parts)
+        ? record.parts.filter((part) => !isPartDroppedBeforeWire(part, providerID))
+        : (record.parts ?? null);
     // The JSON round trip drops undefined fields and shared references, so a live
     // object and its JSON snapshot compare equal when they would serialize equal.
     const plain: unknown = JSON.parse(
         JSON.stringify({
             id: info.id ?? null,
             role: info.role ?? null,
-            parts: record.parts ?? null,
+            error: info.error ?? null,
+            providerID: info.providerID ?? null,
+            modelID: info.modelID ?? null,
+            parts,
         }),
     );
     return stableStringify(plain);
 }
 
 /**
- * Index of the first message whose id, role, or parts differ from the array the
- * session last served, or null when every message both arrays hold is equal.
- * Messages past the end of the served array are new on this request; they carry
- * no cached bytes, so they alone are not a change.
+ * Index of the first message whose provider-visible fields differ from the
+ * array the session last served, or null when every message both arrays hold is
+ * equal. Messages past the end of the served array are not compared; the caller
+ * decides what they mean. `providerID` selects the parts that never reach the
+ * wire.
  */
 export function firstServedDivergenceIndex(
     messages: readonly unknown[],
     lastServed: readonly unknown[],
+    options: { providerID?: string } = {},
 ): number | null {
     const shared = Math.min(messages.length, lastServed.length);
     for (let index = 0; index < shared; index += 1) {
-        if (servedMessageKey(messages[index]) !== servedMessageKey(lastServed[index])) return index;
+        if (
+            servedMessageKey(messages[index], options.providerID) !==
+            servedMessageKey(lastServed[index], options.providerID)
+        ) {
+            return index;
+        }
     }
     return null;
 }
@@ -817,14 +874,14 @@ export function runRustModePostprocess(args: {
      * Set when the module deferred but this pass stops serving a frozen
      * last-known-good replay. The frozen replay served the messages that arrived
      * during the freeze as raw input, so the module's output changes bytes only
-     * from the first of those messages onward, not from the start. The value is
-     * the array the session last served (the last-known-good snapshot), or null
-     * when that snapshot is unavailable. Only thinking at or after the first
-     * message that differs from it may be frozen: a block before that point sits
-     * behind unchanged bytes, so it stays valid and stripping it would rewrite
-     * cached content no other change touched.
+     * from the first of those messages onward, not from the start. Only thinking
+     * at or after the first message that differs from the last-served array may
+     * be frozen: a block before that point sits behind unchanged bytes, so it
+     * stays valid and stripping it would rewrite cached content no other change
+     * touched. See `proactiveStripStartIndex` for a snapshot that is not provably
+     * the last-served array.
      */
-    frozenReleaseLastServed?: readonly unknown[] | null;
+    frozenReleaseLastServed?: FrozenReleaseLastServed;
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     trailingBlankNewestAssistantId?: string;
     tagger: Tagger;
