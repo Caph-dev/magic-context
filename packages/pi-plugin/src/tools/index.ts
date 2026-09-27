@@ -12,7 +12,10 @@
  * resolve to the hidden ephemeral child session.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
@@ -23,6 +26,7 @@ import { createCtxMemoryListTool, createCtxMemoryTool } from "./ctx-memory";
 import { createCtxNoteTool } from "./ctx-note";
 import { createCtxReduceTool } from "./ctx-reduce";
 import { createCtxSearchTool } from "./ctx-search";
+import { throwReturnedToolErrors } from "./pi-tool-errors";
 import { registerTodosCommand } from "./todo-view-pi";
 import { createTodowriteTool } from "./todowrite";
 
@@ -111,25 +115,21 @@ export function registerMagicContextTools(
 	const registration = promptSurfaceRuntime.resolveRegistration(
 		opts.promptSurface,
 	);
-	const surfaceTool = <
-		T extends { name: string; description: string; parameters: unknown },
-	>(
-		definition: T,
-	): T => {
+	const surfaceTool = <T extends ToolDefinition>(definition: T): T => {
 		const parameters = structuredClone(definition.parameters);
 		applyJsonSchemaParameterDescriptions(
 			definition.name,
 			parameters,
 			registration.preset,
 		);
-		return {
+		return throwReturnedToolErrors({
 			...definition,
 			parameters,
 			description: registration.descriptionFor(
 				definition.name,
 				definition.description,
 			),
-		};
+		});
 	};
 
 	pi.registerTool(
@@ -156,7 +156,9 @@ export function registerMagicContextTools(
 		};
 		pi.registerTool(surfaceTool(createCtxMemoryTool(memoryDeps)));
 		if (opts.allowDreamerActions === true) {
-			pi.registerTool(createCtxMemoryListTool(memoryDeps));
+			pi.registerTool(
+				throwReturnedToolErrors(createCtxMemoryListTool(memoryDeps)),
+			);
 		}
 	}
 
