@@ -64,6 +64,7 @@ import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
+import { stableStringify } from "../../shared/stable-json";
 import {
     type ConvertedToolDropMode,
     convertLegacyToolSkeletons,
@@ -533,6 +534,58 @@ export function freezeReasoningOnBustingPass(args: {
     return { strip: { messageIds }, persistenceFailed: false };
 }
 
+/**
+ * Where the proactive thinking strip may start on this pass, or null when it
+ * may not run. A module bust permits the whole array. A pass that only releases
+ * a frozen replay permits the array from its first changed message; with no
+ * change, or no record of what was served, it permits nothing.
+ */
+function proactiveStripStartIndex(args: {
+    messages: MessageLike[];
+    cacheBustingPass?: boolean;
+    frozenReleaseLastServed?: readonly unknown[] | null;
+}): number | null {
+    if (args.cacheBustingPass === true) return 0;
+    if (!args.frozenReleaseLastServed) return null;
+    return firstServedDivergenceIndex(args.messages, args.frozenReleaseLastServed);
+}
+
+/**
+ * A message's id, role, and parts (the parts are what reach the provider) in a
+ * form that ignores object key order.
+ */
+function servedMessageKey(message: unknown): string {
+    const record = isRecord(message) ? message : {};
+    const info = isRecord(record.info) ? record.info : {};
+    // The JSON round trip drops undefined fields and shared references, so a live
+    // object and its JSON snapshot compare equal when they would serialize equal.
+    const plain: unknown = JSON.parse(
+        JSON.stringify({
+            id: info.id ?? null,
+            role: info.role ?? null,
+            parts: record.parts ?? null,
+        }),
+    );
+    return stableStringify(plain);
+}
+
+/**
+ * Index of the first message whose id, role, or parts differ from the array the
+ * session last served, or null when every message both arrays hold is equal.
+ * Messages past the end of the served array are new on this request; they carry
+ * no cached bytes, so they alone are not a change.
+ */
+export function firstServedDivergenceIndex(
+    messages: readonly unknown[],
+    lastServed: readonly unknown[],
+): number | null {
+    const shared = Math.min(messages.length, lastServed.length);
+    for (let index = 0; index < shared; index += 1) {
+        if (servedMessageKey(messages[index]) !== servedMessageKey(lastServed[index])) return index;
+    }
+    return null;
+}
+
 /** Reapply durable binding-mismatch strips when a Rust LKG snapshot is replayed. */
 export function replayRustModeBindingMismatchStrips(args: {
     db: ContextDatabase;
@@ -755,11 +808,23 @@ export function runRustModePostprocess(args: {
     resolvedProviderID?: string;
     thinkingBindingRecoveryEnabledForModel?: boolean;
     /**
-     * The module's decision busts the cache on this pass (HARD, EXECUTE, SOFT, or
-     * a released frozen replay). Only such a pass may freeze thinking that its
-     * own edit invalidated.
+     * The module's decision busts the cache on this pass (HARD, MIGRATE_HARD,
+     * EXECUTE, or SOFT). Such a pass rewrites the prompt from its start, so it
+     * may freeze every thinking block its own edit invalidated.
      */
     cacheBustingPass?: boolean;
+    /**
+     * Set when the module deferred but this pass stops serving a frozen
+     * last-known-good replay. The frozen replay served the messages that arrived
+     * during the freeze as raw input, so the module's output changes bytes only
+     * from the first of those messages onward, not from the start. The value is
+     * the array the session last served (the last-known-good snapshot), or null
+     * when that snapshot is unavailable. Only thinking at or after the first
+     * message that differs from it may be frozen: a block before that point sits
+     * behind unchanged bytes, so it stays valid and stripping it would rewrite
+     * cached content no other change touched.
+     */
+    frozenReleaseLastServed?: readonly unknown[] | null;
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     trailingBlankNewestAssistantId?: string;
     tagger: Tagger;
@@ -927,26 +992,34 @@ export function runRustModePostprocess(args: {
         } catch (error) {
             sessionLog(args.sessionId, "rust thinking binding recovery failed:", error);
         }
+        // Replay the persisted strips first, so the comparison below sees the
+        // blocks earlier passes already removed exactly as those passes served them.
+        stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
         // On a busting pass of a prefix-bound model, every remaining assistant
-        // with reasoning is persisted into the binding-mismatch set before any
-        // reasoning is removed. The one strip call below then applies the whole
-        // set, which later passes replay to produce the same output.
-        if (
-            args.thinkingBindingRecoveryEnabledForModel === true &&
-            args.cacheBustingPass === true
-        ) {
+        // with reasoning past the pass's first changed byte is persisted into the
+        // binding-mismatch set before any of it is removed; later passes replay
+        // the same set to produce the same output.
+        const stripFrom =
+            args.thinkingBindingRecoveryEnabledForModel === true
+                ? proactiveStripStartIndex(args)
+                : null;
+        if (stripFrom !== null) {
             const outcome = freezeReasoningOnBustingPass({
                 db: args.db,
                 sessionId: args.sessionId,
-                messages: args.messages,
+                messages: args.messages.slice(stripFrom),
                 alreadyFrozen: recoveryMessageIds,
             });
             if (outcome.strip) {
                 proactiveThinkingStrip = outcome.strip;
                 for (const id of outcome.strip.messageIds) recoveryMessageIds.add(id);
+                stripReasoningFromAssistantIds(
+                    args.messages,
+                    args.resolvedProviderID,
+                    new Set(outcome.strip.messageIds),
+                );
             }
         }
-        stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
     }
     const marker = getPersistedCompactionMarkerState(args.db, args.sessionId);
     return {

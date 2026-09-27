@@ -1521,6 +1521,17 @@ function syntheticTodoAnchorFromNative(messages: readonly unknown[]): {
     return null;
 }
 
+/** The array a last-known-good snapshot recorded as served, or null when unreadable. */
+function parseLastServedSnapshot(jsonPrefix: string | undefined): unknown[] | null {
+    if (!jsonPrefix) return null;
+    try {
+        const parsed: unknown = JSON.parse(jsonPrefix);
+        return Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
 function mirrorRustSyntheticTodoAnchor(args: {
     db: TransformDeps["db"];
     sessionId: string;
@@ -3621,6 +3632,11 @@ export function createRustModeTransform(
                 // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
                 // so the previous last-known-good (LKG) snapshot is already stale.
                 decisionUpper === "SOFT";
+            // The module's own permission. A released frozen replay below also makes the
+            // pass priced, but it changes bytes only from the first message the freeze
+            // served raw, so it is not a permission to rewrite from the start.
+            const moduleDecisionBusts = cacheBustingPass;
+            let frozenReleaseLastServed: unknown[] | null = null;
             if (!todoProbeRequired && cacheBustingPass) {
                 timings.todoUnprobedBust += 1;
                 sessionLog(
@@ -3671,6 +3687,8 @@ export function createRustModeTransform(
                         state.lkgFrozenAtInputCount = inputCount;
                     }
                     const keys = resolveLkgModelKeys(messages);
+                    // Read before the replay: a replay that fails validation drops the slot.
+                    const lastServedJson = getSlot(sessionId)?.jsonPrefix;
                     const frozen = replayLkg({
                         sessionId,
                         messages,
@@ -3680,6 +3698,7 @@ export function createRustModeTransform(
                     if (!frozen.ok) {
                         cacheBustingPass = true;
                         frozenReleaseReason = frozen.reason;
+                        frozenReleaseLastServed = parseLastServedSnapshot(lastServedJson);
                     } else {
                         frozenHealthyPassesAfterApply = state.lkgFrozenHealthyPasses + 1;
                         const rawTailGrowth = Math.max(0, inputCount - state.lkgFrozenAtInputCount);
@@ -3693,6 +3712,7 @@ export function createRustModeTransform(
                         if (releaseReason) {
                             cacheBustingPass = true;
                             frozenReleaseReason = releaseReason;
+                            frozenReleaseLastServed = parseLastServedSnapshot(lastServedJson);
                         } else {
                             appliedMessages = frozen.messages;
                             // The stored prefix already carries the binding-mismatch
@@ -3738,7 +3758,8 @@ export function createRustModeTransform(
                             model?.providerID,
                             model?.modelID,
                         ),
-                        cacheBustingPass,
+                        cacheBustingPass: moduleDecisionBusts,
+                        ...(frozenReleaseReason ? { frozenReleaseLastServed } : {}),
                         trailingBlankSourceDecisions,
                         trailingBlankNewestAssistantId:
                             typeof trailingBlankNewestAssistantId === "string"
