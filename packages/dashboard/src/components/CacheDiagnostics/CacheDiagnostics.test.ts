@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { DbCacheEvent, SessionCacheStats } from "../../lib/types";
 import {
+  CACHE_FIGURE_PLACEHOLDER,
+  CACHE_NOT_REPORTED,
   cacheActivityNote,
   cacheCardCountLabel,
   cacheCardSummary,
@@ -80,9 +82,7 @@ function event(partial: Partial<DbCacheEvent>): DbCacheEvent {
 
 describe("cache reporting", () => {
   test("unreported event is neutral without a percentage", () => {
-    expect(cacheEventPercentage(event({ cache_reported: false }))).toBe(
-      "No cached tokens reported",
-    );
+    expect(cacheEventPercentage(event({ cache_reported: false }))).toBe(CACHE_NOT_REPORTED);
   });
 
   test("reported zero retains its existing percentage", () => {
@@ -101,7 +101,7 @@ describe("cache reporting", () => {
   test("all-unreported session card has neutral text rather than red zero", () => {
     const ratio = cacheSessionRatio([event({ cache_reported: false })]);
     expect(ratio).toBeNull();
-    expect(cachePercentage(ratio)).toBe("No cached tokens reported");
+    expect(cachePercentage(ratio)).toBe(CACHE_FIGURE_PLACEHOLDER);
   });
 });
 
@@ -153,9 +153,22 @@ describe("session cards", () => {
     const summary = cacheCardSummary([run({ cache_reported: false }), run({ turn_id: "t2" })]);
     expect(summary.tone).toBe("neutral");
     expect(summary.text).toBe("no cache data");
-    expect(cacheCardSummary([run({ cache_reported: false })]).text).toBe(
-      "No cached tokens reported",
-    );
+  });
+
+  test("an unreported session keeps a one-character figure and explains it in small text", () => {
+    const summary = cacheCardSummary([run({ cache_reported: false })]);
+    expect(summary.text).toBe(CACHE_FIGURE_PLACEHOLDER);
+    expect(summary.tone).toBe("neutral");
+    expect(summary.note).toBe(CACHE_NOT_REPORTED);
+    // Reported sessions have no note: their figure speaks for itself.
+    expect(cacheCardSummary([run({ cache_read: 900, input_tokens: 100 })]).note).toBeNull();
+  });
+
+  test("a session with no recorded requests is a neutral no-data card, not 0 events", () => {
+    const summary = cacheCardSummary([]);
+    expect(summary.text).toBe(CACHE_FIGURE_PLACEHOLDER);
+    expect(summary.tone).toBe("neutral");
+    expect(cacheCardCountLabel([])).toBe("no data");
   });
 
   test("a single cold run with reads is neutral", () => {

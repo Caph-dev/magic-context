@@ -46,12 +46,22 @@ export function cacheSessionRatio(events: DbCacheEvent[]): number | null {
   return reported ? (total > 0 ? read / total : 0) : null;
 }
 
+/**
+ * Stands in for a percentage that cannot be computed. It is one character so
+ * a card's big figure keeps the same size whatever the session reported; the
+ * reason goes in smaller text beside it.
+ */
+export const CACHE_FIGURE_PLACEHOLDER = "—";
+
+/** Why a figure is missing when the provider never reported cache reads. */
+export const CACHE_NOT_REPORTED = "cache not reported";
+
 export function cachePercentage(ratio: number | null): string {
-  return ratio === null ? "No cached tokens reported" : `${(ratio * 100).toFixed(1)}%`;
+  return ratio === null ? CACHE_FIGURE_PLACEHOLDER : `${(ratio * 100).toFixed(1)}%`;
 }
 
 export function cacheEventPercentage(event: DbCacheEvent): string {
-  if (!event.cache_reported) return "No cached tokens reported";
+  if (!event.cache_reported) return CACHE_NOT_REPORTED;
   return event.severity === "unknown" ? "no cache data" : cachePercentage(event.hit_ratio);
 }
 
@@ -98,11 +108,14 @@ export function cacheCardTitle(row: SessionCacheStats): string {
 }
 
 export interface CacheCardSummary {
+  /** The big figure: a short percentage, a short label, or the placeholder. */
   text: string;
   /** "ratio" colors the text by hit ratio; "neutral" renders it muted. */
   tone: "ratio" | "neutral";
   ratio: number;
   title: string;
+  /** Small text shown after the event count, explaining a placeholder. */
+  note: string | null;
 }
 
 /**
@@ -112,6 +125,15 @@ export interface CacheCardSummary {
  * opening turn, is shown in a neutral color.
  */
 export function cacheCardSummary(events: DbCacheEvent[]): CacheCardSummary {
+  if (events.length === 0) {
+    return {
+      text: CACHE_FIGURE_PLACEHOLDER,
+      tone: "neutral",
+      ratio: 0,
+      title: "No model request of this session has been recorded yet",
+      note: null,
+    };
+  }
   const ratio = cacheSessionRatio(events);
   if (ratio === null) {
     return {
@@ -119,6 +141,7 @@ export function cacheCardSummary(events: DbCacheEvent[]): CacheCardSummary {
       tone: "neutral",
       ratio: 0,
       title: "No request in this window reported cached tokens",
+      note: CACHE_NOT_REPORTED,
     };
   }
   if (!events.some((event) => event.cache_reported && event.cache_read > 0)) {
@@ -127,6 +150,7 @@ export function cacheCardSummary(events: DbCacheEvent[]): CacheCardSummary {
       tone: "neutral",
       ratio,
       title: "No request in this window read anything from the cache",
+      note: null,
     };
   }
   const turns = new Set(events.map((event) => event.turn_id));
@@ -136,6 +160,7 @@ export function cacheCardSummary(events: DbCacheEvent[]): CacheCardSummary {
       tone: "neutral",
       ratio,
       title: "Only the session's cold first run is loaded: nothing was cached before it",
+      note: null,
     };
   }
   return {
@@ -143,11 +168,17 @@ export function cacheCardSummary(events: DbCacheEvent[]): CacheCardSummary {
     tone: "ratio",
     ratio,
     title: "Cache reads over total prompt tokens in this window",
+    note: null,
   };
 }
 
-/** "1 run" / "3 runs" when every row is a Broca run total, else events. */
+/**
+ * "1 run" / "3 runs" when every row is a Broca run total, else events, and
+ * "no data" for a session with nothing recorded yet (a Broca run that has
+ * just started) rather than "0 events".
+ */
 export function cacheCardCountLabel(events: DbCacheEvent[]): string {
+  if (events.length === 0) return "no data";
   const noun = events.length > 0 && events.every((event) => event.aggregate) ? "run" : "event";
   return `${events.length} ${noun}${events.length === 1 ? "" : "s"}`;
 }
@@ -905,11 +936,19 @@ export default function CacheDiagnostics() {
                         <span>{cacheCardTitle(stat)}</span>
                       </span>
                     </div>
+                    {/* Every line of a card is one fixed-height, non-wrapping
+                        line, so cards in the row stay one height whatever
+                        they show. */}
                     <div
                       title={stat.summary.title}
                       style={{
                         "font-size": "20px",
                         "font-weight": "700",
+                        height: "28px",
+                        "line-height": "28px",
+                        overflow: "hidden",
+                        "text-overflow": "ellipsis",
+                        "white-space": "nowrap",
                         color:
                           stat.summary.tone === "neutral"
                             ? "var(--text-muted)"
@@ -919,8 +958,30 @@ export default function CacheDiagnostics() {
                     >
                       {stat.summary.text}
                     </div>
-                    <div class="card-meta" style={{ "margin-top": "4px" }}>
+                    <div
+                      class="card-meta"
+                      title={stat.summary.title}
+                      style={{
+                        "margin-top": "4px",
+                        "flex-wrap": "nowrap",
+                        overflow: "hidden",
+                        "white-space": "nowrap",
+                      }}
+                    >
                       <span>{stat.countLabel}</span>
+                      <Show when={stat.summary.note}>
+                        {(note) => (
+                          <span
+                            style={{
+                              color: "var(--text-muted)",
+                              overflow: "hidden",
+                              "text-overflow": "ellipsis",
+                            }}
+                          >
+                            {note()}
+                          </span>
+                        )}
+                      </Show>
                       <Show when={stat.bust_count > 0}>
                         <span style={{ color: "var(--red)" }}>{stat.bust_count} busts</span>
                       </Show>
@@ -1131,8 +1192,11 @@ export default function CacheDiagnostics() {
                         <Show
                           when={turn.worstSeverity !== "unknown" && !unreportedTurn}
                           fallback={
-                            <span class="mono" style={{ color: "var(--text-muted)" }}>
-                              {unreportedTurn ? "No cached tokens reported" : "no cache data"}
+                            <span
+                              class={unreportedTurn ? undefined : "mono"}
+                              style={{ color: "var(--text-muted)" }}
+                            >
+                              {unreportedTurn ? CACHE_NOT_REPORTED : "no cache data"}
                             </span>
                           }
                         >
@@ -1212,7 +1276,10 @@ export default function CacheDiagnostics() {
                                     <Show
                                       when={event.severity !== "unknown" && event.cache_reported}
                                       fallback={
-                                        <span class="mono" style={{ color: "var(--text-muted)" }}>
+                                        <span
+                                          class={event.cache_reported ? "mono" : undefined}
+                                          style={{ color: "var(--text-muted)" }}
+                                        >
                                           {cacheEventPercentage(event)}
                                         </span>
                                       }

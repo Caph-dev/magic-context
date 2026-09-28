@@ -12456,6 +12456,7 @@ mod broca_cache_tests {
         )
         .unwrap();
         let gather = identity("alfonso:gather-test");
+        let gather_id = gather.to_string();
         conn.execute(
             "INSERT INTO run_index (run_id, session, state, state_changed_ms)
              VALUES ('g1', ?1, 'active', ?2)",
@@ -12495,7 +12496,7 @@ mod broca_cache_tests {
         let listed = load_broca_cache_sessions_from_conn(&conn, Some(root), 10).unwrap();
         let row = listed
             .iter()
-            .find(|row| row.session_id == gather.to_string())
+            .find(|row| row.session_id == gather_id)
             .unwrap();
         assert_eq!(row.last_activity_ms, started + 5);
         let first_seen = row.last_activity_ms;
@@ -12548,7 +12549,7 @@ mod broca_cache_tests {
         let listed = load_broca_cache_sessions_from_conn(&conn, None, 10).unwrap();
         let row = listed
             .iter()
-            .find(|row| row.session_id == gather.to_string())
+            .find(|row| row.session_id == gather_id)
             .unwrap();
         assert_eq!(row.last_activity_ms, started);
     }
