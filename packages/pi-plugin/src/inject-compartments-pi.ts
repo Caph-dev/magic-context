@@ -1518,7 +1518,7 @@ function readFrozenM0InputsPi(
 		};
 		return { docs, markers, compartments, memories, userProfile, workspace };
 	});
-	return read();
+	return read.deferred();
 }
 
 function renderFreshM0PiNonPersisted(
