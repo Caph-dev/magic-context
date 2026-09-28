@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { alertUrgency, formatAlerts, type LatencyAlert, readNewLines, runLatencySentinel } from "./transform-latency-sentinel";
@@ -75,8 +75,50 @@ test("peer roster name takes precedence over project binding", async () => {
     const result = await runLatencySentinel({ files: [path], stateFile: join(root, "state.json"), db: join(root, "context.db"), peerDb: join(root, "peers.db"), connectionFile: "", send: false, now: () => BASE + 100_000, load: () => [0, 0, 0], stdout: () => {}, stderr: () => {} });
     expect(result.alerts[0]?.name).toBe("CEREB");
 });
+test("LKG declines count by session and UTC hour, appear on refusals, and summary does not advance the cursor", async () => {
+    const decline = (id: string, at: string, reason: string) => `[${at}] [magic-context][${id}] ${reason}\n`;
+    const refusal = (id: string, at: string) => `[${at}] [magic-context][${id}] raw_fallback_over_context_limit\n`;
+    writeFileSync(path, decline("ses_a", "2026-09-28T18:59:59.000Z", "lkg_unsafe_seam")
+        + decline("ses_a", "2026-09-28T19:00:00.000Z", "lkg_anthropic_reasoning_run_invalid")
+        + decline("ses_a", "2026-09-28T19:00:01.000Z", "lkg_anthropic_reasoning_run_invalid")
+        + decline("ses_b", "2026-09-28T19:00:02.000Z", "lkg_model_mismatch")
+        + refusal("ses_a", "2026-09-28T19:00:03.000Z")
+        + refusal("ses_b", "2026-09-28T19:00:04.000Z"));
+    const output: string[] = [];
+    const options = { files: [path], stateFile: join(root, "state.json"), db: "", connectionFile: "", send: false,
+        now: () => BASE + 2 * 3600_000, load: () => [0, 0, 0], stdout: (value: string) => output.push(value), stderr: () => {} };
+    const summary = await runLatencySentinel({ ...options, summary: true, since: BASE + 3600_000, until: BASE + 2 * 3600_000 });
+    expect(summary.declines).toEqual([
+        { sessionId: "ses_a", hour: "2026-09-28T19:00:00.000Z", reasons: { lkg_anthropic_reasoning_run_invalid: 2 } },
+        { sessionId: "ses_b", hour: "2026-09-28T19:00:00.000Z", reasons: { lkg_model_mismatch: 1 } },
+    ]);
+    expect(JSON.parse(output[0]!).declines).toEqual(summary.declines);
+    expect(readFileSync(path, "utf8")).toContain("lkg_unsafe_seam");
+    const result = await runLatencySentinel(options);
+    expect(result.alerts.filter((a) => a.kind === "refusal").map((a) => a.lkgDeclines)).toEqual([
+        { lkg_anthropic_reasoning_run_invalid: 2 }, { lkg_model_mismatch: 1 },
+    ]);
+    expect(formatAlerts(result.alerts)).toContain("LKG declines 2 lkg_anthropic_reasoning_run_invalid");
+    expect((await runLatencySentinel(options)).alerts).toHaveLength(0);
+});
+
+test("--summary CLI reads rotated logs and filters the window without sending or writing state", () => {
+    writeFileSync(`${path}.1`, "[2026-09-28T19:35:29.780Z] [magic-context][ses_cereb] lkg_anthropic_reasoning_run_invalid\n");
+    writeFileSync(path, "[2026-09-28T21:55:43.431Z] [magic-context][ses_cereb] lkg_unsafe_seam\n");
+    const stateFile = join(root, "state.json");
+    const run = Bun.spawnSync([process.execPath, join(import.meta.dir, "transform-latency-sentinel.ts"),
+        "--summary", "--opencode-log", path, "--pi-log", join(root, "missing-pi"),
+        "--module-log", join(root, "missing-module"), "--db", join(root, "missing-db"),
+        "--state-file", stateFile, "--since", "2026-09-28T19:00:00Z", "--until", "2026-09-28T20:00:00Z"]);
+    expect(run.exitCode).toBe(0);
+    expect(JSON.parse(run.stdout.toString()).declines).toEqual([
+        { sessionId: "ses_cereb", hour: "2026-09-28T19:00:00.000Z", reasons: { lkg_anthropic_reasoning_run_invalid: 1 } },
+    ]);
+    expect(existsSync(stateFile)).toBe(false);
+});
+
 test("children of one project collapse to one line; only parks and refusals are high urgency", () => {
-    const base = { at: "2026-09-28T19:44:40.015Z", detail: "", count: 10, p50: 500, moduleP50: 50, moduleP90: 300, pluginP50: 450, pluginP90: 8000, pluginMax: 9000, load: [279, 262, 235], loadSampledAt: "" };
+    const base = { at: "2026-09-28T19:44:40.015Z", detail: "", count: 10, p50: 500, moduleP50: 50, moduleP90: 300, pluginP50: 450, pluginP90: 8000, pluginMax: 9000, load: [279, 262, 235], loadSampledAt: "", lkgDeclines: {} };
     const alerts: LatencyAlert[] = [
         { ...base, kind: "timeout", sessionId: "ses_a", name: "git:3fba", p90: 8000, max: 9000, moduleMax: 400 },
         { ...base, kind: "single", sessionId: "ses_b", name: "git:3fba", p90: 14000, max: 26000, moduleMax: 330 },
