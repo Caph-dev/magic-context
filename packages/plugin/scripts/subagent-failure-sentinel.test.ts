@@ -52,6 +52,17 @@ test("failure share crosses at eight runs and reports empty and aborted separate
     expect(alert?.share).toBeCloseTo(3 / 10);
 });
 
+test("a share alert is per task: a new failure class in the same burst does not re-fire it", async () => {
+    for (let i = 0; i < 6; i++) add("completed");
+    for (let i = 0; i < 4; i++) add("timed_out", NOW - 900 + i, "prompt timed out after 120000ms");
+    const first = (await run()).alerts.find((a) => a.rule === "failure_share");
+    expect(first).toMatchObject({ class: "*", count: 4 });
+    // One more failure of a different class grows the task count 4 -> 5, below the
+    // 50% re-alert threshold, so the share alert must stay quiet.
+    add("failed", NOW - 500, "TimeoutError message=\"The operation timed out.\" code=23");
+    expect((await run()).alerts.some((a) => a.rule === "failure_share")).toBe(false);
+});
+
 test("failure share alerts at exactly two of eight runs", async () => {
     for (let i = 0; i < 6; i++) add("completed");
     add("failed"); add("timed_out");

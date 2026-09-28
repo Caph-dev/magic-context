@@ -83,7 +83,10 @@ function saveState(path: string, state: State): void {
 }
 
 function key(alert: Alert): string {
-    return JSON.stringify([alert.rule, alert.subagent, alert.task, alert.class]);
+    // The share rule describes the whole task, so one burst of mixed failure classes
+    // must dedupe to a single alert instead of re-firing for every class it contains.
+    const klass = alert.rule === "failure_share" ? "*" : alert.class;
+    return JSON.stringify([alert.rule, alert.subagent, alert.task, klass]);
 }
 
 export function evaluateFailures(rows: Row[], newRows: Row[], now: number, completeSince: number): Alert[] {
@@ -118,7 +121,12 @@ export function evaluateFailures(rows: Row[], newRows: Row[], now: number, compl
         if (completeSince <= now - DAY && current.length >= 8 && share >= 0.25) rules.push("failure_share");
         if (completeSince <= now - 2 * DAY && oldClass.length > 0 && classRows.length >= 2 * oldClass.length) rules.push("class_doubled");
         for (const rule of rules) {
-            const alert = { rule, ...base };
+            // A share alert counts every failure of the task, so the 50% re-alert
+            // threshold tracks the task's failures rather than one class's.
+            const alert =
+                rule === "failure_share"
+                    ? { rule, ...base, class: "*", count: failuresToday }
+                    : { rule, ...base };
             if (!seen.has(key(alert))) { alerts.push(alert); seen.add(key(alert)); }
         }
     }
