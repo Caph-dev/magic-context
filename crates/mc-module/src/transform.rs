@@ -21580,7 +21580,8 @@ pub(crate) mod tests {
         assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "SOFT+");
 
         let archived_marker = format!("id=\"{archived}\"");
-        let mutations: [(&str, Box<dyn Fn(&McStore)>); 3] = [
+        type Mutation<'a> = (&'a str, Box<dyn Fn(&McStore)>);
+        let mutations: [Mutation<'_>; 3] = [
             (
                 "rule one corrected",
                 Box::new(move |s: &McStore| {
