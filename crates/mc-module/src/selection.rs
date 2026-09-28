@@ -1388,6 +1388,96 @@ pub fn select_reductions(
     select_reductions_with_outcome(items, frozen_keys, ctx, cfg).decisions
 }
 
+/// Served-or-original token totals for one tool arc, as emergency reclaim
+/// accounting sees them: every call and result block, and the call blocks alone
+/// (a skeleton-kept call keeps its arguments, so only its results shrink).
+struct ArcTokenTotals {
+    call_and_result: f64,
+    call: f64,
+}
+
+impl Default for ArcTokenTotals {
+    /// Both totals start from the value `Iterator::sum` returns for an empty
+    /// `f64` iterator, and blocks are added one at a time in item order. That
+    /// is exactly the fold a per-arc `.sum()` over the same blocks performs, so
+    /// the totals are bit-identical to summing each arc separately.
+    fn default() -> Self {
+        let empty = std::iter::empty::<f64>().sum::<f64>();
+        Self {
+            call_and_result: empty,
+            call: empty,
+        }
+    }
+}
+
+/// Totals every arc's call and result tokens in one pass over `items`, so
+/// emergency accounting does not rescan all items once per arc.
+fn emergency_arc_token_totals(items: &[SelItem]) -> HashMap<&str, ArcTokenTotals> {
+    let mut totals: HashMap<&str, ArcTokenTotals> = HashMap::new();
+    for item in items {
+        let Some(arc_id) = item.arc_id.as_deref() else {
+            continue;
+        };
+        let is_call = matches!(item.kind, SelKind::ToolCall { .. });
+        if !is_call && !matches!(item.kind, SelKind::ToolResult { .. }) {
+            continue;
+        }
+        let tokens = item.served_token_count.or(item.token_count).unwrap_or(0) as f64;
+        let arc = totals.entry(arc_id).or_default();
+        arc.call_and_result += tokens;
+        if is_call {
+            arc.call += tokens;
+        }
+    }
+    totals
+}
+
+/// Calibrated reclaim estimate per active arc for an emergency pass; empty when
+/// the pass has no calibration seed.
+fn emergency_reclaim_by_arc(
+    items: &[SelItem],
+    active_arcs: &[&ToolArc],
+    ctx: &SelectionContext,
+    reasoning_adjacency_collapse_arcs: &HashSet<String>,
+) -> HashMap<String, f64> {
+    let mut reclaim_by_arc = HashMap::new();
+    let Some(seed) = ctx.calibration else {
+        return reclaim_by_arc;
+    };
+    let recent: HashSet<_> = active_arcs
+        .iter()
+        .rev()
+        .take(RECENT_TOOL_SKELETON_WINDOW)
+        .map(|a| a.arc_id.as_str())
+        .collect();
+    let arc_tokens = emergency_arc_token_totals(items);
+    let no_tokens = ArcTokenTotals::default();
+    for arc in active_arcs {
+        let totals = arc_tokens.get(arc.arc_id.as_str()).unwrap_or(&no_tokens);
+        let before = totals.call_and_result;
+        let skeleton = (!ctx.emergency_window_yields
+            && recent.contains(arc.arc_id.as_str())
+            && is_small_tool_input(&arc.input))
+            || reasoning_adjacency_collapse_arcs.contains(&arc.arc_id);
+        // A kept call keeps its real arguments, so its call blocks reclaim
+        // nothing; only the results shrink to the placeholder. Include a
+        // conservative tag-overlay allowance because tag ids are installed
+        // by the renderer.
+        let after = if skeleton {
+            totals.call
+                + (arc.result_ids.len() * (mc_tokenizer::estimate_tokens(DROPPED_PLACEHOLDER) + 32))
+                    as f64
+        } else {
+            0.0
+        };
+        reclaim_by_arc.insert(
+            arc.arc_id.clone(),
+            (before - after).max(0.0) * seed.tools_ratio,
+        );
+    }
+    reclaim_by_arc
+}
+
 pub(crate) fn select_reductions_with_outcome(
     items: &[SelItem],
     frozen_keys: &HashSet<String>,
@@ -1479,60 +1569,12 @@ pub(crate) fn select_reductions_with_outcome(
             // text, media, reasoning, and non-droppable tools; system-prefix and opaque metadata
             // remain outside that population. Only active client tool arcs can be selected below.
             let all_active_floor_tokens = active_floor_tokens(items, frozen_keys, ctx.calibration);
-            let mut reclaim_by_arc = HashMap::new();
-            if let Some(seed) = ctx.calibration {
-                let recent: HashSet<_> = active_arcs
-                    .iter()
-                    .rev()
-                    .take(RECENT_TOOL_SKELETON_WINDOW)
-                    .map(|a| a.arc_id.as_str())
-                    .collect();
-                for arc in &active_arcs {
-                    let before = items
-                        .iter()
-                        .filter(|item| {
-                            item.arc_id.as_deref() == Some(arc.arc_id.as_str())
-                                && matches!(
-                                    item.kind,
-                                    SelKind::ToolCall { .. } | SelKind::ToolResult { .. }
-                                )
-                        })
-                        .map(|item| {
-                            item.served_token_count.or(item.token_count).unwrap_or(0) as f64
-                        })
-                        .sum::<f64>();
-                    let skeleton = (!ctx.emergency_window_yields
-                        && recent.contains(arc.arc_id.as_str())
-                        && is_small_tool_input(&arc.input))
-                        || reasoning_adjacency_collapse_arcs.contains(&arc.arc_id);
-                    // A kept call keeps its real arguments, so its call blocks reclaim
-                    // nothing; only the results shrink to the placeholder. Include a
-                    // conservative tag-overlay allowance because tag ids are installed
-                    // by the renderer.
-                    let after = if skeleton {
-                        let call_tokens = items
-                            .iter()
-                            .filter(|item| {
-                                item.arc_id.as_deref() == Some(arc.arc_id.as_str())
-                                    && matches!(item.kind, SelKind::ToolCall { .. })
-                            })
-                            .map(|item| {
-                                item.served_token_count.or(item.token_count).unwrap_or(0) as f64
-                            })
-                            .sum::<f64>();
-                        call_tokens
-                            + (arc.result_ids.len()
-                                * (mc_tokenizer::estimate_tokens(DROPPED_PLACEHOLDER) + 32))
-                                as f64
-                    } else {
-                        0.0
-                    };
-                    reclaim_by_arc.insert(
-                        arc.arc_id.clone(),
-                        (before - after).max(0.0) * seed.tools_ratio,
-                    );
-                }
-            }
+            let reclaim_by_arc = emergency_reclaim_by_arc(
+                items,
+                &active_arcs,
+                ctx,
+                &reasoning_adjacency_collapse_arcs,
+            );
             let emergency_arc_ids = select_emergency(
                 &active_arcs,
                 ctx,
@@ -2096,6 +2138,156 @@ mod tests {
             &SelectionConfig::default(),
         );
         assert!(result.decisions.is_empty());
+    }
+
+    /// The emergency reclaim estimate as it was computed before arc token totals
+    /// were gathered in one pass: each arc rescanned every item. Kept only as
+    /// the differential reference for the test below.
+    fn rescanning_emergency_reclaim_by_arc(
+        items: &[SelItem],
+        active_arcs: &[&ToolArc],
+        ctx: &SelectionContext,
+        reasoning_adjacency_collapse_arcs: &HashSet<String>,
+    ) -> HashMap<String, f64> {
+        let mut reclaim_by_arc = HashMap::new();
+        let seed = ctx.calibration.unwrap();
+        let recent: HashSet<_> = active_arcs
+            .iter()
+            .rev()
+            .take(RECENT_TOOL_SKELETON_WINDOW)
+            .map(|a| a.arc_id.as_str())
+            .collect();
+        for arc in active_arcs {
+            let before = items
+                .iter()
+                .filter(|item| {
+                    item.arc_id.as_deref() == Some(arc.arc_id.as_str())
+                        && matches!(
+                            item.kind,
+                            SelKind::ToolCall { .. } | SelKind::ToolResult { .. }
+                        )
+                })
+                .map(|item| item.served_token_count.or(item.token_count).unwrap_or(0) as f64)
+                .sum::<f64>();
+            let skeleton = (!ctx.emergency_window_yields
+                && recent.contains(arc.arc_id.as_str())
+                && is_small_tool_input(&arc.input))
+                || reasoning_adjacency_collapse_arcs.contains(&arc.arc_id);
+            let after = if skeleton {
+                let call_tokens = items
+                    .iter()
+                    .filter(|item| {
+                        item.arc_id.as_deref() == Some(arc.arc_id.as_str())
+                            && matches!(item.kind, SelKind::ToolCall { .. })
+                    })
+                    .map(|item| item.served_token_count.or(item.token_count).unwrap_or(0) as f64)
+                    .sum::<f64>();
+                call_tokens
+                    + (arc.result_ids.len()
+                        * (mc_tokenizer::estimate_tokens(DROPPED_PLACEHOLDER) + 32))
+                        as f64
+            } else {
+                0.0
+            };
+            reclaim_by_arc.insert(
+                arc.arc_id.clone(),
+                (before - after).max(0.0) * seed.tools_ratio,
+            );
+        }
+        reclaim_by_arc
+    }
+
+    /// One-pass arc totals must give bit-identical reclaim estimates to the
+    /// per-arc rescan, and the full emergency selection built on them must pick
+    /// the same reductions in the same order. The fixture mixes served and
+    /// original counts, arcs with several calls and results, reasoning inside
+    /// arcs, reasoning-adjacent arcs, small and large inputs, and arcs with no
+    /// counted blocks.
+    #[test]
+    fn one_pass_emergency_totals_match_per_arc_rescan() {
+        let mut items = Vec::new();
+        let mut ordinal = 0;
+        for i in 0..120usize {
+            let arc = format!("arc{i}");
+            let input = if i % 3 == 0 {
+                serde_json::json!({ "command": "x".repeat(4_000) })
+            } else {
+                serde_json::json!({ "path": format!("f{i}") })
+            };
+            if i % 5 == 0 {
+                ordinal += 1;
+                items.push(reasoning_with_id(
+                    &format!("r{i}"),
+                    &arc,
+                    ordinal as u64,
+                    300,
+                ));
+            }
+            for call in 0..(1 + i % 2) {
+                ordinal += 1;
+                let mut item = tool_call_with_ids(
+                    &format!("{arc}c{call}"),
+                    &arc,
+                    ordinal as u64,
+                    "bash",
+                    input.clone(),
+                    500,
+                );
+                item.token_count = (i % 7 != 0).then_some(40 + i * 3 + call);
+                item.served_token_count = (i % 4 == 1).then_some(11 + i);
+                items.push(item);
+            }
+            for result in 0..(1 + i % 3) {
+                ordinal += 1;
+                let mut item = tool_result_with_ids(
+                    &format!("{arc}r{result}"),
+                    &arc,
+                    ordinal as u64,
+                    "bash",
+                    2_000,
+                );
+                item.token_count = Some(900 + i * 13 + result);
+                item.served_token_count = (i % 6 == 2).then_some(7 + result);
+                items.push(item);
+            }
+            if i % 10 == 0 {
+                ordinal += 1;
+                items.push(text_with_id(&format!("t{i}"), ordinal as u64, 1_000));
+            }
+        }
+        let arcs = group_arcs(&items, &HashSet::new());
+        let active_arcs: Vec<&ToolArc> = arcs.iter().collect();
+        assert!(active_arcs.len() >= 100);
+        let collapse = reasoning_adjacency_collapse_arc_ids(&items);
+        for yields in [false, true] {
+            let mut ctx = base_ctx(PassClass::EmergencyForce);
+            ctx.calibration = Some(crate::decision_calibration::DecisionCalibration::for_model(
+                Some("anthropic/claude-fable-5-1"),
+            ));
+            ctx.emergency_window_yields = yields;
+            let current = emergency_reclaim_by_arc(&items, &active_arcs, &ctx, &collapse);
+            let reference =
+                rescanning_emergency_reclaim_by_arc(&items, &active_arcs, &ctx, &collapse);
+            assert_eq!(current.len(), reference.len());
+            for (arc_id, value) in &reference {
+                assert_eq!(
+                    current[arc_id].to_bits(),
+                    value.to_bits(),
+                    "{arc_id} yields={yields}"
+                );
+            }
+            // The rest of the selector is unchanged, so identical estimates
+            // mean identical selection; assert it produces work to compare.
+            ctx.current_total_input_tokens = 400_000.0;
+            ctx.ceiling_tokens = 200_000.0;
+            let outcome = select_reductions_with_outcome(
+                &items,
+                &HashSet::new(),
+                &ctx,
+                &SelectionConfig::default(),
+            );
+            assert!(!outcome.decisions.is_empty(), "yields={yields}");
+        }
     }
 
     fn base_ctx(pass: PassClass) -> SelectionContext {
