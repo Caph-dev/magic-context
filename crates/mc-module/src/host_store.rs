@@ -363,7 +363,8 @@ fn counted<T>(result: Result<T, HostStoreError>) -> Result<T, HostStoreError> {
 
 // ── Schema fingerprints ─────────────────────────────────────────────────────
 
-/// The `sqlite_master` fingerprint each domain table, and [`BRACKET_TABLE`], must carry.
+/// The expected schema fingerprint of each domain table and of [`BRACKET_TABLE`], as
+/// computed by [`read_table_fingerprint`].
 ///
 /// Regenerate together with any migration that touches a domain table:
 /// `bun scripts/dump-context-db-schema.ts > crates/mc-module/tests/fixtures/context-db-schema.sql`
@@ -372,59 +373,130 @@ fn counted<T>(result: Result<T, HostStoreError>) -> Result<T, HostStoreError> {
 pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     (
         "compartment_events",
-        "c25a1a9fbae82a47e449aa1de08a0f9741a9665ada17d83e52e584225087e843",
+        "79cb5301803217125d3831923e70a5d913754d6d733a96727f8cb86f2f5e138d",
     ),
     (
         "compartments",
-        "3ea325c5d2d51df824126f3abcdd9f01707a4b254762b5c613323ad18a4591c3",
+        "80ddceb8c04ee4642fb3c15807e93fd04e62b774fff6f4b146f1906307f08338",
     ),
     (
         "context_privilege_state",
-        "5fe555e971ccd6cb5c7a25aa523d527950bf3f4fd5e38bbd79cbcda9fd2f095b",
+        "ffe1e5a4d218c3a16cacc0a4c716eb227fa1bba59f203f035226d73ee0f88751",
     ),
     (
         "memories",
-        "614cc40bba9242ecd79577df693df5f90b98b5f6cd436f978b1293eda1372a12",
+        "a5b13611e93768e4f53e78e4831a58d74d6c79e078a1a85c5cfbf269a0eb417c",
     ),
     (
         "memory_embedding_watermarks",
-        "35ee22cf02938870a25f214d3b0002fb434a7f005b086fd4642e96e816bf15ad",
+        "b3012ecd26bbc261bbd51ce0e7cdfaa9068864b0d32701c23d7b4704cf9560cc",
     ),
     (
         "notes",
-        "efe8efd4759a9a9cc768808b3c94c55bc2af93ecd66778f64853c2f13c585ad7",
+        "31bf819717d1a09f3762fb1f56848fc19612f110fae8cc894bad5dc00f4ae2db",
     ),
     (
         "primer_candidates",
-        "ddeae5e61b4b3df6025141621a080574f196e3d782a209c79b3a2b21be201141",
+        "9992d881ec72626d4656a7c73c8779e33f1762cf106ea9ffff72e3b08dd3ec27",
     ),
     (
         "session_facts",
-        "1e619e665f653afa4ab62a45f37e0dedee798085f4081ece02f40f278a834f64",
+        "4a51eda591fa24f51a6b500a0773a9a648f1e53a1ada9352b195039230e11ec5",
     ),
     (
         "user_memories",
-        "d1b14d392fe181fb9563068356ebec6519ff956f3fc27ffc7cdc4438a3cbcd98",
+        "db3e60857602228326096491485382054f65432421e673b669b5a91f7dc8c865",
     ),
     (
         "user_memory_candidates",
-        "8129e1b067e2f1f69d2ea36d44c42df0757bc0d86f7c32eab57fb11a5847305a",
+        "95439b71b9b3bf11af21a75f092c8978d732e00be1a833b61214e81852dd83cc",
     ),
 ];
 
-fn expected_fingerprint(table: &str) -> Option<&'static str> {
+pub(crate) fn expected_fingerprint(table: &str) -> Option<&'static str> {
     DOMAIN_TABLE_FINGERPRINTS
         .iter()
         .find(|(name, _)| *name == table)
         .map(|(_, fingerprint)| *fingerprint)
 }
 
-/// Collapse the whitespace SQLite preserves verbatim in `sqlite_master.sql`.
+/// Normalise schema SQL so that spelling alone never reads as a schema change.
 ///
-/// Reformatting a CREATE statement without changing what it declares must not read as a
-/// schema change; changing a column, a constraint, an index or a trigger body must.
+/// Whitespace runs collapse to one space. Spaces next to parentheses and commas go, and
+/// so do identifier quotes (`"`, `` ` ``, `[`, `]`); string literals are left as written.
+/// Changing a column, a constraint, an index or a trigger body still changes the result.
 fn normalize_schema_sql(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(sql.len());
+    let mut in_string = false;
+    let mut pending_space = false;
+    for ch in sql.chars() {
+        if in_string {
+            out.push(ch);
+            if ch == '\'' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => {
+                if pending_space && !out.is_empty() && !out.ends_with(['(', ',']) {
+                    out.push(' ');
+                }
+                pending_space = false;
+                in_string = true;
+                out.push(ch);
+            }
+            '"' | '`' | '[' | ']' => {}
+            c if c.is_whitespace() => pending_space = true,
+            '(' | ')' | ',' => {
+                pending_space = false;
+                out.push(ch);
+            }
+            _ => {
+                if pending_space && !out.is_empty() && !out.ends_with(['(', ',']) {
+                    out.push(' ');
+                }
+                pending_space = false;
+                out.push(ch);
+            }
+        }
+    }
+    out
+}
+
+/// The CHECK constraints a CREATE TABLE statement declares, normalised and sorted, so
+/// their place in the statement (inline, or appended by `ALTER TABLE ADD COLUMN`) does
+/// not matter.
+fn check_constraints(create_sql: &str) -> Vec<String> {
+    let normalized = normalize_schema_sql(create_sql);
+    let upper = normalized.to_ascii_uppercase();
+    let bytes = normalized.as_bytes();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = upper[from..].find("CHECK(") {
+        let start = from + offset;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut end = normalized.len();
+        for (index, byte) in bytes.iter().enumerate().skip(start + "CHECK".len()) {
+            match byte {
+                b'\'' => in_string = !in_string,
+                b'(' if !in_string => depth += 1,
+                b')' if !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = index + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        found.push(normalized[start..end].to_string());
+        from = end;
+    }
+    found.sort();
+    found
 }
 
 /// Hash one table's full `sqlite_master` surface.
@@ -433,42 +505,133 @@ fn normalize_schema_sql(sql: &str) -> String {
 /// which is the surface a migration can change under the module: a trigger-only migration
 /// on a domain table is the demonstrated shape, and a columns-only fingerprint would miss
 /// it entirely.
-fn read_table_fingerprint(
+pub(crate) fn read_table_fingerprint(
     conn: &Connection,
     table: &str,
 ) -> Result<Option<String>, rusqlite::Error> {
-    let mut statement = conn.prepare(
-        "SELECT type, name, sql FROM sqlite_master
-          WHERE tbl_name = ?1 AND sql IS NOT NULL
-          ORDER BY type ASC, name ASC",
-    )?;
-    let rows = statement
+    Ok(table_schema_description(conn, table)?.map(|description| {
+        let mut hasher = Sha256::new();
+        hasher.update(description.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }))
+}
+
+/// The text [`read_table_fingerprint`] hashes: what the table declares, independent of
+/// how its CREATE statement happens to be spelled.
+///
+/// A file that gained columns through `ALTER TABLE ADD COLUMN` over many releases stores a
+/// different CREATE text from a file created at the latest lane in one go, with the same
+/// columns in another order. Hashing the text would read that as a schema change, and
+/// on a long-lived host file every write would be refused. So the description is built
+/// from what SQLite reports instead:
+/// - every column's name, declared type, NOT NULL flag, default and primary-key position,
+///   sorted by name;
+/// - the table's CHECK constraints, normalised and sorted;
+/// - every index (including the ones UNIQUE and PRIMARY KEY constraints create), with its
+///   uniqueness, origin, partial flag and key columns, plus the normalised SQL of an
+///   explicitly created one;
+/// - every trigger by name with its normalised SQL.
+///
+/// Returns `None` when the table does not exist.
+pub(crate) fn table_schema_description(
+    conn: &Connection,
+    table: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let create_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(create_sql) = create_sql else {
+        return Ok(None);
+    };
+    let mut lines = Vec::new();
+
+    let mut columns = conn
+        .prepare("SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1)")?
         .query_map(params![table], |row| {
-            Ok((
+            Ok(format!(
+                "column\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                normalize_schema_sql(&row.get::<_, String>(1)?).to_ascii_uppercase(),
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?
+                    .map(|value| normalize_schema_sql(&value))
+                    .unwrap_or_else(|| "NULL".to_string()),
+                row.get::<_, i64>(4)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    columns.sort();
+    lines.extend(columns);
 
-    if !rows
-        .iter()
-        .any(|(kind, name, _)| kind == "table" && name == table)
-    {
-        return Ok(None);
-    }
+    lines.extend(
+        check_constraints(&create_sql)
+            .into_iter()
+            .map(|check| format!("check\u{1f}{check}")),
+    );
 
-    let mut hasher = Sha256::new();
-    for (kind, name, sql) in &rows {
-        hasher.update(kind.as_bytes());
-        hasher.update([0x1f]);
-        hasher.update(name.as_bytes());
-        hasher.update([0x1f]);
-        hasher.update(normalize_schema_sql(sql).as_bytes());
-        hasher.update([0x1e]);
+    let index_list = conn
+        .prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1)")?
+        .query_map(params![table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut indexes = Vec::new();
+    for (name, unique, origin, partial) in index_list {
+        let key_columns = conn
+            .prepare("SELECT COALESCE(name, '<expr>') FROM pragma_index_info(?1) ORDER BY seqno")?
+            .query_map(params![name], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        // An index SQLite made for a UNIQUE or PRIMARY KEY constraint is named by its
+        // position in the CREATE statement, which differs between an evolved file and a
+        // fresh one, so it is identified by what it covers instead.
+        let identity = if origin == "c" {
+            name.clone()
+        } else {
+            format!("{origin}:{key_columns}")
+        };
+        indexes.push(format!(
+            "index\u{1f}{identity}\u{1f}{unique}\u{1f}{origin}\u{1f}{partial}\u{1f}{key_columns}\u{1f}{}",
+            sql.map(|sql| normalize_schema_sql(&sql)).unwrap_or_default()
+        ));
     }
-    Ok(Some(format!("{:x}", hasher.finalize())))
+    indexes.sort();
+    lines.extend(indexes);
+
+    let mut triggers = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master
+              WHERE type = 'trigger' AND tbl_name = ?1 AND sql IS NOT NULL",
+        )?
+        .query_map(params![table], |row| {
+            Ok(format!(
+                "trigger\u{1f}{}\u{1f}{}",
+                row.get::<_, String>(0)?,
+                normalize_schema_sql(&row.get::<_, String>(1)?)
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    triggers.sort();
+    lines.extend(triggers);
+
+    Ok(Some(lines.join("\u{1e}")))
 }
 
 /// Read the persisted upstream migration lane, ignoring downstream fork numbers.
@@ -501,7 +664,11 @@ pub struct FenceState {
 }
 
 impl FenceState {
-    fn read(conn: &Connection, path: &Path, built_version: i64) -> Result<Self, HostStoreError> {
+    pub(crate) fn read(
+        conn: &Connection,
+        path: &Path,
+        built_version: i64,
+    ) -> Result<Self, HostStoreError> {
         let persisted_version =
             read_persisted_fence(conn)?.ok_or_else(|| HostStoreError::FenceMissing {
                 path: path.display().to_string(),
@@ -534,7 +701,7 @@ impl FenceState {
 
     /// The fence for one table. A table whose surface still hashes to the value this
     /// binary was built against is the table these writers know, at any migration lane.
-    fn check_table(&self, table: &str) -> Result<(), HostStoreError> {
+    pub(crate) fn check_table(&self, table: &str) -> Result<(), HostStoreError> {
         let Some(found) = self.fingerprints.get(table) else {
             return Err(HostStoreError::TableMissing {
                 table: table.to_string(),
@@ -1411,8 +1578,8 @@ fn insert_user_memories(tx: &Transaction<'_>, publish: &FoldPublish) -> Result<(
 /// mark is what asks: the host's backfill drains every memory above `embedded_memory_id`
 /// up to `written_memory_id`. A per-project mark rather than a per-row column keeps the
 /// memories table byte-identical between the two writers.
-fn raise_embedding_watermark(
-    tx: &Transaction<'_>,
+pub(crate) fn raise_embedding_watermark(
+    tx: &Connection,
     project_path: &str,
     memory_id: i64,
     now_ms: i64,

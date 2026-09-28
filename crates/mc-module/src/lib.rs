@@ -50,6 +50,7 @@ pub mod runner_choices;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
+pub mod single_store_migrate;
 mod state_sync_timing;
 mod tail_hygiene;
 pub mod transform;
@@ -21016,7 +21017,10 @@ mod tests {
     #[test]
     fn supported_fences_report_plugin_and_store_ceilings() {
         let line = supported_fences_line();
-        assert_eq!(line, format!("context.db=91 store.db={LATEST_MIGRATION_VERSION}"));
+        assert_eq!(
+            line,
+            format!("context.db=91 store.db={LATEST_MIGRATION_VERSION}")
+        );
     }
 
     #[test]
@@ -41319,7 +41323,7 @@ mod tests {
         let profile = store.load_active_user_memories().unwrap();
         assert_eq!(profile, vec!["prefers root cause", "x < y & z"]);
         let composed = crate::m0_compose::compose_m0_from_store(
-            &store,
+            &*store,
             &crate::m0_compose::M0ComposeInputs {
                 session_id: session,
                 project_path: session,

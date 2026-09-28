@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod historian_claim;
+pub mod single_store_schema;
 
 pub use historian_claim::{
     historian_lease_ms, HistorianClaim, HistorianClaimOutcome, HistorianClaimRefusal,
@@ -7751,6 +7752,45 @@ fn materialize_strip_seed_units(
         core.frozen_units.push(unit);
     }
     skipped
+}
+
+/// Bring an unmigrated `store.db` up to the last version that still holds domain rows, and
+/// no further. The offline single-store migration calls this for a store older than that
+/// version and then applies migration 61 itself, after copying the rows out.
+///
+/// The historical trigger functions are registered with empty scopes: the migrations that
+/// install or replace those triggers only need them to exist.
+pub fn migrate_store_to_pre_single_store(path: &Path) -> Result<u32, McStoreError> {
+    let descriptor = StorageDescriptor {
+        module_id: "magic-context".to_string(),
+        storage_namespace: NS.to_string(),
+        isolation: cortexkit_store_types::Isolation::Module,
+        backend: cortexkit_store_types::StorageBackend::Sqlite {
+            path: path.to_string_lossy().into_owned(),
+        },
+    };
+    let inner = open_sqlite(&descriptor)?;
+    inner.with_conn(|conn| {
+        for name in [
+            "mc_note_caller_project",
+            "mc_facade_authority_domain",
+            "mc_facade_authority_route",
+        ] {
+            conn.create_scalar_function(
+                name,
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                |_| Ok(String::new()),
+            )?;
+        }
+        Ok(())
+    })?;
+    let end = MIGRATIONS
+        .iter()
+        .position(|migration| migration.version > single_store_schema::PRE_SINGLE_STORE_VERSION)
+        .unwrap_or(MIGRATIONS.len());
+    let outcome = inner.migrate(NS, &MIGRATIONS[..end])?;
+    Ok(outcome.recorded)
 }
 
 impl McStore {

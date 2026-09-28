@@ -289,6 +289,7 @@ What older builds do:
 - **ck-mc from v0.44.0 on** refuses the migrated store twice: store-ahead (61 is above its 60, `store:7844-7851`, MC-C13) and the marker (`store:7864-7872`, `single_store_marker`).
 - **ck-mc before v0.44.0** logged store-ahead and kept going (comment at `store:7839-7843`). It does not know the marker. On a migrated store it fails later with "no such table" on the first domain read. The failure is loud, but it does not name the cause. This is the honest limit. The release notes tell Rust-mode users to update ck-mc and the plugin together, and the only outside Rust-mode user is on v0.44.x.
 - **Older plugins** refuse `context.db` v92 at the fence.
+- **The module's `context.db` fence is reported, not enforced** (`BUILT_CONTEXT_FENCE_VERSION`, `host_store:61-67`; per-table fingerprints decide writability). So an old `ck-mc` is stopped by `store.db` (store-ahead and the marker), not by `context.db` v92.
 
 The two flags carry the same stamp: `single_store_state.migrated_at = mc_privilege_state.single_store_set_at_ms`. The module compares them at start (3.5), which binds this `store.db` to this `context.db`.
 

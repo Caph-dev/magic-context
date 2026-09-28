@@ -11,7 +11,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use mc_store::{McStore, McStoreError, MemoryRevision};
+use mc_store::{McStore, McStoreError, MemoryRevision, StoredCompartment};
 use sha2::{Digest, Sha256};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
@@ -424,10 +424,53 @@ fn render_m0_retry(
     m0_bytes
 }
 
+/// The four domain reads m0 is composed from.
+///
+/// The module reads them through its store. The single-store migration engine implements
+/// them twice more, over the old `store.db` tables and over `context.db`, so its render
+/// check composes both sides with this same composer.
+pub trait M0Source {
+    fn load_compartments(&self, session_id: &str) -> Result<Vec<StoredCompartment>, McStoreError>;
+    fn resolve_workspace_membership(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<mc_store::WorkspaceMembership>, McStoreError>;
+    fn load_memory_render_snapshot(
+        &self,
+        project_path: &str,
+        membership: Option<&mc_store::WorkspaceMembership>,
+        now_ms: i64,
+    ) -> Result<mc_store::MemoryRenderSnapshot, McStoreError>;
+    fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError>;
+}
+
+impl M0Source for McStore {
+    fn load_compartments(&self, session_id: &str) -> Result<Vec<StoredCompartment>, McStoreError> {
+        McStore::load_compartments(self, session_id)
+    }
+    fn resolve_workspace_membership(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<mc_store::WorkspaceMembership>, McStoreError> {
+        McStore::resolve_workspace_membership(self, project_path)
+    }
+    fn load_memory_render_snapshot(
+        &self,
+        project_path: &str,
+        membership: Option<&mc_store::WorkspaceMembership>,
+        now_ms: i64,
+    ) -> Result<mc_store::MemoryRenderSnapshot, McStoreError> {
+        McStore::load_memory_render_snapshot(self, project_path, membership, now_ms)
+    }
+    fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
+        McStore::load_active_user_memories(self)
+    }
+}
+
 /// Read the store and compose the HARD m0 bytes + watermarks. `estimate_tokens` is the
 /// token estimator used for every injection budget and the history fit.
-pub fn compose_m0_from_store(
-    store: &McStore,
+pub fn compose_m0_from_store<S: M0Source + ?Sized>(
+    store: &S,
     inputs: &M0ComposeInputs<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<M0Composition, M0ComposeError> {
@@ -440,8 +483,8 @@ pub fn compose_m0_from_store(
     )
 }
 
-pub(crate) fn compose_m0_from_store_timed(
-    store: &McStore,
+pub(crate) fn compose_m0_from_store_timed<S: M0Source + ?Sized>(
+    store: &S,
     inputs: &M0ComposeInputs<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     incremental: bool,
