@@ -235,6 +235,10 @@ export function createV1HiddenCompletionExecutor(
     };
 }
 
+export function historianReasoningBudgetDiagnostic(outputTokens: number): string {
+    return `historian ran out of output budget while reasoning (length-capped at ${outputTokens} tokens, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`;
+}
+
 export async function runValidatedHistorianPass(args: {
     client: PluginContext["client"] | undefined;
     hiddenCompletionExecutor?: HiddenCompletionExecutor;
@@ -698,7 +702,7 @@ async function runHistorianPrompt(args: {
         const reasoningResult = textResult ? null : completion.reasoning;
         const emptyError =
             !textResult && reasoningResult && lengthCapped
-                ? `historian output length-capped at ${completion.usage.output} tokens (all reasoning, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`
+                ? historianReasoningBudgetDiagnostic(completion.usage.output)
                 : !textResult && !reasoningResult
                   ? "Historian returned no assistant output."
                   : !textResult

@@ -117,6 +117,30 @@ test("a length-capped review answer is refused and changes nothing", async () =>
     db.close();
 });
 
+test("reasoning-only length-capped dreamer names its output budget setting", async () => {
+    const db = freshDb("review-user-memories-reasoning-cap");
+    insertUserMemoryCandidates(db, [{ content: "User prefers concise updates", sessionId: "s1" }]);
+    const { executor } = carrier({
+        text: null,
+        reasoning: "private reasoning",
+        lengthCapped: true,
+    });
+    await expect(
+        reviewUserMemories({
+            db,
+            hiddenCompletionExecutor: executor,
+            parentSessionId: undefined,
+            sessionDirectory: "/repo/project",
+            holderId: "holder",
+            leaseKey: "review-user-memories-reasoning-cap",
+            deadline: Date.now() + 60_000,
+            promotionThreshold: 1,
+        }),
+    ).rejects.toThrow(/ran out of output budget while reasoning.*dreamer\.maxTokens/);
+    expect(getActiveUserMemories(db)).toHaveLength(0);
+    db.close();
+});
+
 test("a review answer truncated before its closing brace is refused and changes nothing", async () => {
     const db = freshDb("review-user-memories-truncated");
     insertUserMemoryCandidates(db, [{ content: "User prefers concise updates", sessionId: "s1" }]);

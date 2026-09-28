@@ -422,7 +422,11 @@ async function classifyOneChunk(
                     validateOutput: (completion) => {
                         const messages = completion.messages ?? [];
                         if (completion.lengthCapped) {
-                            throw new Error("classify returned length-capped output");
+                            throw new Error(
+                                completion.reasoning && !completion.text
+                                    ? `classify ran out of output budget while reasoning (length-capped at ${completion.usage.output} tokens, no text) — set dreamer.maxTokens or use a low-reasoning model`
+                                    : "classify returned length-capped output",
+                            );
                         }
                         const text = completion.text;
                         if (!text) throw new Error("classify returned no output");

@@ -104,7 +104,11 @@ export async function runHiddenSingleShotPrompt<T>(
                 fetchOutput: () => args.executor.collect(handle, 50),
                 validateOutput: (completion) => {
                     if (completion.lengthCapped) {
-                        throw new Error(`${args.callContext} returned length-capped output`);
+                        throw new Error(
+                            completion.reasoning && !completion.text
+                                ? `${args.callContext} ran out of output budget while reasoning (length-capped at ${completion.usage.output} tokens, no text) — set dreamer.maxTokens or use a low-reasoning model`
+                                : `${args.callContext} returned length-capped output`,
+                        );
                     }
                     const text = completion.text;
                     if (!text && !args.allowEmpty)
