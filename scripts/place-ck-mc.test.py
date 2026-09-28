@@ -53,7 +53,15 @@ esac
             "ck": '''#!/bin/sh
 case "$*" in
   'module restart magic-context') exit 0 ;;
-  '--json provenance magic-context') echo '{"modules":[{"module_id":"magic-context","daemon_observed":{"pid":1234},"module_declared":{"build":{"build_git_sha":"6d76aeea576fe2a25ac6d5ed0d9c8125a1fff9f2"}}}]}' ;;
+  '--json provenance magic-context')
+    # FAKE_DRAINING_POLLS makes the first N reads look like a restart still in progress:
+    # the new process has not declared its build yet.
+    n=$(cat "$FAKE_POLL_COUNT" 2>/dev/null || echo 0); echo $((n + 1)) > "$FAKE_POLL_COUNT"
+    if [ "$n" -lt "${FAKE_DRAINING_POLLS:-0}" ]; then
+      echo '{"modules":[{"module_id":"magic-context","daemon_observed":{"pid":1234},"module_declared":{}}]}'
+    else
+      echo '{"modules":[{"module_id":"magic-context","daemon_observed":{"pid":1234},"module_declared":{"build":{"build_git_sha":"6d76aeea576fe2a25ac6d5ed0d9c8125a1fff9f2"}}}]}'
+    fi ;;
   '--json health magic-context') if [ "${FAKE_BAD_HEALTH:-}" = 1 ]; then echo '{"status":"failing"}'; else echo '{"status":"ok"}'; fi ;;
   *) exit 3 ;;
 esac
@@ -68,7 +76,8 @@ python3 -c 'import os; p=os.environ["FAKE_DEPLOYED"]; print("i" + str(os.stat(p)
         self.env = dict(os.environ, HOME=str(self.home), MAGIC_CONTEXT_STORAGE_DIR=str(self.store),
                         PATH=str(self.shims) + os.pathsep + os.environ["PATH"],
                         PYTHONPYCACHEPREFIX=str(root / "pycache"), XDG_CACHE_HOME=str(root / "cache"),
-                        FAKE_DEPLOYED=str(self.bin / "ck-mc"))
+                        FAKE_DEPLOYED=str(self.bin / "ck-mc"), FAKE_POLL_COUNT=str(root / "poll-count"),
+                        PLACE_CK_MC_POLL_SECONDS="0")
 
     def versions(self, context, store):
         for name, sql, version in (
@@ -120,6 +129,13 @@ python3 -c 'import os; p=os.environ["FAKE_DEPLOYED"]; print("i" + str(os.stat(p)
         self.assertTrue(rollback.exists())
         self.assertEqual(rollback.read_bytes().count(OLD.encode()), 1)
         self.assertEqual((self.bin / "ck-mc").read_bytes(), self.staged.read_bytes())
+
+    def test_placement_waits_for_the_restarted_module_to_declare_its_build(self):
+        env = dict(self.env, FAKE_DRAINING_POLLS="3")
+        run = subprocess.run(["bash", str(SCRIPT), str(self.staged)], env=env,
+                             cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("inode/version/digest/health ok", run.stdout)
 
     def test_failed_post_placement_check_prints_rollback_without_using_it(self):
         before = (self.bin / "ck-mc").read_bytes()

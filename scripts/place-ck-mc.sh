@@ -110,8 +110,23 @@ cp -p "$staged" "$tmp"
 mv -f "$tmp" "$deployed"
 trap 'echo "placement verification failed; rollback binary only when both stores are compatible: $rollback_cmd" >&2' ERR
 ck module restart magic-context
-provenance=$(ck --json provenance magic-context)
-running=$(printf '%s' "$provenance" | python3 -c 'import json,sys; x=json.load(sys.stdin); m=next(m for m in x["modules"] if m["module_id"] == "magic-context"); print(m["daemon_observed"]["pid"], m["module_declared"]["build"]["build_git_sha"])')
+# The restart returns while the old process drains, before the new one has declared its
+# build. Wait for the new process to report a build instead of reading a half-started state.
+poll_seconds=${PLACE_CK_MC_POLL_SECONDS:-2}
+running=""
+for _ in $(seq 1 60); do
+    provenance=$(ck --json provenance magic-context 2>/dev/null) || provenance=""
+    running=$(printf '%s' "$provenance" | python3 -c 'import json,sys
+try:
+    x = json.load(sys.stdin)
+    m = next(m for m in x["modules"] if m["module_id"] == "magic-context")
+    print(m["daemon_observed"]["pid"], m["module_declared"]["build"]["build_git_sha"])
+except (KeyError, StopIteration, TypeError, ValueError):
+    pass' || true)
+    [[ -n "$running" && "${running#* }" == "$staged_sha" ]] && break
+    sleep "$poll_seconds"
+done
+[[ -n "$running" ]] || { echo "magic-context did not declare a build after the restart" >&2; false; }
 read -r pid running_sha <<< "$running"
 [[ "$pid" =~ ^[0-9]+$ && "$running_sha" == "$staged_sha" ]] || { echo "running build $running_sha does not match staged $staged_sha" >&2; false; }
 running_inode=$(lsof -nP -p "$pid" -a -d txt -F in | python3 -c '
@@ -126,7 +141,16 @@ for line in sys.stdin:
 [[ "$running_inode" == "$(stat -f %i "$deployed")" ]] || { echo "running inode $running_inode differs from placed inode $(stat -f %i "$deployed")" >&2; false; }
 [[ "$(sha_from "$deployed")" == "$staged_sha" ]] || false
 [[ "$(shasum -a 256 "$deployed" | cut -d' ' -f1)" == "$staged_digest" ]] || false
-health=$(ck --json health magic-context)
-printf '%s' "$health" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "ok", "ck health is not ok"'
+# Health reads "unknown" until the new process answers its first probe; allow it to settle.
+health_ok=0
+for _ in $(seq 1 30); do
+    health=$(ck --json health magic-context 2>/dev/null) || health=""
+    if printf '%s' "$health" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("status") == "ok" else 1)' 2>/dev/null; then
+        health_ok=1
+        break
+    fi
+    sleep "$poll_seconds"
+done
+[[ $health_ok -eq 1 ]] || { echo "ck health is not ok after the restart" >&2; false; }
 trap - ERR
 echo "placed ck-mc $staged_sha; context.db $context_live/$context_supported store.db $store_live/$store_supported; inode/version/digest/health ok"
