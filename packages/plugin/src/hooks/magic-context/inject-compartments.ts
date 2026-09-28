@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { MEMORY_MURAL_BLOCK } from "../../agents/magic-context-prompt";
 import {
     buildCompartmentBlock,
     type Compartment,
@@ -2206,14 +2207,14 @@ function renderSessionHistoryWithDecay(args: {
     });
 }
 
-const MEMORY_MURAL_BLOCK =
-    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
-
 /** Remove a stale mural reference when a legacy cached baseline has no paired image payload. */
 export function stripMemoryMuralBlock(m0Text: string): string {
     return m0Text
         .split("\n\n")
-        .filter((section) => section !== MEMORY_MURAL_BLOCK)
+        .filter(
+            (section) =>
+                !(section.startsWith("<memory-mural>\n") && section.endsWith("\n</memory-mural>")),
+        )
         .join("\n\n")
         .trim();
 }

@@ -39,6 +39,11 @@ const CTX_NOTE_GUIDANCE = `\`ctx_note\` is the tray for work you intend to retur
 
 const MEMORY_GUIDANCE = `\`<project-memory>\` is the pinboard: facts about this project that stay true for the months this work lasts, as \`#id: fact\` lines — for you, and for every other agent working on this project. \`ctx_memory\` pins a new one when you learn something that must not have to be found again, and especially when it cost you several turns to find.`;
 
+export const MEMORY_MURAL_GUIDANCE =
+    "The memory mural image lists project memories that did not fit `<project-memory>`, as compressed cues under category banners. A red cue is a prohibition (`⊘thing (reason)`), `→` means leads to. Run `ctx_search` with a cue's identifiers to recall the full memory.";
+
+export const MEMORY_MURAL_BLOCK = `<memory-mural>\nThe project memory mural image follows.\n${MEMORY_MURAL_GUIDANCE}\n</memory-mural>`;
+
 const TOOL_HISTORY_GUIDANCE = `Older work is not kept on the desk at all. Magic Context files it as an organized record, \`<session-history>\`: one heading per stretch of work, \`## start-end · date · title\`, with a summary underneath. Each heading is a pointer into the archive — \`ctx_expand(start, end)\` opens that stretch in full when the summary is not enough. Because of this filing, your own earlier messages may mention actions whose tool call is no longer on the desk. That is normal. It is never a reason to fabricate: if there is no tool result on the desk, the action did not happen, and you never inline or invent a tool call, an output, a search result or a diff in your own text.`;
 
 const SMART_NOTE_GUIDANCE = `A note with a \`surface_condition\` is left with an outside checker that looks the condition up periodically and returns the note only when it holds.`;
