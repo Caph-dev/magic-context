@@ -7132,6 +7132,11 @@ impl McHandler {
         wait_budget: Duration,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
         #[cfg(test)]
+        assert!(
+            wait_budget <= self.transform_historian_followup_budget(),
+            "historian wait budget must remain within the configured follow-up budget"
+        );
+        #[cfg(test)]
         self.transform_historian_wait_budgets
             .lock()
             .expect("transform historian wait budgets mutex")
