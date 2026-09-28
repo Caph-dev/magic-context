@@ -297,7 +297,7 @@ function attachPiPartVersion(
 }
 
 function convertEntriesToRawMessageRange(
-	entries: readonly unknown[],
+	entries: Iterable<unknown>,
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
@@ -464,7 +464,7 @@ export function convertEntriesToRawMessages(
 
 /** Convert only one raw-message page without hydrating the rest of the Pi branch. */
 export function convertEntriesToRawMessagePage(
-	entries: readonly unknown[],
+	entries: Iterable<unknown>,
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
