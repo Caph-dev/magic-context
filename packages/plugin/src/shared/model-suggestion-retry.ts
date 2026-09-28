@@ -767,11 +767,11 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
     log(
         `[${callContext}] all models exhausted; tried: ${failedAttempts.map((failure) => failure.attempt.label).join(", ")}; original error: ${shortErr(firstError)}; last error: ${shortErr(lastError)}`,
     );
-    throwWithPromptFailure(
-        firstError ?? lastError ?? new Error("All fallback models failed validation"),
-        failedAttempts,
-        args,
-        timeoutMs,
-        options.transport,
-    );
+    const cause = lastError ?? firstError;
+    const exhausted =
+        cause instanceof Error
+            ? cause
+            : new Error(String(cause ?? "All fallback models failed validation"));
+    exhausted.message = `All models exhausted (${failedAttempts.map((failure) => failure.attempt.label).join(", ")}): ${exhausted.message}`;
+    throwWithPromptFailure(exhausted, failedAttempts, args, timeoutMs, options.transport);
 }

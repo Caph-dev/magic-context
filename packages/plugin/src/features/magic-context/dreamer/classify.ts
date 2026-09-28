@@ -268,21 +268,18 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     let stage: 2 | 3;
     let toClassify: ClassifyCandidate[];
     let anchors: ClassifyAnchorMemory[] = [];
+    const unclassifiedIds = new Set(
+        getUnclassifiedMemoryIds(
+            args.db,
+            active.map((candidate) => candidate.contextMemory.id),
+        ),
+    );
+    toClassify = active.filter((candidate) => unclassifiedIds.has(candidate.contextMemory.id));
     if (active.length <= FULL_POOL_CEILING) {
-        // Stage 2: classify the whole pool every run.
+        // An unchanged classification is already durable; only new or changed rows need a prompt.
         stage = 2;
-        toClassify = active;
     } else {
-        // Stage 3: only the new/changed (unclassified) memories, with stratified
-        // already-classified anchors for distribution calibration.
         stage = 3;
-        const unclassifiedIds = new Set(
-            getUnclassifiedMemoryIds(
-                args.db,
-                active.map((candidate) => candidate.contextMemory.id),
-            ),
-        );
-        toClassify = active.filter((candidate) => unclassifiedIds.has(candidate.contextMemory.id));
         const classified = active.filter(
             (candidate) => !unclassifiedIds.has(candidate.contextMemory.id),
         );
@@ -583,9 +580,10 @@ async function runClassifyThroughModule(
                 ...(hostCompletion ? { host_completion: hostCompletion } : {}),
             },
             signal,
-            // The module drives a full producer run (model call included) before replying,
-            // so this request carries the classify slice budget, not the transport default.
-            timeoutMs: CLASSIFY_MODULE_RUN_TIMEOUT_MS,
+            // Each model attempt can spend 600 seconds awaiting its provider run and
+            // another 60 seconds recovering its response. Allow every fallback to finish.
+            timeoutMs:
+                Math.max(1, resolvedModelChain.length) * CLASSIFY_MODULE_RUN_TIMEOUT_MS + 30_000,
         });
     const unwrap = (response: unknown) =>
         (response as { result?: unknown } | null)?.result ?? response;

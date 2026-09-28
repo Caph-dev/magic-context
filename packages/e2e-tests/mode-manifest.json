@@ -278,6 +278,34 @@
             ]
         },
         {
+            "path": "tests/dreamer-authority-preflight.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "OpenCode 1.18.30 TypeScript host skips module-managed classification without prompting",
+            "contract_refs": ["TS-HARNESS"],
+            "hosts": ["opencode"],
+            "behavior": true,
+            "divergences": [
+                { "host": "opencode2", "reason": "OpenCode 2 uses a separate completion carrier", "contract_ref": "TS-HARNESS" },
+                { "host": "pi", "reason": "Pi uses a separate JSONL host and has no module client", "contract_ref": "PI-HARNESS" },
+                { "host": "omp", "reason": "OMP uses a separate Pi-compatible host", "contract_ref": "PI-HARNESS" }
+            ]
+        },
+        {
+            "path": "tests/dreamer-pi-model-chain.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Pi 0.87.1 validates its model chain before scheduled classification",
+            "contract_refs": ["PI-HARNESS"],
+            "hosts": ["pi"],
+            "behavior": true,
+            "divergences": [
+                { "host": "opencode", "reason": "OpenCode does not use Pi's model registry", "contract_ref": "PI-HARNESS" },
+                { "host": "opencode2", "reason": "OpenCode 2 does not use Pi's model registry", "contract_ref": "PI-HARNESS" },
+                { "host": "omp", "reason": "OMP has a different model registry and host version", "contract_ref": "PI-HARNESS" }
+            ]
+        },
+        {
             "path": "tests/dreamer-timer-tick.test.ts",
             "tier": "ts-only",
             "invocation": {

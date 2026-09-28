@@ -28,7 +28,10 @@ export function registerCtxDreamCommand(
 		dreamerEnabled?: boolean;
 		resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 		onProjectSeen?: (projectIdentity: string) => void;
-		ensureRegistered?: (ctx: { cwd: string }) => void | Promise<void>;
+		ensureRegistered?: (ctx: {
+			cwd: string;
+			modelRegistry?: { find(provider: string, modelId: string): unknown };
+		}) => void | Promise<void>;
 		registrationOwner: object;
 	},
 ): void {

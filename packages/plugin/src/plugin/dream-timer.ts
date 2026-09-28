@@ -1,8 +1,10 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
+import { getAuthorityManagedMarker } from "../features/magic-context/context-authority";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
+import { logDreamerNotOwnerOnce } from "../features/magic-context/dreamer/module-apply";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
 import {
     historianOrphanStaleMs,
@@ -25,6 +27,7 @@ import type {
     DreamTaskProgress,
 } from "../features/magic-context/dreamer/task-registry";
 import { leaseKeyFor } from "../features/magic-context/dreamer/task-registry";
+import type { DreamTaskRuntimeConfig } from "../features/magic-context/dreamer/task-scheduler";
 import { runDueTasksForProject } from "../features/magic-context/dreamer/task-scheduler";
 import {
     clearDreamerTickFailure,
@@ -90,6 +93,7 @@ interface ProjectRegistration {
     harness: ModelHarness;
     client: PluginContext["client"];
     dreamerConfig?: DreamerConfig;
+    validateTaskModels?: (tasks: DreamTaskRuntimeConfig[]) => DreamTaskRuntimeConfig[];
     sampleDreamRun?: () => Partial<
         Pick<
             ProjectRegistration,
@@ -544,7 +548,7 @@ async function sweepProject(
 
     const dreamerConfig = reg.dreamerConfig;
     const dreamingEnabled = Boolean(dreamerConfig && dreamerConfig.disable !== true);
-    const runtimeConfigs =
+    const configuredTasks =
         dreamingEnabled && dreamerConfig
             ? buildDreamTaskRuntimeConfigs(
                   dreamerConfig,
@@ -553,6 +557,7 @@ async function sweepProject(
                   reg.mural?.model,
               )
             : [];
+    const runtimeConfigs = reg.validateTaskModels?.(configuredTasks) ?? configuredTasks;
     await sweepOrphanedInternalChildren(
         reg,
         runtimeConfigs
@@ -576,7 +581,11 @@ async function sweepProject(
 
     try {
         await runCompiledSmartNoteSweep(reg, db);
+    } catch (error) {
+        log(`[dreamer] compiled smart-note sweep failed for ${reg.projectIdentity}:`, error);
+    }
 
+    try {
         // Dreamer v2: per-task cron scheduling. The scheduler seeds/reads
         // task_schedule_state, evaluates each task's cron + activity gate, and
         // runs due tasks grouped by conflict-domain under keyed leases. The
@@ -671,6 +680,10 @@ export function _resetDreamTimerForTests(): void {
 }
 
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
+    if (getAuthorityManagedMarker(db, reg.projectIdentity)) {
+        logDreamerNotOwnerOnce(reg.projectIdentity);
+        return;
+    }
     const leaseKey = leaseKeyFor("evaluate-smart-notes", reg.projectIdentity);
     const holderId = crypto.randomUUID();
     if (!acquireLease(db, holderId, leaseKey)) return;

@@ -42,6 +42,7 @@ import type {
 	MagicContextConfig,
 } from "@magic-context/core/config/schema/magic-context";
 import {
+	buildDreamTaskRuntimeConfigs,
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
@@ -160,6 +161,7 @@ import {
 	awaitInFlightDreamers,
 	registerPiDreamerProject,
 	unregisterPiDreamerProject,
+	validatePiDreamerModels,
 } from "./dreamer";
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { registerPiDroppedInputGuard } from "./dropped-input-guard-pi";
@@ -887,6 +889,7 @@ setHarness(PI_HARNESS_KIND);
 export function resolveHistorianFromConfig(
 	config: MagicContextConfig,
 	harness: PiHarnessKind = PI_HARNESS_KIND,
+	modelRegistry?: { find(provider: string, modelId: string): unknown },
 ): PiHistorianOptions | undefined {
 	// Defensive: schema declares `historian` required with default {}, but the
 	// runtime config can come from a malformed JSONC merge that drops the
@@ -894,7 +897,27 @@ export function resolveHistorianFromConfig(
 	const historian = config.historian as HistorianConfig | undefined;
 	if (historian?.disable === true) return undefined;
 	const resolved = resolveHistorianModel(config, harness);
-	const model = resolved.primary?.model;
+	const validated =
+		modelRegistry && resolved.primary
+			? validatePiDreamerModels(
+					[
+						{
+							task: "classify-memories",
+							schedule: "",
+							timeoutMinutes: 20,
+							model: resolved.primary,
+							fallbackModels: resolved.fallbacks,
+						},
+					],
+					modelRegistry,
+				)[0]
+			: undefined;
+	const primary = validated
+		? typeof validated.model === "string"
+			? { model: validated.model }
+			: validated.model
+		: resolved.primary;
+	const model = primary?.model;
 	if (!model) return undefined;
 
 	// The historian chunk budget is anchored to the HISTORIAN model because
@@ -906,7 +929,7 @@ export function resolveHistorianFromConfig(
 		historianContextLimit,
 	);
 
-	const fallbackModels = resolved.fallbacks;
+	const fallbackModels = validated?.fallbackModels ?? resolved.fallbacks;
 
 	return {
 		runner: new PiSubagentRunner(),
@@ -927,7 +950,7 @@ export function resolveHistorianFromConfig(
 		// Pi and OMP: explicit thinking level for historian subagent invocations.
 		// When set, passed as --thinking <level> to Pi subprocess.
 		// Required for providers like GitHub Copilot that apply bad defaults.
-		thinkingLevel: resolved.primary?.qualifier,
+		thinkingLevel: primary?.qualifier,
 		executeThresholdPercentage: config.execute_threshold_percentage,
 		executeThresholdTokens: config.execute_threshold_tokens,
 		commitClusterTrigger: config.commit_cluster_trigger,
@@ -1439,6 +1462,9 @@ async function startPiMagicContextRuntime(
 		return resolveProjectDepsForDir(ctx.cwd);
 	}
 
+	let activeModelRegistry:
+		| { find(provider: string, modelId: string): unknown }
+		| undefined;
 	function resolveContextOptionsForProject(
 		dir: string,
 	): PiContextHandlerOptions {
@@ -1447,7 +1473,11 @@ async function startPiMagicContextRuntime(
 			project.config,
 			liveReaderFor(dir, project.config).poll().effective,
 		);
-		const historian = resolveHistorianFromConfig(sampled);
+		const historian = resolveHistorianFromConfig(
+			sampled,
+			PI_HARNESS_KIND,
+			activeModelRegistry,
+		);
 		return { ...project.contextOptions, historian };
 	}
 
@@ -1465,6 +1495,7 @@ async function startPiMagicContextRuntime(
 
 	function syncDreamerProjectRegistration(
 		current: ResolvedPiProjectDeps,
+		modelRegistry?: { find(provider: string, modelId: string): unknown },
 	): void {
 		if (sessionShuttingDown) return;
 		seenDreamerProjectIdentities.add(current.projectIdentity);
@@ -1481,6 +1512,7 @@ async function startPiMagicContextRuntime(
 			projectIdentity: current.projectIdentity,
 			registrationOwner: dreamerRegistrationOwner,
 			config: current.dreamerConfig,
+			modelRegistry,
 			sampleDreamRun: () => {
 				const fresh = liveReaderFor(current.projectDir, current.config).poll()
 					.effective;
@@ -1565,6 +1597,8 @@ async function startPiMagicContextRuntime(
 		// change takes effect at the next session without restarting Pi.
 		projectDepsByDir.delete(ctx.cwd);
 		const current = resolveCurrentProjectDeps(ctx);
+		activeModelRegistry = ctx.modelRegistry;
+		syncDreamerProjectRegistration(current, ctx.modelRegistry);
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
 
 		const failuresToShow = claimConfigParseFailuresOnce(
@@ -1688,6 +1722,34 @@ async function startPiMagicContextRuntime(
 					runnable: current.dreamerEnabled,
 					scheduleSummary: summarizeDreamSchedule(current.config.dreamer),
 				},
+				modelChainWarning: (() => {
+					const registry = activeModelRegistry;
+					if (!registry) return undefined;
+					const tasks = validatePiDreamerModels(
+						buildDreamTaskRuntimeConfigs(
+							current.config.dreamer,
+							PI_HARNESS_KIND,
+							current.config.language,
+							current.config.mural.model,
+						),
+						registry,
+					);
+					const empty: string[] = tasks
+						.filter((task) => task.modelChainUnavailable)
+						.map((task) => task.task);
+					if (
+						!resolveHistorianFromConfig(
+							current.config,
+							PI_HARNESS_KIND,
+							registry,
+						) &&
+						current.historianConfig
+					)
+						empty.push("historian");
+					return empty.length
+						? `Pi model chain empty (no model found): ${empty.join(", ")}`
+						: undefined;
+				})(),
 				activeProfile: current.config.profile,
 				cacheTtlConfig: current.config.cache_ttl,
 				cacheTtlConfigured: current.cacheTtlConfigured,
@@ -1727,8 +1789,11 @@ async function startPiMagicContextRuntime(
 				current.config,
 				liveReaderFor(current.projectDir, current.config).poll().effective,
 			);
-			const historian =
-				resolveHistorianFromConfig(fresh) ?? current.historianConfig;
+			const historian = resolveHistorianFromConfig(
+				fresh,
+				PI_HARNESS_KIND,
+				activeModelRegistry,
+			);
 			return {
 				db,
 				runner: recompRunner,
@@ -1777,8 +1842,11 @@ async function startPiMagicContextRuntime(
 				current.config,
 				liveReaderFor(current.projectDir, current.config).poll().effective,
 			);
-			const historian =
-				resolveHistorianFromConfig(fresh) ?? current.historianConfig;
+			const historian = resolveHistorianFromConfig(
+				fresh,
+				PI_HARNESS_KIND,
+				activeModelRegistry,
+			);
 			return {
 				db,
 				runner: wrapupRunner,
@@ -1822,7 +1890,10 @@ async function startPiMagicContextRuntime(
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		onProjectSeen: (identity) => seenDreamerProjectIdentities.add(identity),
 		ensureRegistered: (ctx) =>
-			syncDreamerProjectRegistration(resolveCurrentProjectDeps(ctx)),
+			syncDreamerProjectRegistration(
+				resolveCurrentProjectDeps(ctx),
+				ctx.modelRegistry,
+			),
 		registrationOwner: dreamerRegistrationOwner,
 	});
 	info("registered /ctx-dream");
@@ -1940,7 +2011,8 @@ async function startPiMagicContextRuntime(
 			// registration created while another checkout's config was active, so the
 			// shared helper releases that ownership explicitly.
 			try {
-				syncDreamerProjectRegistration(effectiveProjectDeps);
+				activeModelRegistry = ctx.modelRegistry;
+				syncDreamerProjectRegistration(effectiveProjectDeps, ctx.modelRegistry);
 			} catch (err) {
 				warn("before_agent_start: dreamer registration sync threw:", err);
 			}

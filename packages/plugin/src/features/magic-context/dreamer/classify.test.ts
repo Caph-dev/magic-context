@@ -161,6 +161,25 @@ describe("runClassify disposition", () => {
         }
     });
 
+    test("Stage 2 does not prompt for an unchanged classified pool", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-stage2-gate";
+            addMemoriesForDisposition(db, projectIdentity, 10);
+            const args = classifyArgs(db, projectIdentity);
+            let prompts = 0;
+            args.client = successfulClassifyClient(() => prompts++) as never;
+            expect((await runClassify(args)).classified).toBe(10);
+            const second = await runClassify(args);
+            expect(second.stage).toBe(2);
+            expect(second.classified).toBe(0);
+            expect(second.remaining).toBe(0);
+            expect(prompts).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("reports a swallowed chunk failure as incomplete", async () => {
         const db = freshDb();
         try {
@@ -355,6 +374,7 @@ describe("module-backed classification", () => {
                 complete: true,
             });
             const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            expect(taskCall?.timeoutMs).toBeGreaterThan(2 * 660_000);
             const applyCall = calls.find((call) => call.method === "memory.set_classification");
             expect((taskCall?.body as { model_chain: string[] }).model_chain).toEqual([
                 "anthropic/profile-dreamer",

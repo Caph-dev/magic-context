@@ -33,6 +33,7 @@ import {
 import type { Database } from "../../../shared/sqlite";
 import { dreamFailureCode, userFacingFailureCode } from "../../../shared/user-facing-codes";
 import { getCompartmentEvents } from "../compartment-events";
+import { getAuthorityManagedMarker } from "../context-authority";
 import {
     getMemoriesByProject,
     getMemoryCountsByStatus,
@@ -72,6 +73,7 @@ import { mapMemories } from "./map-memories";
 import {
     DreamerModuleFailureError,
     type DreamerModuleRoute,
+    logDreamerNotOwnerOnce,
     resolveDreamerModuleRoute,
 } from "./module-apply";
 import { promotePrimers } from "./promote-primers";
@@ -423,11 +425,16 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             });
         };
         reportProgress(0);
+        if (config.modelChainUnavailable) {
+            return {
+                status: "completed",
+                detail: "skipped: Pi model chain is empty (no configured model resolves in Pi)",
+            };
+        }
         const incompleteMessage = (remaining: number): string => {
             const processed = processedDreamTaskItems(backlogAtStart.pending, remaining);
             return `${config.task} incomplete: ${remaining} remain (was ${backlogAtStart.pending} at run start; processed ${processed} this run)`;
         };
-        const parent = await resolveParentSessionId();
         let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
         if (
             config.task === "curate" ||
@@ -451,6 +458,25 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 throw new DreamerModuleFailureError("authority.status", error);
             }
         }
+        if (
+            !moduleRoute &&
+            getAuthorityManagedMarker(db, projectIdentity) &&
+            (
+                [
+                    "curate",
+                    "map-memories",
+                    "compress-cues",
+                    "classify-memories",
+                    "verify",
+                    "verify-broad",
+                    "retrospective",
+                ] as DreamTaskName[]
+            ).includes(config.task)
+        ) {
+            logDreamerNotOwnerOnce(projectIdentity);
+            return { status: "completed", detail: "skipped: module-managed memory; not owner" };
+        }
+        const parent = await resolveParentSessionId();
         if (!leaseOwnershipMatches(db, holderId, leaseAcquisition.generation, leaseKey)) {
             throw new Error("Dream lease lost during executor setup");
         }

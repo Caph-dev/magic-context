@@ -39,6 +39,8 @@ export interface DreamTaskRuntimeConfig {
     schedule: string;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    /** Configured Pi chain contained no models in Pi's registry. */
+    modelChainUnavailable?: boolean;
     thinkingLevel?: PiThinkingLevel;
     language?: string;
     timeoutMinutes: number;

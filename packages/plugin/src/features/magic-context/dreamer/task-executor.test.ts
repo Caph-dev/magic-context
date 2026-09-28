@@ -6,7 +6,11 @@ import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { userFacingFailureCode } from "../../../shared/user-facing-codes";
-import { applyMirrorPage, ensureContextStoreUuid } from "../context-authority";
+import {
+    applyMirrorPage,
+    ensureContextStoreUuid,
+    installAuthorityManagedMarker,
+} from "../context-authority";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -1453,6 +1457,42 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
 });
 
 describe("createDreamTaskExecutor — classify-memories", () => {
+    test("module-managed memory on a TS host returns completed without a prompt or error row", async () => {
+        db = freshDb();
+        const project = "git:ts-not-owner";
+        for (let i = 0; i < 10; i++)
+            insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `Fact ${i}`,
+            });
+        installAuthorityManagedMarker(db, project);
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => {
+                    throw new Error("must not prompt");
+                }),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: process.cwd(),
+            openOpenCodeDb: () => null,
+            transformMode: "ts",
+        });
+        const leaseKey = leaseKeyFor("classify-memories", project);
+        expect(acquireLease(db, "ts-holder", leaseKey)).toBe(true);
+        const outcome = await executor(
+            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "ts-holder", leaseKey },
+        );
+        expect(outcome.status).toBe("completed");
+        expect(outcome.detail).toContain("not owner");
+        expect(client.session.create).not.toHaveBeenCalled();
+        expect(client.session.list).not.toHaveBeenCalled();
+        expect(getDreamRuns(db, project)).toHaveLength(0);
+    });
     test("runs the non-agentic XML transform and applies the manifest host-side", async () => {
         db = freshDb();
         const project = "/repo/project";
