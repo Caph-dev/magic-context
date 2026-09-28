@@ -35438,7 +35438,10 @@ pub(crate) mod tests {
             .get_note_by_id("git:proj", "ses", note.id)
             .unwrap()
             .unwrap();
-        assert_eq!(after.status, "ready", "serving passes must not consume the note");
+        assert_eq!(
+            after.status, "ready",
+            "serving passes must not consume the note"
+        );
         assert_eq!(after.status_version, ready.status_version);
     }
 

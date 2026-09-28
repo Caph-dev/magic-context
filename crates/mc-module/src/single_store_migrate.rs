@@ -2465,8 +2465,19 @@ fn context_version(conn: &Connection) -> rusqlite::Result<i64> {
     )
 }
 
+/// Print how long one step of the migration took, on stderr beside the other progress
+/// lines. A run on a large pair takes minutes, and the operator should see it moving.
+fn log_step(step: &str, started: Instant) {
+    eprintln!("{step}: {:.1}s", started.elapsed().as_secs_f64());
+}
+
 /// Copy both files into `backup_dir` with a consistent snapshot of each, check each copy,
 /// and write `MANIFEST.tsv` (name, source path, schema version, sha256).
+///
+/// Checking a copy means reading it in full twice: once for `PRAGMA quick_check` and once
+/// for its sha256. On a multi-gigabyte `context.db` those two reads, not the copy, are
+/// most of the migration's wall time, so they run side by side rather than one after the
+/// other.
 fn backup(options: &EngineOptions) -> Result<(), EngineError> {
     std::fs::create_dir_all(&options.backup_dir)?;
     let mut manifest = String::from("name\tsource\tschema_version\tsha256\n");
@@ -2475,30 +2486,48 @@ fn backup(options: &EngineOptions) -> Result<(), EngineError> {
         ("store.db", &options.store_db),
     ] {
         let target = options.backup_dir.join(name);
+        eprintln!(
+            "backing up {name} ({:.1} GB)...",
+            file_len(source) as f64 / 1e9
+        );
         let conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::from_millis(u64::from(
             CONTEXT_BUSY_TIMEOUT_MS,
         )))?;
+        let step = Instant::now();
         conn.execute("VACUUM INTO ?1", params![target.to_string_lossy()])?;
         drop(conn);
-        let copy = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let check: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        log_step(&format!("backup {name}: copy"), step);
+        let step = Instant::now();
+        let (check, digest) = std::thread::scope(|scope| {
+            let digest = scope.spawn(|| sha256_file(&target));
+            let check = (|| -> rusqlite::Result<(String, i64)> {
+                let copy = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                let check: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+                let version = if name == "context.db" {
+                    context_version(&copy)?
+                } else {
+                    i64::from(schema::recorded_store_version(&copy)?)
+                };
+                Ok((check, version))
+            })();
+            let digest = digest
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the sha256 thread panicked")));
+            (check, digest)
+        });
+        let (check, version) = check?;
+        let digest = digest?;
+        log_step(&format!("backup {name}: quick_check and sha256"), step);
         if check != "ok" {
             return Err(EngineError::Internal(format!(
                 "backup {} failed quick_check: {check}",
                 target.display()
             )));
         }
-        let version = if name == "context.db" {
-            context_version(&copy)?
-        } else {
-            i64::from(schema::recorded_store_version(&copy)?)
-        };
-        drop(copy);
         manifest.push_str(&format!(
-            "{name}\t{}\t{version}\t{}\n",
+            "{name}\t{}\t{version}\t{digest}\n",
             source.display(),
-            sha256_file(&target)?
         ));
     }
     std::fs::write(options.backup_dir.join("MANIFEST.tsv"), manifest)?;
@@ -2841,6 +2870,7 @@ fn migrate_in_transaction(
     hooks: &mut dyn EngineHooks,
 ) -> Result<Report, EngineError> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
+    let step = Instant::now();
     conn.execute_batch(schema::MIGRATION_61_CREATE_SQL)?;
     let file_uuid: String = conn
         .query_row(
@@ -2866,6 +2896,8 @@ fn migrate_in_transaction(
         }
     }
     let decided = classify_projects(conn, &projects, &file_uuid, options)?;
+    log_step("read and classify", step);
+    let step = Instant::now();
     let skipped_projects: BTreeSet<&String> = decided
         .iter()
         .filter(|(_, decision)| **decision == Classification::Skipped)
@@ -2957,7 +2989,11 @@ fn migrate_in_transaction(
             .map_err(|error| EngineError::Internal(error.to_string()))?;
     }
 
+    log_step("copy", step);
+    let step = Instant::now();
     check_claude_code_ids(conn, &copier, &sessions, options)?;
+    log_step("claude code id check", step);
+    let step = Instant::now();
 
     let sessions_reset = schema::reset_cache_state_for_single_store(conn)?;
     for project in &copier.changed_projects {
@@ -2981,9 +3017,14 @@ fn migrate_in_transaction(
         )?;
     }
 
+    log_step("cache reset and flags", step);
     hooks.after_copy(conn)?;
+    let step = Instant::now();
     verify(conn, &copier, &source, &decided, &copied_sessions)?;
+    log_step("verify", step);
+    let step = Instant::now();
     let render_check = render_check(conn, &sessions, &skipped_sessions, &store_wins, options)?;
+    log_step("render check", step);
 
     let mut projects_report: Vec<ProjectReport> = Vec::new();
     for (project, decision) in &decided {
