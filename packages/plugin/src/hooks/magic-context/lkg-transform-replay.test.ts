@@ -379,6 +379,68 @@ describe("LKG transform replay", () => {
         expect(replay).toEqual({ ok: true, messages: [prefix, current[1]] });
     });
 
+    test("accepts CEREB's contiguous signed thinking pair before a completed tool in one message", () => {
+        const message = assistant("a-cereb", 1, [
+            { type: "step-start" },
+            { type: "reasoning", text: "first trace", signature: "synthetic-sig-a" },
+            { type: "reasoning", text: "second trace", signature: "synthetic-sig-b" },
+            {
+                type: "tool",
+                callID: "call-1",
+                tool: "read",
+                providerExecuted: false,
+                state: { status: "completed", input: {}, output: "result" },
+            },
+            { type: "step-finish" },
+        ]);
+
+        expect(validateAnthropicReasoningRuns([message])).toBe(true);
+    });
+
+    test("declines a contiguous thinking pair split across merged assistant messages", () => {
+        const first = assistant("a-first", 1, [
+            { type: "thinking", thinking: "first trace", signature: "synthetic-sig-a" },
+        ]);
+        const second = assistant("a-second", 2, [
+            { type: "thinking", thinking: "second trace", signature: "synthetic-sig-b" },
+        ]);
+
+        expect(validateAnthropicReasoningRuns([first, second])).toBe(false);
+    });
+
+    test("declines thinking introduced by a second merged assistant even without earlier thinking", () => {
+        expect(
+            validateAnthropicReasoningRuns([
+                assistant("a-empty", 1, [{ type: "step-start" }]),
+                assistant("a-thinking", 2, [
+                    { type: "thinking", thinking: "trace", signature: "synthetic-sig" },
+                ]),
+            ]),
+        ).toBe(false);
+    });
+
+    test("declines thinking after text in the same assistant run", () => {
+        expect(
+            validateAnthropicReasoningRuns([
+                assistant("a-text-first", 1, [
+                    { type: "text", text: "preface" },
+                    { type: "thinking", thinking: "late trace", signature: "synthetic-sig" },
+                ]),
+            ]),
+        ).toBe(false);
+    });
+
+    test("declines thinking after a tool use in the same assistant run", () => {
+        expect(
+            validateAnthropicReasoningRuns([
+                assistant("a-tool-first", 1, [
+                    { type: "tool", providerExecuted: true, state: { status: "completed" } },
+                    { type: "thinking", thinking: "late trace", signature: "synthetic-sig" },
+                ]),
+            ]),
+        ).toBe(false);
+    });
+
     test("declines a new thinking run after a provider-executed tool", () => {
         const first = assistant("a-prefix", 1, [
             { type: "thinking", thinking: "first signed trace", signature: "sig-a" },

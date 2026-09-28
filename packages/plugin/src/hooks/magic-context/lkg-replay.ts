@@ -401,9 +401,9 @@ function partIsOpenCodeStepMetadata(part: unknown): boolean {
  * completed non-provider-executed tool result materializes as user content and
  * starts a new assistant run, while OpenCode's step markers do not materialize
  * on the provider wire.
- * Each resulting assistant run may contain only one leading thinking block; a
- * later signed block would invalidate its provider signature, so recovery declines
- * the entire replay instead of attempting a rewrite.
+ * Leading signed thinking blocks are safe together only when they originate in
+ * the same assistant message. Thinking after content or from a later merged
+ * assistant message is declined rather than rewriting its signature.
  */
 export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean {
     let index = 0;
@@ -412,18 +412,21 @@ export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean
             index += 1;
             continue;
         }
-        let thinkingBlocks = 0;
+        let firstMessageInRun: number | null = null;
         let sawOtherContent = false;
         while (index < messages.length && messageRole(messages[index]) === "assistant") {
+            if (firstMessageInRun === null) firstMessageInRun = index;
             for (const part of messageParts(messages[index])) {
-                if (partIsAnthropicThinking(part)) {
-                    thinkingBlocks += 1;
-                    if (thinkingBlocks > 1 || sawOtherContent) return false;
-                } else if (partEndsAnthropicAssistantRun(part)) {
-                    thinkingBlocks = 0;
+                if (partEndsAnthropicAssistantRun(part)) {
+                    firstMessageInRun = null;
                     sawOtherContent = false;
                 } else if (!partIsOpenCodeStepMetadata(part)) {
-                    sawOtherContent = true;
+                    if (firstMessageInRun === null) firstMessageInRun = index;
+                    if (partIsAnthropicThinking(part)) {
+                        if (sawOtherContent || index !== firstMessageInRun) return false;
+                    } else {
+                        sawOtherContent = true;
+                    }
                 }
             }
             index += 1;
