@@ -21551,6 +21551,88 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn in_session_memory_mutations_ride_the_next_bust_and_defers_replay_them() {
+        // An update, an archive and a merge each append to context.db's
+        // memory_mutation_log and change no memory id. The mutation-log head is the only
+        // revision input that moves, so it alone must open the next execute-band pass as a
+        // SOFT carrying <memory-updates>; the defers after it replay those bytes exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let updated = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule one", 0))
+            .unwrap();
+        let archived = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule two", 0))
+            .unwrap();
+        let merge_target = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule three", 0))
+            .unwrap();
+        let merge_source = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule four", 0))
+            .unwrap();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let defer_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 10, 100);
+        assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "HARD");
+        // With nothing pending, an execute-band pass does not bust.
+        assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "SOFT+");
+
+        let archived_marker = format!("id=\"{archived}\"");
+        let mutations: [(&str, Box<dyn Fn(&McStore)>); 3] = [
+            (
+                "rule one corrected",
+                Box::new(move |s: &McStore| {
+                    s.update_memory_content("git:proj", updated, "rule one corrected", None, 1)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                archived_marker.as_str(),
+                Box::new(move |s: &McStore| {
+                    s.archive_memories("git:proj", &[archived], None, 2)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                "rules three and four",
+                Box::new(move |s: &McStore| {
+                    s.merge_memories(
+                        "git:proj",
+                        merge_target,
+                        &[merge_source],
+                        "rules three and four",
+                        3,
+                    )
+                    .unwrap()
+                    .unwrap();
+                }),
+            ),
+        ];
+        for (marker, mutate) in mutations {
+            mutate(&s);
+            let soft = transform(&s, &execute_req, &ctx).unwrap();
+            assert_eq!(soft.action, "SOFT", "{marker}");
+            let m1 = m1_bytes(&soft);
+            assert!(m1.contains("<memory-updates>"), "{marker}: {m1}");
+            assert!(m1.contains(marker), "{marker}: {m1}");
+            let served = serde_json::to_vec(&soft.ck_messages).unwrap();
+            for _ in 0..3 {
+                let deferred = transform(&s, &defer_req, &ctx).unwrap();
+                assert_eq!(deferred.action, "SOFT+", "{marker}");
+                assert_eq!(
+                    serde_json::to_vec(&deferred.ck_messages).unwrap(),
+                    served,
+                    "{marker}: a defer replays the served bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn project_memory_epoch_in_context_db_is_an_eager_hard_input() {
         // An identity or workspace writer bumps project_state.project_memory_epoch in
         // context.db. The next pass must rebuild m0 (a HARD naming the epoch), and the pass
