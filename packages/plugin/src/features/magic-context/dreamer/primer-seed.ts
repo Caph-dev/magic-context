@@ -139,7 +139,9 @@ function loadPrePostP1(db: Database, sessionId: string, originStartMessage: numb
     const originSeq = origin.sequence;
     const rows = db
         .prepare(
-            `SELECT sequence, start_message, end_message, title, p1, content
+            `SELECT sequence, start_message, end_message,
+                    substr(title, 1, 512) AS title,
+                    substr(p1, 1, 1200) AS p1, substr(content, 1, 1200) AS content
              FROM compartments
              WHERE session_id = ? AND sequence IN (?, ?)
              ORDER BY sequence ASC`,
@@ -162,7 +164,9 @@ function closedBookOriginP1(
 ): { orientation: string; sessionId: string } {
     const row = db
         .prepare(
-            "SELECT title, p1, content FROM compartments WHERE session_id = ? AND start_message = ? ORDER BY sequence ASC LIMIT 1",
+            `SELECT substr(title, 1, 512) AS title,
+                    substr(p1, 1, 2000) AS p1, substr(content, 1, 2000) AS content
+             FROM compartments WHERE session_id = ? AND start_message = ? ORDER BY sequence ASC LIMIT 1`,
         )
         .get(sessionId, originStartMessage) as
         | { title?: string; p1?: string | null; content?: string | null }

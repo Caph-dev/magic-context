@@ -47,8 +47,8 @@ export interface RefreshPrimersArgs {
      * (JSONL), so the orientation seed read works on Pi-only installs where there
      * is no opencode.db. OpenCode leaves this undefined — the seed read falls to
      * the read-only opencode.db path. Returning null → closed-book fallback.
-     * May be async (Pi JSONL discovery is async); the returned provider's
-     * `readMessages()` itself is synchronous (wraps already-loaded entries).
+     * May be async (Pi JSONL discovery is async); the returned provider serves
+     * synchronous summary pages without retaining the historical transcript.
      */
     rawProviderFactory?: (
         sessionId: string,

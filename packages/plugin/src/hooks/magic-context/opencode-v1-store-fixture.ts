@@ -13,6 +13,7 @@ import { Database } from "../../shared/sqlite";
 
 export interface OpenCodeFixtureSession {
     sessionId: string;
+    directory?: string;
     /** Number of user/assistant message pairs. */
     turns: number;
     /** Characters of tool output per assistant message. */
@@ -58,7 +59,10 @@ export function writeOpenCodeV1FixtureStore(
         );
         db.transaction(() => {
             for (const session of sessions) {
-                insertSession.run(session.sessionId, `/fixture/${session.sessionId}`);
+                insertSession.run(
+                    session.sessionId,
+                    session.directory ?? `/fixture/${session.sessionId}`,
+                );
                 const output = "x".repeat(session.toolOutputChars ?? 64);
                 const diagnostics = Array.from(
                     { length: session.diagnosticsPerTool ?? 0 },
