@@ -45,21 +45,30 @@ npx @cortexkit/magic-context@latest doctor --harness opencode
 
 ## Merge split project identities
 
-If the same project has memories under two project identities, preview a merge before changing the shared database:
+Use this when a single project directory has memories or sessions split between a `dir:` identity and a `git:` identity, or two historical Git roots. Nothing merges automatically, including `doctor --fix`.
 
 ```bash
-npx @cortexkit/magic-context@latest doctor merge-identity \
-  --from <source-id> --to <target-id> --dry-run
+# List observed splits and suggested source → target pairs
+npx @cortexkit/magic-context@latest doctor merge-identities
+
+# Read-only preview: review the identities and counts before confirming
+npx @cortexkit/magic-context@latest doctor merge-identities \
+  --from <source-id> --to <target-id>
+
+# Close OpenCode, Pi, OpenCode 2 and ck-mc first, then confirm
+npx @cortexkit/magic-context@latest doctor merge-identities \
+  --from <source-id> --to <target-id> --apply
 ```
 
-The preview lists the project-scoped tables and rows that would be considered. A write requires an explicit confirmation flag:
+Prefer merging `dir:` into `git:`. For two Git roots, the suggestion uses the current resolver's lexicographically smallest root. The command refuses unknown or identical identities, different directories for two Git identities, and different workspace memberships (naming both workspaces). A target must resolve for an observed directory on this machine unless you explicitly use `--force`; that flag does not bypass the other safety checks.
 
-```bash
-npx @cortexkit/magic-context@latest doctor merge-identity \
-  --from <source-id> --to <target-id> --yes
-```
+The preview lists rows per table, duplicate memory IDs to collapse and potential conflicts to retain for review. Memories with the same category and normalized hash collapse into the target, retaining a superseded source audit row and file references. If a colliding hash contains different normalized text, both memories survive: the source gets a disambiguated hash and retains its original hash in metadata. Distinct memories in an overlapping category stay intact and receive `metadata_json.identity_merge_review`; this conservative marker is not a claim that the contents contradict each other. Notes keep their delivery state. Workspace aliases collapse or transfer. Dreamer retains run history, unions processed windows, deduplicates queued reasons, keeps successful progress and uses the target schedule to recompute the next due time. The earliest open broad-verification cycle remains open so completed checks are not repeated.
 
-Without `--dry-run` or `--yes`, the command refuses to mutate `context.db`.
+Before writing, the command checks host liveness and uses `lsof` to check database holders; an unavailable check refuses rather than assuming safety. Keep all hosts closed throughout the operation. It prints a private backup directory beside `context.db`, copies the database and any WAL/SHM files, and saves identity sidecars. **Save and run both printed restore commands with hosts closed** to restore the database/WAL and the sidecars together. Never copy a database backup over an open database.
+
+The merge uses one immediate transaction, bumps the target memory epoch and updates sidecars only after commit. Repeating a successful merge has no further database mutations. Git indexes move with their existing embeddings; sweep leases reset so the next host can rebuild derived state. Existing memory embeddings remain valid because content does not change; FTS indexes follow the normal update triggers. On colliding generated caches/configuration, the target wins.
+
+This repairs **context.db only**, without schema migrations. A project managed by the Rust module is refused by name: its data lives in the module store, and merging it will be possible once the single-store migration lands. The older `merge-identity --dry-run` / `--yes` spellings remain aliases for preview / apply.
 
 ---
 

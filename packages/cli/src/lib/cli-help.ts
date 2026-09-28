@@ -63,7 +63,7 @@ export const DOCTOR_HELP = [
     "    drain-authority <project>   Drain module memory/note authority back to TypeScript",
     "    migrate                     Migrate an OpenCode session to Pi or OMP JSONL",
     "    migrate-session             Re-home an OpenCode session to another directory",
-    "    merge-identity              Merge project rows between identities",
+    "    merge-identities            Preview or explicitly merge split identities",
     "    repair-db                   Back up and salvage a corrupted shared database",
     "    list-hidden-sessions        List Magic Context OpenCode 2 roots",
     "",
@@ -79,16 +79,19 @@ export const DRAIN_AUTHORITY_HELP = [
 
 export const MERGE_IDENTITY_HELP = [
     "",
-    "  Usage: magic-context doctor merge-identity --from <identity> --to <identity> [--dry-run] [--yes] [--db <path>]",
+    "  Usage: magic-context doctor merge-identities [--from <identity> --to <identity>] [--apply] [--force] [--db <path>]",
     "",
     "  Merge every project-scoped row from one project identity into another.",
     "",
     "  Options:",
     "    --from <identity>   Identity whose rows are moved",
     "    --to <identity>     Identity that receives them",
-    "    --dry-run           Report what would change without writing",
-    "    --yes               Confirm the write (required unless --dry-run)",
+    "    (no flags)          List splits; --from/--to previews without writing",
+    "    --apply             Confirm the reviewed preview; hosts must be closed",
+    "    --force             Permit a target not resolving on this machine",
     "    --db <path>         Use this context.db instead of the shared one",
+    "    --host-db <path>    Read session directories from this host database",
+    "    Legacy alias: doctor merge-identity; --dry-run previews, --yes applies",
     "",
 ].join("\n");
 
@@ -112,7 +115,8 @@ export function subcommandHelp(argv: readonly string[]): string | null {
     if (command !== "doctor") return null;
     const subcommand = rest[0];
     if (subcommand === "drain-authority") return DRAIN_AUTHORITY_HELP;
-    if (subcommand === "merge-identity") return MERGE_IDENTITY_HELP;
+    if (subcommand === "merge-identity" || subcommand === "merge-identities")
+        return MERGE_IDENTITY_HELP;
     if (subcommand === "list-hidden-sessions") return LIST_HIDDEN_SESSIONS_HELP;
     if (subcommand !== undefined && DOCTOR_SUBCOMMANDS_WITH_OWN_HELP.has(subcommand)) return null;
     return DOCTOR_HELP;
