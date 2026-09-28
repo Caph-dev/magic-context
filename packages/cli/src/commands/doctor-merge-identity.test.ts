@@ -191,7 +191,7 @@ describe("offline identity command", () => {
 
 it("repairs a real same-directory split, backs up and updates the sidecar after commit", () => {
     const directory = tempDir();
-    execFileSync("git", ["init", directory], { stdio: "ignore" });
+    execFileSync("git", ["init", directory], { stdio: "ignore", windowsHide: true });
     execFileSync(
         "git",
         [
@@ -206,9 +206,9 @@ it("repairs a real same-directory split, backs up and updates the sidecar after 
             "-m",
             "fixture",
         ],
-        { stdio: "ignore" },
+        { stdio: "ignore", windowsHide: true },
     );
-    const identity = `git:${execFileSync("git", ["-C", directory, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()}`;
+    const identity = `git:${execFileSync("git", ["-C", directory, "rev-parse", "HEAD"], { encoding: "utf8", windowsHide: true }).trim()}`;
     const path = join(directory, "context.db");
     createCurrentDatabase(path);
     const db = new Database(path);

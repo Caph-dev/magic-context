@@ -105,6 +105,7 @@ function resolveReadOnly(directory: string): string | undefined {
     try {
         const roots = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], {
             cwd: directory,
+            windowsHide: true,
             encoding: "utf8",
             timeout: 5000,
             stdio: ["ignore", "pipe", "pipe"],
@@ -120,6 +121,7 @@ function resolveReadOnly(directory: string): string | undefined {
     try {
         const result = execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
             cwd: directory,
+            windowsHide: true,
             encoding: "utf8",
             timeout: 5000,
             stdio: ["ignore", "pipe", "pipe"],
