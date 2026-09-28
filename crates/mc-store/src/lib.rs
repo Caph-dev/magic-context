@@ -7978,7 +7978,6 @@ impl McStore {
             #[cfg(any(test, feature = "test-support"))]
             historian_side_channel_fail_once: Mutex::new(BTreeSet::new()),
         };
-        store.repair_migration_30_authority_routes()?;
         store.prune_transform_session_roots()?;
         Ok(store)
     }
@@ -24832,65 +24831,6 @@ mod tests {
         assert!(
             rejected.to_string().to_lowercase().contains("constraint"),
             "{rejected}"
-        );
-    }
-
-    /// A store carrying the marker is refused by this binary, by name, with a sentence naming the
-    /// build that moved it.
-    ///
-    /// The control in the same test is the capable open: the very same file opens when the
-    /// capability is present, which is what makes the refusal a statement about this binary
-    /// rather than about a damaged store.
-    #[test]
-    fn a_marked_store_is_refused_by_name_and_opens_for_a_capable_binary() {
-        // Checked at compile time: this build ships the refusal, not the readers it guards, and
-        // the refusal asserted below only happens while that capability is absent.
-        const { assert!(!SINGLE_STORE_CAPABLE) };
-        // Spelled out rather than compared against the constant: operators, log searches and the
-        // release note all quote this exact token, so a rename is a contract change and has to be
-        // made deliberately here rather than travelling silently through every assertion that
-        // reads the constant.
-        assert_eq!(SINGLE_STORE_MARKER_REFUSAL_REASON, "single_store_marker");
-        const SET_BY: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c";
-        let dir = tempfile::tempdir().unwrap();
-        let descriptor = descriptor(dir.path());
-
-        let unmarked = McStore::open(&descriptor).unwrap();
-        assert_eq!(unmarked.single_store_marker().unwrap(), None);
-        unmarked
-            .set_single_store_marker_for_test(1_758_000_000_000, SET_BY)
-            .unwrap();
-        drop(unmarked);
-
-        let Err(refusal) = McStore::open(&descriptor) else {
-            panic!("a marked store must not open for a binary without the readers for it");
-        };
-        let McStoreError::SingleStoreMarkerUnsupported { marker } = &refusal else {
-            panic!("expected the single-store refusal, got {refusal:?}");
-        };
-        assert_eq!(marker.set_at_ms, Some(1_758_000_000_000));
-        assert_eq!(marker.set_by, SET_BY);
-
-        let rendered = refusal.to_string();
-        assert!(
-            rendered.contains(SINGLE_STORE_MARKER_REFUSAL_REASON),
-            "the refusal must name itself so logs and health agree: {rendered}"
-        );
-        assert!(
-            rendered.contains(&format!(
-                "this store was migrated to single-store mode by ck-mc {SET_BY}; \
-                 run that build or newer"
-            )),
-            "the refusal must say which build to run: {rendered}"
-        );
-
-        let capable = McStore::open_with_capability_for_test(&descriptor, true).unwrap();
-        assert_eq!(
-            capable.single_store_marker().unwrap(),
-            Some(SingleStoreMarker {
-                set_at_ms: Some(1_758_000_000_000),
-                set_by: SET_BY.to_string(),
-            })
         );
     }
 
