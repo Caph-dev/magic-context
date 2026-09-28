@@ -2413,9 +2413,10 @@ fn build_db_cache_events_with_attribution(
     // Expected next cache_read = prev.cache_read + growth, where growth is the
     // freshly-cacheable content the previous step contributed:
     //   - Anthropic reports it directly as cache_write (cache_creation tokens).
-    //   - Other providers never report cache_write (always 0), so the previous
-    //     step's own input + output is what becomes cached on the next step.
-    //   growth = prev.cache_write > 0 ? prev.cache_write : prev.input + prev.output
+    //   - When cache_write is absent, use only the previous uncached input.
+    //     Generated output (including reasoning) is not automatically part of
+    //     the next step's cached input; measured comparisons support this rule
+    //     (docs/reports/pi-openai-cache-busts-2026-09-28.md).
     // retention = current.cache_read / expected (only when prev had a cache):
     //   >= 0.95 stable · 0.80..0.95 warning · < 0.80 bust · ==0 full_bust
     // (Verified empirically: on a stable step retention is 0.97-1.00+ across
@@ -2547,13 +2548,12 @@ fn build_db_cache_events_with_attribution(
                 }
             } else if let Some(&prev_idx) = prev_event_idx_by_session.get(&session_key) {
                 // Snapshot prev values out before mutating chronological[i].
-                let (prev_read, prev_write, prev_input, prev_total) = {
+                let (prev_read, prev_write, prev_input) = {
                     let prev = &chronological[prev_idx];
                     (
                         prev.cache_read,
                         prev.cache_write,
                         prev.input_tokens,
-                        prev.total_tokens,
                     )
                 };
                 if prev_read == 0 {
@@ -2561,11 +2561,10 @@ fn build_db_cache_events_with_attribution(
                     // warming up), so a low/zero cache_read now isn't a LOSS.
                     ("stable".to_string(), None, None)
                 } else {
-                    let prev_output = (prev_total - prev_input - prev_read - prev_write).max(0);
                     let growth = if prev_write > 0 {
                         prev_write
                     } else {
-                        prev_input + prev_output
+                        prev_input
                     };
                     let expected = prev_read + growth; // > 0 since prev_read > 0
                     if cur_read == 0 {
@@ -10758,11 +10757,10 @@ mod cache_turn_tests {
     }
 
     #[test]
-    fn non_anthropic_growth_uses_input_plus_output() {
-        // No cache_write (write=0) → expected growth = prev.input + prev.output.
-        // m1: read=100000, input=2000, output=500 (total=102500), write=0.
-        //     expected next prefix = 100000 + 2000 + 500 = 102500.
-        // m2: read=102500 → retention = 1.0 → stable.
+    fn non_anthropic_growth_uses_input_only() {
+        // Without a reported cache write, generated output is not counted as
+        // next-step cached input; measured traces show cache growth comes from
+        // previously uncached input.
         let rows = vec![
             raw(
                 Harness::Opencode,
@@ -10781,14 +10779,50 @@ mod cache_turn_tests {
                 "s1",
                 200,
                 1_000,
-                102_500,
+                102_000,
                 0,
-                103_700,
+                103_200,
                 Some("tool-calls"),
             ),
         ];
         let events = build_db_cache_events(rows, false);
         assert_eq!(events[1].severity, "stable");
+    }
+
+    #[test]
+    fn broca_input_only_retention_clears_output_sensitive_warnings() {
+        let steps = [
+            (5726, 0, 205),
+            (559, 5632, 177),
+            (6012, 5632, 349),
+            (5141, 10752, 345),
+            (10485, 14848, 448),
+            (1956, 25088, 455),
+            (3053, 26112, 825),
+            (2650, 28160, 3053),
+        ];
+        let rows = steps
+            .iter()
+            .enumerate()
+            .map(|(index, &(input, read, output))| {
+                raw(
+                    Harness::Broca,
+                    &format!("step{}", index + 1),
+                    "broca-sequence",
+                    (index as i64 + 1) * 100,
+                    input,
+                    read,
+                    0,
+                    input + read + output,
+                    Some("tool-calls"),
+                )
+            })
+            .collect();
+        let events = build_db_cache_events(rows, false);
+        assert_eq!(
+            events.iter().map(|event| event.severity.as_str()).collect::<Vec<_>>(),
+            ["stable", "stable", "warning", "warning", "warning", "stable", "stable", "stable"]
+        );
     }
 
     #[test]
@@ -12336,9 +12370,9 @@ mod broca_cache_tests {
         assert_eq!(events[1].cache_read, 0);
         assert_eq!(events[1].severity, "unknown");
         // Step 3 is measured against step 1, the last step that reported
-        // reads: 4,000 of an expected 4,000 + 10 + 10.
+        // reads: 4,000 of an expected 4,000 + 10 uncached input tokens.
         assert_eq!(events[2].severity, "stable");
-        assert!((events[2].hit_ratio - 4_000.0 / 4_020.0).abs() < 1e-9);
+        assert!((events[2].hit_ratio - 4_000.0 / 4_010.0).abs() < 1e-9);
     }
 
     #[test]
