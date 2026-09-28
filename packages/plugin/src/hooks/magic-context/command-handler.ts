@@ -436,9 +436,7 @@ async function executeDreaming(
         );
         await deps.sendNotification(
             sessionId,
-            renderedSummary.includes("Backlog at run end:")
-                ? renderedSummary
-                : `${renderedSummary}\n\nBacklog at run end:\n${endBacklog}`,
+            `${renderedSummary}\n\nBacklog at run end:\n${endBacklog}`,
             dreamNotificationParams,
         );
     } catch (error) {
