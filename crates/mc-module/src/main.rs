@@ -25,6 +25,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{}", mc_module::supported_fences_line());
         return Ok(());
     }
+    // The offline single-store migration runs without subc and without serving: the doctor
+    // command calls it while nothing has either database open.
+    if std::env::args().nth(1).as_deref() == Some("single-store-migrate") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(mc_module::single_store_migrate::cli_main(&args));
+    }
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())

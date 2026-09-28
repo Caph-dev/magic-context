@@ -64,7 +64,7 @@ pub const SINGLE_STORE_CAPABLE: bool = mc_store::SINGLE_STORE_CAPABLE;
 /// this binary was built; whether that migration changed anything these writers depend
 /// on is answered per table by the fingerprints, so a migration that touched only tables
 /// the module never writes does not stop the module writing.
-pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 91;
+pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 92;
 
 /// Versions at or above this number belong to downstream forks and are excluded when
 /// reading the persisted lane, matching the host's own fence arithmetic.
@@ -501,7 +501,11 @@ pub struct FenceState {
 }
 
 impl FenceState {
-    fn read(conn: &Connection, path: &Path, built_version: i64) -> Result<Self, HostStoreError> {
+    pub(crate) fn read(
+        conn: &Connection,
+        path: &Path,
+        built_version: i64,
+    ) -> Result<Self, HostStoreError> {
         let persisted_version =
             read_persisted_fence(conn)?.ok_or_else(|| HostStoreError::FenceMissing {
                 path: path.display().to_string(),
@@ -534,7 +538,7 @@ impl FenceState {
 
     /// The fence for one table. A table whose surface still hashes to the value this
     /// binary was built against is the table these writers know, at any migration lane.
-    fn check_table(&self, table: &str) -> Result<(), HostStoreError> {
+    pub(crate) fn check_table(&self, table: &str) -> Result<(), HostStoreError> {
         let Some(found) = self.fingerprints.get(table) else {
             return Err(HostStoreError::TableMissing {
                 table: table.to_string(),
@@ -1411,8 +1415,8 @@ fn insert_user_memories(tx: &Transaction<'_>, publish: &FoldPublish) -> Result<(
 /// mark is what asks: the host's backfill drains every memory above `embedded_memory_id`
 /// up to `written_memory_id`. A per-project mark rather than a per-row column keeps the
 /// memories table byte-identical between the two writers.
-fn raise_embedding_watermark(
-    tx: &Transaction<'_>,
+pub(crate) fn raise_embedding_watermark(
+    tx: &Connection,
     project_path: &str,
     memory_id: i64,
     now_ms: i64,
