@@ -7,7 +7,10 @@ import {
     DREAMER_RETROSPECTIVE_AGENT,
 } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
-import type { DreamingTask } from "../../../config/schema/magic-context";
+import {
+    DREAM_TASK_PROMOTION_DEFAULTS,
+    type DreamingTask,
+} from "../../../config/schema/magic-context";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import {
     type HiddenCompletionExecutor,
@@ -644,7 +647,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseKey,
                     deadline,
                     leaseAcquisition,
-                    promotionThreshold: config.promotionThreshold ?? 3,
+                    promotionThreshold:
+                        config.promotionThreshold ??
+                        DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"],
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
@@ -834,7 +839,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseKey,
                     deadline,
                     leaseAcquisition,
-                    promotionThreshold: config.promotionThreshold ?? 2,
+                    promotionThreshold:
+                        config.promotionThreshold ??
+                        DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"],
                     ensureProjectRegistered: deps.ensureProjectRegistered,
                 });
                 recordRun("completed", null);
@@ -904,6 +911,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 });
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
+                    backlogAfter:
+                        retro.retrospectiveWatermarkMs == null
+                            ? undefined
+                            : getDreamTaskBacklog(db, projectIdentity, "retrospective", {
+                                  retrospectiveWatermarkMs: retro.retrospectiveWatermarkMs,
+                              }),
                 });
                 // Advance the content watermark on completion (incl. clean "n"
                 // runs) so the next run only scans newer messages.

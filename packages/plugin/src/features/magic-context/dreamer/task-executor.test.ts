@@ -2108,6 +2108,9 @@ describe("createDreamTaskExecutor — retrospective", () => {
             text: `line-${index + 1} ${"diagnostic payload ".repeat(80)}`,
             ts: start + index * 10,
         }));
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("s1", "opencode", project, rows.at(-1)?.ts ?? start);
         const provider = {
             listProjectSessions: mock(() => [{ sessionId: "s1", updatedAt: rows.at(-1)?.ts }]),
             readUserMessagesSince: mock((_sessionId: string, sinceMs: number, cap: number) => {
@@ -2189,6 +2192,10 @@ describe("createDreamTaskExecutor — retrospective", () => {
             task: "retrospective",
         });
         expect(third.ran).toEqual(["retrospective"]);
+        const recordedTask = JSON.parse(getDreamRuns(db, project)[0]?.tasks_json ?? "[]")[0] as {
+            backlog?: { pendingAtEnd: number };
+        };
+        expect(recordedTask.backlog?.pendingAtEnd).toBe(0);
         expect(promptedWindows).toHaveLength(3);
         expect(promptedWindows[1]?.length).toBeLessThan(promptedWindows[0]?.length ?? 0);
         expect(promptedWindows[2]?.filter((line) => promptedWindows[0]?.includes(line))).toEqual(

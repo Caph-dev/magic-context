@@ -424,9 +424,19 @@ async function executeDreaming(
 
     try {
         const summary = await deps.dreamer.runManual(task);
+        summary.backlogBefore = backlogBefore;
+        summary.backlogAfter = {
+            ...backlogBefore,
+            ...readDreamTaskBacklogsSafely(deps.db, deps.dreamer.projectPath, backlogTasks),
+        };
+        const renderedSummary = summarizeManualDream(summary);
+        const endBacklog = formatDreamTaskBacklogs(
+            { ...backlogBefore, ...(summary.backlogAfter ?? {}) },
+            backlogTasks,
+        );
         await deps.sendNotification(
             sessionId,
-            summarizeManualDream(summary),
+            `${renderedSummary}\n\nBacklog at run end:\n${endBacklog}`,
             dreamNotificationParams,
         );
     } catch (error) {

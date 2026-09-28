@@ -1,4 +1,7 @@
-import type { PiThinkingLevel } from "../../../config/schema/magic-context";
+import {
+    DREAM_TASK_PROMOTION_DEFAULTS,
+    type PiThinkingLevel,
+} from "../../../config/schema/magic-context";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import type { Database } from "../../../shared/sqlite";
@@ -414,7 +417,11 @@ async function runDomainGroup(
                         projectIdentity,
                         due.config.task,
                     ),
-                    promotionThreshold: due.config.promotionThreshold ?? 3,
+                    promotionThreshold:
+                        due.config.promotionThreshold ??
+                        (due.config.task === "promote-primers"
+                            ? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"]
+                            : DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"]),
                 });
                 if (!gatePass) {
                     advanceAfterRun(db, projectIdentity, due, Date.now(), "skipped", null);
@@ -561,7 +568,11 @@ export async function runManualDream(
                 deps.projectIdentity,
                 d.config.task,
             ),
-            promotionThreshold: d.config.promotionThreshold ?? 3,
+            promotionThreshold:
+                d.config.promotionThreshold ??
+                (d.config.task === "promote-primers"
+                    ? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"]
+                    : DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"]),
         });
         if (pass) gated.push(d);
         else result.skippedNoWork.push(d.config.task);
@@ -636,7 +647,11 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
                 deps.projectIdentity,
                 d.config.task,
             ),
-            promotionThreshold: d.config.promotionThreshold ?? 3,
+            promotionThreshold:
+                d.config.promotionThreshold ??
+                (d.config.task === "promote-primers"
+                    ? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"]
+                    : DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"]),
         });
         if (pass) {
             gated.push(d);

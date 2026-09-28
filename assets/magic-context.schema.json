@@ -1907,6 +1907,7 @@
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
                 },
                 "promotion_threshold": {
+                  "default": 3,
                   "description": "review-user-memories: min candidate observations before promotion is considered (default: 3)",
                   "x-mc-live-reload": true,
                   "type": "number",
@@ -1930,6 +1931,7 @@
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
                 },
                 "promotion_threshold": {
+                  "default": 2,
                   "description": "promote-primers: min recurring source days before promotion is considered (default: 2)",
                   "x-mc-live-reload": true,
                   "type": "number",

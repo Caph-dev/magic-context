@@ -1455,6 +1455,7 @@ describe("createMagicContextCommandHandler", () => {
             expect(sendNotification.mock.calls[1]?.[1]).toContain(
                 "curate: 8 memory operations applied",
             );
+            expect(sendNotification.mock.calls[1]?.[1]).toContain("Backlog at run end:");
         });
 
         it("samples toast duration once when a dream run starts", async () => {

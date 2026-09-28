@@ -216,9 +216,9 @@ Off-hours maintenance through Dreamer.
 | `dreamer.tasks.maintain-docs.max_tokens` | integer (–9007199254740991) | `12000` | Maximum combined token count of proposed ARCHITECTURE.md and STRUCTURE.md |
 | `dreamer.tasks.evaluate-smart-notes.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.tasks.review-user-memories.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
-| `dreamer.tasks.review-user-memories.promotion_threshold` **Live** | number (2–20) | — | review-user-memories: min candidate observations before promotion is considered (default: 3) |
+| `dreamer.tasks.review-user-memories.promotion_threshold` **Live** | number (2–20) | `3` | review-user-memories: min candidate observations before promotion is considered (default: 3) |
 | `dreamer.tasks.promote-primers.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
-| `dreamer.tasks.promote-primers.promotion_threshold` **Live** | number (2–20) | — | promote-primers: min recurring source days before promotion is considered (default: 2) |
+| `dreamer.tasks.promote-primers.promotion_threshold` **Live** | number (2–20) | `2` | promote-primers: min recurring source days before promotion is considered (default: 2) |
 | `dreamer.tasks.refresh-primers.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true) |
 
