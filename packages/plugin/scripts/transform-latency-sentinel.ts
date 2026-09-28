@@ -147,13 +147,49 @@ function names(dbPath: string, peerDbPath: string | undefined, alerts: LatencyAl
     }
 }
 
-async function deliver(options: LatencyOptions, content: string, id: string): Promise<void> {
+// A roster name marks a head session; a project identity or raw session id marks a short-lived
+// child or worker session. Children of one project are summarised together so a load spike
+// produces one line per project instead of one alert per child.
+const isUnnamedSession = (alert: LatencyAlert) => alert.name === alert.sessionId || /^(git|dir):/.test(alert.name);
+const seconds = (ms: number | null) => `${((ms ?? 0) / 1000).toFixed(1)} s`;
+const KIND_LABEL: Record<Kind, string> = { p90: "slow p90", single: "slow pass", timeout: "timeout", park: "park", refusal: "refused turn", module_climb: "module time climbing" };
+
+/** Only a park or a refused turn needs to interrupt; latency alone is reported at medium urgency. */
+export function alertUrgency(alerts: LatencyAlert[]): "high" | "medium" {
+    return alerts.some((alert) => alert.kind === "park" || alert.kind === "refusal") ? "high" : "medium";
+}
+
+export function formatAlerts(alerts: LatencyAlert[]): string {
+    const groups = new Map<string, { label: string; sessions: Set<string>; alerts: LatencyAlert[] }>();
+    for (const alert of alerts) {
+        const unnamed = isUnnamedSession(alert);
+        const key = unnamed ? `project:${alert.name}` : `session:${alert.sessionId}`;
+        const group = groups.get(key) ?? { label: alert.name, sessions: new Set<string>(), alerts: [] };
+        group.sessions.add(alert.sessionId);
+        group.alerts.push(alert);
+        groups.set(key, group);
+    }
+    const lines = [...groups.entries()].map(([key, group]) => {
+        const counts = new Map<Kind, number>();
+        for (const alert of group.alerts) counts.set(alert.kind, (counts.get(alert.kind) ?? 0) + 1);
+        const kinds = [...counts.entries()].map(([kind, count]) => `${count} ${KIND_LABEL[kind]}${count > 1 ? "s" : ""}`).join(", ");
+        const worst = group.alerts.reduce((a, b) => (b.max > a.max ? b : a));
+        const p90 = Math.max(...group.alerts.map((alert) => alert.p90));
+        const who = key.startsWith("project:") ? `${group.label} (${group.sessions.size} unnamed session${group.sessions.size > 1 ? "s" : ""})` : group.label;
+        return `- ${who}: ${kinds}; worst pass ${seconds(worst.max)} (module ${seconds(worst.moduleMax)}); p90 up to ${seconds(p90)}`;
+    });
+    const load = alerts[0]?.load.map((value) => value.toFixed(0)).join("/") ?? "?";
+    const from = alerts.map((alert) => alert.at).sort()[0];
+    return `Magic Context transform latency since ${from} (load now ${load}):\n${lines.join("\n")}`;
+}
+
+async function deliver(options: LatencyOptions, content: string, id: string, urgency: "high" | "medium"): Promise<void> {
     if (options.wake) return options.wake(content, id);
     const client = await SubcClient.connect({ connectionFile: options.connectionFile, handshakeTimeoutMs: 2_000 });
     try {
         const reply = await client.call("prefrontal-core", "agent.deliver", {
             agent_id: AGENT_ID, delivery_id: id,
-            body: { kind: "peer_message", from_agent: "mc-transform-latency-sentinel", from_session_id: "health-sentinel-mc", from_harness: "magic-context", content }, urgency: "high",
+            body: { kind: "peer_message", from_agent: "mc-transform-latency-sentinel", from_session_id: "health-sentinel-mc", from_harness: "magic-context", content }, urgency,
         }, { identity: { project_root: process.cwd(), harness: "magic-context", session: "health-sentinel-mc" }, consumerIdentity: null, timeoutMs: 15_000 });
         parseAgentDeliverReply(reply);
     } finally { client.close(); }
@@ -185,9 +221,9 @@ export async function runLatencySentinel(options: LatencyOptions): Promise<{ ale
     names(options.db, options.peerDb, alerts);
     if (!options.replay) saveState(options.stateFile, state);
     if (alerts.length) {
-        const content = `Magic Context transform latency sentinel: ${JSON.stringify(alerts)}`;
+        const content = formatAlerts(alerts);
         const id = `mc-transform-latency-${now}-${examined}`;
-        if (options.send) await deliver(options, content, id);
+        if (options.send) await deliver(options, content, id, alertUrgency(alerts));
         else (options.stdout ?? console.log)(JSON.stringify({ delivery_id: id, alerts }));
     }
     (options.stderr ?? console.error)(JSON.stringify({ kind: "transform_latency_sentinel_summary", examined, alerts: alerts.length, bounded, watermark: state.files }));

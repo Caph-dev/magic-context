@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readNewLines, runLatencySentinel } from "./transform-latency-sentinel";
+import { alertUrgency, formatAlerts, type LatencyAlert, readNewLines, runLatencySentinel } from "./transform-latency-sentinel";
 
 const BASE = Date.parse("2026-09-28T18:00:00Z");
 let root: string;
@@ -74,4 +74,23 @@ test("peer roster name takes precedence over project binding", async () => {
     roster.close(false);
     const result = await runLatencySentinel({ files: [path], stateFile: join(root, "state.json"), db: join(root, "context.db"), peerDb: join(root, "peers.db"), connectionFile: "", send: false, now: () => BASE + 100_000, load: () => [0, 0, 0], stdout: () => {}, stderr: () => {} });
     expect(result.alerts[0]?.name).toBe("CEREB");
+});
+test("children of one project collapse to one line; only parks and refusals are high urgency", () => {
+    const base = { at: "2026-09-28T19:44:40.015Z", detail: "", count: 10, p50: 500, moduleP50: 50, moduleP90: 300, pluginP50: 450, pluginP90: 8000, pluginMax: 9000, load: [279, 262, 235], loadSampledAt: "" };
+    const alerts: LatencyAlert[] = [
+        { ...base, kind: "timeout", sessionId: "ses_a", name: "git:3fba", p90: 8000, max: 9000, moduleMax: 400 },
+        { ...base, kind: "single", sessionId: "ses_b", name: "git:3fba", p90: 14000, max: 26000, moduleMax: 330 },
+        { ...base, kind: "p90", sessionId: "ses_c", name: "ses_c", p90: 6000, max: 7000, moduleMax: 100 },
+        { ...base, kind: "p90", sessionId: "ses_head", name: "ALF", p90: 6100, max: 7100, moduleMax: 5800 },
+    ];
+    const text = formatAlerts(alerts);
+    expect(text.split("\n").filter((l) => l.startsWith("- "))).toEqual([
+        "- git:3fba (2 unnamed sessions): 1 timeout, 1 slow pass; worst pass 26.0 s (module 0.3 s); p90 up to 14.0 s",
+        "- ses_c (1 unnamed session): 1 slow p90; worst pass 7.0 s (module 0.1 s); p90 up to 6.0 s",
+        "- ALF: 1 slow p90; worst pass 7.1 s (module 5.8 s); p90 up to 6.1 s",
+    ]);
+    expect(text).toContain("load now 279/262/235");
+    expect(alertUrgency(alerts)).toBe("medium");
+    expect(alertUrgency([...alerts, { ...base, kind: "refusal", sessionId: "ses_head", name: "ALF", p90: 0, max: 0, moduleMax: 0 }])).toBe("high");
+    expect(alertUrgency([{ ...base, kind: "park", sessionId: "ses_x", name: "CEREB", p90: 0, max: 0, moduleMax: 0 }])).toBe("high");
 });
