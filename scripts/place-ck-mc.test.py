@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Isolated placement preflight tests; never points at the operator's HOME."""
+import hashlib
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import tempfile
+import unittest
+
+SCRIPT = Path(__file__).with_name("place-ck-mc.sh")
+ROOT = SCRIPT.parent.parent
+NEW = "6d76aeea576fe2a25ac6d5ed0d9c8125a1fff9f2"
+OLD = subprocess.check_output(["git", "rev-parse", NEW + "^"], cwd=ROOT, text=True).strip()
+
+
+def once(directory, body):
+    path = directory / hashlib.sha256(body.encode()).hexdigest()
+    if not path.exists():
+        path.write_text(body)
+        path.chmod(0o755)
+    return path
+
+
+class PlacementTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.home = root / "home"
+        self.bin = self.home / ".local/share/cortexkit/bin"
+        self.store = root / "stores"
+        self.shims = root / "shims"
+        for path in (self.bin, self.store, self.shims):
+            path.mkdir(parents=True)
+        self.staged = once(root, f'''#!/bin/sh
+case "$1" in
+ --version) echo 'ck-mc 0.1.0 ({NEW})' ;;
+ --print-fences) echo 'context.db=91 store.db=50' ;;
+ *) exit 2 ;;
+esac
+''')
+        deployed = once(root, f'''#!/bin/sh
+case "$1" in
+ --version) echo 'ck-mc 0.1.0 ({OLD})' ;;
+ *) exit 2 ;;
+esac
+''')
+        (self.bin / "ck-mc").write_bytes(deployed.read_bytes())
+        (self.bin / "ck-mc").chmod(0o755)
+        for name, body in {
+            "codesign": '#!/bin/sh\ncase "$1" in --verify) exit 0;; -dv) printf "Executable=x\\nIdentifier=ck-mc\\nFormat=Mach-O\\n" >&2;; esac\n',
+            "ck": '''#!/bin/sh
+case "$*" in
+  'module restart magic-context') exit 0 ;;
+  '--json provenance magic-context') echo '{"modules":[{"module_id":"magic-context","daemon_observed":{"pid":1234},"module_declared":{"build":{"build_git_sha":"6d76aeea576fe2a25ac6d5ed0d9c8125a1fff9f2"}}}]}' ;;
+  '--json health magic-context') if [ "${FAKE_BAD_HEALTH:-}" = 1 ]; then echo '{"status":"failing"}'; else echo '{"status":"ok"}'; fi ;;
+  *) exit 3 ;;
+esac
+''',
+            "lsof": '''#!/bin/sh
+python3 -c 'import os; p=os.environ["FAKE_DEPLOYED"]; print("i" + str(os.stat(p).st_ino) + "\\nn" + p)'
+''',
+        }.items():
+            # Stable content-addressed shim, with a command-name link for PATH lookup.
+            (self.shims / name).symlink_to(once(root, body))
+        self.versions(90, 49)
+        self.env = dict(os.environ, HOME=str(self.home), MAGIC_CONTEXT_STORAGE_DIR=str(self.store),
+                        PATH=str(self.shims) + os.pathsep + os.environ["PATH"],
+                        PYTHONPYCACHEPREFIX=str(root / "pycache"), XDG_CACHE_HOME=str(root / "cache"),
+                        FAKE_DEPLOYED=str(self.bin / "ck-mc"))
+
+    def versions(self, context, store):
+        for name, sql, version in (
+            ("context.db", "CREATE TABLE schema_migrations(version INTEGER)", context),
+            ("store.db", "CREATE TABLE cortexkit_schema_version(namespace TEXT, version INTEGER)", store),
+        ):
+            path = self.store / name
+            path.unlink(missing_ok=True)
+            with sqlite3.connect(path) as conn:
+                conn.execute(sql)
+                if name == "context.db":
+                    conn.execute("INSERT INTO schema_migrations VALUES (?)", (version,))
+                else:
+                    conn.execute("INSERT INTO cortexkit_schema_version VALUES ('mc_cache', ?)", (version,))
+
+    def run_script(self, *args):
+        return subprocess.run(["bash", str(SCRIPT), "--dry-run", *args, str(self.staged)],
+                              env=self.env, cwd=ROOT, capture_output=True, text=True)
+
+    def test_context_fence_refuses(self):
+        self.versions(92, 49)
+        run = self.run_script()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("context.db live=92 staged=91; store.db live=49 staged=50", run.stdout + run.stderr)
+        self.assertIn("rollback refused", run.stderr)
+
+    def test_store_fence_refuses(self):
+        self.versions(90, 51)
+        run = self.run_script()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("context.db live=90 staged=91; store.db live=51 staged=50", run.stdout + run.stderr)
+        self.assertIn("rollback refused", run.stderr)
+
+    def test_epoch_change_advises_or_refuses(self):
+        allowed = self.run_script()
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn("TAGGER_FEATURE_EPOCH: 3 -> 4 CHANGED", allowed.stdout)
+        refused = self.run_script("--require-epochs-unchanged")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("TAGGER_FEATURE_EPOCH: 3 -> 4 CHANGED", refused.stdout)
+        self.assertIn("epochs changed", refused.stderr)
+
+    def test_placement_verifies_and_preserves_rollback(self):
+        run = subprocess.run(["bash", str(SCRIPT), str(self.staged)], env=self.env,
+                             cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("inode/version/digest/health ok", run.stdout)
+        rollback = self.bin / "staging" / ("ck-mc.rollback." + OLD)
+        self.assertTrue(rollback.exists())
+        self.assertEqual(rollback.read_bytes().count(OLD.encode()), 1)
+        self.assertEqual((self.bin / "ck-mc").read_bytes(), self.staged.read_bytes())
+
+    def test_failed_post_placement_check_prints_rollback_without_using_it(self):
+        before = (self.bin / "ck-mc").read_bytes()
+        env = dict(self.env, FAKE_BAD_HEALTH="1")
+        run = subprocess.run(["bash", str(SCRIPT), str(self.staged)], env=env,
+                             cwd=ROOT, capture_output=True, text=True)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("cp ", run.stderr)
+        self.assertIn("ck module restart magic-context", run.stderr)
+        self.assertNotEqual((self.bin / "ck-mc").read_bytes(), before)
+
+    def test_dry_run_never_writes(self):
+        def snapshot():
+            return {str(p.relative_to(self.home)): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in self.home.rglob("*") if p.is_file()}
+        before = snapshot()
+        run = self.run_script("--source-ref", NEW)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("dry-run: would preserve", run.stdout)
+        self.assertEqual(snapshot(), before)
+        self.assertFalse((self.bin / "staging").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
