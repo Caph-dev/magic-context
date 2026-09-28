@@ -8407,6 +8407,14 @@ fn synth_region(key: &str, payload: String) -> FrozenUnit {
 }
 
 fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usize>) -> SelItem {
+    sel_item_from_flat_with_estimator(block, tag_tokens_by_block, mc_tokenizer::estimate_tokens)
+}
+
+fn sel_item_from_flat_with_estimator(
+    block: &FlatBlock,
+    tag_tokens_by_block: &HashMap<&str, usize>,
+    estimate: impl FnOnce(&str) -> usize,
+) -> SelItem {
     let kind = match &block.wire.kind {
         ck_wire::CkKind::ToolCall { name, input, .. } => SelKind::ToolCall {
             name: name.clone(),
@@ -8422,12 +8430,15 @@ fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usi
         ck_wire::CkKind::Opaque(_) => SelKind::Opaque,
     };
     SelItem {
-        served_token_count: Some(
+        // Media and opaque carriers are excluded from calibrated floor accounting and
+        // cannot be tool reclaim candidates. Their token counts are never consumed;
+        // estimating them would repeatedly BPE-tokenize untagged image data on defers.
+        served_token_count: (!matches!(kind, SelKind::Media | SelKind::Opaque)).then(|| {
             tag_tokens_by_block
                 .get(block.id.as_str())
                 .copied()
-                .unwrap_or_else(|| mc_tokenizer::estimate_tokens(&block.bytes)),
-        ),
+                .unwrap_or_else(|| estimate(&block.bytes))
+        }),
         id: block.id.clone(),
         ordinal: block.ordinal,
         message_role: match block.role.as_str() {
@@ -16500,6 +16511,145 @@ pub(crate) mod tests {
             let source = format!("authored\n\n{marker}\ntransport details");
             assert_eq!(strip_system_injection(&source).as_deref(), Some("authored"));
         }
+    }
+
+    fn planning_carrier(id: &str, ordinal: u64, bytes: usize) -> CkIngressMessage {
+        let mut message = item(id, ordinal, "caption");
+        message
+            .ck
+            .content
+            .push(CkWireBlock::bare(ck_wire::CkKind::Media(
+                ck_wire::MediaBlock {
+                    kind: ck_wire::MediaKind::Image,
+                    media_type: "image/png".to_string(),
+                    filename: None,
+                    source: json!({"type": "data_base64", "data": "aB3+".repeat(bytes / 4)}),
+                },
+            )));
+        message
+    }
+
+    #[test]
+    fn planning_carrier_tokenization_cost_is_bounded() {
+        for (count, bytes) in [(1, 64), (64, 65_536)] {
+            let messages = (0..count)
+                .flat_map(|i| {
+                    [
+                        planning_carrier(&format!("carrier-{i}"), i as u64 + 1, bytes),
+                        opaque_result_carrier(&format!("opaque-{i}"), i as u64 + 1, "user"),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let projection = project_messages(&messages).unwrap();
+            let tags = projection
+                .blocks
+                .iter()
+                .filter(|block| matches!(block.wire.kind, ck_wire::CkKind::Text { .. }))
+                .map(|block| (block.id.as_str(), 3))
+                .collect::<HashMap<_, _>>();
+            let calls = std::cell::Cell::new(0);
+            for block in &projection.blocks {
+                sel_item_from_flat_with_estimator(block, &tags, |_| {
+                    calls.set(calls.get() + 1);
+                    99
+                });
+            }
+            assert_eq!(calls.get(), 0, "carrier count={count}, bytes={bytes}");
+        }
+    }
+
+    #[test]
+    fn planning_text_still_estimates_and_respects_tags() {
+        let projection = project_messages(&[item("text", 1, "untagged prose")]).unwrap();
+        let block = &projection.blocks[0];
+        let calls = std::cell::Cell::new(0);
+        let selected = sel_item_from_flat_with_estimator(block, &HashMap::new(), |_| {
+            calls.set(calls.get() + 1);
+            99
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(selected.served_token_count, Some(99));
+        let selected = sel_item_from_flat_with_estimator(
+            block,
+            &HashMap::from([(block.id.as_str(), 7)]),
+            |_| panic!("persisted count must win"),
+        );
+        assert_eq!(selected.served_token_count, Some(7));
+    }
+
+    #[test]
+    #[ignore = "requires CEREB_MEDIA_FIXTURE pointing to a local JSON array of data URLs"]
+    fn planning_carrier_live_payload_timing() {
+        let urls: Vec<String> = serde_json::from_slice(
+            &std::fs::read(std::env::var("CEREB_MEDIA_FIXTURE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        for count in 0..=urls.len() {
+            let messages = urls[..count]
+                .iter()
+                .enumerate()
+                .map(|(i, url)| {
+                    let mut message = planning_carrier(&format!("live-{i}"), i as u64 + 1, 0);
+                    let ck_wire::CkKind::Media(media) = &mut message.ck.content[1].kind else {
+                        unreachable!()
+                    };
+                    media.source = json!({"url": url});
+                    message
+                })
+                .collect::<Vec<_>>();
+            let projection = project_messages(&messages).unwrap();
+            let carriers = projection
+                .blocks
+                .iter()
+                .filter(|b| matches!(b.wire.kind, ck_wire::CkKind::Media(_)))
+                .collect::<Vec<_>>();
+            let bytes: usize = carriers.iter().map(|b| b.bytes.len()).sum();
+            let started = Instant::now();
+            for block in &carriers {
+                std::hint::black_box(mc_tokenizer::estimate_tokens(&block.bytes));
+            }
+            let before = elapsed_ms(started);
+            let started = Instant::now();
+            for block in &carriers {
+                std::hint::black_box(sel_item_from_flat(block, &HashMap::new()));
+            }
+            eprintln!(
+                "carrier timing count={count} bytes={bytes} legacy_ms={before:.3} fixed_ms={:.3}",
+                elapsed_ms(started)
+            );
+        }
+    }
+
+    #[test]
+    fn planning_carrier_replay_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut request = req(
+            "planning-carrier-replay",
+            "cfg0",
+            vec![
+                item("head", 1, "older history"),
+                planning_carrier("image-user", 2, 4096),
+            ],
+        );
+        request.serializer_profile = "opencode-aisdk".to_string();
+        let mut hashes = Vec::new();
+        for _ in 0..3 {
+            let response = run(&store, &request, &spine());
+            let bytes = serde_json::to_vec(&response.ck_messages).unwrap();
+            hashes.push(format!("{}:{:x}", response.action, Sha256::digest(&bytes)));
+        }
+        // This digest records CK response bytes with media token estimation still enabled,
+        // so removing the unused estimate must preserve bootstrap and replay output.
+        let digest = "116dd7f9afc3d7bef3de4f2520945161fa244ecb7e4134f5bc1187e377668083";
+        assert_eq!(
+            hashes,
+            [
+                format!("HARD:{digest}"),
+                format!("SOFT+:{digest}"),
+                format!("SOFT+:{digest}")
+            ]
+        );
     }
 
     #[test]
