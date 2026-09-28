@@ -488,8 +488,8 @@ export async function registerContext(context: V2Context) {
             log(`[magic-context] v2 storage unavailable: ${message}`);
         },
     });
-    // Storage recovery must not hold the host's setup promise. Healthy local
-    // stores usually open immediately; slow discovery continues behind the gate.
+    // Let slow healthy storage finish before fixing the tool list for this host.
+    // Discovery yields to HTTP while setup waits, with a bounded degraded fallback.
     let db: ReturnType<typeof openDatabase> | undefined = await probeV2StorageAtBoot(storage);
     const storageOpenedAtBoot = db !== undefined;
     let storageRecoveryAnnounced = false;

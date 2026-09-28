@@ -90,7 +90,7 @@ test("async Windows inspection bounds CIM and tasklist fallback and caches failu
     ]);
 });
 
-test("boot grace stays responsive with a locked v90 store and slow Windows probes", async () => {
+test("boot storage wait stays responsive with a locked v90 store and slow Windows probes", async () => {
     const root = mkdtempSync(join(tmpdir(), "async-storage-guard-"));
     const dbPath = join(root, "context.db");
     const seeded = new Database(dbPath);
@@ -139,7 +139,6 @@ test("boot grace stays responsive with a locked v90 store and slow Windows probe
                 new Promise<string>((resolve) => setTimeout(() => resolve("responsive"), 10)),
             ]),
         ).toBe("responsive");
-        expect(await boot).toBeUndefined();
         expect(performance.now() - started).toBeLessThan(300);
         expect(gate.current()).toBeUndefined();
         release(
@@ -153,6 +152,7 @@ test("boot grace stays responsive with a locked v90 store and slow Windows probe
             ]),
         );
         expect(await opening).toBeUndefined();
+        expect(await boot).toBeUndefined();
         expect(gate.reason()?.kind).toBe("migration_guard");
         expect(getMigrationOnOpenRefusal()?.serverPids).toEqual([12345]);
         expect(syncCalls).toBe(0);

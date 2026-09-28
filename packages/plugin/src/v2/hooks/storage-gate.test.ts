@@ -20,7 +20,11 @@ import {
 import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { createV2StorageGate, V2_STORAGE_REOPEN_INTERVAL_MS } from "./storage-gate";
+import {
+    createV2StorageGate,
+    probeV2StorageAtBoot,
+    V2_STORAGE_REOPEN_INTERVAL_MS,
+} from "./storage-gate";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -247,3 +251,23 @@ test("storage gate returns before a slow synchronous opener and never piles up r
     release();
     await next;
 });
+
+test("boot wait retains a healthy database that opens after two seconds", async () => {
+    const database = openDatabase();
+    const gate = createV2StorageGate({
+        open: async () => {
+            await Bun.sleep(2000);
+            return database;
+        },
+    });
+    expect(await probeV2StorageAtBoot(gate)).toBe(database);
+    expect(gate.require()).toBe(database);
+});
+
+test("boot wait gives up on an unresolved open after fifteen seconds", async () => {
+    const gate = createV2StorageGate({ open: () => new Promise<null>(() => {}) });
+    const started = performance.now();
+    expect(await probeV2StorageAtBoot(gate)).toBeUndefined();
+    expect(performance.now() - started).toBeGreaterThanOrEqual(15_000);
+    expect(gate.current()).toBeUndefined();
+}, 30_000);

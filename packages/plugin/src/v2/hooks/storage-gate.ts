@@ -120,7 +120,11 @@ export function createV2StorageGate(options: V2StorageGateOptions = {}): V2Stora
     };
 }
 
-/** Allow a healthy open to finish without waiting for storage recovery at setup. */
+/**
+ * Give slow healthy opens time to retain the tools registered during setup.
+ * OpenCode serves HTTP while this asynchronous wait is pending. An open
+ * still unresolved after fifteen seconds takes the degraded, tool-less route.
+ */
 export async function probeV2StorageAtBoot(
     storage: V2StorageGate,
 ): Promise<ContextDatabase | undefined> {
@@ -129,7 +133,7 @@ export async function probeV2StorageAtBoot(
         return await Promise.race([
             storage.probe(),
             new Promise<undefined>((resolve) => {
-                timer = setTimeout(() => resolve(undefined), 100);
+                timer = setTimeout(() => resolve(undefined), 15_000);
             }),
         ]);
     } finally {
