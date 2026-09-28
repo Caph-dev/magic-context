@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { DbCacheEvent, SessionCacheStats } from "../../lib/types";
 import {
   CACHE_FIGURE_PLACEHOLDER,
+  CACHE_NO_READS,
   CACHE_NOT_REPORTED,
   cacheActivityNote,
   cacheCardCountLabel,
@@ -145,14 +146,28 @@ describe("session cards", () => {
     const events = [run({ input_tokens: 614, cache_read: 0, cold_start: true })];
     const summary = cacheCardSummary(events);
     expect(summary.tone).toBe("neutral");
-    expect(summary.text).toBe("no cache data");
+    expect(summary.text).toBe(CACHE_FIGURE_PLACEHOLDER);
+    expect(summary.note).toBe(CACHE_NO_READS);
     expect(cacheCardCountLabel(events)).toBe("1 run");
   });
 
   test("runs that never report reads are neutral", () => {
     const summary = cacheCardSummary([run({ cache_reported: false }), run({ turn_id: "t2" })]);
     expect(summary.tone).toBe("neutral");
-    expect(summary.text).toBe("no cache data");
+    expect(summary.text).toBe(CACHE_FIGURE_PLACEHOLDER);
+    expect(summary.note).toBe(CACHE_NO_READS);
+  });
+
+  test("the card figure is only ever a percentage or the placeholder", () => {
+    const figure = /^(\d+\.\d%|—)$/;
+    const cases = [
+      [],
+      [run({ cache_reported: false })],
+      [run({ cache_read: 0 })],
+      [run({ turn_id: "r1", cold_start: true }), run({ turn_id: "r2", cache_read: 900 })],
+      [event({ turn_id: "r1", cold_start: true, cache_read: 100, severity: "info" })],
+    ];
+    for (const events of cases) expect(cacheCardSummary(events).text).toMatch(figure);
   });
 
   test("an unreported session keeps a one-character figure and explains it in small text", () => {

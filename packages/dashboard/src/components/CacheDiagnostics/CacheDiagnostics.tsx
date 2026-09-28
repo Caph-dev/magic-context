@@ -56,6 +56,9 @@ export const CACHE_FIGURE_PLACEHOLDER = "—";
 /** Why a figure is missing when the provider never reported cache reads. */
 export const CACHE_NOT_REPORTED = "cache not reported";
 
+/** Why a figure is missing when requests reported cache reads, all of them zero. */
+export const CACHE_NO_READS = "no cache reads";
+
 export function cachePercentage(ratio: number | null): string {
   return ratio === null ? CACHE_FIGURE_PLACEHOLDER : `${(ratio * 100).toFixed(1)}%`;
 }
@@ -108,7 +111,7 @@ export function cacheCardTitle(row: SessionCacheStats): string {
 }
 
 export interface CacheCardSummary {
-  /** The big figure: a short percentage, a short label, or the placeholder. */
+  /** The big figure: a percentage or the placeholder, never words. */
   text: string;
   /** "ratio" colors the text by hit ratio; "neutral" renders it muted. */
   tone: "ratio" | "neutral";
@@ -146,11 +149,11 @@ export function cacheCardSummary(events: DbCacheEvent[]): CacheCardSummary {
   }
   if (!events.some((event) => event.cache_reported && event.cache_read > 0)) {
     return {
-      text: "no cache data",
+      text: CACHE_FIGURE_PLACEHOLDER,
       tone: "neutral",
       ratio,
       title: "No request in this window read anything from the cache",
-      note: null,
+      note: CACHE_NO_READS,
     };
   }
   const turns = new Set(events.map((event) => event.turn_id));
