@@ -477,6 +477,42 @@ export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
 
+/** Bun names SQLite codes; node:sqlite exposes the numeric (possibly extended) errcode. */
+export function isTransientSqliteError(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const value = error as { code?: unknown; errcode?: unknown };
+    return (
+        (typeof value.code === "string" && /^(SQLITE_BUSY|SQLITE_LOCKED)(_|$)/.test(value.code)) ||
+        (typeof value.errcode === "number" && [5, 6].includes(value.errcode & 0xff))
+    );
+}
+
+export class SqliteAcquisitionBusyError extends Error {
+    readonly code = "SQLITE_BUSY";
+    readonly stage = "BEGIN IMMEDIATE";
+    constructor(cause: unknown) {
+        super("SQLite writer acquisition remained busy after 3 attempts", { cause });
+        this.name = "SqliteAcquisitionBusyError";
+    }
+}
+
+/** Retry only acquisition: no privilege flag, callback or in-memory mutation has run yet. */
+function beginImmediate(db: Database): void {
+    const delays = [500, 1000];
+    for (let attempt = 0; ; attempt++) {
+        try {
+            db.exec("BEGIN IMMEDIATE");
+            return;
+        } catch (error) {
+            if (!isTransientSqliteError(error)) throw error;
+            if (attempt === delays.length) throw new SqliteAcquisitionBusyError(error);
+            // The database API is synchronous on both hosts. With busy_timeout=5000,
+            // three attempts plus these waits bound one acquisition to 16.5 seconds.
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delays[attempt]);
+        }
+    }
+}
+
 function isInTransaction(db: Database): boolean {
     const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
     return candidate.inTransaction === true || candidate.isTransaction === true;
@@ -501,7 +537,7 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
     if (nested) {
         db.exec(`SAVEPOINT ${savepoint}`);
     } else {
-        db.exec("BEGIN IMMEDIATE");
+        beginImmediate(db);
     }
     privilegeDepth.set(db, previousDepth + 1);
     try {

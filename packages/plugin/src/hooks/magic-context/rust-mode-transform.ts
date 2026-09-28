@@ -62,6 +62,7 @@ import { log, sessionLog } from "../../shared/logger";
 import { getSdkOutputLimit, getSdkWindowGeometry } from "../../shared/models-dev-cache";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
 import { createPromptSurfaceGuidanceEpochCache } from "../../shared/prompt-surface-runtime";
+import { isTransientSqliteError } from "../../shared/sqlite";
 import type { WindowGeometryResult } from "../../shared/window-geometry";
 import {
     cachedToolPermissionDenied,
@@ -141,6 +142,7 @@ import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { StorageBusyRefusalError } from "./storage-busy-refusal";
 import { STORE_AHEAD_OF_BINARY_CODE, storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
@@ -1971,6 +1973,7 @@ export function createRustModeTransform(
     const callModule = async (
         args: Parameters<RustModeModuleClient["call"]>[0],
         attemptTimeoutMs = args.timeoutMs ?? timeoutMs,
+        allowTimeoutRetry = true,
     ): Promise<unknown> => {
         const controller = new AbortController();
         const body = isRecord(args.body) ? args.body : {};
@@ -1997,6 +2000,26 @@ export function createRustModeTransform(
                 timeoutMs: attemptTimeoutMs,
             });
         } catch (error) {
+            const timedOut =
+                controller.signal.aborted ||
+                (error instanceof Error && /timed out|deadline/i.test(error.message));
+            if (
+                allowTimeoutRetry &&
+                options.moduleTimeoutMs === undefined &&
+                args.method === "transform" &&
+                body.transform_page_complete === true &&
+                timedOut
+            ) {
+                clock.clearTimeout(timer);
+                // Retry only the identical content-addressed final page. The module
+                // checks its generation and final digest and replays a completed result;
+                // no state-sync, page upload or host mutation is repeated here.
+                sessionLog(
+                    args.sessionId,
+                    "rust transform deadline: retrying final page once with 45000ms budget",
+                );
+                return await callModule(args, 45_000, false);
+            }
             if (controller.signal.aborted) throw timeoutError;
             throw error;
         } finally {
@@ -2178,12 +2201,23 @@ export function createRustModeTransform(
             return false;
         }
         const keys = resolveLkgModelKeys(currentMessages);
+        const replayModel =
+            modelFromMessages(currentMessages) ??
+            deps.liveModelBySession?.get(sessionId) ??
+            hostModelFallback(sessionId);
         const replay = replayLkg({
             sessionId,
             messages: currentMessages,
             modelKey: keys.modelKey,
             providerKey: keys.providerKey,
             entry,
+            prepareReplay: (messages) =>
+                replayRustModeBindingMismatchStrips({
+                    db: deps.db,
+                    sessionId,
+                    messages,
+                    resolvedProviderID: replayModel?.providerID,
+                }),
         });
         if (!replay.ok) {
             const state = states.get(sessionId);
@@ -2191,16 +2225,6 @@ export function createRustModeTransform(
             sessionLog(sessionId, replay.reason);
             return false;
         }
-        const replayModel =
-            modelFromMessages(currentMessages) ??
-            deps.liveModelBySession?.get(sessionId) ??
-            hostModelFallback(sessionId);
-        replayRustModeBindingMismatchStrips({
-            db: deps.db,
-            sessionId,
-            messages: replay.messages as MessageLike[],
-            resolvedProviderID: replayModel?.providerID,
-        });
         const trustedReplayLimit = replayModel
             ? resolveTrustedContextLimit(replayModel.providerID, replayModel.modelID, {
                   db: deps.db,
@@ -2498,6 +2522,10 @@ export function createRustModeTransform(
                 (providerOverflowProven || persistedProviderEmergency);
         }
         const serveRawFallback = (cause?: unknown): void => {
+            servedFrom = "refused";
+            if (!deps.compactionOff && isTransientSqliteError(cause)) {
+                throw new StorageBusyRefusalError(cause, "rust-mode-transform");
+            }
             const contextLimit =
                 transformGeometry?.usable_hard ??
                 resolvedContextLimit ??
@@ -2549,7 +2577,12 @@ export function createRustModeTransform(
             } else {
                 throw new RawFallbackContextLimitError(Number.POSITIVE_INFINITY, 0, { cause });
             }
+            if (!deps.compactionOff) {
+                servedFrom = "refused";
+                throw new EmergencyFailClosedError(ENGINE_RECONNECTING_USER_MESSAGE, { cause });
+            }
             replaceMessagesInPlace(output, messages);
+            servedFrom = "raw";
         };
         const finishPass = (applied: boolean, served = true): void => {
             const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
@@ -2709,17 +2742,13 @@ export function createRustModeTransform(
                 );
                 if (replayed) {
                     servedFrom = "lkg";
-                } else {
-                    servedFrom = "raw";
-                    try {
-                        serveRawFallback();
-                    } catch (error) {
-                        finishPass(false, false);
-                        throw error;
-                    }
+                    finishPass(false);
+                    return;
                 }
-                finishPass(false);
-                return;
+                // Parking only saves work when a safe cached prompt can serve.
+                // With no LKG, try the module now instead of refusing four turns
+                // out of five even after it has recovered.
+                decision = "pending";
             }
         }
         timings.preflight = performance.now() - passStartedAt;
@@ -3394,7 +3423,16 @@ export function createRustModeTransform(
                         const attemptTimeoutMs =
                             options.moduleTimeoutMs ??
                             (attemptClass === "transform_series_execute"
-                                ? transformColdStartExecuteTimeoutMs(seedMessageCount)
+                                ? Math.max(
+                                      wireDelta
+                                          ? timeoutMs
+                                          : transformColdStartExecuteTimeoutMs(seedMessageCount),
+                                      protectionFloorCacheBustingPass ||
+                                          !wireDelta ||
+                                          passInputs.emergency_recovery_armed === true
+                                          ? 45_000
+                                          : timeoutMs,
+                                  )
                                 : attemptClass === "transform_page_upload"
                                   ? TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS
                                   : timeoutMs);
@@ -4204,6 +4242,10 @@ export function createRustModeTransform(
                 );
             }
             if (emergencyFailClosed) {
+                if (!deps.compactionOff && isTransientSqliteError(error)) {
+                    finishPass(false, false);
+                    throw new StorageBusyRefusalError(error, "rust-mode-emergency");
+                }
                 // At 95% of a trusted limit, or while provider overflow recovery is armed,
                 // any adapter failure aborts. Parking controls retry cadence, not fallback admission.
                 sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");

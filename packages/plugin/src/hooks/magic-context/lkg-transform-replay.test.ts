@@ -379,6 +379,43 @@ describe("LKG transform replay", () => {
         expect(replay).toEqual({ ok: true, messages: [prefix, current[1]] });
     });
 
+    test("applies durable thinking strips before validating a replay candidate", () => {
+        resetLkgSlotsForTest();
+        const input = [user("u0", 1, { providerID: "anthropic", modelID: "claude-test" })];
+        const prefix = assistant("a-prefix", 2, [
+            { type: "thinking", thinking: "signed prefix", signature: "sig-a" },
+            { type: "text", text: "answer" },
+        ]);
+        captureSlot("strip-before-validate", {
+            jsonPrefix: JSON.stringify([prefix]),
+            inputIdSeq: ["u0"],
+            inputContentDigests: [lkgContentDigest(input[0])!],
+            lastInputMessageId: "u0",
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            capturedAt: 1,
+        });
+        const tail = assistant("a-tail", 3, [
+            { type: "thinking", thinking: "previously stripped", signature: "sig-b" },
+            { type: "text", text: "continued answer" },
+        ]);
+        const replay = replayLkg({
+            sessionId: "strip-before-validate",
+            messages: [...input, tail],
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            prepareReplay: (messages) => {
+                const restored = messages.find((message) => message.info.id === "a-tail")!;
+                restored.parts = restored.parts.filter(
+                    (part) => (part as { type: string }).type !== "thinking",
+                );
+            },
+        });
+        expect(replay.ok).toBe(true);
+        if (replay.ok) expect(JSON.stringify(replay.messages)).not.toContain("previously stripped");
+        expect(getSlot("strip-before-validate")).toBeDefined();
+    });
+
     test("declines a new thinking run after a provider-executed tool", () => {
         const first = assistant("a-prefix", 1, [
             { type: "thinking", thinking: "first signed trace", signature: "sig-a" },

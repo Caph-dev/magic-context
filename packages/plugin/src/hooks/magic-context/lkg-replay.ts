@@ -39,11 +39,7 @@ export function resolveLkgModelKeys(messages: MessageLike[]): LkgModelKeys {
         }
         const provider = info?.providerID;
         const model = info?.modelID;
-        if (
-            info?.role === "assistant" &&
-            typeof provider === "string" &&
-            typeof model === "string"
-        ) {
+        if (typeof provider === "string" && typeof model === "string") {
             return canonicalLkgModelKeys(`${provider}/${model}`, provider);
         }
     }
@@ -513,6 +509,8 @@ export function replayLkg(args: {
     providerKey: string | null;
     entry?: LkgEntryNote | null;
     skipSeamValidation?: boolean;
+    /** Reapply persisted thinking-strip decisions before validating the candidate's wire shape. */
+    prepareReplay?: (messages: MessageLike[]) => void;
 }): { ok: true; messages: MessageLike[] } | { ok: false; reason: LkgValidationFailure } {
     const slot = getSlot(args.sessionId);
     if (!slot) return { ok: false, reason: "lkg_invalidated_reshape" };
@@ -547,6 +545,8 @@ export function replayLkg(args: {
         dropSlot(args.sessionId, "lkg_seam_invalid");
         return { ok: false, reason: "lkg_seam_invalid" };
     }
+    const replayed = [...prefix, ...entry.pristineTail];
+    args.prepareReplay?.(replayed);
     if (!args.skipSeamValidation) {
         if (!validateLkgSeamBoundary(prefix, entry.pristineTail)) {
             dropSlot(args.sessionId, "lkg_unsafe_seam");
@@ -557,7 +557,6 @@ export function replayLkg(args: {
             return { ok: false, reason: "lkg_seam_invalid" };
         }
     }
-    const replayed = [...prefix, ...entry.pristineTail];
     if (
         requestedModelKeys.providerKey === "anthropic" &&
         !validateAnthropicReasoningRuns(replayed)

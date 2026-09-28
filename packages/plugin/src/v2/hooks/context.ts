@@ -61,9 +61,14 @@ import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import { preloadTokenizer } from "../../hooks/magic-context/read-session-formatting";
 import { servedModuleM0Text } from "../../hooks/magic-context/rust-served-m0";
+import {
+    STORAGE_BUSY_MESSAGE,
+    StorageBusyRefusalError,
+} from "../../hooks/magic-context/storage-busy-refusal";
 import { createSystemPromptHashHandler } from "../../hooks/magic-context/system-prompt-hash";
 import { createTransform, type TransformDeps } from "../../hooks/magic-context/transform";
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
+import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { registerRpcHandlers } from "../../plugin/rpc-handlers";
 import { detectConflicts } from "../../shared/conflict-detector";
 import { getDataDir, getMagicContextStorageDir } from "../../shared/data-path";
@@ -84,6 +89,7 @@ import {
 } from "../../shared/prompt-surface-runtime";
 import { pushNotification } from "../../shared/rpc-notifications";
 import { MagicContextRpcServer } from "../../shared/rpc-server";
+import { isTransientSqliteError, withPrivilegedWriter } from "../../shared/sqlite";
 import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
 import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-descriptions";
 import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
@@ -113,6 +119,7 @@ import {
     formatStorageRecoveryNotice,
     formatStorageRefusalNotice,
     hasStorageNoticeShape,
+    STORAGE_NOTICE_PREFIX,
 } from "./storage-notice";
 import {
     createV2RawMessageProvider,
@@ -1049,11 +1056,14 @@ export async function registerContext(context: V2Context) {
         // descriptions become the baseline every later request (any session,
         // any model) starts from. Registration happens once, in tools.ts.
         applyV2PromptSurfaceTools(draft, promptSurfaceRuntime, config.prompt_surface);
-        // Measured after the descriptions are final, so the Tool Defs row and the tool-set hash
-        // describe the bytes this request sends rather than the host's unedited catalog.
-        recordV2ToolDefinitions(draft);
         let postFold = false;
         try {
+            // Check writer admission before best-effort setup writers can each spend
+            // their own busy timeout. No transform callback runs in this transaction.
+            const admissionDb = db ?? storage.current();
+            if (!compactionOff && admissionDb) withPrivilegedWriter(admissionDb, () => undefined);
+            // Measure only after admission and after per-model descriptions are final.
+            recordV2ToolDefinitions(draft);
             // Only a failure to read or record usage refuses here. A high reading is
             // left to the transform below: its force band and emergency path are what
             // reduce an over-limit session, and refusing ahead of them would refuse
@@ -1373,7 +1383,16 @@ export async function registerContext(context: V2Context) {
                     );
             }
             const mapped = adaptPayload(draft, admitted);
-            await transform({}, mapped);
+            await createMessagesTransformHandler({
+                magicContext: { "experimental.chat.messages.transform": transform },
+                compactionOff,
+                propagateUnexpectedErrors: true,
+            })(
+                {},
+                mapped as unknown as Parameters<
+                    ReturnType<typeof createMessagesTransformHandler>
+                >[1],
+            );
             mapped.commit();
             if (db) {
                 await deliverPendingChannel2(
@@ -1409,6 +1428,53 @@ export async function registerContext(context: V2Context) {
             }
         } catch (error) {
             if (error instanceof V2ContextRefusal) throw error;
+            if (
+                !compactionOff &&
+                (isTransientSqliteError(error) || error instanceof StorageBusyRefusalError)
+            ) {
+                if (isTransientSqliteError(error)) {
+                    const mapped = adaptPayload(draft);
+                    try {
+                        await createMessagesTransformHandler({
+                            magicContext: {
+                                "experimental.chat.messages.transform": async () => {
+                                    throw error;
+                                },
+                            },
+                        })(
+                            {},
+                            mapped as unknown as Parameters<
+                                ReturnType<typeof createMessagesTransformHandler>
+                            >[1],
+                        );
+                        mapped.commit();
+                        return;
+                    } catch (replayError) {
+                        if (!(replayError instanceof StorageBusyRefusalError)) throw replayError;
+                    }
+                }
+                const refusal =
+                    error instanceof StorageBusyRefusalError
+                        ? error
+                        : new StorageBusyRefusalError(error, "v2-context");
+                pushNotification(
+                    "toast",
+                    { message: STORAGE_BUSY_MESSAGE, variant: "error" },
+                    draft.sessionID,
+                );
+                storeStorageNotice(
+                    draft.sessionID,
+                    `${STORAGE_NOTICE_PREFIX}${STORAGE_BUSY_MESSAGE}`,
+                    "busy",
+                );
+                await refuseBeforeProvider(
+                    context.session,
+                    draft.sessionID,
+                    "storage-busy",
+                    refusal,
+                );
+                throw new V2ContextRefusal(STORAGE_BUSY_MESSAGE, { cause: refusal });
+            }
             if (isBlockingV2TransformError(error)) {
                 // These errors mean the shared transform cannot prove a safe prompt.
                 // Native compaction owns recovery when Magic Context compaction is off.
