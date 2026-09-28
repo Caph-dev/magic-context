@@ -13,8 +13,12 @@
 
 #![forbid(unsafe_code)]
 
+mod context_writes;
 mod historian_claim;
+pub mod single_store_domain;
 pub mod single_store_schema;
+
+pub use single_store_domain::{ContextDomain, SqliteContextDomain};
 
 pub use historian_claim::{
     historian_lease_ms, HistorianClaim, HistorianClaimOutcome, HistorianClaimRefusal,
@@ -3199,76 +3203,6 @@ fn read_single_store_marker(
     })
 }
 
-/// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
-/// Deletes only content twins, then rekeys remaining route rows and their mutation/note
-/// companions. The authority predicate is repeated on every statement so a binding is
-/// harmless until its domain is actually MODULE-owned.
-fn normalize_authority_route_tx(
-    tx: &rusqlite::Transaction<'_>,
-    context_store_uuid: &str,
-    project: &str,
-    route_project_root: &str,
-) -> rusqlite::Result<()> {
-    tx.execute(
-        "DELETE FROM mc_memories
-          WHERE project_path = ?3
-            AND EXISTS (
-                SELECT 1 FROM mc_authority
-                 WHERE context_store_uuid = ?1
-                   AND project = ?2
-                   AND domain = 'memories'
-                   AND state = 'MODULE'
-            )
-            AND EXISTS (
-                SELECT 1 FROM mc_memories canonical
-                 WHERE canonical.project_path = ?2
-                   AND canonical.category = mc_memories.category
-                   AND canonical.normalized_hash = mc_memories.normalized_hash
-            )",
-        params![context_store_uuid, project, route_project_root],
-    )?;
-    tx.execute(
-        "UPDATE mc_memories
-            SET project_path = ?2
-          WHERE project_path = ?3
-            AND EXISTS (
-                SELECT 1 FROM mc_authority
-                 WHERE context_store_uuid = ?1
-                   AND project = ?2
-                   AND domain = 'memories'
-                   AND state = 'MODULE'
-            )",
-        params![context_store_uuid, project, route_project_root],
-    )?;
-    tx.execute(
-        "UPDATE mc_memory_mutation_log
-            SET project_path = ?2
-          WHERE project_path = ?3
-            AND EXISTS (
-                SELECT 1 FROM mc_authority
-                 WHERE context_store_uuid = ?1
-                   AND project = ?2
-                   AND domain = 'memories'
-                   AND state = 'MODULE'
-            )",
-        params![context_store_uuid, project, route_project_root],
-    )?;
-    tx.execute(
-        "UPDATE mc_notes
-            SET project_path = ?2
-          WHERE project_path = ?3
-            AND EXISTS (
-                SELECT 1 FROM mc_authority
-                 WHERE context_store_uuid = ?1
-                   AND project = ?2
-                   AND domain = 'notes'
-                   AND state = 'MODULE'
-            )",
-        params![context_store_uuid, project, route_project_root],
-    )?;
-    Ok(())
-}
-
 /// A project's workspace membership: the union of member identities it reads, which of
 /// them are its OWN (full visibility) vs FOREIGN (visible only in `share_categories`),
 /// the shared-category allow-list, and per-foreign-member display attribution.
@@ -3288,37 +3222,11 @@ fn workspace_membership_from_connection(
     conn: &rusqlite::Connection,
     project_path: &str,
 ) -> rusqlite::Result<Option<WorkspaceMembership>> {
-    let workspace: Option<(i64, String)> = conn
-        .query_row(
-            "SELECT w.id, w.share_categories
-               FROM mc_workspace_members m
-               JOIN mc_workspaces w ON w.id = m.workspace_id
-              WHERE m.project_path = ?1",
-            params![project_path],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((workspace_id, share_categories_json)) = workspace else {
-        return Ok(None);
-    };
-
-    let mut statement = conn.prepare(
-        "SELECT project_path, display_name FROM mc_workspace_members
-          WHERE workspace_id = ?1 ORDER BY project_path ASC",
-    )?;
-    let members: Vec<(String, String)> = statement
-        .query_map(params![workspace_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<Vec<_>, _>>()?;
-    let union_identities = members.iter().map(|(path, _)| path.clone()).collect();
-    let display_name_by_path = members.into_iter().collect();
-    let share_categories = serde_json::from_str(&share_categories_json).unwrap_or_default();
-
-    Ok(Some(WorkspaceMembership {
-        union_identities,
-        own_identity: project_path.to_string(),
-        share_categories,
-        display_name_by_path,
-    }))
+    single_store_schema::read_workspace_membership(
+        conn,
+        &single_store_schema::CONTEXT_TABLES,
+        project_path,
+    )
 }
 
 fn workspace_fingerprint_from_membership(membership: Option<&WorkspaceMembership>) -> String {
@@ -3861,7 +3769,7 @@ pub struct PassTrace {
 
 /// A validated historian fact that may become a project memory. Validation owns
 /// category semantics; the store performs only durable exact-content de-duplication.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactCandidate {
     pub category: String,
     pub content: String,
@@ -5087,16 +4995,14 @@ pub struct SessionStatusSnapshot {
     /// Every durable `mc_tags` row for the session, regardless of coverage, compartment, or drop state.
     pub tag_count: usize,
     pub pass_trace: Option<PassTrace>,
-    pub compartment_page: Option<CompartmentPage>,
 }
 
-/// A bounded chronological page of module-owned compartments.
+/// A bounded chronological page of a session's compartments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompartmentPage {
     pub compartments: Vec<StoredCompartment>,
     pub max_sequence: i64,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrapupCommandRow {
     pub disposition: String,
@@ -5119,7 +5025,7 @@ pub enum TodoStateSetOutcome {
 
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
 /// chronological order (1 = oldest).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredCompartment {
     pub sequence: i64,
     pub start_message: i64,
@@ -5176,15 +5082,17 @@ pub struct M1RevisionSnapshot {
     pub max_memory_mutation_id: i64,
     pub max_compartment_seq: i64,
     pub note_status_version: i64,
+    /// `project_state.project_memory_epoch` for the project, 0 when it has no row.
+    pub project_memory_epoch: i64,
+    /// The session's highest `m0_mutation_log` id, 0 when it has none.
+    pub m0_mutation_head: i64,
 }
 
 /// A project memory row projected for rendering into the prompt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredMemory {
-    /// Module-local primary key used for storage and mutation-log joins.
+    /// The `context.db` row id: the id every harness renders and every tool accepts.
     pub id: i64,
-    /// Agent-visible context.db id acknowledged by a host-backed harness.
-    pub host_row_id: Option<i64>,
     pub project_path: String,
     pub category: String,
     pub content: String,
@@ -5203,13 +5111,12 @@ pub struct StoredMemory {
     pub verified_at: Option<i64>,
 }
 
-/// A complete `mc_memories` row for tool-side guards and lossless mutations. The render
+/// A complete `memories` row for tool-side guards and lossless mutations. The render
 /// path intentionally reads a smaller projection; mutation ports use this shape so they
 /// can preserve status, ownership, merge metadata, and cache-invalidation columns.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredMemoryFull {
     pub id: i64,
-    pub host_row_id: Option<i64>,
     pub project_path: String,
     pub category: String,
     pub content: String,
@@ -5234,8 +5141,6 @@ pub struct StoredMemoryFull {
     pub superseded_by_memory_id: Option<i64>,
     pub merged_from: Option<String>,
     pub metadata_json: Option<String>,
-    pub context_store_uuid: Option<String>,
-    pub context_row_id: Option<i64>,
     /// Compressed mural cue derived from the raw memory content.
     pub mural_cue: Option<String>,
     /// SHA-256 of the raw content used to produce `mural_cue`.
@@ -5245,43 +5150,6 @@ pub struct StoredMemoryFull {
     /// Validation failures for the content identified by `mural_cue_hash`.
     pub mural_cue_rejection_count: i64,
 }
-
-/// Every column that a memories changefeed snapshot must contain. Keep this list aligned with
-/// `mc_memories`; the invariant test below queries the schema and checks every emitted snapshot.
-pub const MEMORY_FEED_COLUMNS: &[&str] = &[
-    "id",
-    "project_path",
-    "category",
-    "content",
-    "normalized_hash",
-    "importance",
-    "scope",
-    "shareable",
-    "source_session_id",
-    "source_type",
-    "seen_count",
-    "retrieval_count",
-    "first_seen_at",
-    "created_at",
-    "updated_at",
-    "last_seen_at",
-    "last_retrieved_at",
-    "status",
-    "expires_at",
-    "verification_status",
-    "verified_at",
-    "classified_at",
-    "superseded_by_memory_id",
-    "merged_from",
-    "metadata_json",
-    "context_store_uuid",
-    "context_row_id",
-    "mural_cue",
-    "mural_cue_hash",
-    "mural_cue_at",
-    "mural_cue_rejection_count",
-    "host_row_id",
-];
 
 /// Inputs for an additive ctx_memory write. Duplicate detection follows the plugin's
 /// normalized-content hash (`lowercase → collapse whitespace → MD5`): a matching
@@ -5407,13 +5275,13 @@ pub struct StoredNote {
     pub harness: String,
     pub anchor_block_id: Option<String>,
     pub anchor_ordinal: Option<i64>,
-    pub dismissed_at: Option<i64>,
-    pub dismissal_resolution: Option<String>,
+    /// The compare-and-set token for note updates. `context.db` has no version column, so
+    /// this is the row's `updated_at`, which every module write moves strictly forward
+    /// (see [`next_note_updated_at_sql`]); a compare on it plus the content closes the
+    /// same-millisecond gap a plain timestamp would leave.
     pub status_version: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub context_store_uuid: Option<String>,
-    pub context_row_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5465,61 +5333,6 @@ pub struct StoredNoteSearchRow {
     pub anchor_ordinal: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-}
-
-/// Durable authority state for one context store, project, and owned domain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthorityRow {
-    pub context_store_uuid: String,
-    pub project: String,
-    pub domain: String,
-    pub state: String,
-    pub generation: u64,
-    pub captured_upper_bound: Option<i64>,
-    pub drain_generation: Option<u64>,
-    pub drain_cursor: i64,
-    pub step_seed: bool,
-    pub step_memories: bool,
-    pub step_notes: bool,
-    pub step_compartments: bool,
-    pub step_reconcile: bool,
-    pub step_verify: bool,
-    pub step_flip: bool,
-    pub coordinator_lease: Option<String>,
-    pub lease_expires_at: Option<i64>,
-    /// Attempt-unique token minted at drain begin/takeover. Step and finish require it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coordinator_token: Option<String>,
-    pub checksum_expected: Option<String>,
-    pub checksum_actual: Option<String>,
-    pub checksum_ok: Option<bool>,
-}
-
-/// One append-only row returned by `mirror.pull`. The snapshot is the complete row
-/// as serialized by the feed trigger, including nullable columns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChangefeedRow {
-    pub feed_seq: i64,
-    pub domain: String,
-    pub op: String,
-    pub module_row_id: i64,
-    pub full_row_snapshot: Value,
-    pub content_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChangefeedPage {
-    pub domain: String,
-    pub cursor: i64,
-    pub next_cursor: i64,
-    pub has_more: bool,
-    pub rows: Vec<ChangefeedRow>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostMemoryIdentityAck {
-    pub module_row_id: i64,
-    pub host_row_id: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5676,64 +5489,6 @@ pub enum RecordWrapupCommandOutcome {
     },
 }
 
-/// Represents one mirrored project-memory row from shadow state-sync. It keeps the
-/// original memory id unchanged because that id is written into prompt data and
-/// referenced by mutation rows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModuleMemoryRow {
-    pub id: i64,
-    /// State-sync memory ids originate in context.db and are already host-visible.
-    pub host_row_id: Option<i64>,
-    pub project_path: String,
-    pub category: String,
-    pub content: String,
-    pub normalized_hash: String,
-    pub importance: Option<i32>,
-    pub scope: String,
-    pub shareable: i32,
-    pub source_session_id: Option<String>,
-    pub source_type: Option<String>,
-    pub seen_count: i64,
-    pub retrieval_count: i64,
-    pub first_seen_at: i64,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub last_seen_at: i64,
-    pub last_retrieved_at: Option<i64>,
-    pub status: String,
-    pub expires_at: Option<i64>,
-    pub verification_status: String,
-    pub verified_at: Option<i64>,
-    pub classified_at: Option<i64>,
-    pub superseded_by_memory_id: Option<i64>,
-    pub merged_from: Option<String>,
-    pub metadata_json: Option<String>,
-    pub mural_cue: Option<String>,
-    pub mural_cue_hash: Option<String>,
-    pub mural_cue_at: Option<i64>,
-    pub mural_cue_rejection_count: i64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModuleWorkspaceMemberRow {
-    pub project_path: String,
-    pub display_name: String,
-    pub display_path: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModuleWorkspaceRow {
-    pub name: String,
-    pub share_categories: Vec<String>,
-    pub members: Vec<ModuleWorkspaceMemberRow>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModuleMemoryMutationRow {
-    pub project_path: String,
-    pub mutation: StoredMemoryMutation,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleDropSeedRow {
     pub block_id: String,
@@ -5786,18 +5541,7 @@ pub struct ModuleStateSyncRequest<'a> {
     pub strip_seeds: &'a [ModuleStripSeedRow],
     pub strip_seed_skipped: usize,
     pub reasoning_cleared_through_tag: Option<u64>,
-    pub compartments: &'a [StoredCompartment],
-    pub memories: &'a [ModuleMemoryRow],
-    pub memory_mutations: &'a [ModuleMemoryMutationRow],
-    pub user_profile: &'a [String],
-    /// False means the sender omitted the profile section; true includes Some(empty) clears.
-    pub user_profile_present: bool,
-    pub workspace: Option<&'a ModuleWorkspaceRow>,
-    /// False means the sender omitted the workspace section; true includes an explicit clear.
-    pub workspace_present: bool,
     pub last_todo_state: Option<String>,
-    pub project_memory_epoch: Option<u64>,
-    pub user_profile_version: Option<u64>,
     pub acked_watermarks: Value,
 }
 
@@ -5806,8 +5550,6 @@ pub struct ModuleStateSyncResult {
     pub shadow_generation: u64,
     pub shadow_seq: u64,
     pub row_version: u64,
-    /// True when incoming memory sections were skipped because the module owns memories.
-    pub memories_skipped: bool,
     /// Number of TS drop rows that could not be materialized into frozen module units.
     pub drop_seeds_skipped: usize,
     pub pending_agent_drops_seeded: usize,
@@ -6176,39 +5918,10 @@ enum MemoryMutationOutcome {
     Duplicate(i64),
 }
 
-enum MuralCueTxnOutcome {
-    Applied(MuralCueApplyResult),
-    AuthorityStateMismatch(String),
-    AuthorityGenerationMismatch(u64),
-}
-
-enum ClassificationTxnOutcome {
-    Applied(ClassificationApplyResult),
-    AuthorityStateMismatch(String),
-    AuthorityGenerationMismatch(u64),
-}
-
-enum VerificationTxnOutcome {
-    Applied(VerificationApplyResult),
-    AuthorityStateMismatch(String),
-    AuthorityGenerationMismatch(u64),
-}
-
-enum MappingTxnOutcome {
-    Applied(MappingApplyResult),
-    AuthorityStateMismatch(String),
-    AuthorityGenerationMismatch(u64),
-}
-
 enum CommitOutcome {
     Committed(u64),
     CasConflict(u64),
     UnhydratedBlockIdentities(usize),
-}
-
-enum AuthorityFinishDrainOutcome {
-    Finished(Box<AuthorityRow>),
-    FeedHeadAdvanced { captured: i64, found: i64 },
 }
 
 enum PublishTxnOutcome {
@@ -6294,124 +6007,6 @@ struct ValidatedSeedBoundary {
     max_sequence: i64,
 }
 
-const AUTHORITY_SELECT_SQL: &str = "SELECT context_store_uuid, project, domain, state, generation,
-    captured_upper_bound, drain_generation, drain_cursor, step_seed, step_memories,
-    step_notes, step_compartments, step_reconcile, step_verify, step_flip,
-    coordinator_lease, lease_expires_at, coordinator_token,
-    checksum_expected, checksum_actual, checksum_ok
-    FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3";
-
-#[derive(Debug)]
-enum AuthorityTransitionError {
-    State { expected: String, found: String },
-    Generation { expected: u64, found: u64 },
-    CoordinatorToken,
-    CoordinatorLeaseExpired,
-    UnresolvedPendingReferences { count: i64 },
-}
-
-impl std::fmt::Display for AuthorityTransitionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::State { expected, found } => {
-                write!(f, "expected state {expected}, found {found}")
-            }
-            Self::Generation { expected, found } => {
-                write!(f, "expected generation {expected}, found {found}")
-            }
-            Self::CoordinatorToken => {
-                write!(f, "drain coordinator token mismatch or missing")
-            }
-            Self::CoordinatorLeaseExpired => {
-                write!(f, "drain coordinator lease expired")
-            }
-            Self::UnresolvedPendingReferences { count } => {
-                write!(
-                    f,
-                    "authority prepare complete rejected: {count} unresolved pending memory references"
-                )
-            }
-        }
-    }
-}
-
-fn mint_coordinator_token(lease: &str, lease_expires_at: i64, generation: u64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!(
-        "{:x}",
-        Sha256::digest(
-            format!("drain-token:{lease}:{lease_expires_at}:{generation}:{nanos}").as_bytes()
-        )
-    )
-}
-
-impl std::error::Error for AuthorityTransitionError {}
-
-fn map_authority_sql_error(error: StoreError) -> McStoreError {
-    // cortexkit-store intentionally erases driver-specific errors at its connection
-    // boundary. Keep the durable operation error rather than pretending it was a
-    // successful transition when a generation or state check failed.
-    McStoreError::Store(error)
-}
-
-fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
-    if matches!(domain, "memories" | "notes") {
-        Ok(())
-    } else {
-        Err(McStoreError::Serde(format!(
-            "unknown authority domain {domain}"
-        )))
-    }
-}
-
-fn authority_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorityRow> {
-    Ok(AuthorityRow {
-        context_store_uuid: row.get(0)?,
-        project: row.get(1)?,
-        domain: row.get(2)?,
-        state: row.get(3)?,
-        generation: row.get::<_, i64>(4)? as u64,
-        captured_upper_bound: row.get(5)?,
-        drain_generation: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
-        drain_cursor: row.get(7)?,
-        step_seed: row.get::<_, i64>(8)? != 0,
-        step_memories: row.get::<_, i64>(9)? != 0,
-        step_notes: row.get::<_, i64>(10)? != 0,
-        step_compartments: row.get::<_, i64>(11)? != 0,
-        step_reconcile: row.get::<_, i64>(12)? != 0,
-        step_verify: row.get::<_, i64>(13)? != 0,
-        step_flip: row.get::<_, i64>(14)? != 0,
-        coordinator_lease: row.get(15)?,
-        lease_expires_at: row.get(16)?,
-        coordinator_token: row.get(17)?,
-        checksum_expected: row.get(18)?,
-        checksum_actual: row.get(19)?,
-        checksum_ok: row.get::<_, Option<i64>>(20)?.map(|value| value != 0),
-    })
-}
-
-fn authority_require_live_coordinator(
-    current: &AuthorityRow,
-    expected_token: &str,
-    now_ms: i64,
-) -> Result<(), rusqlite::Error> {
-    if current.coordinator_token.as_deref() != Some(expected_token) || expected_token.is_empty() {
-        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            AuthorityTransitionError::CoordinatorToken,
-        )));
-    }
-    if current.lease_expires_at.unwrap_or(0) <= now_ms {
-        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            AuthorityTransitionError::CoordinatorLeaseExpired,
-        )));
-    }
-    Ok(())
-}
-
 fn split_flat_block_id(id: &str) -> Option<(&str, u64)> {
     let (mid, index) = id.rsplit_once('#')?;
     if mid.is_empty() || mid.contains('#') {
@@ -6463,6 +6058,8 @@ pub fn validate_state_import_compartments(
     Ok(())
 }
 
+/// Whether `store.db` holds anything for the session. Domain rows are not consulted: they
+/// live in `context.db`, where the host writes them for every session it serves.
 fn session_has_durable_state(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -6470,7 +6067,6 @@ fn session_has_durable_state(
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM mc_cache_state WHERE session_id = ?1
-             UNION ALL SELECT 1 FROM mc_compartments WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_tags WHERE session_id = ?1
              UNION ALL SELECT 1 FROM pending_agent_drops WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_reduce_command_ledger WHERE session_id = ?1
@@ -6482,10 +6078,6 @@ fn session_has_durable_state(
              UNION ALL SELECT 1 FROM mc_recomp_commands WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_pass_trace WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_chunk_transcripts WHERE session_id = ?1
-             UNION ALL SELECT 1 FROM mc_compartment_events WHERE session_id = ?1
-             UNION ALL SELECT 1 FROM mc_primer_candidates WHERE session_id = ?1
-             UNION ALL SELECT 1 FROM mc_user_memory_candidates WHERE session_id = ?1
-             UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
          )",
         params![session_id],
         |row| row.get(0),
@@ -6551,10 +6143,8 @@ fn validated_seed_boundary(
 
 enum ModuleStateSyncTxnOutcome {
     Committed(ModuleStateSyncResult),
-    NonRetryableStoreConstraint { detail: String },
     GenerationMismatch { found: u64 },
     AuthoritySeqMismatch { found: u64 },
-    HistorianBusy { phase: HistorianPhase },
     InvalidSeedBoundary { declared: String, detail: String },
     Serde(String),
 }
@@ -6564,41 +6154,6 @@ type AbandonHistorianHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut
 #[cfg(any(test, feature = "test-support"))]
 type BeforeMaxCompartmentEndReadHook =
     std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut(&McStore) + Send>>>>;
-
-/// The Magic Context cache-state store: one single-writer SQLite handle for the
-/// module's lifetime.
-struct FacadeAuthorityScope {
-    owner: std::thread::ThreadId,
-    route_project_root: String,
-    domain: String,
-}
-
-struct FacadeMutationScopeGuard<'a> {
-    scope: &'a Mutex<Option<FacadeAuthorityScope>>,
-}
-
-impl Drop for FacadeMutationScopeGuard<'_> {
-    fn drop(&mut self) {
-        *self
-            .scope
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-    }
-}
-
-struct FacadeNoteScopeGuard<'a> {
-    scope: &'a Mutex<Option<String>>,
-    previous: Option<String>,
-}
-
-impl Drop for FacadeNoteScopeGuard<'_> {
-    fn drop(&mut self) {
-        *self
-            .scope
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous.take();
-    }
-}
 
 /// The result of one command-aware facade mutation. `Duplicate` contains the exact response bytes
 /// committed by the original command; it is returned without entering the mutation operation.
@@ -6617,14 +6172,12 @@ pub enum NoteDismissOutcome {
     AlreadyDismissed,
 }
 
-/// This error may contain internal module-store row ids. Transaction-scoped callers must convert
-/// those ids to host-visible memory identities before exposing the error to an agent, so
-/// host-backed harnesses do not display internal database ids directly.
+/// Why a facade memory mutation was refused. Ids are `context.db` memory ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FacadeMemoryMutationError {
     Storage(String),
     Unavailable { id: i64 },
-    DuplicateContent { id: i64, host_id: Option<i64> },
+    DuplicateContent { id: i64 },
     InvalidMerge,
 }
 
@@ -6649,10 +6202,11 @@ impl std::fmt::Display for FacadeMemoryMutationError {
 
 impl std::error::Error for FacadeMemoryMutationError {}
 
-/// Transaction-scoped ports used by the module facade. Every method operates on the transaction
-/// owned by `with_facade_command`, so the mutation and its response ledger row commit together.
+/// Transaction-scoped ports used by the module facade. Every method operates on the
+/// `context.db` transaction owned by `with_facade_command`, so a command's writes commit
+/// together.
 pub struct FacadeMutationTxn<'a> {
-    tx: &'a rusqlite::Transaction<'a>,
+    tx: &'a rusqlite::Connection,
 }
 
 impl<'a> FacadeMutationTxn<'a> {
@@ -6661,7 +6215,7 @@ impl<'a> FacadeMutationTxn<'a> {
         let existing: Option<i64> = self
             .tx
             .query_row(
-                "SELECT id FROM mc_memories
+                "SELECT id FROM memories
                   WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3",
                 params![input.project_path, input.category, normalized_hash],
                 |row| row.get(0),
@@ -6671,7 +6225,7 @@ impl<'a> FacadeMutationTxn<'a> {
         if let Some(id) = existing {
             self.tx
                 .execute(
-                    "UPDATE mc_memories
+                    "UPDATE memories
                         SET seen_count = COALESCE(seen_count, 0) + 1,
                             last_seen_at = ?1,
                             updated_at = ?1
@@ -6683,7 +6237,7 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         self.tx
             .execute(
-                "INSERT INTO mc_memories
+                "INSERT INTO memories
                    (project_path, category, content, normalized_hash, importance,
                     source_session_id, source_type, seen_count, retrieval_count,
                     first_seen_at, created_at, updated_at, last_seen_at, status,
@@ -6704,7 +6258,10 @@ impl<'a> FacadeMutationTxn<'a> {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        Ok(self.tx.last_insert_rowid())
+        let id = self.tx.last_insert_rowid();
+        raise_embedding_watermark_tx(self.tx, input.project_path, id, input.now_ms)
+            .map_err(|error| error.to_string())?;
+        Ok(id)
     }
 
     pub fn update_memory_content(
@@ -6731,25 +6288,20 @@ impl<'a> FacadeMutationTxn<'a> {
         let duplicate = self
             .tx
             .query_row(
-                "SELECT id, host_row_id FROM mc_memories
+                "SELECT id FROM memories
                   WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                   LIMIT 1",
                 params![project_path, target_category, normalized_hash],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| row.get::<_, i64>(0),
             )
             .optional()
             .map_err(FacadeMemoryMutationError::storage)?;
-        if let Some((duplicate_id, host_id)) =
-            duplicate.filter(|(duplicate_id, _)| *duplicate_id != id)
-        {
-            return Err(FacadeMemoryMutationError::DuplicateContent {
-                id: duplicate_id,
-                host_id,
-            });
+        if let Some(duplicate_id) = duplicate.filter(|duplicate_id| *duplicate_id != id) {
+            return Err(FacadeMemoryMutationError::DuplicateContent { id: duplicate_id });
         }
         self.tx
             .execute(
-                "UPDATE mc_memories
+                "UPDATE memories
                     SET content = ?1,
                         category = ?2,
                         normalized_hash = ?3,
@@ -6814,7 +6366,7 @@ impl<'a> FacadeMutationTxn<'a> {
                 let metadata_json = merge_archive_reason(memory.metadata_json.as_deref(), reason);
                 self.tx
                     .execute(
-                        "UPDATE mc_memories
+                        "UPDATE memories
                             SET status = 'archived', metadata_json = ?1, updated_at = ?2
                           WHERE id = ?3",
                         params![metadata_json, now_ms, memory.id],
@@ -6823,7 +6375,7 @@ impl<'a> FacadeMutationTxn<'a> {
             } else {
                 self.tx
                     .execute(
-                        "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
+                        "UPDATE memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
                         params![now_ms, memory.id],
                     )
                     .map_err(FacadeMemoryMutationError::storage)?;
@@ -6881,20 +6433,20 @@ impl<'a> FacadeMutationTxn<'a> {
         let matching = self
             .tx
             .query_row(
-                "SELECT id, host_row_id FROM mc_memories
+                "SELECT id FROM memories
                   WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                   LIMIT 1",
                 params![project_path, category, normalized_hash],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| row.get::<_, i64>(0),
             )
             .optional()
             .map_err(FacadeMemoryMutationError::storage)?;
-        if let Some((id, host_id)) = matching.filter(|(id, _)| !ids.contains(id)) {
-            return Err(FacadeMemoryMutationError::DuplicateContent { id, host_id });
+        if let Some(id) = matching.filter(|id| !ids.contains(id)) {
+            return Err(FacadeMemoryMutationError::DuplicateContent { id });
         }
 
         let created_canonical = matching.is_none();
-        let target_id = if let Some((id, _)) = matching {
+        let target_id = if let Some(id) = matching {
             id
         } else {
             self.insert_memory(InsertMemoryInput {
@@ -6931,7 +6483,7 @@ impl<'a> FacadeMutationTxn<'a> {
                 .sum::<i64>();
             self.tx
                 .execute(
-                    "UPDATE mc_memories
+                    "UPDATE memories
                         SET seen_count = ?1, retrieval_count = ?2, merged_from = ?3
                       WHERE id = ?4",
                     params![seen_count, retrieval_count, merged_from, target_id],
@@ -6939,9 +6491,9 @@ impl<'a> FacadeMutationTxn<'a> {
                 .map_err(FacadeMemoryMutationError::storage)?;
             self.tx
                 .execute(
-                    "DELETE FROM mc_memory_mutation_log
+                    "DELETE FROM memory_mutation_log
                       WHERE id = (
-                          SELECT MAX(id) FROM mc_memory_mutation_log
+                          SELECT MAX(id) FROM memory_mutation_log
                            WHERE project_path = ?1 AND mutation_type = 'update'
                              AND target_memory_id = ?2 AND queued_at = ?3
                       )",
@@ -7003,16 +6555,16 @@ impl<'a> FacadeMutationTxn<'a> {
         let duplicate = self
             .tx
             .query_row(
-                "SELECT id, host_row_id FROM mc_memories
+                "SELECT id FROM memories
                   WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                   LIMIT 1",
                 params![project_path, target.category, normalized_hash],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| row.get::<_, i64>(0),
             )
             .optional()
             .map_err(FacadeMemoryMutationError::storage)?;
-        if let Some((id, host_id)) = duplicate.filter(|(id, _)| *id != target_id) {
-            return Err(FacadeMemoryMutationError::DuplicateContent { id, host_id });
+        if let Some(id) = duplicate.filter(|id| *id != target_id) {
+            return Err(FacadeMemoryMutationError::DuplicateContent { id });
         }
         let mut affected = Vec::with_capacity(source_rows.len() + 1);
         affected.push(target.clone());
@@ -7031,7 +6583,7 @@ impl<'a> FacadeMutationTxn<'a> {
         for source in &source_rows {
             self.tx
                 .execute(
-                    "UPDATE mc_memories
+                    "UPDATE memories
                         SET status = 'archived',
                             superseded_by_memory_id = ?1,
                             updated_at = ?2
@@ -7055,7 +6607,7 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         self.tx
             .execute(
-                "UPDATE mc_memories
+                "UPDATE memories
                     SET content = ?1,
                         normalized_hash = ?2,
                         seen_count = ?3,
@@ -7098,95 +6650,29 @@ impl<'a> FacadeMutationTxn<'a> {
 
     pub fn set_memory_verification(
         &self,
-        context_store_uuid: &str,
         project: &str,
-        authority_generation: u64,
         rows: &[VerificationUpdate],
         now_ms: i64,
     ) -> Result<VerificationApplyResult, String> {
-        match set_memory_verification_tx(
-            self.tx,
-            context_store_uuid,
-            project,
-            authority_generation,
-            rows,
-            now_ms,
-        )
-        .map_err(|error| error.to_string())?
-        {
-            VerificationTxnOutcome::Applied(result) => Ok(result),
-            VerificationTxnOutcome::AuthorityStateMismatch(found) if found == "DRAINING" => {
-                Err("authority_draining".to_string())
-            }
-            VerificationTxnOutcome::AuthorityStateMismatch(found) => {
-                Err(format!("authority_state_mismatch:{found}"))
-            }
-            VerificationTxnOutcome::AuthorityGenerationMismatch(found) => Err(format!(
-                "authority_generation_mismatch:{authority_generation}:{found}"
-            )),
-        }
+        set_memory_verification_tx(self.tx, project, rows, now_ms).map_err(|error| error.to_string())
     }
 
     pub fn set_memory_mural_cue(
         &self,
-        context_store_uuid: &str,
         project: &str,
-        authority_generation: u64,
         rows: &[MuralCueUpdate],
         now_ms: i64,
     ) -> Result<MuralCueApplyResult, String> {
-        match set_memory_mural_cue_tx(
-            self.tx,
-            context_store_uuid,
-            project,
-            authority_generation,
-            rows,
-            now_ms,
-        )
-        .map_err(|error| error.to_string())?
-        {
-            MuralCueTxnOutcome::Applied(result) => Ok(result),
-            MuralCueTxnOutcome::AuthorityStateMismatch(found) if found == "DRAINING" => {
-                Err("authority_draining".to_string())
-            }
-            MuralCueTxnOutcome::AuthorityStateMismatch(found) => {
-                Err(format!("authority_state_mismatch:{found}"))
-            }
-            MuralCueTxnOutcome::AuthorityGenerationMismatch(found) => Err(format!(
-                "authority_generation_mismatch:{authority_generation}:{found}"
-            )),
-        }
+        set_memory_mural_cue_tx(self.tx, project, rows, now_ms).map_err(|error| error.to_string())
     }
 
     pub fn set_memory_mapping(
         &self,
-        context_store_uuid: &str,
         project: &str,
-        authority_generation: u64,
         rows: &[MappingUpdate],
         now_ms: i64,
     ) -> Result<MappingApplyResult, String> {
-        match set_memory_mapping_tx(
-            self.tx,
-            context_store_uuid,
-            project,
-            authority_generation,
-            rows,
-            now_ms,
-        )
-        .map_err(|error| error.to_string())?
-        {
-            MappingTxnOutcome::Applied(result) => Ok(result),
-            MappingTxnOutcome::AuthorityStateMismatch(found) if found == "DRAINING" => {
-                Err("authority_draining".to_string())
-            }
-            MappingTxnOutcome::AuthorityStateMismatch(found) => {
-                Err(format!("authority_state_mismatch:{found}"))
-            }
-            MappingTxnOutcome::AuthorityGenerationMismatch(found) => Err(format!(
-                "authority_generation_mismatch:{authority_generation}:{found}"
-            )),
-        }
+        set_memory_mapping_tx(self.tx, project, rows, now_ms).map_err(|error| error.to_string())
     }
 
     pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, String> {
@@ -7196,10 +6682,10 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         self.tx
             .execute(
-                "INSERT INTO mc_notes
+                "INSERT INTO notes
                  (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, harness, created_at_ms, updated_at_ms)
-                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
+                  anchor_block_id, harness, created_at, updated_at)
+                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, ?7, ?6, ?6)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -7207,6 +6693,8 @@ impl<'a> FacadeMutationTxn<'a> {
                     input.surface_condition,
                     input.anchor_block_id,
                     input.now_ms,
+                    session_harness_tx(self.tx, input.session_id)
+                        .map_err(|error| error.to_string())?,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -7228,11 +6716,11 @@ impl<'a> FacadeMutationTxn<'a> {
         };
         self.tx
             .execute(
-                "INSERT INTO mc_notes
+                "INSERT INTO notes
                  (type, project_path, session_id, content, status, surface_condition,
                   compiled_provider, compiled_config, compiled_at, compile_status,
-                  anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                  VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'module', ?12, ?12)",
+                  anchor_block_id, anchor_ordinal, harness, created_at, updated_at)
+                  VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'opencode', ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -7266,9 +6754,9 @@ impl<'a> FacadeMutationTxn<'a> {
         let mut statement = self
             .tx
             .prepare(
-                "SELECT created_at_ms, updated_at_ms FROM mc_notes
-                 WHERE project_path = ?1 AND type = 'session' AND session_id = ?2
-                   AND status = 'active'",
+                "SELECT created_at, updated_at FROM notes
+                 WHERE (project_path = ?1 OR project_path IS NULL) AND type = 'session'
+                   AND session_id = ?2 AND status = 'active'",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -7312,7 +6800,8 @@ impl<'a> FacadeMutationTxn<'a> {
         let Some(current) = current else {
             return Ok(NoteCasOutcome::Conflict { current: None });
         };
-        if current.project_path != project_path
+        if (current.project_path != project_path
+            && !(current.type_name == "session" && current.project_path.is_empty()))
             || current.status != expected_status
             || current.status_version != expected_version
         {
@@ -7335,12 +6824,12 @@ impl<'a> FacadeMutationTxn<'a> {
         let changed = self
             .tx
             .execute(
-                "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
+                "UPDATE notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
                     compiled_provider = CASE WHEN ?2 THEN ?4 ELSE compiled_provider END,
                     compiled_config = CASE WHEN ?2 THEN ?5 ELSE compiled_config END,
                     compiled_at = CASE WHEN ?2 THEN ?6 ELSE compiled_at END,
                     compile_status = CASE WHEN ?2 THEN ?7 ELSE compile_status END,
-                    status = ?8, status_version = status_version + 1, updated_at_ms = ?9,
+                    status = ?8, updated_at = MAX(?9, updated_at + 1),
                     last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
                     ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
                     ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
@@ -7357,7 +6846,8 @@ impl<'a> FacadeMutationTxn<'a> {
                     check_compiled_at = CASE WHEN ?2 THEN NULL ELSE check_compiled_at END,
                     check_false_since_at = CASE WHEN ?2 THEN NULL ELSE check_false_since_at END,
                     check_last_liveness_at = CASE WHEN ?2 THEN NULL ELSE check_last_liveness_at END
-                  WHERE id = ?10 AND project_path = ?11 AND status = ?12 AND status_version = ?13",
+                  WHERE id = ?10 AND COALESCE(project_path, '') = ?11 AND status = ?12
+                    AND updated_at = ?13 AND content = ?14",
                 params![
                     next_content,
                     condition_changed,
@@ -7369,9 +6859,10 @@ impl<'a> FacadeMutationTxn<'a> {
                     next_status,
                     now_ms,
                     note_id,
-                    project_path,
+                    current.project_path,
                     expected_status,
                     expected_version,
+                    current.content,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -7401,7 +6892,10 @@ impl<'a> FacadeMutationTxn<'a> {
         else {
             return Ok((NoteDismissOutcome::NotFound, None));
         };
-        if current.project_path != project_path
+        // A session note the host wrote carries no project; the session is its owner.
+        let project_matches = current.project_path == project_path
+            || (current.type_name == "session" && current.project_path.is_empty());
+        if !project_matches
             || (current.type_name != "smart" && current.session_id != session_id)
         {
             return Ok((NoteDismissOutcome::NotOwned, None));
@@ -7411,7 +6905,7 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         if !matches!(
             current.status.as_str(),
-            "active" | "pending" | "ready" | "surfacing" | "surfaced"
+            "active" | "pending" | "ready"
         ) {
             return Ok((NoteDismissOutcome::AlreadyDismissed, Some(current)));
         }
@@ -7422,18 +6916,15 @@ impl<'a> FacadeMutationTxn<'a> {
         let changed = self
             .tx
             .execute(
-                "UPDATE mc_notes
-                    SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, updated_at_ms = ?2,
-                        dismissed_at = ?2, dismissal_resolution = ?3
-                  WHERE id = ?4 AND project_path = ?5
-                    AND status = ?6 AND status_version = ?7",
+                "UPDATE notes
+                    SET status = 'dismissed', content = ?1, updated_at = MAX(?2, updated_at + 1)
+                  WHERE id = ?3 AND COALESCE(project_path, '') = ?4
+                    AND status = ?5 AND updated_at = ?6",
                 params![
                     content,
                     now_ms,
-                    resolution,
                     note_id,
-                    project_path,
+                    current.project_path,
                     current.status,
                     current.status_version,
                 ],
@@ -7487,83 +6978,19 @@ impl<'a> FacadeMutationTxn<'a> {
     }
 }
 
-/// SQLite handle that copies process-local facade identity into a durable transaction row.
-///
-/// The singleton row is safe because SQLite allows only one writer, and its elevated values are
-/// cleared before commit. A second connection therefore sees only the committed empty state.
-struct ScopedSqliteStore {
-    inner: SqliteStore,
-    note_caller_project: Arc<Mutex<Option<String>>>,
-    facade_authority_scope: Arc<Mutex<Option<FacadeAuthorityScope>>>,
-}
-
-impl std::ops::Deref for ScopedSqliteStore {
-    type Target = SqliteStore;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl ScopedSqliteStore {
-    fn with_conn_fenced<T>(
-        &self,
-        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
-    ) -> Result<T, StoreError> {
-        let authority = self
-            .facade_authority_scope
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .filter(|scope| scope.owner == std::thread::current().id())
-            .map(|scope| (scope.domain.clone(), scope.route_project_root.clone()));
-        let note_caller = self
-            .note_caller_project
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if authority.is_none() && note_caller.is_none() {
-            return self.inner.with_conn_fenced(operation);
-        }
-        let (authority_domain, authority_route) = authority.unwrap_or_default();
-        let note_caller = note_caller.unwrap_or_default();
-        self.inner.with_conn_fenced(|tx| {
-            tx.execute(
-                "INSERT INTO mc_privilege_state(
-                     id, facade_authority_domain, facade_authority_route, note_caller_project
-                 ) VALUES (1, ?1, ?2, ?3)
-                 ON CONFLICT(id) DO UPDATE SET
-                     facade_authority_domain = excluded.facade_authority_domain,
-                     facade_authority_route = excluded.facade_authority_route,
-                     note_caller_project = excluded.note_caller_project",
-                params![authority_domain, authority_route, note_caller],
-            )?;
-            let result = operation(tx)?;
-            tx.execute(
-                "UPDATE mc_privilege_state
-                    SET facade_authority_domain = '',
-                        facade_authority_route = '',
-                        note_caller_project = ''
-                  WHERE id = 1",
-                [],
-            )?;
-            Ok(result)
-        })
-    }
-}
-
+/// The Magic Context cache-state store: one single-writer SQLite handle on `store.db` for
+/// the module's lifetime, plus the installed [`ContextDomain`] for the rows in `context.db`.
 pub struct McStore {
-    inner: ScopedSqliteStore,
+    inner: SqliteStore,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
     // opens one store for the module lifetime; tests and embedded callers may open several.
     tag_cache_namespace: u64,
-    /// The process-local note caller copied into `mc_privilege_state` for each fenced write.
-    /// The legacy UDF reads the same scope while an old-shape store is migrating.
-    note_caller_project: Arc<Mutex<Option<String>>>,
-    /// Facade scope is copied into the durable privilege row for each write transaction. A
-    /// separate lock serializes scopes so one request cannot lend its authority to another.
-    facade_authority_scope: Arc<Mutex<Option<FacadeAuthorityScope>>>,
+    /// Serializes facade mutations, so one command's ledger check and write cannot
+    /// interleave with another's.
     facade_mutation_lock: Mutex<()>,
+    /// Where the domain rows live. The module installs it right after opening the store;
+    /// until then every domain read and write refuses with `context_not_installed`.
+    context: std::sync::RwLock<Option<Arc<dyn ContextDomain>>>,
     #[cfg(any(test, feature = "test-support"))]
     abandon_historian_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
@@ -7789,6 +7216,25 @@ fn materialize_strip_seed_units(
     skipped
 }
 
+/// Register the SQL functions the triggers of older migrations call.
+///
+/// Stores below v53 install triggers on the domain tables that call these functions, and a
+/// migration that runs on such a store needs them to exist. Migration 61 drops those
+/// tables and their triggers, so the functions only ever answer "no caller", an empty
+/// string.
+fn register_legacy_trigger_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    for name in [
+        "mc_note_caller_project",
+        "mc_facade_authority_domain",
+        "mc_facade_authority_route",
+    ] {
+        conn.create_scalar_function(name, 0, FunctionFlags::SQLITE_UTF8, |_| {
+            Ok(String::new())
+        })?;
+    }
+    Ok(())
+}
+
 /// Bring an unmigrated `store.db` up to the last version that still holds domain rows, and
 /// no further. The offline single-store migration calls this for a store older than that
 /// version and then applies migration 61 itself, after copying the rows out.
@@ -7805,21 +7251,7 @@ pub fn migrate_store_to_pre_single_store(path: &Path) -> Result<u32, McStoreErro
         },
     };
     let inner = open_sqlite(&descriptor)?;
-    inner.with_conn(|conn| {
-        for name in [
-            "mc_note_caller_project",
-            "mc_facade_authority_domain",
-            "mc_facade_authority_route",
-        ] {
-            conn.create_scalar_function(
-                name,
-                0,
-                FunctionFlags::SQLITE_UTF8,
-                |_| Ok(String::new()),
-            )?;
-        }
-        Ok(())
-    })?;
+    inner.with_conn(register_legacy_trigger_functions)?;
     let end = MIGRATIONS
         .iter()
         .position(|migration| migration.version > single_store_schema::PRE_SINGLE_STORE_VERSION)
@@ -7834,58 +7266,91 @@ impl McStore {
         self.tag_cache_namespace
     }
 
+    /// Install the `context.db` connections domain rows are read from and written to.
+    pub fn install_context_domain(&self, domain: Arc<dyn ContextDomain>) {
+        *self
+            .context
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(domain);
+    }
+
+    /// Whether a `context.db` domain is installed.
+    pub fn has_context_domain(&self) -> bool {
+        self.context
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn context_domain(&self) -> Result<Arc<dyn ContextDomain>, McStoreError> {
+        self.context
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                single_store_domain::context_error(
+                    "context_not_installed",
+                    "no context.db is attached to this store",
+                )
+            })
+    }
+
+    /// Run `read` against `context.db` in one read snapshot.
+    fn context_read<T>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, McStoreError> {
+        let domain = self.context_domain()?;
+        let mut read = Some(read);
+        let mut output = None;
+        domain.read(&mut |conn| {
+            let read = read.take().expect("a context read runs its callback once");
+            output = Some(read(conn)?);
+            Ok(())
+        })?;
+        Ok(output.expect("a successful context read produced its value"))
+    }
+
+    /// Run `write` against `context.db` in one `BEGIN IMMEDIATE`. `tables` names the domain
+    /// tables it writes, for the module's per-table schema fence.
+    fn context_write<T>(
+        &self,
+        tables: &[&str],
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> Result<T, McStoreError> {
+        let domain = self.context_domain()?;
+        let mut write = Some(write);
+        let mut output = None;
+        domain.write(tables, &mut |tx| {
+            let write = write.take().expect("a context write runs its callback once");
+            output = Some(write(tx)?);
+            Ok(())
+        })?;
+        Ok(output.expect("a successful context write produced its value"))
+    }
+
+    /// Open a store for a test, with a `context.db` beside it (created from the schema
+    /// snapshot when missing) installed as its domain.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_for_test(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
+        let store = Self::open(descriptor)?;
+        let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend else {
+            return Ok(store);
+        };
+        let context_path = Path::new(path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("context.db");
+        single_store_domain::create_test_context_db(&context_path)?;
+        store.install_context_domain(Arc::new(SqliteContextDomain::open(&context_path)?));
+        Ok(store)
+    }
+
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
         let inner = open_sqlite(descriptor)?;
-        let note_caller_project = Arc::new(Mutex::new(None::<String>));
-        let facade_authority_scope = Arc::new(Mutex::new(None::<FacadeAuthorityScope>));
-        let note_udf_scope = Arc::clone(&note_caller_project);
-        let facade_domain_scope = Arc::clone(&facade_authority_scope);
-        let facade_route_scope = Arc::clone(&facade_authority_scope);
-        // Register before migrations: stores below v53 still install the historical UDF-backed
-        // triggers before v53 replaces them. Keeping the functions registered also lets a new
-        // binary open an old-shape/store-ahead database without a bootstrap-only failure.
-        inner.with_conn(move |conn| {
-            conn.create_scalar_function(
-                "mc_note_caller_project",
-                0,
-                FunctionFlags::SQLITE_UTF8,
-                move |_context| {
-                    Ok(note_udf_scope
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone()
-                        .unwrap_or_default())
-                },
-            )?;
-            conn.create_scalar_function(
-                "mc_facade_authority_domain",
-                0,
-                FunctionFlags::SQLITE_UTF8,
-                move |_context| {
-                    Ok(facade_domain_scope
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .as_ref()
-                        .filter(|scope| scope.owner == std::thread::current().id())
-                        .map(|scope| scope.domain.clone())
-                        .unwrap_or_default())
-                },
-            )?;
-            conn.create_scalar_function(
-                "mc_facade_authority_route",
-                0,
-                FunctionFlags::SQLITE_UTF8,
-                move |_context| {
-                    Ok(facade_route_scope
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .as_ref()
-                        .filter(|scope| scope.owner == std::thread::current().id())
-                        .map(|scope| scope.route_project_root.clone())
-                        .unwrap_or_default())
-                },
-            )
-        })?;
+        // Registered before migrating: the older migrations of a store below v53 install
+        // triggers that call these functions.
+        inner.with_conn(register_legacy_trigger_functions)?;
         // Migration 61 drops the tables whose rows now live in context.db. A store that still
         // holds such rows has not been through the offline migration, which copies them first,
         // so it is refused here before any migration runs; the file stays exactly as it was.
@@ -7948,15 +7413,10 @@ impl McStore {
             })?;
         }
         let store = McStore {
-            inner: ScopedSqliteStore {
-                inner,
-                note_caller_project: Arc::clone(&note_caller_project),
-                facade_authority_scope: Arc::clone(&facade_authority_scope),
-            },
+            inner,
             tag_cache_namespace: NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
-            note_caller_project,
-            facade_authority_scope,
             facade_mutation_lock: Mutex::new(()),
+            context: std::sync::RwLock::new(None),
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
@@ -8072,16 +7532,21 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Execute a command-aware facade mutation in one fenced transaction. The operation callback
-    /// must return the exact response bytes that the caller would receive; those bytes are stored
-    /// before the transaction commits. A duplicate command returns the stored bytes without
-    /// invoking the callback.
+    /// Execute a command-aware facade mutation. The operation callback runs inside one
+    /// `context.db` write transaction and must return the exact response bytes the caller
+    /// would receive; those bytes are then recorded in `store.db`'s command ledger. A
+    /// duplicate command returns the recorded bytes without invoking the callback.
+    ///
+    /// The two files commit separately, `context.db` first. A process that dies between the
+    /// two leaves the mutation applied without a ledger row, so a retry of the same command
+    /// runs it again: inserts are idempotent on the natural key, and an update or archive
+    /// re-applies the same values.
     #[allow(clippy::too_many_arguments)]
     pub fn with_facade_command(
         &self,
-        route_project_root: &str,
-        caller_project: &str,
-        domain: &str,
+        _route_project_root: &str,
+        _caller_project: &str,
+        _domain: &str,
         identity_scope: &str,
         tool: &str,
         action: &str,
@@ -8092,314 +7557,88 @@ impl McStore {
             .facade_mutation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous_note_scope = self
-            .note_caller_project
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace(caller_project.to_string());
-        let _note_scope_guard = FacadeNoteScopeGuard {
-            scope: &self.note_caller_project,
-            previous: previous_note_scope,
-        };
-        {
-            let mut scope = self
-                .facade_authority_scope
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *scope = Some(FacadeAuthorityScope {
-                owner: std::thread::current().id(),
-                route_project_root: route_project_root.to_string(),
-                domain: domain.to_string(),
-            });
+        if let Some(command_id) = command_id {
+            let stored = self.inner.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT response_json
+                       FROM mc_facade_mutation_ledger
+                      WHERE identity_scope = ?1 AND tool = ?2
+                        AND action = ?3 AND command_id = ?4",
+                    params![identity_scope, tool, action, command_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+            })?;
+            if let Some(response) = stored {
+                return Ok(FacadeMutationOutcome::Duplicate(response));
+            }
         }
-        let _scope_guard = FacadeMutationScopeGuard {
-            scope: &self.facade_authority_scope,
-        };
-        self.inner
-            .with_conn_fenced(|tx| {
-                if let Some(command_id) = command_id {
-                    let stored = tx
-                        .query_row(
-                            "SELECT response_json
-                               FROM mc_facade_mutation_ledger
-                              WHERE identity_scope = ?1 AND tool = ?2
-                                AND action = ?3 AND command_id = ?4",
-                            params![identity_scope, tool, action, command_id],
-                            |row| row.get::<_, Vec<u8>>(0),
-                        )
-                        .optional()?;
-                    if let Some(response) = stored {
-                        return Ok(FacadeMutationOutcome::Duplicate(response));
-                    }
-                }
 
-                let response = mutation(&FacadeMutationTxn { tx }).map_err(|error| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                        error,
-                    )))
-                })?;
-                if let Some(command_id) = command_id {
-                    let created_at_ms = current_time_ms();
-                    tx.execute(
-                        "INSERT INTO mc_facade_mutation_ledger
-                             (identity_scope, tool, action, command_id, response_json, created_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![
-                            identity_scope,
-                            tool,
-                            action,
-                            command_id,
-                            response,
-                            created_at_ms
-                        ],
-                    )?;
-                    // Keep only the newest 512 commands for each session identity. The command
-                    // key remains unique while it is retained; old outcomes are intentionally
-                    // forgettable because the host session has a bounded replay horizon.
-                    tx.execute(
-                        "DELETE FROM mc_facade_mutation_ledger
-                          WHERE identity_scope = ?1
-                            AND (created_at_ms, tool, action, command_id) IN (
-                                SELECT created_at_ms, tool, action, command_id
-                                  FROM mc_facade_mutation_ledger
-                                 WHERE identity_scope = ?1
-                                 ORDER BY created_at_ms DESC, tool DESC, action DESC, command_id DESC
-                                 LIMIT -1 OFFSET 512
-                            )",
-                        params![identity_scope],
-                    )?;
-                    #[cfg(any(test, feature = "test-support"))]
-                    if let Some(hook) = self
-                        .facade_mutation_abandon_hook
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .as_mut()
-                    {
-                        // This callback runs after both writes and before commit, allowing tests
-                        // to simulate a process abandoning the transaction at the crash window.
-                        hook();
-                    }
-                }
-                Ok(FacadeMutationOutcome::Applied(response))
+        let response = self.context_write(&["memories", "notes"], |tx| {
+            mutation(&FacadeMutationTxn { tx }).map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
             })
-            .map_err(Into::into)
+        })?;
+        if let Some(command_id) = command_id {
+            self.inner.with_conn_fenced(|tx| {
+                let created_at_ms = current_time_ms();
+                tx.execute(
+                    "INSERT INTO mc_facade_mutation_ledger
+                         (identity_scope, tool, action, command_id, response_json, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        identity_scope,
+                        tool,
+                        action,
+                        command_id,
+                        response,
+                        created_at_ms
+                    ],
+                )?;
+                // Keep only the newest 512 commands for each session identity. The command
+                // key remains unique while it is retained; old outcomes are intentionally
+                // forgettable because the host session has a bounded replay horizon.
+                tx.execute(
+                    "DELETE FROM mc_facade_mutation_ledger
+                      WHERE identity_scope = ?1
+                        AND (created_at_ms, tool, action, command_id) IN (
+                            SELECT created_at_ms, tool, action, command_id
+                              FROM mc_facade_mutation_ledger
+                             WHERE identity_scope = ?1
+                             ORDER BY created_at_ms DESC, tool DESC, action DESC, command_id DESC
+                             LIMIT -1 OFFSET 512
+                        )",
+                    params![identity_scope],
+                )?;
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(hook) = self
+                    .facade_mutation_abandon_hook
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_mut()
+                {
+                    // Runs after the ledger row is written and before it commits, so a test
+                    // can abandon the ledger half of a command whose mutation already landed.
+                    hook();
+                }
+                Ok(())
+            })?;
+        }
+        Ok(FacadeMutationOutcome::Applied(response))
     }
 
-    /// Run one facade mutation while SQLite triggers can verify the route's authority state in
-    /// the mutation transaction. The scope is cleared on every normal return before another
-    /// facade mutation can enter.
+    /// Run one facade mutation, serialized against every other facade mutation.
     pub fn with_facade_mutation<T, E>(
         &self,
-        route_project_root: &str,
-        domain: &str,
+        _route_project_root: &str,
+        _domain: &str,
         mutation: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
         let _mutation_guard = self
             .facade_mutation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        {
-            let mut scope = self
-                .facade_authority_scope
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *scope = Some(FacadeAuthorityScope {
-                owner: std::thread::current().id(),
-                route_project_root: route_project_root.to_string(),
-                domain: domain.to_string(),
-            });
-        }
-        let _scope_guard = FacadeMutationScopeGuard {
-            scope: &self.facade_authority_scope,
-        };
         mutation()
-    }
-
-    /// Complete route normalization after schema upgrades using the same caller-identity
-    /// check as runtime note writes. Because the SQL migration cannot safely rekey several
-    /// note owners under one caller identity, replay this idempotent repair on every store
-    /// open, including stores that already recorded the upgraded schema version.
-    fn repair_migration_30_authority_routes(&self) -> Result<(), McStoreError> {
-        let bindings = self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT binding.context_store_uuid, binding.project, binding.route_project_root
-                   FROM mc_authority_route_bindings binding
-                  WHERE EXISTS (
-                        SELECT 1 FROM mc_authority authority
-                         WHERE authority.context_store_uuid = binding.context_store_uuid
-                           AND authority.project = binding.project
-                           AND authority.state = 'MODULE'
-                           AND authority.domain IN ('memories', 'notes')
-                  )
-                  ORDER BY binding.route_project_root",
-            )?;
-            let rows = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<Result<Vec<(String, String, String)>, _>>()?;
-            Ok(rows)
-        })?;
-        for (context_store_uuid, project, route_project_root) in bindings {
-            self.with_note_conn_fenced(&route_project_root, |tx| {
-                normalize_authority_route_tx(tx, &context_store_uuid, &project, &route_project_root)
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Associate a daemon-bound route root with an authority identity. The route path
-    /// is transport vocabulary; the identity remains the key used by domain rows.
-    pub fn bind_authority_route(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        route_project_root: &str,
-    ) -> Result<(), McStoreError> {
-        self.with_note_conn_fenced(route_project_root, |tx| {
-            tx.execute(
-                "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(route_project_root) DO UPDATE SET
-                    context_store_uuid = excluded.context_store_uuid,
-                    project = excluded.project",
-                params![route_project_root, context_store_uuid, project],
-            )?;
-            // The trigger remains the direct-SQL safety net, but cleanup also belongs to
-            // this operation: a bind can happen before twins exist and never be retried
-            // by the cached authority-status path. Running it after every upsert makes
-            // the vocabulary law independent of write ordering.
-            normalize_authority_route_tx(tx, context_store_uuid, project, route_project_root)?;
-            Ok(())
-        })
-    }
-
-    /// Resolve a requested facade identity to the MODULE authority that owns it. The
-    /// context UUID is returned with the identity so a write can establish the route
-    /// binding even when the transform's authority-status result was cached.
-    pub fn module_authority_for_project(
-        &self,
-        project: &str,
-        domain: &str,
-    ) -> Result<Option<(String, String)>, McStoreError> {
-        validate_authority_domain(domain)?;
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT context_store_uuid, project
-                       FROM mc_authority
-                      WHERE project = ?1 AND domain = ?2 AND state = 'MODULE'
-                      ORDER BY context_store_uuid
-                      LIMIT 1",
-                    params![project, domain],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-            })
-            .map_err(Into::into)
-    }
-
-    /// Resolve a facade-supplied identity while it is module-owned or draining. DRAINING remains
-    /// visible so callers can return a retryable transition error instead of falling back to a
-    /// filesystem route.
-    pub fn facade_authority_for_project(
-        &self,
-        project: &str,
-        domain: &str,
-    ) -> Result<Option<(String, String, String)>, McStoreError> {
-        validate_authority_domain(domain)?;
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT context_store_uuid, project, state
-                       FROM mc_authority
-                      WHERE project = ?1 AND domain = ?2
-                        AND state IN ('MODULE', 'DRAINING')
-                      ORDER BY context_store_uuid
-                      LIMIT 1",
-                    params![project, domain],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()
-            })
-            .map_err(Into::into)
-    }
-
-    /// Return the authority identity and state bound to this daemon route while ownership is
-    /// active or draining. Mutation callers use the state; transforms and reads keep continuity.
-    pub fn authority_project_state_for_route(
-        &self,
-        route_project_root: &str,
-        domain: &str,
-    ) -> Result<Option<(String, String)>, McStoreError> {
-        validate_authority_domain(domain)?;
-        #[cfg(any(test, feature = "test-support"))]
-        if self
-            .authority_project_resolution_fail_once
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(McStoreError::Serde(
-                "injected authority project resolution failure".to_string(),
-            ));
-        }
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT authority.project, authority.state
-                       FROM mc_authority_route_bindings binding
-                       JOIN mc_authority authority
-                         ON authority.context_store_uuid = binding.context_store_uuid
-                        AND authority.project = binding.project
-                      WHERE binding.route_project_root = ?1
-                        AND authority.domain = ?2
-                        AND authority.state IN ('MODULE', 'DRAINING')",
-                    params![route_project_root, domain],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-            })
-            .map_err(Into::into)
-    }
-
-    /// Return the authority identity bound to this daemon route only while ownership is active
-    /// or draining. PREPARING remains route-keyed so transforms cannot observe a partial seed;
-    /// the verified MODULE acknowledgement publishes the identity-key flip.
-    pub fn authority_project_for_route(
-        &self,
-        route_project_root: &str,
-        domain: &str,
-    ) -> Result<Option<String>, McStoreError> {
-        validate_authority_domain(domain)?;
-        #[cfg(any(test, feature = "test-support"))]
-        if self
-            .authority_project_resolution_fail_once
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(McStoreError::Serde(
-                "injected authority project resolution failure".to_string(),
-            ));
-        }
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT authority.project
-                       FROM mc_authority_route_bindings binding
-                       JOIN mc_authority authority
-                         ON authority.context_store_uuid = binding.context_store_uuid
-                        AND authority.project = binding.project
-                      WHERE binding.route_project_root = ?1
-                        AND authority.domain = ?2
-                        AND authority.state IN ('MODULE', 'DRAINING')",
-                    params![route_project_root, domain],
-                    |row| row.get(0),
-                )
-                .optional()
-            })
-            .map_err(Into::into)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn fail_next_authority_project_resolution_for_test(&self) {
-        self.authority_project_resolution_fail_once
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -8412,25 +7651,6 @@ impl McStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(kind.to_string());
-    }
-
-    /// Reject a facade write that crosses the route's active authority identity.
-    pub fn enforce_facade_project_vocabulary(
-        &self,
-        route_project_root: &str,
-        write_project: &str,
-        domain: &str,
-    ) -> Result<(), McStoreError> {
-        let authority_project = self.authority_project_for_route(route_project_root, domain)?;
-        if let Some(authority_project) = authority_project.filter(|value| value != write_project) {
-            return Err(McStoreError::FacadeProjectVocabularyMismatch {
-                route_project_root: route_project_root.to_string(),
-                authority_project,
-                write_project: write_project.to_string(),
-                domain: domain.to_string(),
-            });
-        }
-        Ok(())
     }
 
     /// Install a one-shot callback immediately before the max-compartment-end query. It lets
@@ -8509,21 +7729,13 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Run one note write in a `context.db` write transaction.
     fn with_note_conn_fenced<T>(
         &self,
-        caller_project: &str,
+        _caller_project: &str,
         operation: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
     ) -> Result<T, McStoreError> {
-        let previous = self
-            .note_caller_project
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace(caller_project.to_string());
-        let _scope_guard = FacadeNoteScopeGuard {
-            scope: &self.note_caller_project,
-            previous,
-        };
-        self.inner.with_conn_fenced(operation).map_err(Into::into)
+        self.context_write(&["notes"], operation)
     }
 
     /// The applied schema version of this store's `mc_cache` migration chain:
@@ -8631,14 +7843,46 @@ impl McStore {
     }
 
     /// Delete every row whose ownership is expressed by an exact `session_id` column.
-    /// Project memories and smart notes survive because their ownership is project-scoped;
-    /// session notes and every cache/overlay/producer ledger row are removed atomically.
+    /// Project memories and smart notes survive because their ownership is project-scoped.
+    /// The session's `context.db` history rows and session notes go in one transaction, then
+    /// every `store.db` cache, overlay and producer ledger row in another.
     pub fn delete_session(
         &self,
         session_id: &str,
         project_path: &str,
     ) -> Result<usize, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        // The session's history rows in context.db first, then every store.db cache row.
+        let mut deleted = self.context_write(
+            &[
+                "compartment_events",
+                "compartments",
+                "notes",
+                "primer_candidates",
+                "user_memory_candidates",
+            ],
+            |tx| {
+                let mut deleted = 0usize;
+                for table in [
+                    "compartment_events",
+                    "compartments",
+                    "primer_candidates",
+                    "user_memory_candidates",
+                ] {
+                    deleted = deleted.saturating_add(tx.execute(
+                        &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                        params![session_id],
+                    )?);
+                }
+                deleted = deleted.saturating_add(tx.execute(
+                    "DELETE FROM notes
+                      WHERE session_id = ?1 AND type = 'session'
+                        AND (project_path = ?2 OR project_path IS NULL)",
+                    params![session_id, project_path],
+                )?);
+                Ok(deleted)
+            },
+        )?;
+        deleted = deleted.saturating_add(self.inner.with_conn_fenced(|tx| {
             let tables = {
                 let mut stmt = tx.prepare(
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -8659,23 +7903,15 @@ impl McStore {
                     columns.into_iter().any(|column| column == "session_id")
                 };
                 if has_session_id {
-                    deleted = deleted.saturating_add(if table == "mc_notes" {
-                        tx.execute(
-                            &format!(
-                                "DELETE FROM {quoted} WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'"
-                            ),
-                            params![session_id, project_path],
-                        )?
-                    } else {
-                        tx.execute(
-                            &format!("DELETE FROM {quoted} WHERE session_id = ?1"),
-                            params![session_id],
-                        )?
-                    });
+                    deleted = deleted.saturating_add(tx.execute(
+                        &format!("DELETE FROM {quoted} WHERE session_id = ?1"),
+                        params![session_id],
+                    )?);
                 }
             }
             Ok(deleted)
-        })
+        })?);
+        Ok(deleted)
     }
 
     /// Load a session's persisted state. Returns defaults (uninitialized, no row)
@@ -8742,19 +7978,24 @@ impl McStore {
     ) -> Result<(ModuleMeta, String, i64), McStoreError> {
         let row = self.inner.with_conn(|conn| {
             conn.query_row(
-                "SELECT meta, CASE WHEN ?2 THEN COALESCE(json_extract(core_state, '$.boundary_id'), '') ELSE '' END,
-                        (SELECT COALESCE(MAX(sequence), -1) FROM mc_compartments WHERE session_id = ?1)
+                "SELECT meta, CASE WHEN ?2 THEN COALESCE(json_extract(core_state, '$.boundary_id'), '') ELSE '' END
                  FROM mc_cache_state WHERE session_id = ?1",
                 params![session_id, include_boundary],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             ).optional()
         })?;
         match row {
-            Some((meta, boundary, sequence)) => Ok((
+            Some((meta, boundary)) => Ok((
                 serde_json::from_str(&meta)
                     .map_err(|error| McStoreError::Serde(error.to_string()))?,
                 boundary,
-                sequence,
+                self.context_read(|conn| {
+                    conn.query_row(
+                        "SELECT COALESCE(MAX(sequence), -1) FROM compartments WHERE session_id = ?1",
+                        params![session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })?,
             )),
             None => Ok((ModuleMeta::default(), String::new(), -1)),
         }
@@ -8906,12 +8147,19 @@ impl McStore {
         Ok(snapshot)
     }
 
-    /// Load all durable fields used by session.status from one SQLite read transaction.
+    /// Load the durable fields used by session.status: the cache fields from one `store.db`
+    /// read transaction, and the compartment count from `context.db`.
     pub fn load_session_status_snapshot(
         &self,
         session_id: &str,
-        compartment_page: Option<(i64, usize)>,
     ) -> Result<SessionStatusSnapshot, McStoreError> {
+        let compartment_count = self.context_read(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM compartments WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+        })?;
         let snapshot = self.inner.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
             let state = transaction
@@ -8971,35 +8219,6 @@ impl McStore {
                     |row| row.get::<_, i64>(0),
                 )?
                 .max(0) as usize;
-            let compartment_page = compartment_page
-                .map(|(after_sequence, limit)| {
-                    let max_sequence = transaction
-                        .query_row(
-                            "SELECT MAX(sequence) FROM mc_compartments WHERE session_id = ?1",
-                            params![session_id],
-                            |row| row.get::<_, Option<i64>>(0),
-                        )?
-                        .map_or(after_sequence, |max| max.max(after_sequence));
-                    let mut statement = transaction.prepare(
-                        "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                                start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                                episode_type, legacy, created_at
-                           FROM mc_compartments
-                          WHERE session_id = ?1 AND sequence > ?2
-                          ORDER BY sequence ASC LIMIT ?3",
-                    )?;
-                    let compartments = statement
-                        .query_map(
-                            params![session_id, after_sequence, i64::try_from(limit).unwrap_or(i64::MAX)],
-                            Self::stored_compartment_from_row,
-                        )?
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok::<CompartmentPage, rusqlite::Error>(CompartmentPage {
-                        compartments,
-                        max_sequence,
-                    })
-                })
-                .transpose()?;
             let pass_trace = transaction
                 .query_row(
                     "SELECT last_received_at_ms, last_completed_at_ms, last_reject_error,
@@ -9042,11 +8261,10 @@ impl McStore {
                 .optional()?;
             let snapshot = SessionStatusSnapshot {
                 loaded,
-                compartment_count: count("mc_compartments")?,
+                compartment_count: compartment_count.max(0) as usize,
                 pending_drop_count: count("pending_agent_drops")?,
                 tag_count,
                 pass_trace,
-                compartment_page,
             };
             transaction.commit()?;
             Ok(snapshot)
@@ -10406,42 +9624,17 @@ impl McStore {
         })?)
     }
 
-    /// Apply classifier metadata under the memories authority, updating each row only when its
-    /// content hash still matches the supplied hash. Importance and classification writes that
+    /// Apply classifier metadata, updating each row only when its content hash still matches the supplied hash. Importance and classification writes that
     /// keep foreign visibility unchanged remain mutation-neutral. A visibility grant/revocation
     /// appends an internal correction marker in this same transaction so m1 can reconcile the row
     /// without waiting for a HARD fold.
     pub fn set_memory_classification(
         &self,
-        context_store_uuid: &str,
         project: &str,
-        authority_generation: u64,
         rows: &[ClassificationUpdate],
         now_ms: i64,
     ) -> Result<ClassificationApplyResult, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            let authority: Option<(String, u64)> = tx
-                .query_row(
-                    "SELECT state, generation FROM mc_authority
-                       WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
-                    params![context_store_uuid, project],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let Some((state, generation)) = authority else {
-                return Ok(ClassificationTxnOutcome::AuthorityStateMismatch(
-                    "missing memories authority".to_string(),
-                ));
-            };
-            if state != "MODULE" {
-                return Ok(ClassificationTxnOutcome::AuthorityStateMismatch(state));
-            }
-            if generation != authority_generation {
-                return Ok(ClassificationTxnOutcome::AuthorityGenerationMismatch(
-                    generation,
-                ));
-            }
-
+        self.context_write(&["memories"], |tx| {
             let membership = workspace_membership_from_connection(tx, project)?;
             let mut accepted = Vec::new();
             let mut rejected = Vec::new();
@@ -10516,7 +9709,7 @@ impl McStore {
                 values.push(rusqlite::types::Value::Integer(now_ms));
                 values.push(rusqlite::types::Value::Integer(update.memory_id));
                 let sql = format!(
-                    "UPDATE mc_memories SET {} WHERE id = ?",
+                    "UPDATE memories SET {} WHERE id = ?",
                     assignments.join(", ")
                 );
                 tx.execute(&sql, rusqlite::params_from_iter(values.iter()))?;
@@ -10536,139 +9729,43 @@ impl McStore {
                 }
                 accepted.push(update.memory_id);
             }
-            Ok(ClassificationTxnOutcome::Applied(
-                ClassificationApplyResult { accepted, rejected },
-            ))
-        })?;
-        match outcome {
-            ClassificationTxnOutcome::Applied(result) => Ok(result),
-            ClassificationTxnOutcome::AuthorityStateMismatch(found) => {
-                Err(McStoreError::AuthorityStateMismatch {
-                    expected: "MODULE".to_string(),
-                    found,
-                })
-            }
-            ClassificationTxnOutcome::AuthorityGenerationMismatch(found) => {
-                Err(McStoreError::AuthorityGenerationMismatch {
-                    expected: authority_generation,
-                    found,
-                })
-            }
-        }
+            Ok(ClassificationApplyResult { accepted, rejected })
+        })
     }
 
-    /// Apply derived mural-cue columns through the memories authority. These writes update only
-    /// derived columns: they emit a complete mirror snapshot but do not record a cache mutation
-    /// or change the memory content. The normal process that folds memory updates will later
+    /// Apply derived mural-cue columns. These writes update only derived columns: they do not
+    /// record a memory mutation or change the memory content. The normal process that folds memory updates will later
     /// decide when to render the mural.
     pub fn set_memory_mural_cue(
         &self,
-        context_store_uuid: &str,
         project: &str,
-        authority_generation: u64,
         rows: &[MuralCueUpdate],
         now_ms: i64,
     ) -> Result<MuralCueApplyResult, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            set_memory_mural_cue_tx(
-                tx,
-                context_store_uuid,
-                project,
-                authority_generation,
-                rows,
-                now_ms,
-            )
-        })?;
-        match outcome {
-            MuralCueTxnOutcome::Applied(result) => Ok(result),
-            MuralCueTxnOutcome::AuthorityStateMismatch(found) => {
-                Err(McStoreError::AuthorityStateMismatch {
-                    expected: "MODULE".to_string(),
-                    found,
-                })
-            }
-            MuralCueTxnOutcome::AuthorityGenerationMismatch(found) => {
-                Err(McStoreError::AuthorityGenerationMismatch {
-                    expected: authority_generation,
-                    found,
-                })
-            }
-        }
+        self.context_write(&["memories"], |tx| set_memory_mural_cue_tx(tx, project, rows, now_ms))
     }
 
-    /// Apply verification updates only when their authority generation and content hash still match
-    /// the values used for verification. The row change, mapping snapshot feed, and any memory
-    /// mutation commit together.
+    /// Apply verification updates only when their content hash still matches the value used
+    /// for verification. The row change, its `memory_verifications` rows and any memory
+    /// mutation commit together in `context.db`.
     pub fn set_memory_verification(
         &self,
-        context_store_uuid: &str,
         project: &str,
-        authority_generation: u64,
         rows: &[VerificationUpdate],
         now_ms: i64,
     ) -> Result<VerificationApplyResult, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            set_memory_verification_tx(
-                tx,
-                context_store_uuid,
-                project,
-                authority_generation,
-                rows,
-                now_ms,
-            )
-        })?;
-        match outcome {
-            VerificationTxnOutcome::Applied(result) => Ok(result),
-            VerificationTxnOutcome::AuthorityStateMismatch(found) => {
-                Err(McStoreError::AuthorityStateMismatch {
-                    expected: "MODULE".to_string(),
-                    found,
-                })
-            }
-            VerificationTxnOutcome::AuthorityGenerationMismatch(found) => {
-                Err(McStoreError::AuthorityGenerationMismatch {
-                    expected: authority_generation,
-                    found,
-                })
-            }
-        }
+        self.context_write(&["memories"], |tx| set_memory_verification_tx(tx, project, rows, now_ms))
     }
 
-    /// Store the complete file set reported by map-memories and emit the resulting mapping and
-    /// verification snapshot for the context mirror in the same transaction.
+    /// Store the complete file set reported by map-memories as `memory_verifications` rows,
+    /// the way the host's own mapper records them.
     pub fn set_memory_mapping(
         &self,
-        context_store_uuid: &str,
         project: &str,
-        authority_generation: u64,
         rows: &[MappingUpdate],
         now_ms: i64,
     ) -> Result<MappingApplyResult, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            set_memory_mapping_tx(
-                tx,
-                context_store_uuid,
-                project,
-                authority_generation,
-                rows,
-                now_ms,
-            )
-        })?;
-        match outcome {
-            MappingTxnOutcome::Applied(result) => Ok(result),
-            MappingTxnOutcome::AuthorityStateMismatch(found) => {
-                Err(McStoreError::AuthorityStateMismatch {
-                    expected: "MODULE".to_string(),
-                    found,
-                })
-            }
-            MappingTxnOutcome::AuthorityGenerationMismatch(found) => {
-                Err(McStoreError::AuthorityGenerationMismatch {
-                    expected: authority_generation,
-                    found,
-                })
-            }
-        }
+        self.context_write(&["memories"], |tx| set_memory_mapping_tx(tx, project, rows, now_ms))
     }
 
     /// Record a terminal wrapup outcome only while the cache row still matches the
@@ -10842,10 +9939,11 @@ impl McStore {
         }
     }
 
-    /// Atomically seed compartments into a never-used real-session key and record the
-    /// completed import id. No cache row is created: the normal first transform observes
-    /// the compartments with an empty boundary and performs the bootstrap HARD fold that
-    /// mints the live boundary anchor.
+    /// Record a completed import for a never-used real-session key. The compartments are
+    /// validated but not written: they live in `context.db`, where the host that owns the
+    /// session already wrote them. No cache row is created: the normal first transform
+    /// observes the compartments with an empty boundary and performs the bootstrap HARD
+    /// fold that mints the live boundary anchor.
     pub fn commit_state_import(
         &self,
         session_id: &str,
@@ -10878,9 +9976,8 @@ impl McStore {
                 return Ok(StateImportTxnOutcome::Validation(error));
             }
 
-            for compartment in compartments {
-                insert_compartment_tx(tx, session_id, compartment.sequence, compartment)?;
-            }
+            // The compartments themselves are already in context.db, written by the host
+            // that owns the session; the import records only that it happened.
             tx.execute(
                 "INSERT INTO mc_state_imports
                      (session_id, import_id, imported_count, completed_at_ms)
@@ -10973,8 +10070,8 @@ impl McStore {
             meta,
             consumed_drop_ids,
             first_applied_command_ids,
-            memory_revision,
-            compartment_max_seq,
+            memory_revision: _,
+            compartment_max_seq: _,
             project_root,
             first_divergence,
             scheduler_observation,
@@ -11072,59 +10169,10 @@ impl McStore {
                 // Empty txn (commits nothing); the caller re-loads and re-steps.
                 return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
             }
-            if let Some(revision) = memory_revision.filter(|value| !value.project_paths.is_empty()) {
-                let placeholders = std::iter::repeat_n("?", revision.project_paths.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let current_memory: i64 = if revision.reader_project_path.is_empty() {
-                    tx.query_row(
-                        &format!(
-                            "SELECT COALESCE(MAX(id), 0) FROM mc_memories \
-                             WHERE project_path IN ({placeholders})"
-                        ),
-                        rusqlite::params_from_iter(revision.project_paths.iter()),
-                        |row| row.get(0),
-                    )?
-                } else {
-                    let membership = workspace_membership_from_connection(
-                        tx,
-                        &revision.reader_project_path,
-                    )?;
-                    let (pool_filter, pool_binds) = memory_render_pool_filter_for_column(
-                        membership.as_ref(),
-                        &revision.reader_project_path,
-                        "project_path",
-                        revision.expiry_cutoff_ms,
-                    );
-                    tx.query_row(
-                        &format!(
-                            "SELECT COALESCE(MAX(id), 0) FROM mc_memories WHERE {pool_filter}"
-                        ),
-                        rusqlite::params_from_iter(pool_binds.iter()),
-                        |row| row.get(0),
-                    )?
-                };
-                let current_mutation: i64 = tx.query_row(
-                    &format!("SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log WHERE project_path IN ({placeholders})"),
-                    rusqlite::params_from_iter(revision.project_paths.iter()),
-                    |row| row.get(0),
-                )?;
-                if current_memory != revision.max_memory_id
-                    || current_mutation != revision.mutation_cursor
-                {
-                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
-                }
-            }
-            if let Some(expected_seq) = compartment_max_seq {
-                let current_seq: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )?;
-                if current_seq != expected_seq {
-                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
-                }
-            }
+            // The domain heads (memory, mutation, compartment) are not re-read here: they
+            // live in context.db, and the revision this commit stores is the one the pass
+            // rendered from, read in one context.db snapshot. A write that lands after that
+            // snapshot shows up as a changed head on the next pass.
 
             // Refuse before the diff runs rather than treating an unhydrated meta as a
             // request to delete the session's identity history.
@@ -11439,6 +10487,17 @@ impl McStore {
         let mut import_ms = 0.0;
         let default_core_json = serde_json::to_string(&CoreState::default())
             .map_err(|e| ModuleStateSyncError::Serde(e.to_string()))?;
+        // A declared seed boundary is checked against the session's compartments, which
+        // live in context.db; they are read before the store.db transaction, never inside it.
+        let seed_compartments = if request.seed_boundary_id.is_some() {
+            self.load_compartments(request.session_id)?
+        } else {
+            Vec::new()
+        };
+        let published_end = seed_compartments
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max();
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -11474,16 +10533,7 @@ impl McStore {
                     (NO_ROW, core, ModuleMeta::default())
                 }
             };
-            let initialized_before_sync = meta.initialized;
             let mut adopted_over_materialized_boundary = false;
-
-            if !request.compartments.is_empty()
-                && meta.historian.state != HistorianPhase::Idle
-            {
-                return Ok(ModuleStateSyncTxnOutcome::HistorianBusy {
-                    phase: meta.historian.state,
-                });
-            }
             if meta.shadow_generation != request.shadow_generation {
                 return Ok(ModuleStateSyncTxnOutcome::GenerationMismatch {
                     found: meta.shadow_generation,
@@ -11496,7 +10546,7 @@ impl McStore {
             }
 
             if let Some(declared) = request.seed_boundary_id {
-                let adoption = match validated_seed_boundary(declared, request.compartments) {
+                let adoption = match validated_seed_boundary(declared, &seed_compartments) {
                     Ok(adoption) => adoption,
                     Err(detail) => {
                         return Ok(ModuleStateSyncTxnOutcome::InvalidSeedBoundary {
@@ -11528,11 +10578,6 @@ impl McStore {
                 let seed_ahead_of_module = meta.initialized
                     && match meta.coverage_ordinal {
                         Some(folded_end) => {
-                            let published_end: Option<i64> = tx.query_row(
-                                "SELECT MAX(end_message) FROM mc_compartments WHERE session_id = ?1",
-                                params![request.session_id],
-                                |row| row.get(0),
-                            )?;
                             let module_end = published_end
                                 .and_then(|end| u64::try_from(end).ok())
                                 .map_or(folded_end, |end| end.max(folded_end));
@@ -11647,113 +10692,18 @@ impl McStore {
             );
 
             if adopted_over_materialized_boundary {
-                // The host and the module chunk history independently, so the same sequence
-                // number can cover different ordinals on each side. Overwriting by sequence
-                // would leave the module's higher-numbered rows behind with ranges that
-                // overlap the host's, a non-monotonic set the renderer and historian
-                // validation reject. The adopted seed therefore replaces the whole set, along
-                // with the rows keyed to the module's compartment sequences: chunk transcripts
-                // and compartment events. Candidate and side-channel rows are keyed by message
-                // ordinals, which stay valid under any chunking, so they are kept.
-                for table in [
-                    "mc_chunk_transcripts",
-                    "mc_compartment_events",
-                    "mc_compartments",
-                ] {
-                    tx.execute(
-                        &format!("DELETE FROM {table} WHERE session_id = ?1"),
-                        params![request.session_id],
-                    )?;
-                }
-            }
-            let mut compartment_overwrites_skipped = 0usize;
-            for compartment in request.compartments {
-                // After adopting a newer seed the set above is empty and the host's
-                // compartments are written as the new set.
-                if initialized_before_sync && !adopted_over_materialized_boundary {
-                    let retained_sequence = meta.folded_compartment_seq;
-                    if compartment.sequence <= retained_sequence
-                        || !write_seed_compartment_tx(
-                            tx,
-                            request.session_id,
-                            compartment,
-                            false,
-                        )?
-                    {
-                        compartment_overwrites_skipped =
-                            compartment_overwrites_skipped.saturating_add(1);
-                    }
-                } else {
-                    write_seed_compartment_tx(tx, request.session_id, compartment, true)?;
-                }
-            }
-            if compartment_overwrites_skipped > 0 {
-                tracing::info!(
-                    "mc-store: skipped {} state-sync compartment overwrite(s) while retaining folded sequence {} for session {}",
-                    compartment_overwrites_skipped,
-                    meta.folded_compartment_seq,
-                    request.session_id
-                );
-            }
-            if request.workspace_present {
-                if let Err(error) =
-                    replace_workspace_tx(tx, request.project_path, request.workspace)
-                {
-                    if error.sqlite_error_code()
-                        == Some(rusqlite::ErrorCode::ConstraintViolation)
-                    {
-                        return Ok(ModuleStateSyncTxnOutcome::NonRetryableStoreConstraint {
-                            detail: error.to_string(),
-                        });
-                    }
-                    return Err(error);
-                }
-            }
-            // Each authority pool has exactly one writer. When the module owns memories, this
-            // state-sync lane can only mirror module changes back to TypeScript; applying the
-            // TypeScript view here would let a stale sender overwrite module-authored fields.
-            let memories_authority_state: Option<String> = tx
-                .query_row(
-                    "SELECT authority.state
-                       FROM mc_authority_route_bindings binding
-                       JOIN mc_authority authority
-                         ON authority.context_store_uuid = binding.context_store_uuid
-                        AND authority.project = binding.project
-                      WHERE binding.route_project_root = ?1
-                        AND authority.domain = 'memories'",
-                    params![request.project_path],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let memories_skipped = matches!(
-                memories_authority_state.as_deref(),
-                Some("PREPARING" | "MODULE" | "DRAINING")
-            );
-            if !memories_skipped {
-                replace_authority_memories_tx(tx, request.project_path, request.memories)?;
-                replace_authority_memory_mutations_tx(
-                    tx,
-                    request.project_path,
-                    request.memory_mutations,
+                // The module's chunk transcripts are keyed to the compartment sequences of
+                // the coverage it just gave up, so they go. The compartments themselves are
+                // the host's rows in context.db and stay as they are.
+                tx.execute(
+                    "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
+                    params![request.session_id],
                 )?;
             }
-            if request.user_profile_present {
-                replace_authority_user_profile_tx(tx, request.user_profile)?;
-            }
-
             let in_session_watermark_changed = meta.shadow_acked_watermarks != request.acked_watermarks;
             meta.last_todo_state = request.last_todo_state.clone();
             if in_session_watermark_changed && meta.m1_pending_since_ms.is_none() {
                 meta.m1_pending_since_ms = Some(current_time_ms());
-            }
-            if let Some(epoch) = request.project_memory_epoch {
-                if epoch != meta.project_memory_epoch {
-                    meta.project_memory_epoch_pending = true;
-                }
-                meta.project_memory_epoch = epoch;
-            }
-            if let Some(version) = request.user_profile_version {
-                meta.user_profile_version = version;
             }
             if let Some(watermark) = request.reasoning_cleared_through_tag {
                 meta.reasoning_cleared_through_tag =
@@ -11790,7 +10740,6 @@ impl McStore {
                 shadow_generation: meta.shadow_generation,
                 shadow_seq: meta.shadow_seq,
                 row_version: next,
-                memories_skipped,
                 drop_seeds_skipped,
                 pending_agent_drops_seeded,
                 pending_agent_drops_skipped,
@@ -11804,12 +10753,9 @@ impl McStore {
         })?;
 
         let commit_ms = (timing_started.elapsed().as_secs_f64() * 1000.0 - import_ms).max(0.0);
-        tracing::debug!("mc-state-sync-timing side=store session={} import_ms={:.3} drop_seed_units_ms={:.3} commit_ms={:.3} compartments={} tags={}", request.session_id, import_ms, drop_seed_units_ms, commit_ms, request.compartments.len(), request.drop_seeds.len());
+        tracing::debug!("mc-state-sync-timing side=store session={} import_ms={:.3} drop_seed_units_ms={:.3} commit_ms={:.3} compartments={} tags={}", request.session_id, import_ms, drop_seed_units_ms, commit_ms, seed_compartments.len(), request.drop_seeds.len());
         match outcome {
             ModuleStateSyncTxnOutcome::Committed(result) => Ok(result),
-            ModuleStateSyncTxnOutcome::NonRetryableStoreConstraint { detail } => {
-                Err(ModuleStateSyncError::NonRetryableStoreConstraint { detail })
-            }
             ModuleStateSyncTxnOutcome::GenerationMismatch { found } => {
                 Err(ModuleStateSyncError::GenerationMismatch {
                     expected: request.shadow_generation,
@@ -11821,9 +10767,6 @@ impl McStore {
                     expected: request.expected_shadow_seq,
                     found,
                 })
-            }
-            ModuleStateSyncTxnOutcome::HistorianBusy { phase } => {
-                Err(ModuleStateSyncError::HistorianBusy { phase })
             }
             ModuleStateSyncTxnOutcome::InvalidSeedBoundary { declared, detail } => {
                 Err(ModuleStateSyncError::InvalidSeedBoundary { declared, detail })
@@ -11837,8 +10780,8 @@ impl McStore {
             sequence: r.get(0)?,
             start_message: r.get(1)?,
             end_message: r.get(2)?,
-            start_message_id: r.get(3)?,
-            end_message_id: r.get(4)?,
+            start_message_id: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            end_message_id: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
             start_date: r.get(5)?,
             end_date: r.get(6)?,
             title: r.get(7)?,
@@ -11854,36 +10797,52 @@ impl McStore {
         })
     }
 
+    /// Fill the date segment of each compartment from `store.db`'s date cache. `context.db`
+    /// has no date columns; a cached row whose message ids no longer match belongs to an
+    /// earlier compartment at the same position and is ignored.
+    fn apply_compartment_dates(
+        &self,
+        session_id: &str,
+        compartments: &mut [StoredCompartment],
+    ) -> Result<(), McStoreError> {
+        if compartments.is_empty() {
+            return Ok(());
+        }
+        self.inner.with_conn(|conn| {
+            single_store_schema::apply_compartment_dates(conn, session_id, compartments)
+        })?;
+        Ok(())
+    }
+
     /// Read a session's compartments in chronological order (oldest first), the order
     /// the decay renderer expects (it indexes from newest internally).
     pub fn load_compartments(
         &self,
         session_id: &str,
     ) -> Result<Vec<StoredCompartment>, McStoreError> {
-        let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                        episode_type, legacy, created_at
-                 FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
-            )?;
+        let mut rows = self.context_read(|conn| {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {COMPARTMENT_SELECT_COLUMNS}
+                 FROM compartments WHERE session_id = ?1 ORDER BY sequence ASC"
+            ))?;
             let mapped = stmt
                 .query_map(params![session_id], Self::stored_compartment_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(mapped)
         })?;
+        self.apply_compartment_dates(session_id, &mut rows)?;
         Ok(rows)
     }
 
-    /// Read only structural boundaries from one SQLite snapshot, without summary bodies.
+    /// Read only structural boundaries from one snapshot, without summary bodies.
     pub fn load_compartment_boundaries(
         &self,
         session_id: &str,
     ) -> Result<Vec<CompartmentBoundary>, McStoreError> {
-        let rows = self.inner.with_conn(|conn| {
+        self.context_read(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT sequence, start_message, end_message, end_message_id
-                 FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
+                "SELECT sequence, start_message, end_message, COALESCE(end_message_id, '')
+                 FROM compartments WHERE session_id = ?1 ORDER BY sequence ASC",
             )?;
             let rows = stmt
                 .query_map(params![session_id], |row| {
@@ -11896,13 +10855,11 @@ impl McStore {
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
-        })?;
-        Ok(rows)
+        })
     }
 
     /// Return the greatest message ordinal covered by a session's compartments without
-    /// materializing the wide compartment rows. The migration-42 index covers both the session
-    /// predicate and the aggregate value.
+    /// materializing the wide compartment rows.
     pub fn max_compartment_end_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -11915,17 +10872,15 @@ impl McStore {
                 hook(self);
             }
         }
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT COALESCE(MAX(end_message), 0)
-                       FROM mc_compartments
-                      WHERE session_id = ?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )
-            })
-            .map_err(Into::into)
+        self.context_read(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(MAX(end_message), 0)
+                   FROM compartments
+                  WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+        })
     }
 
     /// Return the newest ordinal covered by a persisted compacted compartment.
@@ -11947,28 +10902,26 @@ impl McStore {
             return Ok(Vec::new());
         }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.inner
-            .with_conn(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                            start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                            episode_type, legacy, created_at
-                       FROM mc_compartments
-                      WHERE session_id = ?1
-                        AND end_message >= ?2
-                        AND start_message <= ?3
-                      ORDER BY sequence ASC
-                      LIMIT ?4",
-                )?;
-                let mapped = stmt
-                    .query_map(
-                        params![session_id, start, end, limit],
-                        Self::stored_compartment_from_row,
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(mapped)
-            })
-            .map_err(Into::into)
+        let mut rows = self.context_read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COMPARTMENT_SELECT_COLUMNS}
+                   FROM compartments
+                  WHERE session_id = ?1
+                    AND end_message >= ?2
+                    AND start_message <= ?3
+                  ORDER BY sequence ASC
+                  LIMIT ?4"
+            ))?;
+            let mapped = stmt
+                .query_map(
+                    params![session_id, start, end, limit],
+                    Self::stored_compartment_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        self.apply_compartment_dates(session_id, &mut rows)?;
+        Ok(rows)
     }
 
     /// Read the next chronological compartment page and the highest sequence currently
@@ -11979,22 +10932,20 @@ impl McStore {
         after_sequence: i64,
         limit: usize,
     ) -> Result<CompartmentPage, McStoreError> {
-        let page = self.inner.with_conn(|conn| {
+        let mut page = self.context_read(|conn| {
             let max_sequence = conn
                 .query_row(
-                    "SELECT MAX(sequence) FROM mc_compartments WHERE session_id = ?1",
+                    "SELECT MAX(sequence) FROM compartments WHERE session_id = ?1",
                     params![session_id],
                     |row| row.get::<_, Option<i64>>(0),
                 )?
                 .map_or(after_sequence, |max| max.max(after_sequence));
-            let mut stmt = conn.prepare(
-                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                        episode_type, legacy, created_at
-                 FROM mc_compartments
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COMPARTMENT_SELECT_COLUMNS}
+                 FROM compartments
                  WHERE session_id = ?1 AND sequence > ?2
-                 ORDER BY sequence ASC LIMIT ?3",
-            )?;
+                 ORDER BY sequence ASC LIMIT ?3"
+            ))?;
             let compartments = stmt
                 .query_map(
                     params![session_id, after_sequence, limit as i64],
@@ -12006,46 +10957,47 @@ impl McStore {
                 max_sequence,
             })
         })?;
+        self.apply_compartment_dates(session_id, &mut page.compartments)?;
         Ok(page)
     }
 
-    /// Read the compartment rows and session revert epoch in one store snapshot for
-    /// historian assembly. The epoch is the fence carried by the firing until publish.
+    /// Read the compartment rows (from `context.db`) and the session revert epoch (from
+    /// `store.db`) for historian assembly. The epoch is the fence carried by the firing
+    /// until publish.
     pub fn load_historian_assembly_snapshot(
         &self,
         session_id: &str,
     ) -> Result<HistorianAssemblySnapshot, McStoreError> {
-        let (meta_json, compartments, compartment_set_generation) =
-            self.inner.with_conn(|conn| {
-                let meta_json = conn
-                    .query_row(
-                        "SELECT meta FROM mc_cache_state WHERE session_id = ?1",
-                        params![session_id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()?;
-                let mut stmt = conn.prepare(
-                    "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                        episode_type, legacy, created_at
-                 FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
-                )?;
-                let compartments = stmt
-                    .query_map(params![session_id], Self::stored_compartment_from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let compartment_set_generation = conn.query_row(
-                    "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
-                 FROM mc_compartments WHERE session_id = ?1",
-                    params![session_id],
-                    |row| {
-                        Ok(CompartmentSetGeneration {
-                            max_sequence: row.get(0)?,
-                            count: row.get(1)?,
-                        })
-                    },
-                )?;
-                Ok((meta_json, compartments, compartment_set_generation))
-            })?;
+        let meta_json = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT meta FROM mc_cache_state WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })?;
+        let (mut compartments, compartment_set_generation) = self.context_read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COMPARTMENT_SELECT_COLUMNS}
+                 FROM compartments WHERE session_id = ?1 ORDER BY sequence ASC"
+            ))?;
+            let compartments = stmt
+                .query_map(params![session_id], Self::stored_compartment_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            let compartment_set_generation = conn.query_row(
+                "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
+                 FROM compartments WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(CompartmentSetGeneration {
+                        max_sequence: row.get(0)?,
+                        count: row.get(1)?,
+                    })
+                },
+            )?;
+            Ok((compartments, compartment_set_generation))
+        })?;
+        self.apply_compartment_dates(session_id, &mut compartments)?;
         let revert_epoch = match meta_json {
             Some(json) => {
                 serde_json::from_str::<ModuleMeta>(&json)
@@ -12066,15 +11018,13 @@ impl McStore {
     /// loading the full compartment rows (those load only on the pass that actually
     /// re-composes the m1 delta block).
     pub fn max_compartment_seq(&self, session_id: &str) -> Result<i64, McStoreError> {
-        let max = self.inner.with_conn(|conn| {
-            let v: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
+        self.context_read(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM compartments WHERE session_id = ?1",
                 params![session_id],
                 |r| r.get(0),
-            )?;
-            Ok(v)
-        })?;
-        Ok(max)
+            )
+        })
     }
 
     /// Whether the session has any compartment at all. This is a presence check, NOT a
@@ -12083,15 +11033,14 @@ impl McStore {
     /// cannot answer "does a compartment exist". The first-fold HARD trigger needs the
     /// unambiguous existence answer (empty boundary + a compartment present => the first
     /// fold is due), so this returns a true/false from `SELECT EXISTS` on the session
-    /// index — O(1), never touches the sequence value.
+    /// index.
     pub fn has_compartments(&self, session_id: &str) -> Result<bool, McStoreError> {
-        let exists = self.inner.with_conn(|conn| {
-            let v: i64 = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM mc_compartments WHERE session_id = ?1)",
+        let exists: i64 = self.context_read(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM compartments WHERE session_id = ?1)",
                 params![session_id],
                 |r| r.get(0),
-            )?;
-            Ok(v)
+            )
         })?;
         Ok(exists != 0)
     }
@@ -12103,7 +11052,10 @@ impl McStore {
         &self,
         request: LineageDescentRequest<'_>,
     ) -> Result<LineageDescentOutcome, McStoreError> {
-        let note_caller_project = Arc::clone(&self.note_caller_project);
+        self.resume_pending_context_write(request.target_key)?;
+        // The context.db half (the target's compartments and session notes) is recorded
+        // as pending inside the store.db transaction and applied after it commits.
+        let mut lineage_write: Option<context_writes::PendingContextWrite> = None;
         let outcome = self.inner.with_conn_fenced(|tx| {
             let current_target = tx
                 .query_row(
@@ -12435,22 +11387,28 @@ impl McStore {
                 }));
             }
 
-            let mut statement = tx.prepare(
-                "SELECT sequence, start_message, end_message
-                   FROM mc_compartments
-                  WHERE session_id = ?1
-                  ORDER BY sequence ASC",
-            )?;
-            let ranges = statement
-                .query_map(params![source_key], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(statement);
+            // A read of the other file inside this write transaction takes no lock there:
+            // context.db is in WAL mode and this is a plain read.
+            let ranges = self
+                .context_read(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT sequence, start_message, end_message
+                           FROM compartments
+                          WHERE session_id = ?1
+                          ORDER BY sequence ASC",
+                    )?;
+                    let rows = statement
+                        .query_map(params![source_key], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             let prior_last_i64 = match i64::try_from(prior_last) {
                 Ok(value) => value,
                 Err(_) => {
@@ -12579,7 +11537,7 @@ impl McStore {
 
             for table in [
                 "mc_chunk_transcripts",
-                "mc_compartments",
+                "mc_compartment_dates",
                 "mc_tags",
                 "mc_temporal_marks",
                 "mc_user_hints",
@@ -12595,71 +11553,12 @@ impl McStore {
             // meta goes first. This is the explicit clear: a descent really does mean "remove
             // what is there", which a commit carrying an empty map never does.
             clear_meta_row_state_tx(tx, request.target_key)?;
-            // Session notes follow the descended conversation key. Do not copy smart notes:
-            // their project-wide visibility is independent of one lineage's retained history.
-            let note_projects = {
-                let mut statement = tx.prepare(
-                    "SELECT DISTINCT project_path FROM mc_notes
-                      WHERE session_id = ?1 AND type = 'session'",
-                )?;
-                let projects = statement
-                    .query_map(params![source_key], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                projects
-            };
-            for note_project in note_projects {
-                tx.execute(
-                    "UPDATE mc_privilege_state SET note_caller_project = ?1 WHERE id = 1",
-                    params![note_project],
-                )?;
-                let previous_project = note_caller_project
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .replace(note_project.clone());
-                let copy_result = (|| -> rusqlite::Result<()> {
-                    tx.execute(
-                        "DELETE FROM mc_notes
-                          WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
-                        params![request.target_key, note_project],
-                    )?;
-                    tx.execute(
-                        &format!(
-                             "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
-                              SELECT type, project_path, ?1, content, status, surface_condition,
-                                     compiled_provider, compiled_config, compiled_at, compile_status,
-                                     ready_at, ready_reason, manifest_json, compiled_check, check_hash,
-                                    check_cron, check_failure_count, check_network_failure_count,
-                                    check_quarantined_until, check_next_due_at, check_compiled_at,
-                                    check_false_since_at, check_last_liveness_at, last_checked_at,
-                                    check_status, check_version, policy_version, harness,
-                                    anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution,
-                                    status_version, created_at_ms, updated_at_ms, NULL, NULL
-                               FROM mc_notes
-                              WHERE session_id = ?2 AND project_path = ?3 AND type = 'session'"
-                        ),
-                        params![request.target_key, source_key, note_project],
-                    )?;
-                    Ok(())
-                })();
-                *note_caller_project
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous_project;
-                copy_result?;
-                tx.execute(
-                    "UPDATE mc_privilege_state SET note_caller_project = '' WHERE id = 1",
-                    [],
-                )?;
-            }
             tx.execute(
-                "INSERT INTO mc_compartments (
-                     session_id, sequence, start_message, end_message, start_message_id,
-                     end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
-                     importance, episode_type, legacy, created_at
+                "INSERT INTO mc_compartment_dates (
+                     session_id, sequence, start_message_id, end_message_id, start_date, end_date
                  )
-                 SELECT ?1, sequence, start_message, end_message, start_message_id,
-                        end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
-                        importance, episode_type, legacy, created_at
-                   FROM mc_compartments WHERE session_id = ?2",
+                 SELECT ?1, sequence, start_message_id, end_message_id, start_date, end_date
+                   FROM mc_compartment_dates WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
             tx.execute(
@@ -12713,44 +11612,30 @@ impl McStore {
                    FROM mc_block_identities WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
-            tx.execute(
-                "INSERT INTO mc_compartments (
-                     session_id, sequence, start_message, end_message, start_message_id,
-                     end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
-                     importance, episode_type, legacy, created_at
-                 ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, NULL, NULL, '', '', '', '', '', '', 100,
-                           'lineage_boundary', 0, ?6)",
-                params![
-                    request.target_key,
-                    placeholder_sequence,
-                    placeholder_ordinal_i64,
-                    anchor.message_id,
-                    anchor.block_id,
-                    request.now_ms
-                ],
-            )?;
-            let placeholder_valid = tx
-                .query_row(
-                    "SELECT start_message, end_message, end_message_id
-                       FROM mc_compartments
-                      WHERE session_id = ?1 AND sequence = ?2",
-                    params![request.target_key, placeholder_sequence],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )?
-                == (
-                    placeholder_ordinal_i64,
-                    placeholder_ordinal_i64,
-                    anchor.block_id.clone(),
-                );
-            if !placeholder_valid {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
+            let write = context_writes::PendingContextWrite::LineageCopy {
+                source_key: source_key.clone(),
+                placeholder: StoredCompartment {
+                    sequence: placeholder_sequence,
+                    start_message: placeholder_ordinal_i64,
+                    end_message: placeholder_ordinal_i64,
+                    start_message_id: anchor.message_id.clone(),
+                    end_message_id: anchor.block_id.clone(),
+                    start_date: None,
+                    end_date: None,
+                    title: String::new(),
+                    content: String::new(),
+                    p1: Some(String::new()),
+                    p2: Some(String::new()),
+                    p3: Some(String::new()),
+                    p4: Some(String::new()),
+                    importance: 100,
+                    episode_type: Some("lineage_boundary".to_string()),
+                    legacy: 0,
+                    created_at: request.now_ms,
+                },
+            };
+            context_writes::record_pending_context_write_tx(tx, request.target_key, &write)?;
+            lineage_write = Some(write);
 
             tx.execute(
                 "UPDATE mc_cache_state
@@ -12796,6 +11681,9 @@ impl McStore {
             }))
         })?;
 
+        if let (LineageDescentTxnOutcome::Committed(_), Some(write)) = (&outcome, &lineage_write) {
+            self.finish_context_write(request.target_key, write);
+        }
         match outcome {
             LineageDescentTxnOutcome::Committed(outcome) => Ok(outcome),
             LineageDescentTxnOutcome::CasConflict(found) => Err(McStoreError::CasConflict {
@@ -12809,23 +11697,29 @@ impl McStore {
         }
     }
 
-    /// Return the newest note status version for the project. Note readiness is an
-    /// in-session m1 input, so it may defer, but it must not be invisible to the next
-    /// genuine rendering opportunity.
+    /// Return the newest note compare-and-set token (`updated_at`) for the project. Note
+    /// readiness is an in-session m1 input, so it may defer, but it must not be invisible
+    /// to the next genuine rendering opportunity.
     pub fn max_note_status_version(&self, project_path: &str) -> Result<i64, McStoreError> {
-        let max = self.inner.with_conn(|conn| {
+        self.context_read(|conn| {
             conn.query_row(
-                "SELECT COALESCE(MAX(status_version), 0) FROM mc_notes WHERE project_path = ?1",
+                "SELECT COALESCE(MAX(updated_at), 0) FROM notes WHERE project_path = ?1",
                 params![project_path],
                 |row| row.get(0),
             )
-        })?;
-        Ok(max)
+        })
     }
 
-    /// Read the membership and all m1 revision watermarks from one SQLite read transaction.
-    /// The memory-id watermark uses the same visible render-pool predicate as m0 and m1
-    /// additions at `now_ms`; note and compartment watermarks retain their existing scopes.
+    /// Read the membership and all m1 revision watermarks from one `context.db` read
+    /// transaction. The memory-id watermark uses the same visible render-pool predicate as
+    /// m0 and m1 additions at `now_ms`; note and compartment watermarks retain their
+    /// existing scopes.
+    ///
+    /// Two further heads come from the same snapshot for the caller to fold into the
+    /// external revision: the project's `project_memory_epoch` (bumped by identity and
+    /// workspace changes and by the single-store migration) and the session's
+    /// `m0_mutation_log` head (bumped by any in-place compartment rewrite). A change in
+    /// either is a baseline change, not an m1 delta.
     pub fn load_m1_revision_snapshot(
         &self,
         project_path: &str,
@@ -12834,98 +11728,129 @@ impl McStore {
         memory_enabled: bool,
         now_ms: i64,
     ) -> Result<M1RevisionSnapshot, McStoreError> {
-        self.inner
-            .with_conn(|conn| {
-                let transaction = conn.unchecked_transaction()?;
-                let membership = workspace_membership_from_connection(&transaction, project_path)?;
-                let project_paths = if memory_enabled {
-                    membership
-                        .as_ref()
-                        .map(|value| value.union_identities.clone())
-                        .unwrap_or_else(|| vec![project_path.to_string()])
-                } else {
-                    Vec::new()
-                };
+        self.context_read(|transaction| {
+            let membership = workspace_membership_from_connection(transaction, project_path)?;
+            let project_paths = if memory_enabled {
+                membership
+                    .as_ref()
+                    .map(|value| value.union_identities.clone())
+                    .unwrap_or_else(|| vec![project_path.to_string()])
+            } else {
+                Vec::new()
+            };
 
-                let (max_memory_id, max_memory_mutation_id) = if project_paths.is_empty() {
-                    (0, 0)
-                } else {
-                    let (pool_filter, pool_binds) = memory_render_pool_filter_for_column(
-                        membership.as_ref(),
-                        project_path,
-                        "project_path",
-                        now_ms,
-                    );
-                    let max_memory_id = transaction.query_row(
-                        &format!(
-                            "SELECT COALESCE(MAX(id), 0) FROM mc_memories WHERE {pool_filter}"
-                        ),
-                        rusqlite::params_from_iter(pool_binds.iter()),
-                        |row| row.get(0),
-                    )?;
-                    let mut projects = project_paths.clone();
-                    projects.sort_unstable();
-                    projects.dedup();
-                    let placeholders = std::iter::repeat_n("?", projects.len())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let max_memory_mutation_id = transaction.query_row(
-                        &format!(
-                            "SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log
-                              WHERE project_path IN ({placeholders})"
-                        ),
-                        rusqlite::params_from_iter(projects.iter()),
-                        |row| row.get(0),
-                    )?;
-                    (max_memory_id, max_memory_mutation_id)
-                };
-                let max_compartment_seq = transaction.query_row(
-                    "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
-                    params![session_id],
+            let (max_memory_id, max_memory_mutation_id) = if project_paths.is_empty() {
+                (0, 0)
+            } else {
+                let (pool_filter, pool_binds) = memory_render_pool_filter_for_column(
+                    membership.as_ref(),
+                    project_path,
+                    "project_path",
+                    now_ms,
+                );
+                let max_memory_id = transaction.query_row(
+                    &format!("SELECT COALESCE(MAX(id), 0) FROM memories WHERE {pool_filter}"),
+                    rusqlite::params_from_iter(pool_binds.iter()),
                     |row| row.get(0),
                 )?;
-                let note_status_version = transaction.query_row(
-                    "SELECT COALESCE(MAX(status_version), 0) FROM mc_notes WHERE project_path = ?1",
-                    params![note_project_path],
+                let mut projects = project_paths.clone();
+                projects.sort_unstable();
+                projects.dedup();
+                let placeholders = std::iter::repeat_n("?", projects.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let max_memory_mutation_id = transaction.query_row(
+                    &format!(
+                        "SELECT COALESCE(MAX(id), 0) FROM memory_mutation_log
+                          WHERE project_path IN ({placeholders})"
+                    ),
+                    rusqlite::params_from_iter(projects.iter()),
                     |row| row.get(0),
                 )?;
-                transaction.commit()?;
-                Ok(M1RevisionSnapshot {
-                    membership,
-                    max_memory_id,
-                    max_memory_mutation_id,
-                    max_compartment_seq,
-                    note_status_version,
-                })
+                (max_memory_id, max_memory_mutation_id)
+            };
+            let max_compartment_seq = transaction.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM compartments WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            let note_status_version = transaction.query_row(
+                "SELECT COALESCE(MAX(updated_at), 0) FROM notes WHERE project_path = ?1",
+                params![note_project_path],
+                |row| row.get(0),
+            )?;
+            let project_memory_epoch = transaction
+                .query_row(
+                    "SELECT project_memory_epoch FROM project_state WHERE project_path = ?1",
+                    params![project_path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let m0_mutation_head = transaction.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM m0_mutation_log WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            Ok(M1RevisionSnapshot {
+                membership,
+                max_memory_id,
+                max_memory_mutation_id,
+                max_compartment_seq,
+                note_status_version,
+                project_memory_epoch,
+                m0_mutation_head,
             })
-            .map_err(Into::into)
+        })
     }
 
-    /// Replace a session's entire compartment set in one fenced transaction. The
-    /// history producer republishes the full chronological set each time, so a
-    /// wholesale delete-then-insert (rather than an incremental upsert) keeps the
-    /// stored `sequence` contiguous. Writes are serialized by the store's single-writer
-    /// lease (the same one guarding the cache-state commit).
+    /// Replace a session's entire compartment set. The history producer republishes the
+    /// full chronological set each time. Rows equal to the stored ones stay untouched,
+    /// changed ones are updated in place and missing ones inserted, so the stored
+    /// `sequence` stays contiguous without churning `context.db` ids.
     pub fn replace_compartments(
         &self,
         session_id: &str,
         compartments: &[StoredCompartment],
     ) -> Result<(), McStoreError> {
+        self.resume_pending_context_write(session_id)?;
+        let write = context_writes::PendingContextWrite::ReplaceCompartments {
+            compartments: compartments.to_vec(),
+            now_ms: current_time_ms(),
+        };
         self.inner.with_conn_fenced(|tx| {
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
                 params![session_id],
             )?;
             tx.execute(
-                "DELETE FROM mc_compartments WHERE session_id = ?1",
+                "DELETE FROM mc_compartment_dates WHERE session_id = ?1",
                 params![session_id],
             )?;
-            for c in compartments {
-                insert_compartment_tx(tx, session_id, c.sequence, c)?;
-            }
-            Ok(())
+            single_store_schema::write_compartment_dates(tx, session_id, compartments)?;
+            context_writes::record_pending_context_write_tx(tx, session_id, &write)
         })?;
+        self.finish_context_write(session_id, &write);
         Ok(())
+    }
+
+    /// Apply a `context.db` half the caller just recorded as pending. A failure (most
+    /// often a busy `context.db`) leaves the pending row for the next pass to finish, so
+    /// it is logged, not returned: the `store.db` half has already committed.
+    fn finish_context_write(
+        &self,
+        session_id: &str,
+        write: &context_writes::PendingContextWrite,
+    ) -> Vec<PromotedRef> {
+        match self.complete_pending_context_write(session_id, write) {
+            Ok(promoted) => promoted,
+            Err(error) => {
+                tracing::warn!(
+                    "mc-store: context.db write for session {session_id} left pending: {error}"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Reset the module cache to the never-minted boundary used by native recomp.
@@ -12940,6 +11865,10 @@ impl McStore {
         session_id: &str,
         expected_row_version: Option<u64>,
     ) -> Result<TruncateOutcome, McStoreError> {
+        self.resume_pending_context_write(session_id)?;
+        let write = context_writes::PendingContextWrite::ClearSession {
+            now_ms: current_time_ms(),
+        };
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -12978,30 +11907,19 @@ impl McStore {
                 Ok(json) => json,
                 Err(error) => return Ok(TruncateTxnOutcome::Serde(error.to_string())),
             };
-            tx.execute(
-                "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_compartments WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_compartment_events WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_primer_candidates WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_user_memory_candidates WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_historian_side_channel_outbox WHERE session_id = ?1",
-                params![session_id],
-            )?;
+            for table in [
+                "mc_chunk_transcripts",
+                "mc_compartment_dates",
+                "mc_historian_side_channel_outbox",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                    params![session_id],
+                )?;
+            }
+            // The compartments and the rows derived from them go in context.db, after
+            // this transaction commits.
+            context_writes::record_pending_context_write_tx(tx, session_id, &write)?;
             // The reset writes a default ModuleMeta, which used to blank the identity map and
             // the served fingerprints along with it. They are rows now, so drop them here.
             clear_meta_row_state_tx(tx, session_id)?;
@@ -13024,6 +11942,9 @@ impl McStore {
                 row_version: next_version,
             }))
         })?;
+        if matches!(outcome, TruncateTxnOutcome::Committed(_)) {
+            self.finish_context_write(session_id, &write);
+        }
         match outcome {
             TruncateTxnOutcome::Committed(outcome) => Ok(outcome),
             TruncateTxnOutcome::CasConflict(found) => Err(McStoreError::CasConflict {
@@ -13043,6 +11964,47 @@ impl McStore {
         keep_through_seq: i64,
         expected_row_version: Option<u64>,
     ) -> Result<TruncateOutcome, McStoreError> {
+        self.resume_pending_context_write(session_id)?;
+        // What the truncation removes and what survives is read from context.db before
+        // the store.db transaction; the removal itself runs after that transaction commits.
+        let (dropped_count, dropped_min, dropped_max, surviving_tail, surviving_head_id, surviving_end) =
+            self.context_read(|conn| {
+                let (count, min, max): (i64, Option<i64>, Option<i64>) = conn.query_row(
+                    "SELECT COUNT(*), MIN(sequence), MAX(sequence)
+                     FROM compartments WHERE session_id = ?1 AND sequence > ?2",
+                    params![session_id, keep_through_seq],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                let tail = conn
+                    .query_row(
+                        "SELECT sequence, COALESCE(end_message_id, '') FROM compartments
+                         WHERE session_id = ?1 AND sequence <= ?2
+                         ORDER BY sequence DESC LIMIT 1",
+                        params![session_id, keep_through_seq],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                let head = conn
+                    .query_row(
+                        "SELECT COALESCE(start_message_id, '') FROM compartments
+                         WHERE session_id = ?1 AND sequence <= ?2
+                         ORDER BY sequence ASC LIMIT 1",
+                        params![session_id, keep_through_seq],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let end: i64 = conn.query_row(
+                    "SELECT COALESCE(MAX(end_message), -1) FROM compartments
+                     WHERE session_id = ?1 AND sequence <= ?2",
+                    params![session_id, keep_through_seq],
+                    |r| r.get(0),
+                )?;
+                Ok((count, min, max, tail, head, end))
+            })?;
+        let write = context_writes::PendingContextWrite::TruncateAfter {
+            keep_through_seq,
+            now_ms: current_time_ms(),
+        };
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -13068,13 +12030,6 @@ impl McStore {
                 Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
             };
 
-            let (dropped_count, dropped_min, dropped_max): (i64, Option<i64>, Option<i64>) = tx
-                .query_row(
-                    "SELECT COUNT(*), MIN(sequence), MAX(sequence)
-                     FROM mc_compartments WHERE session_id = ?1 AND sequence > ?2",
-                    params![session_id, keep_through_seq],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )?;
             if dropped_count == 0 {
                 return Ok(TruncateTxnOutcome::Committed(TruncateOutcome {
                     revert_epoch: meta.revert_epoch,
@@ -13082,25 +12037,6 @@ impl McStore {
                     row_version: current.max(0) as u64,
                 }));
             }
-
-            let surviving_tail = tx
-                .query_row(
-                    "SELECT sequence, end_message_id FROM mc_compartments
-                     WHERE session_id = ?1 AND sequence <= ?2
-                     ORDER BY sequence DESC LIMIT 1",
-                    params![session_id, keep_through_seq],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            let surviving_head_id = tx
-                .query_row(
-                    "SELECT start_message_id FROM mc_compartments
-                     WHERE session_id = ?1 AND sequence <= ?2
-                     ORDER BY sequence ASC LIMIT 1",
-                    params![session_id, keep_through_seq],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?;
 
             let next_epoch = meta.revert_epoch.saturating_add(1);
             let dropped_range = match (dropped_min, dropped_max) {
@@ -13132,35 +12068,15 @@ impl McStore {
                 params![session_id, keep_through_seq],
             )?;
             tx.execute(
-                "DELETE FROM mc_compartments WHERE session_id = ?1 AND sequence > ?2",
+                "DELETE FROM mc_compartment_dates WHERE session_id = ?1 AND sequence > ?2",
                 params![session_id, keep_through_seq],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_compartment_events
-                  WHERE session_id = ?1 AND compartment_id > ?2",
-                params![session_id, keep_through_seq],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_primer_candidates
-                  WHERE session_id = ?1
-                    AND source_compartment_start > COALESCE(
-                        (SELECT MAX(end_message) FROM mc_compartments WHERE session_id = ?1), -1)",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_user_memory_candidates
-                  WHERE session_id = ?1
-                    AND source_compartment_start > COALESCE(
-                        (SELECT MAX(end_message) FROM mc_compartments WHERE session_id = ?1), -1)",
-                params![session_id],
             )?;
             tx.execute(
                 "DELETE FROM mc_historian_side_channel_outbox
-                  WHERE session_id = ?1
-                    AND source_start > COALESCE(
-                        (SELECT MAX(end_message) FROM mc_compartments WHERE session_id = ?1), -1)",
-                params![session_id],
+                  WHERE session_id = ?1 AND source_start > ?2",
+                params![session_id, surviving_end],
             )?;
+            context_writes::record_pending_context_write_tx(tx, session_id, &write)?;
             let next = current as u64 + 1;
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
@@ -13174,6 +12090,9 @@ impl McStore {
                 row_version: next,
             }))
         })?;
+        if dropped_count > 0 && matches!(outcome, TruncateTxnOutcome::Committed(_)) {
+            self.finish_context_write(session_id, &write);
+        }
 
         match outcome {
             TruncateTxnOutcome::Committed(outcome) => Ok(outcome),
@@ -13194,11 +12113,12 @@ impl McStore {
         session_id: &str,
         compartments: &[StoredCompartment],
     ) -> Result<(), McStoreError> {
-        let outcome = self
-            .inner
-            .with_conn_fenced(|tx| append_compartments_tx(tx, session_id, compartments))?;
-        match outcome {
-            AppendCompartmentsTxnOutcome::Appended => Ok(()),
+        self.resume_pending_context_write(session_id)?;
+        let first_sequence = self.max_compartment_seq(session_id)? + 1;
+        match self.append_compartments_now(session_id, compartments)? {
+            AppendCompartmentsTxnOutcome::Appended => {
+                self.record_appended_dates(session_id, first_sequence, compartments)
+            }
             AppendCompartmentsTxnOutcome::Overlap {
                 existing_sequence,
                 incoming_start_message,
@@ -13211,6 +12131,27 @@ impl McStore {
         }
     }
 
+    /// Record the date segments of compartments appended from `first_sequence` on.
+    fn record_appended_dates(
+        &self,
+        session_id: &str,
+        first_sequence: i64,
+        compartments: &[StoredCompartment],
+    ) -> Result<(), McStoreError> {
+        let numbered: Vec<StoredCompartment> = compartments
+            .iter()
+            .enumerate()
+            .map(|(index, compartment)| StoredCompartment {
+                sequence: first_sequence + index as i64,
+                ..compartment.clone()
+            })
+            .collect();
+        self.inner.with_conn_fenced(|tx| {
+            single_store_schema::write_compartment_dates(tx, session_id, &numbered)
+        })?;
+        Ok(())
+    }
+
     /// Append a boundary-only historian marker only if its assembly snapshot is still current.
     /// Reverts and concurrent publications must not turn a scan of old noise into new coverage.
     pub fn append_filtered_noise_marker(
@@ -13220,25 +12161,46 @@ impl McStore {
         expected_revert_epoch: u64,
         expected_generation: CompartmentSetGeneration,
     ) -> Result<bool, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
-            let epoch: i64 = tx.query_row(
+        self.resume_pending_context_write(session_id)?;
+        let epoch: i64 = self.inner.with_conn(|conn| {
+            conn.query_row(
                 "SELECT COALESCE((SELECT json_extract(meta, '$.revert_epoch') FROM mc_cache_state WHERE session_id = ?1), 0)",
-                params![session_id], |row| row.get(0),
-            )?;
+                params![session_id],
+                |row| row.get(0),
+            )
+        })?;
+        if epoch as u64 != expected_revert_epoch {
+            return Ok(false);
+        }
+        let appended = self.context_write(context_writes::HISTORY_TABLES, |tx| {
             let (max_sequence, count): (i64, i64) = tx.query_row(
-                "SELECT COALESCE(MAX(sequence), 0), COUNT(*) FROM mc_compartments WHERE session_id = ?1",
-                params![session_id], |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT COALESCE(MAX(sequence), 0), COUNT(*) FROM compartments WHERE session_id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if epoch as u64 != expected_revert_epoch || max_sequence != expected_generation.max_sequence || count != expected_generation.count {
-                return Ok(false);
+            if max_sequence != expected_generation.max_sequence
+                || count != expected_generation.count
+            {
+                return Ok(None);
             }
-            Ok(matches!(append_compartments_tx(tx, session_id, std::slice::from_ref(marker))?, AppendCompartmentsTxnOutcome::Appended))
-        })?)
+            Ok(matches!(
+                append_compartments_tx(tx, session_id, std::slice::from_ref(marker))?,
+                AppendCompartmentsTxnOutcome::Appended
+            )
+            .then_some(max_sequence + 1))
+        })?;
+        match appended {
+            Some(sequence) => {
+                self.record_appended_dates(session_id, sequence, std::slice::from_ref(marker))?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Promote validated historian facts into project memories using exact-content
     /// de-duplication against the active render set. This path is additive only: it
-    /// inserts new `mc_memories` rows and never writes mutation-log rows, so the next
+    /// inserts new `memories` rows and never writes mutation-log rows, so the next
     /// m1/materialization pass observes the rows solely through the max-memory-id
     /// watermark.
     pub fn promote_facts(
@@ -13246,16 +12208,16 @@ impl McStore {
         project_path: &str,
         facts: &[FactCandidate],
     ) -> Result<Vec<PromotedRef>, McStoreError> {
-        let promoted = self
-            .inner
-            .with_conn_fenced(|tx| promote_facts_tx(tx, project_path, facts, current_time_ms()))?;
+        let promoted = self.context_write(&["memories", "memory_embedding_watermarks"], |tx| {
+            promote_facts_tx(tx, project_path, facts, current_time_ms())
+        })?;
         Ok(promoted)
     }
 
     /// Load a complete memory row by id. This is the guard-layer read: unlike the render
     /// projection it includes ownership, lifecycle, merge lineage, and metadata columns.
     pub fn get_memory_full(&self, id: i64) -> Result<Option<StoredMemoryFull>, McStoreError> {
-        let row = self.inner.with_conn(|conn| {
+        let row = self.context_read(|conn| {
             conn.query_row(
                 MEMORY_FULL_SELECT_BY_ID,
                 params![id],
@@ -13264,58 +12226,6 @@ impl McStore {
             .optional()
         })?;
         Ok(row)
-    }
-
-    /// Record context.db ids acknowledged by a host mirror. The visibility marker makes a
-    /// memory rendered without an id eligible for reconsideration during the next correction pass.
-    pub fn acknowledge_host_memory_ids(
-        &self,
-        project_path: &str,
-        acknowledgements: &[HostMemoryIdentityAck],
-    ) -> Result<usize, McStoreError> {
-        self.inner
-            .with_conn_fenced(|tx| {
-                let mut changed = 0usize;
-                for acknowledgement in acknowledgements {
-                    let row = tx
-                        .query_row(
-                            "SELECT project_path, host_row_id FROM mc_memories WHERE id = ?1",
-                            params![acknowledgement.module_row_id],
-                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
-                        )
-                        .optional()?;
-                    let Some((row_project, current_host_id)) = row else {
-                        continue;
-                    };
-                    if row_project != project_path {
-                        return Err(rusqlite::Error::InvalidParameterName(format!(
-                            "memory {} belongs to a different project",
-                            acknowledgement.module_row_id
-                        )));
-                    }
-                    if current_host_id == Some(acknowledgement.host_row_id) {
-                        continue;
-                    }
-                    tx.execute(
-                        "UPDATE mc_memories SET host_row_id = ?1 WHERE id = ?2",
-                        params![acknowledgement.host_row_id, acknowledgement.module_row_id],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO mc_memory_mutation_log(
-                         project_path, mutation_type, target_memory_id, category, queued_at
-                     ) VALUES (?1, 'update', ?2, ?3, ?4)",
-                        params![
-                            project_path,
-                            acknowledgement.module_row_id,
-                            MEMORY_VISIBILITY_MUTATION_CATEGORY,
-                            current_time_ms(),
-                        ],
-                    )?;
-                    changed += 1;
-                }
-                Ok(changed)
-            })
-            .map_err(Into::into)
     }
 
     /// Load multiple memory rows by id through the same workspace-visibility predicate the
@@ -13354,18 +12264,12 @@ impl McStore {
         let mut binds = id_binds;
         binds.extend(visibility_binds);
         let sql = format!(
-            "SELECT id, host_row_id, project_path, category, content, normalized_hash, importance, scope,
-                    shareable, source_session_id, source_type, seen_count, retrieval_count,
-                    first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
-                    status, expires_at, verification_status, verified_at, classified_at,
-                     superseded_by_memory_id, merged_from, metadata_json,
-                     context_store_uuid, context_row_id, mural_cue, mural_cue_hash, mural_cue_at,
-                     mural_cue_rejection_count
-                FROM mc_memories
+            "{MEMORY_FULL_SELECT_COLUMNS}
+                FROM memories
               WHERE id IN ({placeholders})
                 AND ({visibility})"
         );
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
@@ -13383,18 +12287,11 @@ impl McStore {
     /// `seen_count` and timestamps, and skip the mutation log because the rendered content
     /// did not change.
     pub fn insert_memory(&self, input: InsertMemoryInput<'_>) -> Result<i64, McStoreError> {
-        if let Some(route_project_root) = input.route_project_root {
-            self.enforce_facade_project_vocabulary(
-                route_project_root,
-                input.project_path,
-                "memories",
-            )?;
-        }
-        let memory_id = self.inner.with_conn_fenced(|tx| {
+        let memory_id = self.context_write(&["memories", "memory_embedding_watermarks"], |tx| {
             let normalized_hash = compute_normalized_memory_hash(input.content);
             let existing: Option<i64> = tx
                 .query_row(
-                    "SELECT id FROM mc_memories
+                    "SELECT id FROM memories
                      WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3",
                     params![input.project_path, input.category, normalized_hash],
                     |r| r.get(0),
@@ -13402,7 +12299,7 @@ impl McStore {
                 .optional()?;
             if let Some(id) = existing {
                 tx.execute(
-                    "UPDATE mc_memories
+                    "UPDATE memories
                         SET seen_count = COALESCE(seen_count, 0) + 1,
                             last_seen_at = ?1,
                             updated_at = ?1
@@ -13413,7 +12310,7 @@ impl McStore {
             }
 
             tx.execute(
-                "INSERT INTO mc_memories
+                "INSERT INTO memories
                    (project_path, category, content, normalized_hash, importance,
                     source_session_id, source_type, seen_count, retrieval_count,
                     first_seen_at, created_at, updated_at, last_seen_at, status,
@@ -13433,7 +12330,9 @@ impl McStore {
                     input.metadata_json,
                 ],
             )?;
-            Ok(tx.last_insert_rowid())
+            let id = tx.last_insert_rowid();
+            raise_embedding_watermark_tx(tx, input.project_path, id, input.now_ms)?;
+            Ok(id)
         })?;
         Ok(memory_id)
     }
@@ -13450,7 +12349,7 @@ impl McStore {
         category: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredMemoryFull>, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let outcome = self.context_write(&["memories"], |tx| {
             let Some(memory) = load_memory_full_tx(tx, id)? else {
                 return Ok(MemoryMutationOutcome::NotFound);
             };
@@ -13464,7 +12363,7 @@ impl McStore {
             let normalized_hash = compute_normalized_memory_hash(content);
             let duplicate_id = tx
                 .query_row(
-                    "SELECT id FROM mc_memories
+                    "SELECT id FROM memories
                       WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                       LIMIT 1",
                     params![project_path, target_category, normalized_hash],
@@ -13475,7 +12374,7 @@ impl McStore {
                 return Ok(MemoryMutationOutcome::Duplicate(duplicate_id));
             }
             tx.execute(
-                "UPDATE mc_memories
+                "UPDATE memories
                     SET content = ?1,
                         category = ?2,
                         normalized_hash = ?3,
@@ -13537,8 +12436,7 @@ impl McStore {
         reason: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<Vec<i64>>, McStoreError> {
-        self.inner
-            .with_conn_fenced(|tx| {
+        self.context_write(&["memories"], |tx| {
                 let mut memories = Vec::with_capacity(ids.len());
                 for id in ids {
                     let Some(memory) = load_memory_full_tx(tx, *id)? else {
@@ -13563,14 +12461,14 @@ impl McStore {
                         let metadata_json =
                             merge_archive_reason(memory.metadata_json.as_deref(), reason);
                         tx.execute(
-                            "UPDATE mc_memories
+                            "UPDATE memories
                                 SET status = 'archived', metadata_json = ?1, updated_at = ?2
                               WHERE id = ?3",
                             params![metadata_json, now_ms, memory.id],
                         )?;
                     } else {
                         tx.execute(
-                        "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
+                        "UPDATE memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
                         params![now_ms, memory.id],
                     )?;
                     }
@@ -13590,7 +12488,6 @@ impl McStore {
                 }
                 Ok(Some(archived))
             })
-            .map_err(McStoreError::from)
     }
 
     /// Merge owned primary source memories into an owned primary target in one fenced
@@ -13604,7 +12501,7 @@ impl McStore {
         merged_content: &str,
         now_ms: i64,
     ) -> Result<Option<StoredMemoryFull>, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let outcome = self.context_write(&["memories"], |tx| {
             let Some(target) = load_memory_full_tx(tx, target_id)? else {
                 return Ok(MemoryMutationOutcome::NotFound);
             };
@@ -13643,7 +12540,7 @@ impl McStore {
             let normalized_hash = compute_normalized_memory_hash(merged_content);
             let duplicate_id = tx
                 .query_row(
-                    "SELECT id FROM mc_memories
+                    "SELECT id FROM memories
                       WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                       LIMIT 1",
                     params![project_path, target.category, normalized_hash],
@@ -13673,7 +12570,7 @@ impl McStore {
 
             for source in &source_rows {
                 tx.execute(
-                    "UPDATE mc_memories
+                    "UPDATE memories
                         SET status = 'archived',
                             superseded_by_memory_id = ?1,
                             updated_at = ?2
@@ -13695,7 +12592,7 @@ impl McStore {
             }
 
             tx.execute(
-                "UPDATE mc_memories
+                "UPDATE memories
                     SET content = ?1,
                         normalized_hash = ?2,
                         seen_count = ?3,
@@ -13915,6 +12812,81 @@ impl McStore {
         let session_id = request.session_id;
         let expected_row_version = request.expected_row_version;
         let predicate = request.predicate;
+        // A fold whose context.db half an earlier publish left pending lands first, so the
+        // compartment set this publish is checked against is the complete one.
+        self.resume_pending_context_write(session_id)?;
+        // The compartment set lives in context.db. It is read before the store.db
+        // transaction (never inside a write lock on the other file); the module is the only
+        // writer of a session's compartments, and every such write goes through here or
+        // resumes before it, so the set cannot move between this read and the commit.
+        let (current_compartment_set_generation, existing_ranges) = self.context_read(|conn| {
+            let generation = conn.query_row(
+                "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
+                 FROM compartments WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(CompartmentSetGeneration {
+                        max_sequence: row.get(0)?,
+                        count: row.get(1)?,
+                    })
+                },
+            )?;
+            let mut statement = conn.prepare(
+                "SELECT sequence, start_message, end_message FROM compartments WHERE session_id = ?1",
+            )?;
+            let ranges = statement
+                .query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((generation, ranges))
+        })?;
+        let first_appended_sequence = current_compartment_set_generation.max_sequence + 1;
+        let numbered: Vec<StoredCompartment> = request
+            .compartments
+            .iter()
+            .enumerate()
+            .map(|(index, compartment)| StoredCompartment {
+                sequence: first_appended_sequence + index as i64,
+                ..compartment.clone()
+            })
+            .collect();
+        let published_at_ms = request
+            .compartments
+            .iter()
+            .find_map(|compartment| (compartment.created_at > 0).then_some(compartment.created_at))
+            .unwrap_or_else(current_time_ms);
+        // Side channels are best effort: a test can make one fail, and the fold's
+        // compartments must still land.
+        let fold = context_writes::FoldWrite {
+            project_path: request.project_path.to_string(),
+            compartments: numbered.clone(),
+            facts: request.facts.to_vec(),
+            promote_facts: request.promote_facts,
+            published_at_ms,
+            events: if self.take_historian_side_channel_fault_for_test("event") {
+                Vec::new()
+            } else {
+                request.events.to_vec()
+            },
+            primer_candidates: if self.take_historian_side_channel_fault_for_test("primer") {
+                Vec::new()
+            } else {
+                request.primer_candidates.to_vec()
+            },
+            user_memory_candidates: if self
+                .take_historian_side_channel_fault_for_test("user_observation")
+            {
+                Vec::new()
+            } else {
+                request.user_memory_candidates.to_vec()
+            },
+        };
+        let write = context_writes::PendingContextWrite::Fold(fold);
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -13995,17 +12967,6 @@ impl McStore {
                 });
             }
 
-            let current_compartment_set_generation = tx.query_row(
-                "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
-                 FROM mc_compartments WHERE session_id = ?1",
-                params![session_id],
-                |row| {
-                    Ok(CompartmentSetGeneration {
-                        max_sequence: row.get(0)?,
-                        count: row.get(1)?,
-                    })
-                },
-            )?;
             if current_compartment_set_generation != predicate.compartment_set_generation {
                 return Ok(PublishTxnOutcome::FenceRejected(format!(
                     "compartment set changed after firing (expected max sequence {} with {} rows, found {} with {} rows)",
@@ -14016,20 +12977,25 @@ impl McStore {
                 )));
             }
 
-            let first_appended_sequence = next_compartment_sequence_tx(tx, session_id)?;
-            match append_compartments_tx(tx, session_id, request.compartments)? {
-                AppendCompartmentsTxnOutcome::Appended => {}
-                AppendCompartmentsTxnOutcome::Overlap {
-                    existing_sequence,
-                    incoming_start_message,
-                    incoming_end_message,
-                } => {
+            // Validate the whole append against the stored ranges before anything is
+            // written, so ordinal-overlap corruption is impossible even if a caller
+            // bypassed the historian's optimistic publish fence.
+            let mut ranges = existing_ranges.clone();
+            for compartment in &numbered {
+                if let Some((existing_sequence, _, _)) = ranges.iter().find(|(_, start, end)| {
+                    compartment.start_message <= *end && *start <= compartment.end_message
+                }) {
                     return Ok(PublishTxnOutcome::CompartmentOverlap {
-                        existing_sequence,
-                        incoming_start_message,
-                        incoming_end_message,
+                        existing_sequence: *existing_sequence,
+                        incoming_start_message: compartment.start_message,
+                        incoming_end_message: compartment.end_message,
                     });
                 }
+                ranges.push((
+                    compartment.sequence,
+                    compartment.start_message,
+                    compartment.end_message,
+                ));
             }
             if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
                 insert_chunk_transcripts_tx(
@@ -14041,44 +13007,8 @@ impl McStore {
                     request.raw_chunk_messages,
                 )?;
             }
-            let promoted_refs = if request.promote_facts {
-                // Compartments and facts belong to one historian publication. Reuse the
-                // compartment stamp when available so every row shares that event time.
-                let published_at_ms = request
-                    .compartments
-                    .iter()
-                    .find_map(|compartment| (compartment.created_at > 0).then_some(compartment.created_at))
-                    .unwrap_or_else(current_time_ms);
-                promote_facts_tx(tx, request.project_path, request.facts, published_at_ms)?
-            } else {
-                Vec::new()
-            };
-            // Side channels share the accepted publication transaction when their writes
-            // succeed, but are re-derivable and must not abort core historian progress.
-            // Failed writes are deliberately not enqueued for retry.
-            if !request.events.is_empty()
-                && !self.take_historian_side_channel_fault_for_test("event")
-            {
-                let _ = insert_historian_events_tx(tx, request.session_id, request.events);
-            }
-            if !request.primer_candidates.is_empty()
-                && !self.take_historian_side_channel_fault_for_test("primer")
-            {
-                for candidate in request.primer_candidates {
-                    if insert_historian_primer_tx(tx, candidate).is_err() {
-                        break;
-                    }
-                }
-            }
-            if !request.user_memory_candidates.is_empty()
-                && !self.take_historian_side_channel_fault_for_test("user_observation")
-            {
-                for candidate in request.user_memory_candidates {
-                    if insert_historian_user_observation_tx(tx, candidate).is_err() {
-                        break;
-                    }
-                }
-            }
+            single_store_schema::write_compartment_dates(tx, session_id, &numbered)?;
+            context_writes::record_pending_context_write_tx(tx, session_id, &write)?;
             meta.publication_floor_ordinal = Some(
                 meta.publication_floor_ordinal
                     .unwrap_or(1)
@@ -14099,12 +13029,15 @@ impl McStore {
 
             Ok(PublishTxnOutcome::Committed(HistorianPublishResult {
                 row_version: next,
-                promoted_refs,
+                promoted_refs: Vec::new(),
             }))
         })?;
 
         match outcome {
-            PublishTxnOutcome::Committed(result) => Ok(result),
+            PublishTxnOutcome::Committed(mut result) => {
+                result.promoted_refs = self.finish_context_write(session_id, &write);
+                Ok(result)
+            }
             PublishTxnOutcome::CasConflict { found, reason } => {
                 Err(HistorianPublishError::CasConflict {
                     expected: expected_row_version,
@@ -14281,31 +13214,31 @@ impl McStore {
             "event" => {
                 let candidate: HistorianEventCandidate = serde_json::from_str(&row.payload_json)
                     .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                self.inner.with_conn_fenced(|tx| {
+                self.context_write(&["compartment_events"], |tx| {
+                    let harness = session_harness_tx(tx, &row.session_id)?;
                     insert_historian_events_tx(
                         tx,
                         &row.session_id,
                         std::slice::from_ref(&candidate),
-                    )?;
-                    mark_historian_side_channel_delivered_tx(tx, row, now_ms)
+                        &harness,
+                    )
                 })?;
             }
             "primer" => {
                 let candidate: HistorianPrimerCandidate =
                     serde_json::from_str(&row.payload_json)
                         .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                self.inner.with_conn_fenced(|tx| {
-                    insert_historian_primer_tx(tx, &candidate)?;
-                    mark_historian_side_channel_delivered_tx(tx, row, now_ms)
+                self.context_write(&["primer_candidates"], |tx| {
+                    let harness = session_harness_tx(tx, &row.session_id)?;
+                    insert_historian_primer_tx(tx, &candidate, &harness)
                 })?;
             }
             "user_observation" => {
                 let candidate: HistorianUserMemoryCandidate =
                     serde_json::from_str(&row.payload_json)
                         .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                self.inner.with_conn_fenced(|tx| {
-                    insert_historian_user_observation_tx(tx, &candidate)?;
-                    mark_historian_side_channel_delivered_tx(tx, row, now_ms)
+                self.context_write(&["user_memory_candidates"], |tx| {
+                    insert_historian_user_observation_tx(tx, &candidate)
                 })?;
             }
             other => {
@@ -14314,6 +13247,9 @@ impl McStore {
                 )))
             }
         }
+        // The row landed in context.db; mark the outbox entry delivered in store.db.
+        self.inner
+            .with_conn_fenced(|tx| mark_historian_side_channel_delivered_tx(tx, row, now_ms))?;
         Ok(())
     }
 
@@ -14401,11 +13337,14 @@ impl McStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<HistorianEventCandidate>, McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
+        // An event's `compartment_id` is a `compartments.id` in context.db; callers see the
+        // compartment's sequence, the handle every other compartment read uses.
+        self.context_read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT kind, at_compartment, compartment_id, fields_json, created_at, harness
-                   FROM mc_compartment_events
-                  WHERE session_id = ?1 ORDER BY id",
+                "SELECT e.kind, e.at_compartment, c.sequence, e.fields_json, e.created_at, e.harness
+                   FROM compartment_events e
+                   LEFT JOIN compartments c ON c.id = e.compartment_id
+                  WHERE e.session_id = ?1 ORDER BY e.id",
             )?;
             let rows = stmt.query_map(params![session_id], |row| {
                 Ok(HistorianEventCandidate {
@@ -14418,19 +13357,19 @@ impl McStore {
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
-        })?)
+        })
     }
 
     pub fn load_primer_candidates(
         &self,
         session_id: &str,
     ) -> Result<Vec<HistorianPrimerCandidate>, McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
+        self.context_read(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT project_path, session_id, question, source_compartment_start,
                         source_compartment_end, source_start_message_id, source_end_message_id,
                         source_message_time, created_at
-                   FROM mc_primer_candidates
+                   FROM primer_candidates
                   WHERE session_id = ?1 ORDER BY id",
             )?;
             let rows = stmt.query_map(params![session_id], |row| {
@@ -14447,18 +13386,18 @@ impl McStore {
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
-        })?)
+        })
     }
 
     pub fn load_user_memory_candidates(
         &self,
         session_id: &str,
     ) -> Result<Vec<HistorianUserMemoryCandidate>, McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
+        self.context_read(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT content, session_id, source_compartment_start,
                         source_compartment_end, created_at
-                   FROM mc_user_memory_candidates
+                   FROM user_memory_candidates
                   WHERE session_id = ?1 ORDER BY id",
             )?;
             let rows = stmt.query_map(params![session_id], |row| {
@@ -14471,7 +13410,7 @@ impl McStore {
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
-        })?)
+        })
     }
 
     /// Load a project's render-eligible memories: `active` + `permanent`, excluding
@@ -14486,11 +13425,11 @@ impl McStore {
         project_path: &str,
         now_ms: i64,
     ) -> Result<Vec<StoredMemory>, McStoreError> {
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, host_row_id, project_path, category, content, importance, status, expires_at,
+                "SELECT id, project_path, category, content, importance, status, expires_at,
                         superseded_by_memory_id, updated_at, last_seen_at, verified_at
-                 FROM mc_memories
+                 FROM memories
                  WHERE project_path = ?1
                    AND status IN ('active', 'permanent')
                    AND (expires_at IS NULL OR expires_at > ?2)
@@ -14500,88 +13439,22 @@ impl McStore {
                 .query_map(params![project_path, now_ms], |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
-                        host_row_id: r.get(1)?,
-                        project_path: r.get(2)?,
-                        category: r.get(3)?,
-                        content: r.get(4)?,
-                        importance: r.get(5)?,
-                        status: r.get(6)?,
-                        expires_at: r.get(7)?,
-                        superseded_by_memory_id: r.get(8)?,
-                        updated_at: r.get(9)?,
-                        last_seen_at: r.get(10)?,
-                        verified_at: r.get(11)?,
+                        project_path: r.get(1)?,
+                        category: r.get(2)?,
+                        content: r.get(3)?,
+                        importance: r.get(4)?,
+                        status: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "active".to_string()),
+                        expires_at: r.get(6)?,
+                        superseded_by_memory_id: r.get(7)?,
+                        updated_at: r.get(8)?,
+                        last_seen_at: r.get(9)?,
+                        verified_at: r.get(10)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(mapped)
         })?;
         Ok(rows)
-    }
-
-    pub fn module_memory_ids_for_host_ids(
-        &self,
-        project_paths: &[String],
-        host_ids: &[i64],
-    ) -> Result<HashMap<i64, i64>, McStoreError> {
-        if project_paths.is_empty() || host_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let project_placeholders = std::iter::repeat_n("?", project_paths.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let id_placeholders = std::iter::repeat_n("?", host_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT host_row_id, id FROM mc_memories
-              WHERE project_path IN ({project_placeholders})
-                AND host_row_id IN ({id_placeholders})"
-        );
-        let mut binds = project_paths
-            .iter()
-            .cloned()
-            .map(rusqlite::types::Value::from)
-            .collect::<Vec<_>>();
-        binds.extend(host_ids.iter().copied().map(rusqlite::types::Value::from));
-        self.inner
-            .with_conn(|conn| {
-                let mut statement = conn.prepare(&sql)?;
-                let rows = statement
-                    .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                    })?
-                    .collect::<Result<HashMap<_, _>, _>>()?;
-                Ok(rows)
-            })
-            .map_err(Into::into)
-    }
-
-    pub fn host_memory_ids_for_module_ids(
-        &self,
-        module_ids: &[i64],
-    ) -> Result<HashMap<i64, i64>, McStoreError> {
-        if module_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let placeholders = std::iter::repeat_n("?", module_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT id, host_row_id FROM mc_memories
-              WHERE id IN ({placeholders}) AND host_row_id IS NOT NULL"
-        );
-        self.inner
-            .with_conn(|conn| {
-                let mut statement = conn.prepare(&sql)?;
-                let rows = statement
-                    .query_map(rusqlite::params_from_iter(module_ids.iter()), |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                    })?
-                    .collect::<Result<HashMap<_, _>, _>>()?;
-                Ok(rows)
-            })
-            .map_err(Into::into)
     }
 
     /// The coalesced memory corrections to render as the delta across the workspace union.
@@ -14609,12 +13482,11 @@ impl McStore {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let rows = self.inner.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
+        let rows = self.context_read(|tx| {
             let mut requested: BTreeSet<i64> = rendered_memory_ids.iter().copied().collect();
             let visibility_sql = format!(
                 "SELECT DISTINCT target_memory_id
-                   FROM mc_memory_mutation_log
+                   FROM memory_mutation_log
                   WHERE project_path IN ({proj_ph}) AND id > ?
                     AND category = ?"
             );
@@ -14635,7 +13507,6 @@ impl McStore {
             drop(visibility_stmt);
             requested.extend(visibility_targets);
             if requested.is_empty() {
-                tx.commit()?;
                 return Ok(Vec::new());
             }
 
@@ -14654,7 +13525,7 @@ impl McStore {
                 let sql = format!(
                     "SELECT id, mutation_type, target_memory_id, superseded_by_id, category,
                             new_content, queued_at
-                       FROM mc_memory_mutation_log
+                       FROM memory_mutation_log
                       WHERE project_path IN ({proj_ph}) AND id > ?
                         AND target_memory_id IN ({target_ph})
                       ORDER BY id ASC"
@@ -14695,7 +13566,6 @@ impl McStore {
                     .collect();
                 loaded.extend(batch);
             }
-            tx.commit()?;
             Ok(loaded)
         })?;
 
@@ -14759,9 +13629,7 @@ impl McStore {
         &self,
         project_path: &str,
     ) -> Result<Option<WorkspaceMembership>, McStoreError> {
-        self.inner
-            .with_conn(|conn| workspace_membership_from_connection(conn, project_path))
-            .map_err(Into::into)
+        self.context_read(|conn| workspace_membership_from_connection(conn, project_path))
     }
 
     /// A DETERMINISTIC fingerprint of the project's workspace membership + share policy.
@@ -14797,8 +13665,7 @@ impl McStore {
 
     /// Load render-eligible memories across a workspace UNION: every member's `active` +
     /// `permanent` non-expired memories, but a FOREIGN member's only in the shared
-    /// categories (`share_categories`); the OWN project sees all its own. Shadow
-    /// workspaces use the isolated mirror table while following the same visibility path.
+    /// categories (`share_categories`); the OWN project sees all its own. 
     pub fn load_workspace_union_memories(
         &self,
         membership: &WorkspaceMembership,
@@ -14808,7 +13675,7 @@ impl McStore {
             return Ok(Vec::new());
         }
         let path_column = "project_path";
-        let table = "mc_memories";
+        let table = "memories";
         let (pool_filter, binds) = memory_render_pool_filter_for_column(
             Some(membership),
             &membership.own_identity,
@@ -14816,9 +13683,9 @@ impl McStore {
             now_ms,
         );
 
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let sql = format!(
-"SELECT id, host_row_id, {path_column}, category, content, importance, status, expires_at,
+"SELECT id, {path_column}, category, content, importance, status, expires_at,
                          superseded_by_memory_id, updated_at, last_seen_at, verified_at
                    FROM {table}
                   WHERE {pool_filter}
@@ -14829,17 +13696,16 @@ impl McStore {
                 .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
-                        host_row_id: r.get(1)?,
-                        project_path: r.get(2)?,
-                        category: r.get(3)?,
-                        content: r.get(4)?,
-                        importance: r.get(5)?,
-                        status: r.get(6)?,
-                        expires_at: r.get(7)?,
-                        superseded_by_memory_id: r.get(8)?,
-                        updated_at: r.get(9)?,
-                        last_seen_at: r.get(10)?,
-                        verified_at: r.get(11)?,
+                        project_path: r.get(1)?,
+                        category: r.get(2)?,
+                        content: r.get(3)?,
+                        importance: r.get(4)?,
+                        status: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "active".to_string()),
+                        expires_at: r.get(6)?,
+                        superseded_by_memory_id: r.get(7)?,
+                        updated_at: r.get(8)?,
+                        last_seen_at: r.get(9)?,
+                        verified_at: r.get(10)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -14848,87 +13714,23 @@ impl McStore {
         Ok(rows)
     }
 
-    /// Load rendered memory rows and both source watermarks from one SQLite read snapshot.
+    /// Load rendered memory rows and both source watermarks from one `context.db` read
+    /// snapshot.
     pub fn load_memory_render_snapshot(
         &self,
         project_path: &str,
         membership: Option<&WorkspaceMembership>,
         now_ms: i64,
     ) -> Result<MemoryRenderSnapshot, McStoreError> {
-        let project_paths = membership
-            .map(|value| value.union_identities.clone())
-            .unwrap_or_else(|| vec![project_path.to_string()]);
-        let table = "mc_memories";
-        let path_column = "project_path";
-        let mutation_table = "mc_memory_mutation_log";
-        let snapshot = self.inner.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let (pool_filter, binds) = memory_render_pool_filter_for_column(
-                membership,
+        self.context_read(|conn| {
+            single_store_schema::read_memory_render_snapshot(
+                conn,
+                &single_store_schema::CONTEXT_TABLES,
                 project_path,
-                path_column,
+                membership,
                 now_ms,
-            );
-            let sql = format!(
-"SELECT id, host_row_id, {path_column}, category, content, importance, status, expires_at,
-                         superseded_by_memory_id, updated_at, last_seen_at, verified_at
-                   FROM {table}
-                  WHERE {pool_filter}
-                  ORDER BY COALESCE(importance, 50) DESC, id ASC"
-            );
-            let mut stmt = tx.prepare(&sql)?;
-            let memories = stmt
-                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
-                    Ok(StoredMemory {
-                        id: row.get(0)?,
-                        host_row_id: row.get(1)?,
-                        project_path: row.get(2)?,
-                        category: row.get(3)?,
-                        content: row.get(4)?,
-                        importance: row.get(5)?,
-                        status: row.get(6)?,
-                        expires_at: row.get(7)?,
-                        superseded_by_memory_id: row.get(8)?,
-                        updated_at: row.get(9)?,
-                        last_seen_at: row.get(10)?,
-                        verified_at: row.get(11)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
-
-            let placeholders = std::iter::repeat_n("?", project_paths.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let max_memory_id = tx.query_row(
-                &format!("SELECT COALESCE(MAX(id), 0) FROM {table} WHERE {pool_filter}"),
-                rusqlite::params_from_iter(binds.iter()),
-                |row| row.get(0),
-            )?;
-            let mutation_cursor = if project_paths.is_empty() {
-                0
-            } else {
-                tx.query_row(
-                    &format!(
-                        "SELECT COALESCE(MAX(id), 0) FROM {mutation_table} WHERE {path_column} IN ({placeholders})"
-                    ),
-                    rusqlite::params_from_iter(project_paths.iter()),
-                    |row| row.get(0),
-                )?
-            };
-            tx.commit()?;
-            Ok(MemoryRenderSnapshot {
-                memories,
-                revision: MemoryRevision {
-                    project_paths: project_paths.clone(),
-                    reader_project_path: project_path.to_string(),
-                    expiry_cutoff_ms: now_ms,
-                    max_memory_id,
-                    mutation_cursor,
-                },
-            })
-        })?;
-        Ok(snapshot)
+            )
+        })
     }
 
     /// Load the bounded visible pool used by the in-memory lexical hint scorer.
@@ -14946,10 +13748,10 @@ impl McStore {
             None => project_memory_visibility_filter(project_path),
         };
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let sql = format!(
                 "SELECT id, project_path, category, content, created_at, updated_at
-                   FROM mc_memories
+                   FROM memories
                   WHERE ({sharing})
                     AND status IN ('active', 'permanent')
                     AND (expires_at IS NULL OR expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
@@ -14986,10 +13788,10 @@ impl McStore {
             return Ok(Vec::new());
         }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let mut statement = conn.prepare(
                 "SELECT sequence, start_message, end_message, title, content, p1, p2, p3, p4, created_at
-                   FROM mc_compartments
+                   FROM compartments
                   WHERE session_id = ?1
                   ORDER BY sequence DESC
                   LIMIT ?2",
@@ -15033,10 +13835,10 @@ impl McStore {
         };
         let pattern = sql_like_pattern(query);
 
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let sql = format!(
                 "SELECT id, project_path, category, content, created_at, updated_at
-                   FROM mc_memories
+                   FROM memories
                   WHERE ({sharing})
                     AND status IN ('active', 'permanent')
                     AND (expires_at IS NULL OR expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
@@ -15076,10 +13878,10 @@ impl McStore {
             return Ok(Vec::new());
         }
         let pattern = sql_like_pattern(query);
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT sequence, start_message, end_message, title, content, p1, p2, p3, p4, created_at
-                   FROM mc_compartments
+                   FROM compartments
                   WHERE session_id = ?1
                     AND (LOWER(title) LIKE ?2 ESCAPE '\\'
                       OR LOWER(content) LIKE ?2 ESCAPE '\\'
@@ -15178,16 +13980,14 @@ impl McStore {
     }
 
     fn note_by_id(&self, note_id: i64) -> Result<Option<StoredNote>, McStoreError> {
-        self.inner
-            .with_conn(|conn| {
+        self.context_read(|conn| {
                 conn.query_row(
-                    &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
+                    &format!("SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE id = ?1"),
                     params![note_id],
                     stored_note_from_row,
                 )
                 .optional()
             })
-            .map_err(Into::into)
     }
 
     fn require_note_project(&self, project_path: &str, note_id: i64) -> Result<(), McStoreError> {
@@ -15211,12 +14011,12 @@ impl McStore {
         session_id: &str,
         note_id: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        self.inner
-            .with_conn(|conn| {
+        self.context_read(|conn| {
                 conn.query_row(
                     &format!(
-                        "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
-                         WHERE id = ?1 AND project_path = ?2
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes
+                         WHERE id = ?1
+                           AND (project_path = ?2 OR (project_path IS NULL AND type = 'session'))
                            AND (type = 'smart' OR session_id = ?3)"
                     ),
                     params![note_id, project_path, session_id],
@@ -15224,7 +14024,6 @@ impl McStore {
                 )
                 .optional()
             })
-            .map_err(Into::into)
     }
 
     /// Page the notes visible to one session: all project smart notes plus that session's
@@ -15250,13 +14049,13 @@ impl McStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
-             WHERE project_path = ? AND status IN ({placeholders})
+            "SELECT {NOTE_SELECT_COLUMNS} FROM notes
+             WHERE (project_path = ? OR (project_path IS NULL AND type = 'session'))
+               AND status IN ({placeholders})
                AND (type = 'smart' OR session_id = ?)
-             ORDER BY updated_at_ms DESC, id DESC LIMIT ? OFFSET ?"
+             ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
         );
-        self.inner
-            .with_conn(|conn| {
+        self.context_read(|conn| {
                 let mut stmt = conn.prepare(&sql)?;
                 let mut values = Vec::with_capacity(statuses.len() + 3);
                 values.push(SqlValue::Text(project_path.to_string()));
@@ -15271,17 +14070,9 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>();
                 rows
             })
-            .map_err(Into::into)
     }
 
     pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, McStoreError> {
-        if let Some(route_project_root) = input.route_project_root {
-            self.enforce_facade_project_vocabulary(
-                route_project_root,
-                input.project_path,
-                "notes",
-            )?;
-        }
         let content = input.content.trim();
         if content.is_empty() {
             return Err(McStoreError::Serde(
@@ -15292,11 +14083,12 @@ impl McStore {
         // used by the previous context-note surface; the full project smart-note writer
         // below deliberately uses pending instead while still recording condition text.
         self.with_note_conn_fenced(input.project_path, |tx| {
+            let harness = session_harness_tx(tx, input.session_id)?;
             tx.execute(
-                "INSERT INTO mc_notes
+                "INSERT INTO notes
                  (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, harness, created_at_ms, updated_at_ms)
-                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
+                  anchor_block_id, harness, created_at, updated_at)
+                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, ?7, ?6, ?6)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -15304,6 +14096,7 @@ impl McStore {
                     input.surface_condition,
                     input.anchor_block_id,
                     input.now_ms,
+                    harness,
                 ],
             )?;
             load_note_tx(tx, tx.last_insert_rowid())
@@ -15314,13 +14107,6 @@ impl McStore {
         &self,
         input: NoteWriteInput<'_>,
     ) -> Result<StoredNote, McStoreError> {
-        if let Some(route_project_root) = input.route_project_root {
-            self.enforce_facade_project_vocabulary(
-                route_project_root,
-                input.project_path,
-                "notes",
-            )?;
-        }
         let content = input.content.trim();
         if content.is_empty() {
             return Err(McStoreError::Serde(
@@ -15337,11 +14123,11 @@ impl McStore {
         };
         self.with_note_conn_fenced(input.project_path, |tx| {
             tx.execute(
-                "INSERT INTO mc_notes
+                "INSERT INTO notes
                  (type, project_path, session_id, content, status, surface_condition,
                   compiled_provider, compiled_config, compiled_at, compile_status,
-                  anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                  VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'module', ?12, ?12)",
+                  anchor_block_id, anchor_ordinal, harness, created_at, updated_at)
+                  VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'opencode', ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -15396,18 +14182,21 @@ impl McStore {
         let placeholders = std::iter::repeat_n("?", statuses.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let session_clause = if session_id.is_some() {
-            " AND type = 'session' AND session_id = ?"
+        // A session note the host wrote carries no project; the session filter scopes it.
+        let (project_clause, session_clause) = if session_id.is_some() {
+            (
+                "(project_path = ? OR project_path IS NULL)",
+                " AND type = 'session' AND session_id = ?",
+            )
         } else {
-            ""
+            ("project_path = ?", "")
         };
         let sql = format!(
-            "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
-             WHERE project_path = ? AND status IN ({placeholders}){session_clause}
-             ORDER BY updated_at_ms DESC, id DESC LIMIT ? OFFSET ?"
+            "SELECT {NOTE_SELECT_COLUMNS} FROM notes
+             WHERE {project_clause} AND status IN ({placeholders}){session_clause}
+             ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
         );
-        self.inner
-            .with_conn(|conn| {
+        self.context_read(|conn| {
                 let mut stmt = conn.prepare(&sql)?;
                 let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 4);
                 values.push(SqlValue::Text(project_path.to_string()));
@@ -15424,7 +14213,6 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>();
                 rows
             })
-            .map_err(Into::into)
     }
 
     pub fn read_smart_notes(
@@ -15447,12 +14235,11 @@ impl McStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+            "SELECT {NOTE_SELECT_COLUMNS} FROM notes
              WHERE project_path = ? AND type = 'smart' AND status IN ({placeholders})
-             ORDER BY updated_at_ms DESC, id DESC LIMIT ? OFFSET ?"
+             ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
         );
-        self.inner
-            .with_conn(|conn| {
+        self.context_read(|conn| {
                 let mut statement = conn.prepare(&sql)?;
                 let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 3);
                 values.push(SqlValue::Text(project_path.to_string()));
@@ -15466,7 +14253,6 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
-            .map_err(Into::into)
     }
 
     /// Every note the glance shows, unpaged and newest-first. The glance needs
@@ -15569,16 +14355,15 @@ impl McStore {
         let placeholders = std::iter::repeat_n("?", statuses.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let session_clause = if session_id.is_some() {
-            " AND session_id = ?"
+        let (project_clause, session_clause) = if session_id.is_some() {
+            ("(project_path = ? OR project_path IS NULL)", " AND session_id = ?")
         } else {
-            ""
+            ("project_path = ?", "")
         };
         let sql = format!(
-            "SELECT COUNT(*) FROM mc_notes WHERE project_path = ? AND type = ? AND status IN ({placeholders}){session_clause}"
+            "SELECT COUNT(*) FROM notes WHERE {project_clause} AND type = ? AND status IN ({placeholders}){session_clause}"
         );
-        self.inner
-            .with_conn(|conn| {
+        self.context_read(|conn| {
                 let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 3);
                 values.push(SqlValue::Text(project_path.to_string()));
                 values.push(SqlValue::Text(type_name.to_string()));
@@ -15592,7 +14377,6 @@ impl McStore {
                     row.get::<_, i64>(0)
                 })
             })
-            .map_err(Into::into)
             .and_then(|count| {
                 usize::try_from(count)
                     .map_err(|_| McStoreError::Serde("note count exceeds usize".to_string()))
@@ -15611,7 +14395,7 @@ impl McStore {
         let current = current.filter(|note| {
             matches!(
                 note.status.as_str(),
-                "active" | "pending" | "ready" | "surfacing" | "surfaced"
+                "active" | "pending" | "ready"
             )
         });
         let Some(current) = current else {
@@ -15669,8 +14453,8 @@ impl McStore {
                 current.status.as_str()
             };
             let changed = tx.execute(
-                "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
-                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
+                "UPDATE notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
+                    status = ?4, updated_at = MAX(?5, updated_at + 1),
                     last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
                     ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
                     ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
@@ -15678,7 +14462,8 @@ impl McStore {
                     manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
                     check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
                     check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
-                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND updated_at = ?9
+                    AND content = ?10",
                 params![
                     next_content,
                     condition_changed,
@@ -15689,6 +14474,7 @@ impl McStore {
                     project_path,
                     expected_status,
                     expected_version,
+                    current.content,
                 ],
             )?;
             if changed == 0 {
@@ -15718,10 +14504,12 @@ impl McStore {
             let Some(current) = load_note_tx(tx, note_id).optional()? else {
                 return Ok(None);
             };
-            if current.project_path != project_path
+            let owned = current.project_path == project_path
+                || (current.type_name == "session" && current.project_path.is_empty());
+            if !owned
                 || !matches!(
                     current.status.as_str(),
-                    "active" | "pending" | "ready" | "surfacing" | "surfaced"
+                    "active" | "pending" | "ready"
                 )
             {
                 return Ok(None);
@@ -15730,18 +14518,15 @@ impl McStore {
                 .map(|value| format!("{}\n\nResolution: {value}", current.content))
                 .unwrap_or_else(|| current.content.clone());
             let changed = tx.execute(
-                "UPDATE mc_notes
-                    SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, updated_at_ms = ?2,
-                        dismissed_at = ?2, dismissal_resolution = ?3
-                  WHERE id = ?4 AND project_path = ?5
-                    AND status = ?6 AND status_version = ?7",
+                "UPDATE notes
+                    SET status = 'dismissed', content = ?1, updated_at = MAX(?2, updated_at + 1)
+                  WHERE id = ?3 AND COALESCE(project_path, '') = ?4
+                    AND status = ?5 AND updated_at = ?6",
                 params![
                     content,
                     now_ms,
-                    resolution,
                     note_id,
-                    project_path,
+                    current.project_path,
                     current.status,
                     current.status_version,
                 ],
@@ -15815,13 +14600,13 @@ impl McStore {
             }
             let status = if input.verdict { "ready" } else { "pending" };
             tx.execute(
-                "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
-                    updated_at_ms = ?2, ready_at = CASE WHEN ?1 = 'ready' THEN ?2 ELSE ready_at END,
+                "UPDATE notes SET status = ?1, updated_at = MAX(?2, updated_at + 1),
+                    ready_at = CASE WHEN ?1 = 'ready' THEN ?2 ELSE ready_at END,
                     ready_reason = CASE WHEN ?1 = 'ready' THEN 'condition_true' ELSE ready_reason END,
                     compiled_check = ?3, manifest_json = ?4, check_hash = ?5,
                     check_next_due_at = ?6, last_checked_at = ?2,
                     check_status = CASE WHEN ?1 = 'ready' THEN 'true' ELSE 'false' END
-                  WHERE id = ?7 AND project_path = ?8 AND status = 'pending' AND status_version = ?9",
+                  WHERE id = ?7 AND project_path = ?8 AND status = 'pending' AND updated_at = ?9",
                 params![
                     status,
                     input.now_ms,
@@ -15867,7 +14652,7 @@ impl McStore {
         self.require_note_project(project_path, note_id)?;
         if !matches!(
             to_status,
-            "active" | "pending" | "ready" | "surfacing" | "surfaced" | "dismissed"
+            "active" | "pending" | "ready" | "dismissed"
         ) {
             return Err(McStoreError::Serde(format!(
                 "invalid note transition target {to_status}"
@@ -15884,22 +14669,19 @@ impl McStore {
                 return Ok(NoteCasOutcome::Conflict { current: Some(current) });
             }
             tx.execute(
-                "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
-                    updated_at_ms = ?2,
+                "UPDATE notes SET status = ?1, updated_at = MAX(?2, updated_at + 1),
                     ready_at = CASE WHEN ?1 = 'ready' THEN COALESCE(ready_at, ?2) ELSE ready_at END,
-                    ready_reason = CASE WHEN ?1 = 'ready' THEN COALESCE(?3, ready_reason) ELSE ready_reason END,
-                    dismissed_at = CASE WHEN ?1 = 'dismissed' THEN ?2 ELSE dismissed_at END,
-                    dismissal_resolution = CASE WHEN ?1 = 'dismissed' THEN ?3 ELSE dismissal_resolution END
-                  WHERE id = ?4 AND project_path = ?5 AND status = ?6 AND status_version = ?7",
+                    ready_reason = CASE WHEN ?1 = 'ready' THEN COALESCE(?3, ready_reason) ELSE ready_reason END
+                  WHERE id = ?4 AND project_path = ?5 AND status = ?6 AND updated_at = ?7",
                 params![to_status, now_ms, result, note_id, project_path, expected_status, expected_version],
             )?;
             Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
         })
     }
 
-    /// Claim one due pending smart note for an evaluator. The source revision is the
-    /// status_version observed by the evaluator; the lease itself is represented by the
-    /// module-internal `surfacing` state and is released by a CAS transition.
+    /// Claim one due pending smart note for an evaluator. The claim moves the note's
+    /// compare-and-set token (`updated_at`), so a second claimant's CAS against the old
+    /// token fails; the evaluator's verdict is written against the new one.
     pub fn claim_due_note(
         &self,
         project_path: &str,
@@ -15909,7 +14691,7 @@ impl McStore {
             let note = tx
                 .query_row(
                     &format!(
-                        "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes
                          WHERE project_path = ?1 AND type = 'smart' AND status = 'pending'
                            AND (check_next_due_at IS NULL OR check_next_due_at <= ?2)
                            AND (check_quarantined_until IS NULL OR check_quarantined_until <= ?2)
@@ -15921,202 +14703,87 @@ impl McStore {
                 .optional()?;
             let Some(note) = note else { return Ok(None) };
             let changed = tx.execute(
-                "UPDATE mc_notes SET status_version = status_version + 1, updated_at_ms = ?1
-                   WHERE id = ?2 AND project_path = ?3 AND status = 'pending' AND status_version = ?4",
+                "UPDATE notes SET updated_at = MAX(?1, updated_at + 1)
+                   WHERE id = ?2 AND project_path = ?3 AND status = 'pending' AND updated_at = ?4",
                 params![now_ms, note.id, project_path, note.status_version],
             )?;
             if changed == 0 { return Ok(None); }
             tx.query_row(
-                &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
+                &format!("SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE id = ?1"),
                 params![note.id],
                 stored_note_from_row,
             ).map(Some)
         })
     }
 
+    /// The project's ready smart notes, each with a delivery handle for this pass.
+    ///
+    /// `context.db` has no delivery table and no in-flight surfacing states: a note is
+    /// `ready` until something dismisses it, which is what every other writer of the file
+    /// understands. The handle is derived from the pass, so a retried pass gets the same
+    /// one, and acknowledging or refusing it changes nothing durable.
     pub fn claim_note_delivery(
         &self,
         project_path: &str,
         session_id: &str,
         delivered_pass_fingerprint: &str,
         transform_pass_id: &str,
-        now_ms: i64,
+        _now_ms: i64,
     ) -> Result<Vec<(StoredNote, NoteDelivery)>, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
-            let notes = {
-                let mut stmt = tx.prepare(&format!(
-                    "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
-                     WHERE project_path = ?1 AND type = 'smart' AND
-                       (status = 'ready' OR status = 'surfacing' OR status = 'surfaced')
-                     ORDER BY updated_at_ms ASC, id ASC"
-                ))?;
-                let rows = stmt
-                    .query_map(params![project_path], stored_note_from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
-            };
-            let mut candidates = Vec::new();
-            for note in notes {
-                let unacked = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM mc_note_deliveries
-                       WHERE project_path = ?1 AND note_id = ?2 AND session_id = ?3 AND disposition IS NULL)",
-                    params![project_path, note.id, session_id],
-                    |r| r.get::<_, i64>(0),
-                )? != 0;
-                if note.status == "surfaced" && !unacked {
-                    continue;
-                }
-                let existing = tx
-                    .query_row(
-                        "SELECT delivery_id, transform_pass_id, acked_at
-                           FROM mc_note_deliveries
-                          WHERE project_path = ?1 AND note_id = ?2 AND session_id = ?3
-                            AND delivered_pass_fingerprint = ?4 AND disposition IS NULL",
-                        params![project_path, note.id, session_id, delivered_pass_fingerprint],
-                        |r| {
-                            Ok(NoteDelivery {
-                                delivery_id: r.get(0)?,
-                                note_id: note.id,
-                                session_id: session_id.to_string(),
-                                delivered_pass_fingerprint: delivered_pass_fingerprint.to_string(),
-                                transform_pass_id: r.get(1)?,
-                                acked_at: r.get(2)?,
-                            })
-                        },
-                    )
-                    .optional()?;
-                if let Some(delivery) = existing {
-                    if delivery.acked_at.is_none() {
-                        candidates.push((note, delivery));
-                    }
-                    continue;
-                }
-                if note.status == "ready" {
-                    let changed = tx.execute(
-                        "UPDATE mc_notes SET status = 'surfacing', status_version = status_version + 1,
-                            updated_at_ms = ?1
-                          WHERE id = ?2 AND project_path = ?3 AND status = 'ready' AND status_version = ?4",
-                        params![now_ms, note.id, project_path, note.status_version],
-                    )?;
-                    if changed == 0 {
-                        continue;
-                    }
-                }
-                let delivery_id = format!(
-                    "{}:{project_path}:{}:{session_id}:{transform_pass_id}:{}",
-                    project_path.len(),
-                    session_id.len(),
-                    note.id
-                );
-                tx.execute(
-                    "INSERT INTO mc_note_deliveries
-                       (delivery_id, note_id, session_id, delivered_pass_fingerprint,
-                        transform_pass_id, created_at_ms, project_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        delivery_id,
-                        note.id,
-                        session_id,
-                        delivered_pass_fingerprint,
-                        transform_pass_id,
-                        now_ms,
-                        project_path
-                    ],
-                )?;
-                let stored = load_note_tx(tx, note.id)?;
-                candidates.push((
-                    stored,
-                    NoteDelivery {
-                        delivery_id,
-                        note_id: note.id,
-                        session_id: session_id.to_string(),
-                        delivered_pass_fingerprint: delivered_pass_fingerprint.to_string(),
-                        transform_pass_id: transform_pass_id.to_string(),
-                        acked_at: None,
-                    },
-                ));
-            }
-            Ok(candidates)
-        })
+        let notes = self.context_read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {NOTE_SELECT_COLUMNS} FROM notes
+                 WHERE project_path = ?1 AND type = 'smart' AND status = 'ready'
+                 ORDER BY updated_at ASC, id ASC"
+            ))?;
+            let rows = stmt
+                .query_map(params![project_path], stored_note_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(notes
+            .into_iter()
+            .map(|note| {
+                let delivery = NoteDelivery {
+                    delivery_id: format!(
+                        "{}:{project_path}:{}:{session_id}:{transform_pass_id}:{}",
+                        project_path.len(),
+                        session_id.len(),
+                        note.id
+                    ),
+                    note_id: note.id,
+                    session_id: session_id.to_string(),
+                    delivered_pass_fingerprint: delivered_pass_fingerprint.to_string(),
+                    transform_pass_id: transform_pass_id.to_string(),
+                    acked_at: None,
+                };
+                (note, delivery)
+            })
+            .collect())
     }
 
+    /// Acknowledge a pass's note deliveries. Nothing durable records a delivery, so there
+    /// is nothing to change; see [`Self::claim_note_delivery`].
     pub fn ack_note_delivery(
         &self,
-        project_path: &str,
-        session_id: &str,
-        transform_pass_id: &str,
-        now_ms: i64,
+        _project_path: &str,
+        _session_id: &str,
+        _transform_pass_id: &str,
+        _now_ms: i64,
     ) -> Result<usize, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
-            let ids = tx
-                .prepare(
-                    "SELECT DISTINCT note_id FROM mc_note_deliveries
-                       WHERE project_path = ?1 AND session_id = ?2 AND transform_pass_id = ?3
-                         AND disposition IS NULL",
-                )?
-                .query_map(
-                    params![project_path, session_id, transform_pass_id],
-                    |row| row.get::<_, i64>(0),
-                )?
-                .collect::<Result<Vec<_>, _>>()?;
-            let changed = tx.execute(
-                "UPDATE mc_note_deliveries SET acked_at = ?1, disposition = 'acked'
-                   WHERE project_path = ?2 AND session_id = ?3 AND transform_pass_id = ?4
-                     AND disposition IS NULL",
-                params![now_ms, project_path, session_id, transform_pass_id],
-            )?;
-            for id in ids {
-                tx.execute(
-                    "UPDATE mc_note_deliveries SET disposition = 'superseded'
-                       WHERE project_path = ?1 AND note_id = ?2 AND session_id = ?3
-                         AND disposition IS NULL",
-                    params![project_path, id, session_id],
-                )?;
-                tx.execute(
-                    "UPDATE mc_notes SET status = 'surfaced', status_version = status_version + 1,
-                        updated_at_ms = ?1
-                      WHERE id = ?2 AND project_path = ?3 AND status IN ('surfacing', 'surfaced')",
-                    params![now_ms, id, project_path],
-                )?;
-            }
-            Ok(changed)
-        })
+        Ok(0)
     }
 
+    /// Refuse a pass's note deliveries. The notes stay `ready`; see
+    /// [`Self::claim_note_delivery`].
     pub fn nack_note_delivery(
         &self,
-        project_path: &str,
-        session_id: &str,
-        transform_pass_id: &str,
-        now_ms: i64,
+        _project_path: &str,
+        _session_id: &str,
+        _transform_pass_id: &str,
+        _now_ms: i64,
     ) -> Result<usize, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
-            let ids = tx
-                .prepare(
-                    "SELECT DISTINCT note_id FROM mc_note_deliveries
-                       WHERE project_path = ?1 AND session_id = ?2 AND transform_pass_id = ?3
-                         AND disposition IS NULL",
-                )?
-                .query_map(params![project_path, session_id, transform_pass_id], |r| {
-                    r.get::<_, i64>(0)
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            let changed = tx.execute(
-                "UPDATE mc_note_deliveries SET disposition = 'nacked'
-                   WHERE project_path = ?1 AND session_id = ?2 AND transform_pass_id = ?3
-                     AND disposition IS NULL",
-                params![project_path, session_id, transform_pass_id],
-            )?;
-            for id in &ids {
-                tx.execute(
-                    "UPDATE mc_notes SET status = 'ready', status_version = status_version + 1,
-                        updated_at_ms = ?1
-                      WHERE id = ?2 AND project_path = ?3 AND status IN ('surfacing', 'surfaced')",
-                    params![now_ms, id, project_path],
-                )?;
-            }
-            Ok(changed)
-        })
+        Ok(0)
     }
 
     pub fn search_notes_like(
@@ -16142,14 +14809,14 @@ impl McStore {
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!(
-            "SELECT id, content, status, surface_condition, session_id, anchor_ordinal,
-                        created_at_ms, updated_at_ms
-                   FROM mc_notes
-                  WHERE project_path = ?1
+            "SELECT id, content, status, surface_condition, COALESCE(session_id, ''), anchor_ordinal,
+                        created_at, updated_at
+                   FROM notes
+                  WHERE (project_path = ?1 OR (project_path IS NULL AND type = 'session'))
                     AND (type = 'smart' OR session_id = ?2)
                     AND status IN ('active', 'pending', 'ready')
                     AND ({predicates})
-                  ORDER BY updated_at_ms DESC, id DESC
+                  ORDER BY updated_at DESC, id DESC
                   LIMIT 100"
         );
         let mut parameters = vec![
@@ -16161,7 +14828,7 @@ impl McStore {
                 .iter()
                 .map(|term| SqlValue::Text(sql_like_pattern(term))),
         );
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(parameters.iter()), |r| {
@@ -16187,9 +14854,9 @@ impl McStore {
     /// tie at ms granularity and a non-deterministic order would drift the rendered
     /// bytes between passes. Returns just the contents (the render is `- <content>`).
     pub fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
-        let rows = self.inner.with_conn(|conn| {
+        let rows = self.context_read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT content FROM mc_user_memories WHERE status = 'active'
+                "SELECT content FROM user_memories WHERE status = 'active'
                  ORDER BY promoted_at ASC, id ASC",
             )?;
             let mapped = stmt
@@ -16215,9 +14882,9 @@ impl McStore {
         let ph = std::iter::repeat_n("?", projects.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let max = self.inner.with_conn(|conn| {
+        let max = self.context_read(|conn| {
             let sql = format!(
-                "SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log
+                "SELECT COALESCE(MAX(id), 0) FROM memory_mutation_log
                  WHERE project_path IN ({ph})"
             );
             let v: i64 =
@@ -16243,9 +14910,9 @@ impl McStore {
         let ph = std::iter::repeat_n("?", projects.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let max = self.inner.with_conn(|conn| {
+        let max = self.context_read(|conn| {
             let sql = format!(
-                "SELECT COALESCE(MAX(id), 0) FROM mc_memories WHERE project_path IN ({ph})"
+                "SELECT COALESCE(MAX(id), 0) FROM memories WHERE project_path IN ({ph})"
             );
             let v: i64 =
                 conn.query_row(&sql, rusqlite::params_from_iter(projects.iter()), |r| {
@@ -16272,9 +14939,9 @@ impl McStore {
         content: &str,
         importance: i64,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        self.context_write(&["memories"], |tx| {
             tx.execute(
-                "INSERT INTO mc_memories (id, project_path, category, content, normalized_hash,
+                "INSERT INTO memories (id, project_path, category, content, normalized_hash,
                                           importance, status, first_seen_at, created_at,
                                           updated_at, last_seen_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?7, ?7, ?7)",
@@ -16305,9 +14972,9 @@ impl McStore {
         scope: &str,
         shareable: bool,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        self.context_write(&["memories"], |tx| {
             tx.execute(
-                "UPDATE mc_memories SET scope = ?2, shareable = ?3 WHERE id = ?1",
+                "UPDATE memories SET scope = ?2, shareable = ?3 WHERE id = ?1",
                 params![id, scope, shareable as i64],
             )?;
             Ok(())
@@ -16324,9 +14991,9 @@ impl McStore {
         importance: i64,
         expires_at: i64,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        self.context_write(&["memories"], |tx| {
             tx.execute(
-                "INSERT INTO mc_memories (id, project_path, category, content, normalized_hash,
+                "INSERT INTO memories (id, project_path, category, content, normalized_hash,
                                           importance, status, expires_at, first_seen_at,
                                           created_at, updated_at, last_seen_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?8, ?8, ?8)",
@@ -16354,19 +15021,20 @@ impl McStore {
         project_path: &str,
         share_categories_json: &str,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        self.context_write(&["memories"], |tx| {
             tx.execute(
-                "INSERT INTO mc_workspaces (name, share_categories) VALUES (?1, ?2)
+                "INSERT INTO workspaces (name, share_categories, created_at, updated_at)
+                 VALUES (?1, ?2, 0, 0)
                  ON CONFLICT(name) DO NOTHING",
                 params![workspace, share_categories_json],
             )?;
             let ws_id: i64 = tx.query_row(
-                "SELECT id FROM mc_workspaces WHERE name = ?1",
+                "SELECT id FROM workspaces WHERE name = ?1",
                 params![workspace],
                 |r| r.get(0),
             )?;
             tx.execute(
-                "INSERT INTO mc_workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                "INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
                  VALUES (?1, ?2, ?2, ?2, 0)",
                 params![ws_id, project_path],
             )?;
@@ -16383,9 +15051,9 @@ impl McStore {
         target_memory_id: i64,
         new_content: &str,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        self.context_write(&["memories"], |tx| {
             tx.execute(
-                "INSERT INTO mc_memory_mutation_log
+                "INSERT INTO memory_mutation_log
                     (project_path, mutation_type, target_memory_id, new_content, queued_at)
                  VALUES (?1, ?2, ?3, ?4, 0)",
                 params![project_path, mutation_type, target_memory_id, new_content],
@@ -16401,7 +15069,7 @@ impl McStore {
         target_memory_id: i64,
         superseded_by_id: i64,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        self.context_write(&["memories"], |tx| {
             append_memory_mutation_tx(
                 tx,
                 MemoryMutationAppend {
@@ -16418,1882 +15086,36 @@ impl McStore {
         })?;
         Ok(())
     }
-
-    pub fn seed_module_memory_authority_for_test(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        generation: u64,
-    ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
-            tx.execute(
-                "INSERT INTO mc_authority(context_store_uuid, project, domain, state, generation)
-                 VALUES (?1, ?2, 'memories', 'MODULE', ?3)",
-                params![context_store_uuid, project, generation],
-            )?;
-            Ok(())
-        })?;
-        Ok(())
-    }
 }
 
-impl McStore {
-    /// Read the durable authority row. A missing row is normal for a store that has
-    /// never opted a project into module ownership.
-    pub fn authority_status(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-    ) -> Result<Option<AuthorityRow>, McStoreError> {
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )
-                .optional()
-            })
-            .map_err(Into::into)
-    }
-
-    /// Enter PREPARING and bump the generation. Repeating the request is idempotent
-    /// only when the row is already preparing at the same generation.
-    pub fn authority_begin_prepare(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-    ) -> Result<AuthorityRow, McStoreError> {
-        validate_authority_domain(domain)?;
-        self.with_note_conn_fenced(project, |tx| {
-                tx.execute(
-                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
-                     VALUES (?1, ?2, ?3, 'TS') ON CONFLICT(context_store_uuid, project, domain) DO NOTHING",
-                    params![context_store_uuid, project, domain],
-                )?;
-                let current = tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )?;
-                if current.state == "TS" {
-                    if domain == "memories" {
-                        tx.execute(
-                            "DELETE FROM mc_memories WHERE context_store_uuid = ?1 AND project_path = ?2",
-                            params![context_store_uuid, project],
-                        )?;
-                        tx.execute(
-                            "DELETE FROM mc_authority_pending_memory_references
-                              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
-                            params![context_store_uuid, project, domain],
-                        )?;
-                    } else {
-                        tx.execute(
-                            "DELETE FROM mc_notes WHERE context_store_uuid = ?1 AND project_path = ?2",
-                            params![context_store_uuid, project],
-                        )?;
-                    }
-                    tx.execute(
-                        "DELETE FROM mc_authority_seed_rows WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
-                        params![context_store_uuid, project, domain],
-                    )?;
-                    tx.execute(
-                        "UPDATE mc_authority SET state = 'PREPARING', generation = generation + 1,
-                                checksum_expected = NULL, checksum_actual = NULL, checksum_ok = NULL
-                         WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
-                        params![context_store_uuid, project, domain],
-                    )?;
-                } else if current.state != "PREPARING" {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: "TS".to_string(),
-                            found: current.state,
-                        },
-                    )));
-                }
-                tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )
-            })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn authority_verify_prepare(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-        expected_generation: u64,
-        checksum_expected: &str,
-        checksum_actual: &str,
-    ) -> Result<AuthorityRow, McStoreError> {
-        validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
-                let current = tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )?;
-                if current.generation != expected_generation || current.state != "PREPARING" {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: format!("PREPARING generation {expected_generation}"),
-                            found: format!("{} generation {}", current.state, current.generation),
-                        },
-                    )));
-                }
-                if domain == "memories" {
-                    let pending: i64 = tx.query_row(
-                        "SELECT COUNT(*) FROM mc_authority_pending_memory_references
-                          WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
-                        params![context_store_uuid, project, domain],
-                        |row| row.get(0),
-                    )?;
-                    if pending > 0 {
-                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                            AuthorityTransitionError::UnresolvedPendingReferences { count: pending },
-                        )));
-                    }
-                }
-                tx.execute(
-                    "UPDATE mc_authority SET checksum_expected = ?1, checksum_actual = ?2, checksum_ok = ?3
-                       WHERE context_store_uuid = ?4 AND project = ?5 AND domain = ?6",
-                    params![
-                        checksum_expected,
-                        checksum_actual,
-                        if checksum_expected == checksum_actual { 1 } else { 0 },
-                        context_store_uuid,
-                        project,
-                        domain
-                    ],
-                )?;
-                tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )
-            })
-            .map_err(map_authority_sql_error)
-    }
-
-    pub fn authority_ack_prepare(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-        expected_generation: u64,
-    ) -> Result<AuthorityRow, McStoreError> {
-        validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
-                let current = tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )?;
-                if current.generation != expected_generation
-                    || current.state != "PREPARING"
-                    || current.checksum_ok != Some(true)
-                {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: format!(
-                                "verified PREPARING generation {expected_generation}"
-                            ),
-                            found: format!("{} generation {}", current.state, current.generation),
-                        },
-                    )));
-                }
-                tx.execute(
-                    "UPDATE mc_authority SET state = 'MODULE', generation = generation + 1
-                       WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
-                    params![context_store_uuid, project, domain],
-                )?;
-                tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )
-            })
-            .map_err(map_authority_sql_error)
-    }
-
-    /// Record seed verification and complete TS -> MODULE. The host keeps its
-    /// context.db barrier until this transition has committed on the module side.
-    /// The arguments are kept explicit because each value is part of the durable
-    /// transition record and must be validated together.
-    #[allow(clippy::too_many_arguments)]
-    pub fn authority_finish_prepare(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-        expected_generation: u64,
-        checksum_expected: &str,
-        checksum_actual: &str,
-        verified: bool,
-    ) -> Result<AuthorityRow, McStoreError> {
-        validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
-                let current = tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )?;
-                if current.generation != expected_generation {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::Generation {
-                            expected: expected_generation,
-                            found: current.generation,
-                        },
-                    )));
-                }
-                if current.state != "PREPARING" {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: "PREPARING".to_string(),
-                            found: current.state,
-                        },
-                    )));
-                }
-                if verified && checksum_expected != checksum_actual {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: "matching checksums".to_string(),
-                            found: "verification failed".to_string(),
-                        },
-                    )));
-                }
-                let next_state = if verified { "MODULE" } else { "TS" };
-                tx.execute(
-                    "UPDATE mc_authority
-                        SET state = ?1, generation = generation + 1,
-                            checksum_expected = ?2, checksum_actual = ?3, checksum_ok = ?4
-                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7",
-                    params![
-                        next_state,
-                        checksum_expected,
-                        checksum_actual,
-                        if verified { 1 } else { 0 },
-                        context_store_uuid,
-                        project,
-                        domain
-                    ],
-                )?;
-                tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )
-            })
-            .map_err(map_authority_sql_error)
-    }
-
-    /// Abort a failed preparation without erasing the diagnostic checksum.
-    pub fn authority_abort_prepare(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-        expected_generation: u64,
-    ) -> Result<AuthorityRow, McStoreError> {
-        self.authority_finish_prepare(
-            context_store_uuid,
-            project,
-            domain,
-            expected_generation,
-            "",
-            "",
-            false,
+/// The harness label a session's `context.db` rows carry: the one its host recorded in
+/// `session_projects`, or `opencode`, the column default, for a session no host recorded.
+fn session_harness_tx(conn: &rusqlite::Connection, session_id: &str) -> rusqlite::Result<String> {
+    Ok(conn
+        .query_row(
+            "SELECT harness FROM session_projects WHERE session_id = ?1 ORDER BY harness LIMIT 1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
         )
-    }
-
-    pub fn authority_begin_drain(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-        lease: &str,
-        lease_expires_at: i64,
-        now_ms: i64,
-    ) -> Result<AuthorityRow, McStoreError> {
-        validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
-                let current = tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )?;
-                if current.state == "DRAINING" {
-                    let held_by_other = current.coordinator_lease.as_deref() != Some(lease);
-                    let lease_live = current.lease_expires_at.unwrap_or(0) > now_ms;
-                    if held_by_other && lease_live {
-                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                            AuthorityTransitionError::State {
-                                expected: "the existing drain coordinator or an expired lease"
-                                    .to_string(),
-                                found: "a different live drain coordinator".to_string(),
-                            },
-                        )));
-                    }
-                    // Takeover or same-lease resume mints a fresh token so the prior
-                    // coordinator cannot keep journaling with a stale attempt identity. It also
-                    // captures a new feed head after a finish fence reports a late append.
-                    let token = mint_coordinator_token(lease, lease_expires_at, current.generation);
-                    let feed_head: i64 = tx.query_row(
-                        "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
-                        params![domain],
-                        |row| row.get(0),
-                    )?;
-                    let captured_upper_bound = current
-                        .captured_upper_bound
-                        .unwrap_or(0)
-                        .max(feed_head);
-                    tx.execute(
-                        "UPDATE mc_authority
-                            SET coordinator_lease = ?1, lease_expires_at = ?2, coordinator_token = ?3,
-                                captured_upper_bound = ?4
-                          WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7",
-                        params![
-                            lease,
-                            lease_expires_at,
-                            token,
-                            captured_upper_bound,
-                            context_store_uuid,
-                            project,
-                            domain
-                        ],
-                    )?;
-                    return tx.query_row(
-                        AUTHORITY_SELECT_SQL,
-                        params![context_store_uuid, project, domain],
-                        authority_row_from_sql,
-                    );
-                }
-                if current.state != "MODULE" {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: "MODULE".to_string(),
-                            found: current.state,
-                        },
-                    )));
-                }
-                let upper_bound: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
-                    params![domain],
-                    |row| row.get(0),
-                )?;
-                let next_generation = current.generation + 1;
-                let token = mint_coordinator_token(lease, lease_expires_at, next_generation);
-                tx.execute(
-                    "UPDATE mc_authority
-                        SET state = 'DRAINING', generation = generation + 1,
-                            captured_upper_bound = ?1, drain_generation = generation + 1,
-                            drain_cursor = 0, coordinator_lease = ?2, lease_expires_at = ?3,
-                            coordinator_token = ?4,
-                            step_seed = 0, step_memories = 0, step_notes = 0,
-                            step_compartments = 0, step_reconcile = 0, step_verify = 0, step_flip = 0
-                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7",
-                    params![
-                        upper_bound,
-                        lease,
-                        lease_expires_at,
-                        token,
-                        context_store_uuid,
-                        project,
-                        domain
-                    ],
-                )?;
-                tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )
-            })
-            .map_err(map_authority_sql_error)
-    }
-
-    /// Advance one idempotent DRAINING journal bit or its feed cursor.
-    #[allow(clippy::too_many_arguments)]
-    pub fn authority_drain_step(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-        expected_generation: u64,
-        step: &str,
-        cursor: Option<i64>,
-        coordinator_token: &str,
-        now_ms: i64,
-    ) -> Result<AuthorityRow, McStoreError> {
-        validate_authority_domain(domain)?;
-        let column = match step {
-            "seed" => "step_seed",
-            "memories" => "step_memories",
-            "notes" => "step_notes",
-            "compartments" => "step_compartments",
-            "reconcile" => "step_reconcile",
-            "verify" => "step_verify",
-            "flip" => "step_flip",
-            _ => return Err(McStoreError::Serde(format!("unknown drain step {step}"))),
-        };
-        self.inner
-            .with_conn_fenced(|tx| {
-                let current = tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )?;
-                if current.generation != expected_generation {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::Generation {
-                            expected: expected_generation,
-                            found: current.generation,
-                        },
-                    )));
-                }
-                if current.state != "DRAINING" {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: "DRAINING".to_string(),
-                            found: current.state,
-                        },
-                    )));
-                }
-                authority_require_live_coordinator(&current, coordinator_token, now_ms)?;
-                tx.execute(
-                    &format!("UPDATE mc_authority SET {column} = 1, drain_cursor = COALESCE(?1, drain_cursor) WHERE context_store_uuid = ?2 AND project = ?3 AND domain = ?4"),
-                    params![cursor, context_store_uuid, project, domain],
-                )?;
-                tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )
-            })
-            .map_err(map_authority_sql_error)
-    }
-
-    /// Complete DRAINING after the host has verified every journal step.
-    /// The checksum, generation, coordinator token, and captured feed head are checked
-    /// together so a stale coordinator cannot publish a partial handoff.
-    #[allow(clippy::too_many_arguments)]
-    pub fn authority_finish_drain(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-        expected_generation: u64,
-        checksum_expected: &str,
-        checksum_actual: &str,
-        verified: bool,
-        coordinator_token: &str,
-        now_ms: i64,
-    ) -> Result<AuthorityRow, McStoreError> {
-        validate_authority_domain(domain)?;
-        let outcome = self
-            .inner
-            .with_conn_fenced(|tx| {
-                let current = tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )?;
-                if current.generation != expected_generation {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::Generation {
-                            expected: expected_generation,
-                            found: current.generation,
-                        },
-                    )));
-                }
-                if current.state != "DRAINING" {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: "DRAINING".to_string(),
-                            found: current.state,
-                        },
-                    )));
-                }
-                authority_require_live_coordinator(&current, coordinator_token, now_ms)?;
-                let all_steps = current.step_seed
-                    && current.step_memories
-                    && current.step_notes
-                    && current.step_compartments
-                    && current.step_reconcile
-                    && current.step_verify;
-                if !all_steps || !verified || checksum_expected != checksum_actual {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        AuthorityTransitionError::State {
-                            expected: "all drain steps and verification".to_string(),
-                            found: "incomplete or failed".to_string(),
-                        },
-                    )));
-                }
-                let feed_head: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
-                    params![domain],
-                    |row| row.get(0),
-                )?;
-                let captured = current.captured_upper_bound.unwrap_or(0);
-                if feed_head != captured {
-                    // This comparison shares the transaction with the ownership flip. A writer
-                    // either commits before the flip and forces replay, or after TypeScript owns the domain.
-                    return Ok(AuthorityFinishDrainOutcome::FeedHeadAdvanced {
-                        captured,
-                        found: feed_head,
-                    });
-                }
-                tx.execute(
-                    "UPDATE mc_authority SET state = 'TS', generation = generation + 1,
-                            checksum_expected = ?1, checksum_actual = ?2, checksum_ok = ?3,
-                            coordinator_lease = NULL, lease_expires_at = NULL,
-                            coordinator_token = NULL, step_flip = 1
-                      WHERE context_store_uuid = ?4 AND project = ?5 AND domain = ?6",
-                    params![
-                        checksum_expected,
-                        checksum_actual,
-                        if verified { 1 } else { 0 },
-                        context_store_uuid,
-                        project,
-                        domain
-                    ],
-                )?;
-                tx.query_row(
-                    AUTHORITY_SELECT_SQL,
-                    params![context_store_uuid, project, domain],
-                    authority_row_from_sql,
-                )
-                .map(Box::new)
-                .map(AuthorityFinishDrainOutcome::Finished)
-            })
-            .map_err(map_authority_sql_error)?;
-        match outcome {
-            AuthorityFinishDrainOutcome::Finished(row) => Ok(*row),
-            AuthorityFinishDrainOutcome::FeedHeadAdvanced { captured, found } => {
-                Err(McStoreError::AuthorityFeedHeadAdvanced { captured, found })
-            }
-        }
-    }
-
-    /// Upsert a seeded context row by its durable source key. The source key is
-    /// intentionally independent of the module's integer id allocation.
-    ///
-    /// This compatibility wrapper keeps the original one-row API for tests and older
-    /// callers. The authority wire path uses [`Self::seed_authority_rows`] so one frame
-    /// owns one fenced transaction.
-    pub fn seed_authority_row(
-        &self,
-        context_store_uuid: &str,
-        domain: &str,
-        source_row_id: i64,
-        snapshot: &Value,
-    ) -> Result<i64, McStoreError> {
-        let project = snapshot
-            .get("project_path")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let row = AuthoritySeedRow {
-            source_row_id,
-            snapshot: snapshot.clone(),
-        };
-        self.seed_authority_rows(
-            context_store_uuid,
-            project,
-            domain,
-            std::slice::from_ref(&row),
-        )?
-        .into_iter()
-        .next()
-        .ok_or_else(|| McStoreError::Serde("authority seed returned no module row id".to_string()))
-    }
-
-    /// Seed every row in one authority wire frame under one epoch-fenced transaction.
-    ///
-    /// The transaction carries the same active store fence that each old per-row call
-    /// carried. N rows under one fence is equivalent to N fences here: seeding is a
-    /// single-writer operation per project, and the fence rejects strictly-newer epochs.
-    /// A frame is validated and committed atomically, so a bad row fails loudly without
-    /// leaving a partially applied frame behind.
-    pub fn seed_authority_rows(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-        rows: &[AuthoritySeedRow],
-    ) -> Result<Vec<i64>, McStoreError> {
-        validate_authority_domain(domain)?;
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-        match domain {
-            "memories" => self.seed_memory_snapshots(context_store_uuid, project, rows),
-            "notes" => self.seed_note_snapshots(context_store_uuid, project, rows),
-            _ => unreachable!(),
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn authority_seed_transaction_count_for_test(&self) -> usize {
-        self.authority_seed_transaction_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn authority_seed_resolution_pass_count_for_test(&self) -> usize {
-        self.authority_seed_resolution_pass_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub fn authority_seed_checksum(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        domain: &str,
-    ) -> Result<String, McStoreError> {
-        validate_authority_domain(domain)?;
-        let rows = self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT source_row_id, snapshot_json FROM mc_authority_seed_rows WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3 ORDER BY source_row_id ASC",
-            )?;
-            let rows = statement
-                .query_map(params![context_store_uuid, project, domain], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })?;
-        let mut canonical_rows = Vec::with_capacity(rows.len());
-        for (source_row_id, snapshot_json) in rows {
-            let snapshot: Value = serde_json::from_str(&snapshot_json)
-                .map_err(|error| McStoreError::Serde(error.to_string()))?;
-            canonical_rows.push(serde_json::json!({
-                "source_row_id": source_row_id,
-                "snapshot": snapshot,
-            }));
-        }
-        let canonical = canonical_authority_value(&Value::Array(canonical_rows));
-        Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
-    }
-
-    fn seed_memory_snapshots(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        rows: &[AuthoritySeedRow],
-    ) -> Result<Vec<i64>, McStoreError> {
-        struct PreparedMemorySeed {
-            source_row_id: i64,
-            snapshot_json: String,
-            mapping_json: Option<String>,
-            mapping_origin: Option<String>,
-            category: String,
-            normalized_hash: String,
-        }
-
-        let prepared = rows
-            .iter()
-            .map(|row| {
-                let object = row.snapshot.as_object().ok_or_else(|| {
-                    McStoreError::Serde("memory seed snapshot must be an object".to_string())
-                })?;
-                if object.get("project_path").and_then(Value::as_str) != Some(project) {
-                    return Err(McStoreError::Serde(
-                        "memory seed snapshot project_path did not match the authority project"
-                            .to_string(),
-                    ));
-                }
-                let snapshot_json = serde_json::to_string(&row.snapshot)
-                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                let mapping_json = object
-                    .get("mapping")
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                let mapping_origin = object
-                    .get("mapping_origin")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                Ok(PreparedMemorySeed {
-                    source_row_id: row.source_row_id,
-                    snapshot_json,
-                    mapping_json,
-                    mapping_origin,
-                    category: object
-                        .get("category")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    normalized_hash: object
-                        .get("normalized_hash")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-            })
-            .collect::<Result<Vec<_>, McStoreError>>()?;
-
-        // A wire frame can contain natural-key duplicates even though source row ids differ.
-        // The source database's final row is authoritative, so process only the last snapshot
-        // while retaining an alias from every source id to that survivor's module row.
-        let mut last_index_by_natural_key = BTreeMap::new();
-        for (index, row) in prepared.iter().enumerate() {
-            last_index_by_natural_key
-                .insert((row.category.clone(), row.normalized_hash.clone()), index);
-        }
-        let survivor_index_for_row = prepared
-            .iter()
-            .map(|row| {
-                *last_index_by_natural_key
-                    .get(&(row.category.clone(), row.normalized_hash.clone()))
-                    .expect("every prepared memory has a natural-key survivor")
-            })
-            .collect::<Vec<_>>();
-        let source_aliases = prepared
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                (
-                    row.source_row_id,
-                    prepared[survivor_index_for_row[index]].source_row_id,
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
-        #[cfg(any(test, feature = "test-support"))]
-        self.authority_seed_transaction_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        self.inner
-            .with_conn_fenced(|tx| {
-                let mut memory_by_identity = tx.prepare(
-                    "SELECT id, project_path, category, normalized_hash
-                       FROM mc_memories
-                      WHERE context_store_uuid = ?1 AND context_row_id = ?2",
-                )?;
-                let mut memory_by_natural_key = tx.prepare(
-                    "SELECT id FROM mc_memories
-                      WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
-                      ORDER BY updated_at DESC, id DESC
-                      LIMIT 1",
-                )?;
-                let mut memory_merge_into_survivor = tx.prepare(
-                    "UPDATE mc_memories AS survivor
-                        SET content = COALESCE((
-                                SELECT candidate.content
-                                  FROM mc_memories candidate
-                                 WHERE candidate.project_path = ?1
-                                   AND candidate.category = ?2
-                                   AND candidate.normalized_hash = ?3
-                                 ORDER BY candidate.updated_at DESC, candidate.id DESC
-                                 LIMIT 1
-                            ), survivor.content),
-                            updated_at = COALESCE((
-                                SELECT MAX(candidate.updated_at)
-                                  FROM mc_memories candidate
-                                 WHERE candidate.project_path = ?1
-                                   AND candidate.category = ?2
-                                   AND candidate.normalized_hash = ?3
-                            ), survivor.updated_at),
-                            verified_at = (
-                                SELECT MAX(candidate.verified_at)
-                                  FROM mc_memories candidate
-                                 WHERE candidate.id = ?4 OR (
-                                       candidate.project_path = ?1
-                                   AND candidate.category = ?2
-                                   AND candidate.normalized_hash = ?3
-                                 )
-                            ),
-                            classified_at = (
-                                SELECT MAX(candidate.classified_at)
-                                  FROM mc_memories candidate
-                                 WHERE candidate.id = ?4 OR (
-                                       candidate.project_path = ?1
-                                   AND candidate.category = ?2
-                                   AND candidate.normalized_hash = ?3
-                                 )
-                            )
-                      WHERE survivor.id = ?4",
-                )?;
-                let mut mapping_delete_twins = tx.prepare(
-                    "DELETE FROM mc_memory_mappings
-                      WHERE memory_id != ?4
-                        AND memory_id IN (
-                            SELECT id FROM mc_memories
-                             WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
-                        )",
-                )?;
-                let mut memory_delete_twins = tx.prepare(
-                    "DELETE FROM mc_memories
-                      WHERE id != ?4
-                        AND project_path = ?1 AND category = ?2 AND normalized_hash = ?3",
-                )?;
-                let mut memory_adopt_by_id = tx.prepare(
-                    "UPDATE mc_memories
-                        SET project_path=?1, category=?2,
-                            content=CASE WHEN ?27 != 0 OR ?14 >= updated_at THEN ?3 ELSE content END,
-                            normalized_hash=?4,
-                            importance=?5, scope=?6, shareable=?7, source_session_id=?8,
-                            source_type=?9, seen_count=?10, retrieval_count=?11,
-                            first_seen_at=?12, created_at=?13, updated_at=MAX(updated_at, ?14),
-                            last_seen_at=?15, last_retrieved_at=?16, status=?17, expires_at=?18,
-                            verification_status=?19,
-                            verified_at=CASE
-                                WHEN verified_at IS NULL THEN ?20
-                                WHEN ?20 IS NULL THEN verified_at
-                                ELSE MAX(verified_at, ?20)
-                            END,
-                            classified_at=CASE
-                                WHEN classified_at IS NULL THEN ?21
-                                WHEN ?21 IS NULL THEN classified_at
-                                ELSE MAX(classified_at, ?21)
-                            END,
-                            superseded_by_memory_id=?22, merged_from=?23, metadata_json=?24,
-                            context_store_uuid=?25, context_row_id=?26, host_row_id=?28
-                      WHERE id=?29",
-                )?;
-                let mut memory_upsert = tx.prepare(
-                    "INSERT INTO mc_memories
-                        (project_path, category, content, normalized_hash, importance, scope, shareable,
-                         source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
-                         created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
-                         verification_status, verified_at, classified_at, superseded_by_memory_id,
-                         merged_from, metadata_json, context_store_uuid, context_row_id, host_row_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
-                     ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
-                        project_path=excluded.project_path, category=excluded.category,
-                        content=excluded.content, normalized_hash=excluded.normalized_hash,
-                        importance=excluded.importance, scope=excluded.scope, shareable=excluded.shareable,
-                        source_session_id=excluded.source_session_id, source_type=excluded.source_type,
-                        seen_count=excluded.seen_count, retrieval_count=excluded.retrieval_count,
-                        first_seen_at=excluded.first_seen_at, created_at=excluded.created_at,
-                        updated_at=excluded.updated_at, last_seen_at=excluded.last_seen_at,
-                        last_retrieved_at=excluded.last_retrieved_at, status=excluded.status,
-                        expires_at=excluded.expires_at, verification_status=excluded.verification_status,
-                        verified_at=CASE
-                            WHEN verified_at IS NULL THEN excluded.verified_at
-                            WHEN excluded.verified_at IS NULL THEN verified_at
-                            ELSE MAX(verified_at, excluded.verified_at)
-                        END,
-                        classified_at=CASE
-                            WHEN classified_at IS NULL THEN excluded.classified_at
-                            WHEN excluded.classified_at IS NULL THEN classified_at
-                            ELSE MAX(classified_at, excluded.classified_at)
-                        END,
-                         superseded_by_memory_id=excluded.superseded_by_memory_id,
-                         merged_from=excluded.merged_from, metadata_json=excluded.metadata_json,
-                         host_row_id=excluded.host_row_id",
-                )?;
-                let mut memory_by_source = tx.prepare(
-                    "SELECT id FROM mc_memories
-                       WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
-                )?;
-                let mut pending_upsert = tx.prepare(
-                    "INSERT INTO mc_authority_pending_memory_references(
-                         context_store_uuid, project, domain, source_context_row_id, target_context_row_id
-                     ) VALUES (?1, ?2, 'memories', ?3, ?4)
-                     ON CONFLICT(context_store_uuid, project, domain, source_context_row_id)
-                     DO UPDATE SET target_context_row_id = excluded.target_context_row_id",
-                )?;
-                let mut pending_delete = tx.prepare(
-                    "DELETE FROM mc_authority_pending_memory_references
-                       WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
-                         AND source_context_row_id = ?3",
-                )?;
-                let mut mapping_upsert = tx.prepare(
-                    "INSERT INTO mc_memory_mappings
-                         (memory_id, project_path, mapped_files_json, updated_at, mapping_origin)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(memory_id) DO UPDATE SET
-                         project_path = excluded.project_path,
-                         mapped_files_json = excluded.mapped_files_json,
-                         updated_at = excluded.updated_at,
-                         mapping_origin = excluded.mapping_origin",
-                )?;
-                let mut mapping_delete =
-                    tx.prepare("DELETE FROM mc_memory_mappings WHERE memory_id = ?1")?;
-                let mut seed_row_upsert = tx.prepare(
-                    "INSERT INTO mc_authority_seed_rows(
-                         context_store_uuid, project, domain, source_row_id, snapshot_json
-                     ) VALUES (?1, ?2, 'memories', ?3, ?4)
-                     ON CONFLICT(context_store_uuid, project, domain, source_row_id)
-                     DO UPDATE SET snapshot_json = excluded.snapshot_json",
-                )?;
-                let mut module_row_id_by_survivor = HashMap::new();
-
-                for (index, row) in rows.iter().enumerate() {
-                    if survivor_index_for_row[index] != index {
-                        continue;
-                    }
-                    let prepared_row = &prepared[index];
-                    let object = row.snapshot.as_object().expect("validated memory seed object");
-                    let text = |name: &str| object.get(name).and_then(Value::as_str);
-                    let integer = |name: &str| object.get(name).and_then(Value::as_i64);
-                    let target_source_row_id = integer("superseded_by_memory_id");
-                    let canonical_target_source_row_id = target_source_row_id.map(|target| {
-                        source_aliases.get(&target).copied().unwrap_or(target)
-                    });
-                    let superseded_by_memory_id = match canonical_target_source_row_id {
-                        Some(target) => memory_by_source
-                            .query_row(params![context_store_uuid, project, target], |row| {
-                                row.get::<_, i64>(0)
-                            })
-                            .optional()?,
-                        None => None,
-                    };
-                    let existing_identity = memory_by_identity
-                        .query_row(params![context_store_uuid, prepared_row.source_row_id], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                            ))
-                        })
-                        .optional()?;
-                    let natural_candidate = memory_by_natural_key
-                        .query_row(
-                            params![project, &prepared_row.category, &prepared_row.normalized_hash],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .optional()?;
-                    let selected_id = existing_identity
-                        .as_ref()
-                        .map(|existing| existing.0)
-                        .or(natural_candidate);
-
-                    if let Some(selected_id) = selected_id {
-                        memory_merge_into_survivor.execute(params![
-                            project,
-                            &prepared_row.category,
-                            &prepared_row.normalized_hash,
-                            selected_id,
-                        ])?;
-                        mapping_delete_twins.execute(params![
-                            project,
-                            &prepared_row.category,
-                            &prepared_row.normalized_hash,
-                            selected_id,
-                        ])?;
-                        memory_delete_twins.execute(params![
-                            project,
-                            &prepared_row.category,
-                            &prepared_row.normalized_hash,
-                            selected_id,
-                        ])?;
-                        let force_incoming_content = existing_identity
-                            .as_ref()
-                            .is_some_and(|existing| {
-                                existing.1 != project
-                                    || existing.2 != prepared_row.category
-                                    || existing.3 != prepared_row.normalized_hash
-                            });
-                        memory_adopt_by_id.execute(params![
-                            project,
-                            &prepared_row.category,
-                            text("content").unwrap_or_default(),
-                            &prepared_row.normalized_hash,
-                            integer("importance"),
-                            text("scope").unwrap_or("project"),
-                            integer("shareable").unwrap_or(0),
-                            text("source_session_id"),
-                            text("source_type").unwrap_or("historian"),
-                            integer("seen_count").unwrap_or(1),
-                            integer("retrieval_count").unwrap_or(0),
-                            integer("first_seen_at").unwrap_or(0),
-                            integer("created_at").unwrap_or(0),
-                            integer("updated_at").unwrap_or(0),
-                            integer("last_seen_at").unwrap_or(0),
-                            integer("last_retrieved_at"),
-                            text("status").unwrap_or("active"),
-                            integer("expires_at"),
-                            text("verification_status").unwrap_or("unverified"),
-                            integer("verified_at"),
-                            integer("classified_at"),
-                            superseded_by_memory_id,
-                            text("merged_from"),
-                            text("metadata_json"),
-                            context_store_uuid,
-                            prepared_row.source_row_id,
-                            i64::from(force_incoming_content),
-                            prepared_row.source_row_id,
-                            selected_id,
-                        ])?;
-                    } else {
-                        memory_upsert.execute(params![
-                            project,
-                            &prepared_row.category,
-                            text("content").unwrap_or_default(),
-                            &prepared_row.normalized_hash,
-                            integer("importance"),
-                            text("scope").unwrap_or("project"),
-                            integer("shareable").unwrap_or(0),
-                            text("source_session_id"),
-                            text("source_type").unwrap_or("historian"),
-                            integer("seen_count").unwrap_or(1),
-                            integer("retrieval_count").unwrap_or(0),
-                            integer("first_seen_at").unwrap_or(0),
-                            integer("created_at").unwrap_or(0),
-                            integer("updated_at").unwrap_or(0),
-                            integer("last_seen_at").unwrap_or(0),
-                            integer("last_retrieved_at"),
-                            text("status").unwrap_or("active"),
-                            integer("expires_at"),
-                            text("verification_status").unwrap_or("unverified"),
-                            integer("verified_at"),
-                            integer("classified_at"),
-                            superseded_by_memory_id,
-                            text("merged_from"),
-                            text("metadata_json"),
-                            context_store_uuid,
-                            prepared_row.source_row_id,
-                            prepared_row.source_row_id,
-                        ])?;
-                    }
-
-                    let module_row_id: i64 = memory_by_source.query_row(
-                        params![context_store_uuid, project, prepared_row.source_row_id],
-                        |row| row.get(0),
-                    )?;
-                    if let (Some(target), None) =
-                        (canonical_target_source_row_id, superseded_by_memory_id)
-                    {
-                        pending_upsert.execute(params![
-                            context_store_uuid,
-                            project,
-                            prepared_row.source_row_id,
-                            target,
-                        ])?;
-                    } else {
-                        pending_delete.execute(params![
-                            context_store_uuid,
-                            project,
-                            prepared_row.source_row_id
-                        ])?;
-                    }
-                    if let Some(mapped_files_json) = &prepared_row.mapping_json {
-                        mapping_upsert.execute(params![
-                            module_row_id,
-                            project,
-                            mapped_files_json,
-                            integer("updated_at").unwrap_or(0),
-                            prepared_row.mapping_origin.as_deref().unwrap_or("mapper"),
-                        ])?;
-                    } else {
-                        mapping_delete.execute(params![module_row_id])?;
-                    }
-                    module_row_id_by_survivor.insert(index, module_row_id);
-                }
-
-                // Keep the digest source complete even though duplicate natural keys share one
-                // physical module row. Pending target references use the same aliases so a
-                // reference to either context row resolves to the survivor.
-                for prepared_row in &prepared {
-                    seed_row_upsert.execute(params![
-                        context_store_uuid,
-                        project,
-                        prepared_row.source_row_id,
-                        &prepared_row.snapshot_json,
-                    ])?;
-                }
-                for (source_row_id, survivor_source_row_id) in &source_aliases {
-                    if source_row_id == survivor_source_row_id {
-                        continue;
-                    }
-                    tx.execute(
-                        "UPDATE mc_authority_pending_memory_references
-                            SET target_context_row_id = ?1
-                          WHERE context_store_uuid = ?2 AND project = ?3 AND domain = 'memories'
-                            AND target_context_row_id = ?4",
-                        params![
-                            survivor_source_row_id,
-                            context_store_uuid,
-                            project,
-                            source_row_id
-                        ],
-                    )?;
-                    pending_delete.execute(params![context_store_uuid, project, source_row_id])?;
-                }
-
-                let module_row_ids = survivor_index_for_row
-                    .iter()
-                    .map(|survivor_index| {
-                        *module_row_id_by_survivor
-                            .get(survivor_index)
-                            .expect("every natural-key survivor was seeded")
-                    })
-                    .collect::<Vec<_>>();
-                drop((
-                    memory_by_identity,
-                    memory_by_natural_key,
-                    memory_merge_into_survivor,
-                    mapping_delete_twins,
-                    memory_delete_twins,
-                    memory_adopt_by_id,
-                    memory_upsert,
-                    memory_by_source,
-                    pending_upsert,
-                    pending_delete,
-                    mapping_upsert,
-                    mapping_delete,
-                    seed_row_upsert,
-                ));
-
-                // Resolve all staged forward references after the complete frame is present.
-                // The UPDATE and DELETE are one set-based pass over the pending relation; no
-                // per-memory SELECT/UPDATE loop remains on the seed hot path.
-                #[cfg(any(test, feature = "test-support"))]
-                self.authority_seed_resolution_pass_count
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                tx.execute(
-                    "UPDATE mc_memories AS source
-                        SET superseded_by_memory_id = (
-                            SELECT target.id
-                              FROM mc_authority_pending_memory_references pending
-                              JOIN mc_memories target
-                                ON target.context_store_uuid = pending.context_store_uuid
-                               AND target.project_path = pending.project
-                               AND target.context_row_id = pending.target_context_row_id
-                             WHERE pending.context_store_uuid = ?1
-                               AND pending.project = ?2
-                               AND pending.domain = 'memories'
-                               AND pending.source_context_row_id = source.context_row_id
-                        )
-                      WHERE source.context_store_uuid = ?1
-                        AND source.project_path = ?2
-                        AND EXISTS (
-                            SELECT 1
-                              FROM mc_authority_pending_memory_references pending
-                              JOIN mc_memories target
-                                ON target.context_store_uuid = pending.context_store_uuid
-                               AND target.project_path = pending.project
-                               AND target.context_row_id = pending.target_context_row_id
-                             WHERE pending.context_store_uuid = ?1
-                               AND pending.project = ?2
-                               AND pending.domain = 'memories'
-                               AND pending.source_context_row_id = source.context_row_id
-                        )",
-                    params![context_store_uuid, project],
-                )?;
-                tx.execute(
-                    "DELETE FROM mc_authority_pending_memory_references AS pending
-                      WHERE pending.context_store_uuid = ?1
-                        AND pending.project = ?2
-                        AND pending.domain = 'memories'
-                        AND EXISTS (
-                            SELECT 1 FROM mc_memories target
-                             WHERE target.context_store_uuid = pending.context_store_uuid
-                               AND target.project_path = pending.project
-                               AND target.context_row_id = pending.target_context_row_id
-                        )",
-                    params![context_store_uuid, project],
-                )?;
-                Ok(module_row_ids)
-            })
-            .map_err(Into::into)
-    }
-
-    fn seed_note_snapshots(
-        &self,
-        context_store_uuid: &str,
-        project: &str,
-        rows: &[AuthoritySeedRow],
-    ) -> Result<Vec<i64>, McStoreError> {
-        let prepared = rows
-            .iter()
-            .map(|row| {
-                let object = row.snapshot.as_object().ok_or_else(|| {
-                    McStoreError::Serde("note seed snapshot must be an object".to_string())
-                })?;
-                if object.get("project_path").and_then(Value::as_str) != Some(project) {
-                    return Err(McStoreError::Serde(
-                        "note seed snapshot project_path did not match the authority project"
-                            .to_string(),
-                    ));
-                }
-                let snapshot_json = serde_json::to_string(&row.snapshot)
-                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                Ok((row.source_row_id, snapshot_json))
-            })
-            .collect::<Result<Vec<_>, McStoreError>>()?;
-
-        #[cfg(any(test, feature = "test-support"))]
-        self.authority_seed_transaction_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        self.with_note_conn_fenced(project, |tx| {
-            let mut note_upsert = tx.prepare(&format!(
-                "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
-                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
-                 ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
-                    type=excluded.type, project_path=excluded.project_path,
-                    session_id=excluded.session_id, content=excluded.content,
-                    status=excluded.status, surface_condition=excluded.surface_condition,
-                    compiled_provider=excluded.compiled_provider,
-                    compiled_config=excluded.compiled_config, compiled_at=excluded.compiled_at,
-                    compile_status=excluded.compile_status,
-                    ready_at=excluded.ready_at, ready_reason=excluded.ready_reason,
-                    manifest_json=excluded.manifest_json, compiled_check=excluded.compiled_check,
-                    check_hash=excluded.check_hash, check_cron=excluded.check_cron,
-                    check_failure_count=excluded.check_failure_count,
-                    check_network_failure_count=excluded.check_network_failure_count,
-                    check_quarantined_until=excluded.check_quarantined_until,
-                    check_next_due_at=excluded.check_next_due_at, check_compiled_at=excluded.check_compiled_at,
-                    check_false_since_at=excluded.check_false_since_at,
-                    check_last_liveness_at=excluded.check_last_liveness_at,
-                    last_checked_at=excluded.last_checked_at, check_status=excluded.check_status,
-                    check_version=excluded.check_version, policy_version=excluded.policy_version,
-                    harness=excluded.harness, anchor_block_id=excluded.anchor_block_id,
-                    anchor_ordinal=excluded.anchor_ordinal, dismissed_at=excluded.dismissed_at,
-                    dismissal_resolution=excluded.dismissal_resolution,
-                    status_version=excluded.status_version, created_at_ms=excluded.created_at_ms,
-                    updated_at_ms=excluded.updated_at_ms"
-            ))?;
-            let mut note_by_source = tx.prepare(
-                "SELECT id FROM mc_notes
-                   WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
-            )?;
-            let mut seed_row_upsert = tx.prepare(
-                "INSERT INTO mc_authority_seed_rows(
-                     context_store_uuid, project, domain, source_row_id, snapshot_json
-                 ) VALUES (?1, ?2, 'notes', ?3, ?4)
-                 ON CONFLICT(context_store_uuid, project, domain, source_row_id)
-                 DO UPDATE SET snapshot_json = excluded.snapshot_json",
-            )?;
-            let mut module_row_ids = Vec::with_capacity(rows.len());
-
-            for ((source_row_id, snapshot_json), row) in prepared.iter().zip(rows) {
-                let object = row.snapshot.as_object().expect("validated note seed object");
-                let text = |name: &str| object.get(name).and_then(Value::as_str);
-                let integer = |name: &str| object.get(name).and_then(Value::as_i64);
-                note_upsert.execute(params![
-                    text("type").unwrap_or("smart"),
-                    project,
-                    text("session_id"),
-                    text("content").unwrap_or(""),
-                    text("status").unwrap_or("active"),
-                    text("surface_condition"),
-                    text("compiled_provider"),
-                    text("compiled_config"),
-                    integer("compiled_at"),
-                    text("compile_status"),
-                    integer("ready_at"),
-                    text("ready_reason"),
-                    text("manifest_json"),
-                    text("compiled_check"),
-                    text("check_hash"),
-                    text("check_cron"),
-                    integer("check_failure_count").unwrap_or(0),
-                    integer("check_network_failure_count").unwrap_or(0),
-                    integer("check_quarantined_until"),
-                    integer("check_next_due_at"),
-                    integer("check_compiled_at"),
-                    integer("check_false_since_at"),
-                    integer("check_last_liveness_at"),
-                    integer("last_checked_at"),
-                    text("check_status").unwrap_or("uncompiled"),
-                    integer("check_version").unwrap_or(0),
-                    integer("policy_version").unwrap_or(1),
-                    text("harness").unwrap_or("module"),
-                    text("anchor_block_id"),
-                    integer("anchor_ordinal"),
-                    integer("dismissed_at"),
-                    text("dismissal_resolution"),
-                    integer("status_version").unwrap_or(0),
-                    integer("created_at_ms").or_else(|| integer("created_at")).unwrap_or(0),
-                    integer("updated_at_ms").or_else(|| integer("updated_at")).unwrap_or(0),
-                    context_store_uuid,
-                    source_row_id,
-                ])?;
-                let module_row_id: i64 = note_by_source.query_row(
-                    params![context_store_uuid, project, source_row_id],
-                    |row| row.get(0),
-                )?;
-                seed_row_upsert.execute(params![
-                    context_store_uuid,
-                    project,
-                    source_row_id,
-                    snapshot_json,
-                ])?;
-                module_row_ids.push(module_row_id);
-            }
-            Ok(module_row_ids)
-        })
-    }
-
-    /// Return the newest sequence available to a domain mirror consumer.
-    pub fn changefeed_head(&self, domain: &str) -> Result<i64, McStoreError> {
-        validate_authority_domain(domain)?;
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
-                    params![domain],
-                    |row| row.get(0),
-                )
-            })
-            .map_err(Into::into)
-    }
-
-    /// Return the latest complete feed snapshot for one live memory without advancing a
-    /// consumer cursor. Host adapters use this bounded path to obtain a freshly written row's
-    /// context.db id before replying; the ordinary cursor drain may replay it idempotently.
-    pub fn pull_memory_changefeed_row(
-        &self,
-        module_row_id: i64,
-    ) -> Result<Option<ChangefeedRow>, McStoreError> {
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT feed_seq, domain, op, module_row_id, full_row_snapshot, content_hash
-                       FROM mc_changefeed
-                      WHERE domain = 'memories' AND module_row_id = ?1 AND op != 'tombstone'
-                      ORDER BY feed_seq DESC LIMIT 1",
-                    params![module_row_id],
-                    |row| {
-                        let snapshot: String = row.get(4)?;
-                        Ok(ChangefeedRow {
-                            feed_seq: row.get(0)?,
-                            domain: row.get(1)?,
-                            op: row.get(2)?,
-                            module_row_id: row.get(3)?,
-                            full_row_snapshot: serde_json::from_str(&snapshot).map_err(
-                                |error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        4,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                },
-                            )?,
-                            content_hash: row.get(5)?,
-                        })
-                    },
-                )
-                .optional()
-            })
-            .map_err(Into::into)
-    }
-
-    /// Count current module-owned memory rows for mirror-health discrimination.
-    pub fn live_memory_row_count(&self) -> Result<i64, McStoreError> {
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM mc_memories", [], |row| row.get(0))
-            })
-            .map_err(Into::into)
-    }
-
-    /// Pull a bounded, ordered feed page. The cursor is a global feed sequence;
-    /// filtering by domain preserves monotonic retry semantics even when domains interleave.
-    pub fn pull_changefeed(
-        &self,
-        domain: &str,
-        cursor: i64,
-        limit: usize,
-    ) -> Result<ChangefeedPage, McStoreError> {
-        validate_authority_domain(domain)?;
-        let limit = i64::try_from(limit.clamp(1, 1000))
-            .map_err(|_| McStoreError::Serde("feed limit exceeds i64".to_string()))?;
-        self.inner
-            .with_conn(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT feed_seq, domain, op, module_row_id, full_row_snapshot, content_hash
-                       FROM mc_changefeed WHERE domain = ?1 AND feed_seq > ?2
-                       ORDER BY feed_seq ASC LIMIT ?3",
-                )?;
-                let rows = stmt
-                    .query_map(params![domain, cursor, limit], |row| {
-                        let snapshot: String = row.get(4)?;
-                        Ok(ChangefeedRow {
-                            feed_seq: row.get(0)?,
-                            domain: row.get(1)?,
-                            op: row.get(2)?,
-                            module_row_id: row.get(3)?,
-                            full_row_snapshot: serde_json::from_str(&snapshot).map_err(
-                                |error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        4,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                },
-                            )?,
-                            content_hash: row.get(5)?,
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let next_cursor = rows.last().map(|row| row.feed_seq).unwrap_or(cursor);
-                Ok(ChangefeedPage {
-                    domain: domain.to_string(),
-                    cursor,
-                    next_cursor,
-                    has_more: rows.len() == limit as usize,
-                    rows,
-                })
-            })
-            .map_err(Into::into)
-    }
-
-    /// Enumerate the module's currently live memory identities for a mirror upgrade.
-    /// This keyset snapshot is applied before old feed tombstones may delete context rows.
-    pub fn pull_live_memory_snapshot(
-        &self,
-        cursor: i64,
-        limit: usize,
-    ) -> Result<ChangefeedPage, McStoreError> {
-        let limit = i64::try_from(limit.clamp(1, 1000))
-            .map_err(|_| McStoreError::Serde("snapshot limit exceeds i64".to_string()))?;
-        self.inner
-            .with_conn(|conn| {
-                // The resnapshot consumer heals mirror rows from these snapshots, so each row
-                // carries both the complete memory and its current mapping state.
-                let mut stmt = conn.prepare(&format!(
-                    "{MEMORY_FULL_SELECT_COLUMNS} FROM mc_memories WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
-                ))?;
-                let memories = stmt
-                    .query_map(params![cursor, limit], stored_memory_full_from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let rows = memories
-                    .into_iter()
-                    .map(|memory| {
-                        let mapping = memory_mapping_feed_value(conn, memory.id)?;
-                        let mapping_origin = memory_mapping_origin_feed_value(conn, memory.id)?;
-                        Ok(ChangefeedRow {
-                            feed_seq: 0,
-                            domain: "memories".to_string(),
-                            op: "insert".to_string(),
-                            module_row_id: memory.id,
-                            content_hash: Some(memory.normalized_hash.clone()),
-                            full_row_snapshot: memory_feed_snapshot(&memory, mapping, mapping_origin),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-                let next_cursor = rows.last().map(|row| row.module_row_id).unwrap_or(cursor);
-                Ok(ChangefeedPage {
-                    domain: "memories".to_string(),
-                    cursor,
-                    next_cursor,
-                    has_more: rows.len() == limit as usize,
-                    rows,
-                })
-            })
-            .map_err(Into::into)
-    }
+        .optional()?
+        .unwrap_or_else(|| "opencode".to_string()))
 }
 
-fn write_seed_compartment_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    c: &StoredCompartment,
-    overwrite_existing: bool,
-) -> rusqlite::Result<bool> {
-    let conflict_clause = if overwrite_existing {
-        "ON CONFLICT(session_id, sequence) DO UPDATE SET
-            start_message = excluded.start_message,
-            end_message = excluded.end_message,
-            start_message_id = excluded.start_message_id,
-            end_message_id = excluded.end_message_id,
-            start_date = excluded.start_date,
-            end_date = excluded.end_date,
-            title = excluded.title,
-            content = excluded.content,
-            p1 = excluded.p1,
-            p2 = excluded.p2,
-            p3 = excluded.p3,
-            p4 = excluded.p4,
-            importance = excluded.importance,
-            episode_type = excluded.episode_type,
-            legacy = excluded.legacy,
-            created_at = excluded.created_at"
-    } else {
-        "ON CONFLICT(session_id, sequence) DO NOTHING"
-    };
-    let sql = format!(
-        "INSERT INTO mc_compartments
-           (session_id, sequence, start_message, end_message, start_message_id,
-            end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
-            importance, episode_type, legacy, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-         {conflict_clause}"
-    );
-    let changed = tx.execute(
-        &sql,
-        params![
-            session_id,
-            c.sequence,
-            c.start_message,
-            c.end_message,
-            &c.start_message_id,
-            &c.end_message_id,
-            c.start_date.as_deref(),
-            c.end_date.as_deref(),
-            &c.title,
-            &c.content,
-            c.p1.as_deref(),
-            c.p2.as_deref(),
-            c.p3.as_deref(),
-            c.p4.as_deref(),
-            c.importance as i64,
-            c.episode_type.as_deref(),
-            c.legacy as i64,
-            c.created_at,
-        ],
-    )?;
-    Ok(changed != 0)
-}
-
-fn replace_workspace_tx(
-    tx: &rusqlite::Transaction<'_>,
-    project_path: &str,
-    workspace: Option<&ModuleWorkspaceRow>,
-) -> rusqlite::Result<()> {
-    // Authority workspaces store the bound domain identity as their owning member, while
-    // state sync addresses the route by filesystem path. Clear a replaced workspace through
-    // either spelling, but retain a same-name row so reactivation preserves its durable id.
-    tx.execute(
-        "DELETE FROM mc_workspaces
-          WHERE id IN (
-              SELECT member.workspace_id
-                FROM mc_workspace_members member
-                LEFT JOIN mc_authority_route_bindings binding
-                  ON binding.route_project_root = ?1
-               WHERE member.project_path = ?1
-                  OR member.project_path = binding.project
-          )
-            AND (?2 IS NULL OR name <> ?2)",
-        params![project_path, workspace.map(|row| row.name.as_str())],
-    )?;
-    let Some(workspace) = workspace else {
-        return Ok(());
-    };
-    let share_categories = serde_json::to_string(&workspace.share_categories)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    tx.execute(
-        "INSERT INTO mc_workspaces (name, created_at, updated_at, share_categories)
-         VALUES (?1, 0, 0, ?2)
-         ON CONFLICT(name) DO UPDATE SET
-             name = excluded.name,
-             share_categories = excluded.share_categories",
-        params![&workspace.name, share_categories],
-    )?;
-    let workspace_id: i64 = tx.query_row(
-        "SELECT id FROM mc_workspaces WHERE name = ?1",
-        params![&workspace.name],
-        |row| row.get(0),
-    )?;
-    tx.execute(
-        "DELETE FROM mc_workspace_members WHERE workspace_id = ?1",
-        params![workspace_id],
-    )?;
-    for member in &workspace.members {
-        tx.execute(
-            "INSERT INTO mc_workspace_members
-                (workspace_id, project_path, display_name, display_path, added_at)
-             VALUES (?1, ?2, ?3, ?4, 0)
-             ON CONFLICT(project_path) DO UPDATE SET
-                 workspace_id = excluded.workspace_id,
-                 display_name = excluded.display_name,
-                 display_path = excluded.display_path",
-            params![
-                workspace_id,
-                &member.project_path,
-                &member.display_name,
-                &member.display_path
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn authority_route_context_store_uuid_tx(
-    tx: &rusqlite::Transaction<'_>,
-    route_project_root: &str,
-) -> rusqlite::Result<Option<String>> {
-    tx.query_row(
-        "SELECT context_store_uuid
-           FROM mc_authority_route_bindings
-          WHERE route_project_root = ?1",
-        params![route_project_root],
-        |row| row.get(0),
-    )
-    .optional()
-}
-
-fn authority_memory_id_for_source_tx(
-    tx: &rusqlite::Transaction<'_>,
-    context_store_uuid: Option<&str>,
-    context_row_id: i64,
-) -> rusqlite::Result<Option<i64>> {
-    let Some(context_store_uuid) = context_store_uuid else {
-        return Ok(None);
-    };
-    tx.query_row(
-        "SELECT id FROM mc_memories
-          WHERE context_store_uuid = ?1 AND context_row_id = ?2",
-        params![context_store_uuid, context_row_id],
-        |row| row.get(0),
-    )
-    .optional()
-}
-
-fn replace_authority_memories_tx(
-    tx: &rusqlite::Transaction<'_>,
-    route_project_root: &str,
-    memories: &[ModuleMemoryRow],
-) -> rusqlite::Result<()> {
-    let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
-    for memory in memories {
-        // The source row id is the context identity, not necessarily the module row id
-        // allocated during the authority seed. Adopt that seeded row before the ordinary
-        // id/content upserts so a mirror-back update cannot create a second module row.
-        let superseded_by_memory_id = memory
-            .superseded_by_memory_id
-            .map(|source_id| {
-                authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), source_id)
-                    .map(|translated| translated.unwrap_or(source_id))
-            })
-            .transpose()?;
-        if let Some(existing_id) =
-            authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), memory.id)?
-        {
-            tx.execute(
-                "UPDATE mc_memories
-                    SET project_path = ?2, category = ?3, content = ?4, normalized_hash = ?5,
-                        importance = ?6, scope = ?7, shareable = ?8, source_session_id = ?9,
-                        source_type = ?10, seen_count = ?11, retrieval_count = ?12,
-                        first_seen_at = ?13, created_at = ?14, updated_at = ?15, last_seen_at = ?16,
-                        last_retrieved_at = ?17, status = ?18, expires_at = ?19,
-                        verification_status = ?20, verified_at = ?21, classified_at = ?22,
-                        superseded_by_memory_id = ?23, merged_from = ?24, metadata_json = ?25,
-                        mural_cue = ?26, mural_cue_hash = ?27, mural_cue_at = ?28,
-                        mural_cue_rejection_count = ?29, host_row_id = ?30
-                  WHERE id = ?1",
-                params![
-                    existing_id,
-                    &memory.project_path,
-                    &memory.category,
-                    &memory.content,
-                    &memory.normalized_hash,
-                    memory.importance.map(i64::from),
-                    &memory.scope,
-                    memory.shareable as i64,
-                    memory.source_session_id.as_deref(),
-                    memory.source_type.as_deref(),
-                    memory.seen_count,
-                    memory.retrieval_count,
-                    memory.first_seen_at,
-                    memory.created_at,
-                    memory.updated_at,
-                    memory.last_seen_at,
-                    memory.last_retrieved_at,
-                    &memory.status,
-                    memory.expires_at,
-                    &memory.verification_status,
-                    memory.verified_at,
-                    memory.classified_at,
-                    superseded_by_memory_id,
-                    memory.merged_from.as_deref(),
-                    memory.metadata_json.as_deref(),
-                    memory.mural_cue.as_deref(),
-                    memory.mural_cue_hash.as_deref(),
-                    memory.mural_cue_at,
-                    memory.mural_cue_rejection_count,
-                    memory.host_row_id.or(Some(memory.id)),
-                ],
-            )?;
-            continue;
-        }
-        tx.execute(
-            "INSERT INTO mc_memories
-               (id, project_path, category, content, normalized_hash, importance,
-                scope, shareable, source_session_id, source_type, seen_count, retrieval_count,
-                first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
-                status, expires_at, verification_status, verified_at, classified_at,
-                  superseded_by_memory_id, merged_from, metadata_json, mural_cue, mural_cue_hash,
-                  mural_cue_at, mural_cue_rejection_count, host_row_id)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)
-             ON CONFLICT(id) DO UPDATE SET
-                project_path = excluded.project_path,
-                category = excluded.category,
-                content = excluded.content,
-                normalized_hash = excluded.normalized_hash,
-                importance = excluded.importance,
-                scope = excluded.scope,
-                shareable = excluded.shareable,
-                source_session_id = excluded.source_session_id,
-                source_type = excluded.source_type,
-                seen_count = excluded.seen_count,
-                retrieval_count = excluded.retrieval_count,
-                first_seen_at = excluded.first_seen_at,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at,
-                last_seen_at = excluded.last_seen_at,
-                last_retrieved_at = excluded.last_retrieved_at,
-                status = excluded.status,
-                expires_at = excluded.expires_at,
-                verification_status = excluded.verification_status,
-                verified_at = excluded.verified_at,
-                classified_at = excluded.classified_at,
-                 superseded_by_memory_id = excluded.superseded_by_memory_id,
-                 merged_from = excluded.merged_from,
-                 metadata_json = excluded.metadata_json,
-                 mural_cue = excluded.mural_cue,
-                 mural_cue_hash = excluded.mural_cue_hash,
-                  mural_cue_at = excluded.mural_cue_at,
-                  mural_cue_rejection_count = excluded.mural_cue_rejection_count,
-                  host_row_id = excluded.host_row_id
-               ON CONFLICT(project_path, category, normalized_hash) DO UPDATE SET
-                 content = excluded.content,
-                 importance = excluded.importance,
-                 scope = excluded.scope,
-                 shareable = excluded.shareable,
-                 source_session_id = excluded.source_session_id,
-                 source_type = excluded.source_type,
-                 seen_count = excluded.seen_count,
-                 retrieval_count = excluded.retrieval_count,
-                 first_seen_at = excluded.first_seen_at,
-                 created_at = excluded.created_at,
-                 updated_at = excluded.updated_at,
-                 last_seen_at = excluded.last_seen_at,
-                 last_retrieved_at = excluded.last_retrieved_at,
-                 status = excluded.status,
-                 expires_at = excluded.expires_at,
-                 verification_status = excluded.verification_status,
-                 verified_at = excluded.verified_at,
-                 classified_at = excluded.classified_at,
-                 superseded_by_memory_id = excluded.superseded_by_memory_id,
-                 merged_from = excluded.merged_from,
-                 metadata_json = excluded.metadata_json,
-                 mural_cue = excluded.mural_cue,
-                 mural_cue_hash = excluded.mural_cue_hash,
-                  mural_cue_at = excluded.mural_cue_at,
-                  mural_cue_rejection_count = excluded.mural_cue_rejection_count,
-                  host_row_id = excluded.host_row_id",
-            params![
-                memory.id,
-                &memory.project_path,
-                &memory.category,
-                &memory.content,
-                &memory.normalized_hash,
-                memory.importance.map(i64::from),
-                &memory.scope,
-                memory.shareable as i64,
-                memory.source_session_id.as_deref(),
-                memory.source_type.as_deref(),
-                memory.seen_count,
-                memory.retrieval_count,
-                memory.first_seen_at,
-                memory.created_at,
-                memory.updated_at,
-                memory.last_seen_at,
-                memory.last_retrieved_at,
-                &memory.status,
-                memory.expires_at,
-                &memory.verification_status,
-                memory.verified_at,
-                memory.classified_at,
-                superseded_by_memory_id,
-                memory.merged_from.as_deref(),
-                memory.metadata_json.as_deref(),
-                memory.mural_cue.as_deref(),
-                memory.mural_cue_hash.as_deref(),
-                memory.mural_cue_at,
-                memory.mural_cue_rejection_count,
-                memory.host_row_id.or(Some(memory.id)),
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn replace_authority_memory_mutations_tx(
-    tx: &rusqlite::Transaction<'_>,
-    route_project_root: &str,
-    mutations: &[ModuleMemoryMutationRow],
-) -> rusqlite::Result<()> {
-    let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
-    for row in mutations {
-        let mutation = &row.mutation;
-        let target_memory_id = authority_memory_id_for_source_tx(
-            tx,
-            context_store_uuid.as_deref(),
-            mutation.target_memory_id,
-        )?
-        .unwrap_or(mutation.target_memory_id);
-        let superseded_by_id = mutation
-            .superseded_by_id
-            .map(|source_id| {
-                authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), source_id)
-                    .map(|translated| translated.unwrap_or(source_id))
-            })
-            .transpose()?;
-        tx.execute(
-            "INSERT INTO mc_memory_mutation_log
-               (id, project_path, mutation_type, target_memory_id, superseded_by_id,
-                category, new_content, queued_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(id) DO UPDATE SET
-                project_path = excluded.project_path,
-                mutation_type = excluded.mutation_type,
-                target_memory_id = excluded.target_memory_id,
-                superseded_by_id = excluded.superseded_by_id,
-                category = excluded.category,
-                new_content = excluded.new_content,
-                queued_at = excluded.queued_at",
-            params![
-                mutation.id,
-                &row.project_path,
-                &mutation.mutation_type,
-                target_memory_id,
-                superseded_by_id,
-                mutation.category.as_deref(),
-                mutation.new_content.as_deref(),
-                mutation.queued_at,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn replace_authority_user_profile_tx(
-    tx: &rusqlite::Transaction<'_>,
-    profile_lines: &[String],
-) -> rusqlite::Result<()> {
-    tx.execute("DELETE FROM mc_user_memories", [])?;
-    for (index, content) in profile_lines.iter().enumerate() {
-        tx.execute(
-            "INSERT INTO mc_user_memories
-                (content, status, promoted_at, source_candidate_ids, created_at, updated_at)
-             VALUES (?1, 'active', ?2, '[]', 0, 0)",
-            params![content, index as i64],
-        )?;
-    }
-    Ok(())
-}
-
+/// Insert one compartment and return its `context.db` id. Dates are not a `context.db`
+/// column; the caller records them in `store.db`'s `mc_compartment_dates`.
 fn insert_compartment_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     session_id: &str,
     sequence: i64,
     c: &StoredCompartment,
-) -> rusqlite::Result<()> {
+    harness: &str,
+) -> rusqlite::Result<i64> {
     tx.execute(
-        "INSERT INTO mc_compartments
+        "INSERT INTO compartments
            (session_id, sequence, start_message, end_message, start_message_id,
-            end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
-            importance, episode_type, legacy, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            end_message_id, title, content, p1, p2, p3, p4,
+            importance, episode_type, legacy, created_at, harness)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
         params![
             session_id,
             sequence,
@@ -18301,8 +15123,6 @@ fn insert_compartment_tx(
             c.end_message,
             &c.start_message_id,
             &c.end_message_id,
-            c.start_date.as_deref(),
-            c.end_date.as_deref(),
             &c.title,
             &c.content,
             c.p1.as_deref(),
@@ -18313,21 +15133,28 @@ fn insert_compartment_tx(
             c.episode_type.as_deref(),
             c.legacy as i64,
             c.created_at,
+            harness,
         ],
     )?;
-    Ok(())
+    Ok(tx.last_insert_rowid())
 }
 
+/// Insert historian events. An event's `compartment_id` arrives as the compartment's
+/// sequence (the only handle a fold has before its rows exist); it is written as the
+/// `context.db` id of that compartment, or NULL when the session has no such sequence.
 fn insert_historian_events_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     session_id: &str,
     events: &[HistorianEventCandidate],
+    harness: &str,
 ) -> rusqlite::Result<()> {
     for event in events {
         tx.execute(
-            "INSERT INTO mc_compartment_events
+            "INSERT INTO compartment_events
                (session_id, compartment_id, at_compartment, kind, fields_json, created_at, harness)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'module')",
+             VALUES (?1,
+                     (SELECT id FROM compartments WHERE session_id = ?1 AND sequence = ?2),
+                     ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_id,
                 event.compartment_id.map(|v| v as i64),
@@ -18335,6 +15162,7 @@ fn insert_historian_events_tx(
                 event.kind,
                 event.fields_json,
                 event.created_at,
+                harness,
             ],
         )?;
     }
@@ -18369,8 +15197,9 @@ fn mark_historian_side_channel_delivered_tx(
 }
 
 fn insert_historian_primer_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     candidate: &HistorianPrimerCandidate,
+    harness: &str,
 ) -> rusqlite::Result<()> {
     let question = candidate.question.trim();
     if question.is_empty() {
@@ -18382,12 +15211,12 @@ fn insert_historian_primer_tx(
         .join(" ")
         .to_lowercase();
     tx.execute(
-        "INSERT INTO mc_primer_candidates
+        "INSERT INTO primer_candidates
            (project_path, harness, session_id, question, normalized_question,
             source_compartment_start, source_compartment_end,
             source_start_message_id, source_end_message_id,
             source_message_time, created_at)
-         VALUES (?1, 'module', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         VALUES (?1, ?11, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(project_path, harness, session_id,
                      source_start_message_id, source_end_message_id)
          DO UPDATE SET question = excluded.question,
@@ -18395,7 +15224,7 @@ fn insert_historian_primer_tx(
                        source_compartment_start = excluded.source_compartment_start,
                        source_compartment_end = excluded.source_compartment_end,
                        source_message_time = excluded.source_message_time,
-                       created_at = MIN(mc_primer_candidates.created_at, excluded.created_at)",
+                       created_at = MIN(primer_candidates.created_at, excluded.created_at)",
         params![
             candidate.project_path,
             candidate.session_id,
@@ -18407,13 +15236,14 @@ fn insert_historian_primer_tx(
             candidate.source_end_message_id,
             candidate.source_message_time,
             candidate.created_at,
+            harness,
         ],
     )?;
     Ok(())
 }
 
 fn insert_historian_user_observation_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     candidate: &HistorianUserMemoryCandidate,
 ) -> rusqlite::Result<()> {
     let content = candidate.content.trim();
@@ -18421,7 +15251,7 @@ fn insert_historian_user_observation_tx(
         return Ok(());
     }
     tx.execute(
-        "INSERT INTO mc_user_memory_candidates
+        "INSERT INTO user_memory_candidates
            (content, session_id, source_compartment_start, source_compartment_end, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
@@ -18436,7 +15266,7 @@ fn insert_historian_user_observation_tx(
 }
 
 fn append_compartments_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     session_id: &str,
     compartments: &[StoredCompartment],
 ) -> rusqlite::Result<AppendCompartmentsTxnOutcome> {
@@ -18445,9 +15275,10 @@ fn append_compartments_tx(
     }
 
     let next_sequence = next_compartment_sequence_tx(tx, session_id)?;
+    let harness = session_harness_tx(tx, session_id)?;
     let mut statement = tx.prepare(
         "SELECT sequence, start_message, end_message
-         FROM mc_compartments WHERE session_id = ?1",
+         FROM compartments WHERE session_id = ?1",
     )?;
     let mut ranges = statement
         .query_map(params![session_id], |row| {
@@ -18481,17 +15312,23 @@ fn append_compartments_tx(
     }
 
     for (index, compartment) in compartments.iter().enumerate() {
-        insert_compartment_tx(tx, session_id, next_sequence + index as i64, compartment)?;
+        insert_compartment_tx(
+            tx,
+            session_id,
+            next_sequence + index as i64,
+            compartment,
+            &harness,
+        )?;
     }
     Ok(AppendCompartmentsTxnOutcome::Appended)
 }
 
 fn next_compartment_sequence_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     session_id: &str,
 ) -> rusqlite::Result<i64> {
     tx.query_row(
-        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mc_compartments WHERE session_id = ?1",
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM compartments WHERE session_id = ?1",
         params![session_id],
         |r| r.get(0),
     )
@@ -18668,8 +15505,22 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
 /// 1000 rows, so the walkers step in that unit and stop on a short page.
 const GLANCE_PAGE: usize = 1000;
 
-const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
-const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+/// The `compartments` columns a [`StoredCompartment`] is read from. `context.db` has no
+/// date columns, so the two date slots read NULL and are filled from `store.db`'s
+/// `mc_compartment_dates` afterwards.
+const COMPARTMENT_SELECT_COLUMNS: &str = "sequence, start_message, end_message, start_message_id, end_message_id, NULL, NULL, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at";
+
+/// The `notes` columns a [`StoredNote`] is read from. `updated_at` is read twice: once as
+/// the row's timestamp and once as its compare-and-set token.
+const NOTE_SELECT_COLUMNS: &str = "id, type, COALESCE(project_path, ''), session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, updated_at, created_at, updated_at";
+
+/// The SQL expression for a note's next `updated_at`, given the write's clock in `?now`.
+///
+/// It never repeats a previous value, even when two writes land in one millisecond, so
+/// the timestamp doubles as the note's compare-and-set token.
+pub fn next_note_updated_at_sql(now_param: &str) -> String {
+    format!("MAX({now_param}, updated_at + 1)")
+}
 
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     Ok(StoredNote {
@@ -18704,26 +15555,22 @@ fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
         harness: r.get(28)?,
         anchor_block_id: r.get(29)?,
         anchor_ordinal: r.get(30)?,
-        dismissed_at: r.get(31)?,
-        dismissal_resolution: r.get(32)?,
-        status_version: r.get(33)?,
-        created_at_ms: r.get(34)?,
-        updated_at_ms: r.get(35)?,
-        context_store_uuid: r.get(36)?,
-        context_row_id: r.get(37)?,
+        status_version: r.get(31)?,
+        created_at_ms: r.get(32)?,
+        updated_at_ms: r.get(33)?,
     })
 }
 
-fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<StoredNote> {
+fn load_note_tx(tx: &rusqlite::Connection, id: i64) -> rusqlite::Result<StoredNote> {
     tx.query_row(
-        &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
+        &format!("SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE id = ?1"),
         params![id],
         stored_note_from_row,
     )
 }
 
 fn promote_facts_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     project_path: &str,
     facts: &[FactCandidate],
     now_ms: i64,
@@ -18731,7 +15578,7 @@ fn promote_facts_tx(
     let mut active_content = HashSet::new();
     {
         let mut stmt = tx.prepare(
-            "SELECT content FROM mc_memories
+            "SELECT content FROM memories
              WHERE project_path = ?1 AND status IN ('active', 'permanent')",
         )?;
         let rows = stmt.query_map(params![project_path], |r| r.get::<_, String>(0))?;
@@ -18741,7 +15588,7 @@ fn promote_facts_tx(
     }
 
     let mut next_nonce: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(id), 0) + 1 FROM mc_memories",
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM memories",
         [],
         |r| r.get(0),
     )?;
@@ -18760,7 +15607,7 @@ fn promote_facts_tx(
             stable_content_hash(&fact.content)
         );
         tx.execute(
-            "INSERT INTO mc_memories
+            "INSERT INTO memories
                (project_path, category, content, normalized_hash, importance,
                 source_session_id, source_type, seen_count, retrieval_count,
                 first_seen_at, created_at, updated_at, last_seen_at, status,
@@ -18778,6 +15625,7 @@ fn promote_facts_tx(
             ],
         )?;
         let memory_id = tx.last_insert_rowid();
+        raise_embedding_watermark_tx(tx, project_path, memory_id, now_ms)?;
         active_content.insert(fact.content.clone());
         promoted.push(PromotedRef {
             memory_id,
@@ -18790,67 +15638,62 @@ fn promote_facts_tx(
 }
 
 const MEMORY_FULL_SELECT_COLUMNS: &str =
-    "SELECT id, host_row_id, project_path, category, content, normalized_hash, importance, scope,
+    "SELECT id, project_path, category, content, normalized_hash, importance, scope,
             shareable, source_session_id, source_type, seen_count, retrieval_count,
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
             superseded_by_memory_id, merged_from, metadata_json,
-            context_store_uuid, context_row_id, mural_cue, mural_cue_hash, mural_cue_at,
-            mural_cue_rejection_count";
+            mural_cue, mural_cue_hash, mural_cue_at, mural_cue_rejection_count";
 
 const MEMORY_FULL_SELECT_BY_ID: &str =
-    "SELECT id, host_row_id, project_path, category, content, normalized_hash, importance, scope,
+    "SELECT id, project_path, category, content, normalized_hash, importance, scope,
             shareable, source_session_id, source_type, seen_count, retrieval_count,
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
             superseded_by_memory_id, merged_from, metadata_json,
-            context_store_uuid, context_row_id, mural_cue, mural_cue_hash, mural_cue_at,
-            mural_cue_rejection_count
-       FROM mc_memories WHERE id = ?1";
+            mural_cue, mural_cue_hash, mural_cue_at, mural_cue_rejection_count
+       FROM memories WHERE id = ?1";
 
 fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemoryFull> {
     Ok(StoredMemoryFull {
         id: r.get(0)?,
-        host_row_id: r.get(1)?,
-        project_path: r.get(2)?,
-        category: r.get(3)?,
-        content: r.get(4)?,
-        normalized_hash: r.get(5)?,
-        importance: r.get::<_, Option<i64>>(6)?.map(|v| v as i32),
-        scope: r.get(7)?,
-        shareable: r.get::<_, i64>(8)? as i32,
-        source_session_id: r.get(9)?,
-        source_type: r.get(10)?,
-        seen_count: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
-        retrieval_count: r.get::<_, Option<i64>>(12)?.unwrap_or(0),
-        first_seen_at: r.get(13)?,
-        created_at: r.get(14)?,
-        updated_at: r.get(15)?,
-        last_seen_at: r.get(16)?,
-        last_retrieved_at: r.get(17)?,
+        project_path: r.get(1)?,
+        category: r.get(2)?,
+        content: r.get(3)?,
+        normalized_hash: r.get(4)?,
+        importance: r.get::<_, Option<i64>>(5)?.map(|v| v as i32),
+        scope: r.get(6)?,
+        shareable: r.get::<_, i64>(7)? as i32,
+        source_session_id: r.get(8)?,
+        source_type: r.get(9)?,
+        seen_count: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
+        retrieval_count: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+        first_seen_at: r.get(12)?,
+        created_at: r.get(13)?,
+        updated_at: r.get(14)?,
+        last_seen_at: r.get(15)?,
+        last_retrieved_at: r.get(16)?,
         status: r
-            .get::<_, Option<String>>(18)?
+            .get::<_, Option<String>>(17)?
             .unwrap_or_else(|| "active".to_string()),
-        expires_at: r.get(19)?,
+        expires_at: r.get(18)?,
         verification_status: r
-            .get::<_, Option<String>>(20)?
+            .get::<_, Option<String>>(19)?
             .unwrap_or_else(|| "unverified".to_string()),
-        verified_at: r.get(21)?,
-        classified_at: r.get(22)?,
-        superseded_by_memory_id: r.get(23)?,
-        merged_from: r.get(24)?,
-        metadata_json: r.get(25)?,
-        context_store_uuid: r.get(26)?,
-        context_row_id: r.get(27)?,
-        mural_cue: r.get(28)?,
-        mural_cue_hash: r.get(29)?,
-        mural_cue_at: r.get(30)?,
-        mural_cue_rejection_count: r.get::<_, Option<i64>>(31)?.unwrap_or(0),
+        verified_at: r.get(20)?,
+        classified_at: r.get(21)?,
+        superseded_by_memory_id: r.get(22)?,
+        merged_from: r.get(23)?,
+        metadata_json: r.get(24)?,
+        mural_cue: r.get(25)?,
+        mural_cue_hash: r.get(26)?,
+        mural_cue_at: r.get(27)?,
+        mural_cue_rejection_count: r.get::<_, Option<i64>>(28)?.unwrap_or(0),
     })
 }
 
 fn load_memory_full_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     id: i64,
 ) -> rusqlite::Result<Option<StoredMemoryFull>> {
     tx.query_row(
@@ -18861,117 +15704,27 @@ fn load_memory_full_tx(
     .optional()
 }
 
-fn memory_mapping_feed_value(
-    conn: &rusqlite::Connection,
+/// Raise a project's embedding high-water mark to `memory_id`.
+///
+/// Hosts embed memories in their own code, not in a trigger, so a memory row the module
+/// inserts arrives without a vector. The mark is what asks for one: the host's drain
+/// embeds every memory of the project above `embedded_memory_id` up to
+/// `written_memory_id`. Every module memory insert raises it in the same transaction.
+fn raise_embedding_watermark_tx(
+    tx: &rusqlite::Connection,
+    project_path: &str,
     memory_id: i64,
-) -> rusqlite::Result<Value> {
-    let stored = conn
-        .query_row(
-            "SELECT mapped_files_json FROM mc_memory_mappings WHERE memory_id = ?1",
-            params![memory_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let Some(stored) = stored else {
-        return Ok(Value::Null);
-    };
-    let value = serde_json::from_str::<Value>(&stored).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
-    })?;
-    match value {
-        Value::Null => Ok(Value::Array(Vec::new())),
-        Value::Array(_) => Ok(value),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "memory mapping must be null or an array",
-            )),
-        )),
-    }
-}
-
-fn memory_mapping_origin_feed_value(
-    conn: &rusqlite::Connection,
-    memory_id: i64,
-) -> rusqlite::Result<Value> {
-    let origin = conn
-        .query_row(
-            "SELECT mapping_origin FROM mc_memory_mappings WHERE memory_id = ?1",
-            params![memory_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(origin.map(Value::String).unwrap_or(Value::Null))
-}
-
-fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Value, mapping_origin: Value) -> Value {
-    serde_json::json!({
-        "id": memory.id,
-        "project_path": memory.project_path,
-        "category": memory.category,
-        "content": memory.content,
-        "normalized_hash": memory.normalized_hash,
-        "importance": memory.importance,
-        "scope": memory.scope,
-        "shareable": memory.shareable,
-        "source_session_id": memory.source_session_id,
-        "source_type": memory.source_type,
-        "seen_count": memory.seen_count,
-        "retrieval_count": memory.retrieval_count,
-        "first_seen_at": memory.first_seen_at,
-        "created_at": memory.created_at,
-        "updated_at": memory.updated_at,
-        "last_seen_at": memory.last_seen_at,
-        "last_retrieved_at": memory.last_retrieved_at,
-        "status": memory.status,
-        "expires_at": memory.expires_at,
-        "verification_status": memory.verification_status,
-        "verified_at": memory.verified_at,
-        "classified_at": memory.classified_at,
-        "superseded_by_memory_id": memory.superseded_by_memory_id,
-        "merged_from": memory.merged_from,
-        "metadata_json": memory.metadata_json,
-        "context_store_uuid": memory.context_store_uuid,
-        "context_row_id": memory.context_row_id,
-        "mural_cue": memory.mural_cue,
-        "mural_cue_hash": memory.mural_cue_hash,
-        "mural_cue_at": memory.mural_cue_at,
-        "mural_cue_rejection_count": memory.mural_cue_rejection_count,
-        "host_row_id": memory.host_row_id,
-        "mapping": mapping,
-        "mapping_origin": mapping_origin,
-    })
-}
-
-fn emit_verification_memory_snapshot_tx(
-    tx: &rusqlite::Transaction<'_>,
-    memory: &StoredMemoryFull,
-    feed_seq_before: i64,
+    now_ms: i64,
 ) -> rusqlite::Result<()> {
-    let mapping = memory_mapping_feed_value(tx, memory.id)?;
-    let mapping_origin = memory_mapping_origin_feed_value(tx, memory.id)?;
-    let snapshot = serde_json::to_string(&memory_feed_snapshot(memory, mapping, mapping_origin))
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let enriched = tx.execute(
-        "UPDATE mc_changefeed
-            SET full_row_snapshot = ?1, content_hash = ?2
-          WHERE feed_seq = (
-                SELECT feed_seq FROM mc_changefeed
-                 WHERE domain = 'memories' AND op = 'update'
-                   AND module_row_id = ?3 AND feed_seq > ?4
-                 ORDER BY feed_seq DESC LIMIT 1
-          )",
-        params![snapshot, memory.normalized_hash, memory.id, feed_seq_before],
+    tx.execute(
+        "INSERT INTO memory_embedding_watermarks
+           (project_path, written_memory_id, embedded_memory_id, updated_at)
+         VALUES (?1, ?2, 0, ?3)
+         ON CONFLICT(project_path) DO UPDATE SET
+             written_memory_id = MAX(memory_embedding_watermarks.written_memory_id, excluded.written_memory_id),
+             updated_at = excluded.updated_at",
+        params![project_path, memory_id, now_ms],
     )?;
-    if enriched == 0 {
-        tx.execute(
-            "INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
-             VALUES ('memories', 'update', ?1, ?2, ?3)",
-            params![memory.id, snapshot, memory.normalized_hash],
-        )?;
-    }
     Ok(())
 }
 
@@ -19381,33 +16134,11 @@ fn record_row_state_digest_tx(
 }
 
 fn set_memory_mural_cue_tx(
-    tx: &rusqlite::Transaction<'_>,
-    context_store_uuid: &str,
+    tx: &rusqlite::Connection,
     project: &str,
-    authority_generation: u64,
     rows: &[MuralCueUpdate],
     now_ms: i64,
-) -> rusqlite::Result<MuralCueTxnOutcome> {
-    let authority = tx
-        .query_row(
-            "SELECT state, generation FROM mc_authority
-              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
-            params![context_store_uuid, project],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
-        )
-        .optional()?;
-    let Some((state, generation)) = authority else {
-        return Ok(MuralCueTxnOutcome::AuthorityStateMismatch(
-            "missing".to_string(),
-        ));
-    };
-    if state != "MODULE" {
-        return Ok(MuralCueTxnOutcome::AuthorityStateMismatch(state));
-    }
-    if generation != authority_generation {
-        return Ok(MuralCueTxnOutcome::AuthorityGenerationMismatch(generation));
-    }
-
+) -> rusqlite::Result<MuralCueApplyResult> {
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
     for update in rows {
@@ -19452,7 +16183,7 @@ fn set_memory_mural_cue_tx(
             0
         };
         tx.execute(
-            "UPDATE mc_memories
+            "UPDATE memories
                 SET mural_cue = ?1, mural_cue_hash = ?2, mural_cue_at = ?3,
                     mural_cue_rejection_count = ?4
               WHERE id = ?5",
@@ -19466,42 +16197,18 @@ fn set_memory_mural_cue_tx(
         )?;
         accepted.push(update.memory_id);
     }
-    Ok(MuralCueTxnOutcome::Applied(MuralCueApplyResult {
+    Ok(MuralCueApplyResult {
         accepted,
         rejected,
-    }))
+    })
 }
 
 fn set_memory_verification_tx(
-    tx: &rusqlite::Transaction<'_>,
-    context_store_uuid: &str,
+    tx: &rusqlite::Connection,
     project: &str,
-    authority_generation: u64,
     rows: &[VerificationUpdate],
     now_ms: i64,
-) -> rusqlite::Result<VerificationTxnOutcome> {
-    let authority = tx
-        .query_row(
-            "SELECT state, generation FROM mc_authority
-              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
-            params![context_store_uuid, project],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
-        )
-        .optional()?;
-    let Some((state, generation)) = authority else {
-        return Ok(VerificationTxnOutcome::AuthorityStateMismatch(
-            "missing".to_string(),
-        ));
-    };
-    if state != "MODULE" {
-        return Ok(VerificationTxnOutcome::AuthorityStateMismatch(state));
-    }
-    if generation != authority_generation {
-        return Ok(VerificationTxnOutcome::AuthorityGenerationMismatch(
-            generation,
-        ));
-    }
-
+) -> rusqlite::Result<VerificationApplyResult> {
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
     for update in rows {
@@ -19526,17 +16233,19 @@ fn set_memory_verification_tx(
             });
             continue;
         }
-        let feed_seq_before = tx.query_row(
-            "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
         match update.verification_status.as_str() {
             "verified" => {
                 tx.execute(
-                    "UPDATE mc_memories
+                    "UPDATE memories
                          SET verification_status = 'verified', verified_at = ?1, updated_at = ?1
                        WHERE id = ?2",
+                    params![now_ms, update.memory_id],
+                )?;
+                // The files that back the memory stay; they are now content-verified, as
+                // the host's own verify records them.
+                tx.execute(
+                    "UPDATE memory_verifications SET verified_at = ?1, mapped_at = ?1
+                      WHERE memory_id = ?2",
                     params![now_ms, update.memory_id],
                 )?;
             }
@@ -19555,7 +16264,7 @@ fn set_memory_verification_tx(
                 };
                 let hash = compute_normalized_memory_hash(content);
                 tx.execute(
-                    "UPDATE mc_memories
+                    "UPDATE memories
                         SET content = ?1, normalized_hash = ?2, updated_at = ?3,
                             shareable = 0, classified_at = NULL,
                             verification_status = 'verified', verified_at = ?3
@@ -19563,7 +16272,7 @@ fn set_memory_verification_tx(
                     params![content, hash, now_ms, update.memory_id],
                 )?;
                 tx.execute(
-                    "DELETE FROM mc_memory_mappings WHERE memory_id = ?1",
+                    "DELETE FROM memory_verifications WHERE memory_id = ?1",
                     params![update.memory_id],
                 )?;
                 append_memory_mutation_tx(
@@ -19588,13 +16297,13 @@ fn set_memory_verification_tx(
                         .unwrap_or("verified archive"),
                 );
                 tx.execute(
-                    "UPDATE mc_memories
+                    "UPDATE memories
                         SET status = 'archived', metadata_json = ?1, updated_at = ?2
                       WHERE id = ?3",
                     params![metadata, now_ms, update.memory_id],
                 )?;
                 tx.execute(
-                    "DELETE FROM mc_memory_mappings WHERE memory_id = ?1",
+                    "DELETE FROM memory_verifications WHERE memory_id = ?1",
                     params![update.memory_id],
                 )?;
                 append_memory_mutation_tx(
@@ -19618,45 +16327,20 @@ fn set_memory_verification_tx(
                 continue;
             }
         }
-        let memory = load_memory_full_tx(tx, update.memory_id)?
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-        emit_verification_memory_snapshot_tx(tx, &memory, feed_seq_before)?;
         accepted.push(update.memory_id);
     }
-    Ok(VerificationTxnOutcome::Applied(VerificationApplyResult {
+    Ok(VerificationApplyResult {
         accepted,
         rejected,
-    }))
+    })
 }
 
 fn set_memory_mapping_tx(
-    tx: &rusqlite::Transaction<'_>,
-    context_store_uuid: &str,
+    tx: &rusqlite::Connection,
     project: &str,
-    authority_generation: u64,
     rows: &[MappingUpdate],
     now_ms: i64,
-) -> rusqlite::Result<MappingTxnOutcome> {
-    let authority = tx
-        .query_row(
-            "SELECT state, generation FROM mc_authority
-              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
-            params![context_store_uuid, project],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
-        )
-        .optional()?;
-    let Some((state, generation)) = authority else {
-        return Ok(MappingTxnOutcome::AuthorityStateMismatch(
-            "missing".to_string(),
-        ));
-    };
-    if state != "MODULE" {
-        return Ok(MappingTxnOutcome::AuthorityStateMismatch(state));
-    }
-    if generation != authority_generation {
-        return Ok(MappingTxnOutcome::AuthorityGenerationMismatch(generation));
-    }
-
+) -> rusqlite::Result<MappingApplyResult> {
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
     for update in rows {
@@ -19691,41 +16375,39 @@ fn set_memory_mapping_tx(
             });
             continue;
         }
-        let files = serde_json::to_string(&update.mapped_files)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        // One row per backing file, as the host's mapper writes them: `verified_at = 0`
+        // (mapped, not yet content-verified). A memory with no files gets the one
+        // sentinel row with an empty path, which is how the host records "independent".
+        let mut files: Vec<&str> = update
+            .mapped_files
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|file| !file.is_empty())
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        if files.is_empty() {
+            files.push("");
+        }
         tx.execute(
-            "INSERT INTO mc_memory_mappings
-                 (memory_id, project_path, mapped_files_json, updated_at, mapping_origin)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(memory_id) DO UPDATE SET
-                 project_path = excluded.project_path,
-                 mapped_files_json = excluded.mapped_files_json,
-                 updated_at = excluded.updated_at,
-                 mapping_origin = excluded.mapping_origin",
-            params![
-                update.memory_id,
-                project,
-                files,
-                now_ms,
-                update.mapping_origin
-            ],
+            "DELETE FROM memory_verifications WHERE memory_id = ?1",
+            params![update.memory_id],
         )?;
-        let mapping = memory_mapping_feed_value(tx, update.memory_id)?;
-        let mapping_origin = memory_mapping_origin_feed_value(tx, update.memory_id)?;
-        let snapshot =
-            serde_json::to_string(&memory_feed_snapshot(&memory, mapping, mapping_origin))
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        tx.execute(
-            "INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
-             VALUES ('memories', 'update', ?1, ?2, ?3)",
-            params![update.memory_id, snapshot, memory.normalized_hash],
-        )?;
+        for file in files {
+            tx.execute(
+                "INSERT INTO memory_verifications
+                     (memory_id, file_path, verified_at, mapped_at, mapping_origin)
+                 VALUES (?1, ?2, 0, ?3, ?4)",
+                params![update.memory_id, file, now_ms, update.mapping_origin],
+            )?;
+        }
         accepted.push(update.memory_id);
     }
-    Ok(MappingTxnOutcome::Applied(MappingApplyResult {
+    Ok(MappingApplyResult {
         accepted,
         rejected,
-    }))
+    })
 }
 
 struct MemoryMutationAppend<'a> {
@@ -19739,11 +16421,11 @@ struct MemoryMutationAppend<'a> {
 }
 
 fn append_memory_mutation_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     mutation: MemoryMutationAppend<'_>,
 ) -> rusqlite::Result<()> {
     tx.execute(
-        "INSERT INTO mc_memory_mutation_log
+        "INSERT INTO memory_mutation_log
             (project_path, mutation_type, target_memory_id, superseded_by_id,
              category, new_content, queued_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -19949,39 +16631,6 @@ fn sql_like_pattern(query: &str) -> String {
 
 /// Compute the ctx_memory normalized hash used for duplicate detection. This mirrors the
 /// plugin path: lowercase, collapse whitespace runs to one space, trim, then MD5 hex.
-fn canonical_authority_value(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
-        Value::String(value) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_authority_value)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        Value::Object(map) => {
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by_key(|(key, _)| *key);
-            format!(
-                "{{{}}}",
-                entries
-                    .into_iter()
-                    .map(|(key, value)| format!(
-                        "{}:{}",
-                        serde_json::to_string(key).unwrap_or_default(),
-                        canonical_authority_value(value)
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        }
-    }
-}
-
 pub fn compute_normalized_memory_hash(content: &str) -> String {
     let normalized = content
         .to_lowercase()
@@ -20060,46 +16709,6 @@ fn wrapup_replaced_failure_summary(summary: &str, failed_created_at: i64) -> Str
 
 fn capped_trace_error(error: &str) -> String {
     error.chars().take(2000).collect()
-}
-
-#[cfg(test)]
-fn assert_memory_feed_snapshots_complete(store: &McStore) {
-    let (columns, snapshots) = store
-        .inner
-        .with_conn(|conn| {
-            let mut columns_statement = conn.prepare("PRAGMA table_info(mc_memories)")?;
-            let columns = columns_statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut snapshots_statement = conn.prepare(
-                "SELECT full_row_snapshot FROM mc_changefeed WHERE domain = 'memories' ORDER BY feed_seq",
-            )?;
-            let snapshots = snapshots_statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((columns, snapshots))
-        })
-        .unwrap();
-    assert_eq!(
-        columns,
-        MEMORY_FEED_COLUMNS
-            .iter()
-            .map(|column| (*column).to_string())
-            .collect::<Vec<_>>(),
-        "the shared feed-column list must track the mc_memories schema"
-    );
-    // This invariant intentionally checks every operation's emitted row rather than listing
-    // operation-specific keys, so a new mc_memories column cannot silently disappear from a feed.
-    for serialized in snapshots {
-        let snapshot: Value = serde_json::from_str(&serialized).unwrap();
-        let object = snapshot.as_object().unwrap();
-        for column in MEMORY_FEED_COLUMNS {
-            assert!(
-                object.contains_key(*column),
-                "memory feed snapshot omitted column {column}: {serialized}"
-            );
-        }
-    }
 }
 
 #[cfg(test)]
