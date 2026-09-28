@@ -56,6 +56,7 @@ import {
     createToolExecuteAfterHook,
 } from "../../hooks/magic-context/hook-handlers";
 import { materializeM0 } from "../../hooks/magic-context/inject-compartments";
+import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
@@ -106,6 +107,7 @@ import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
 import { startDreamTrigger } from "./dream-trigger";
 import { HiddenChildHook, registerHiddenChildAgents } from "./hidden-child";
+import { V2LkgSystemReplay } from "./lkg-system";
 import { modelLimitCacheWarm, warmModelLimitCacheFromCatalog } from "./model-limit-cache";
 import { adaptPayload, HEAD_IDS } from "./payload";
 import { interruptBeforeProvider, V2ContextRefusal } from "./refusal";
@@ -779,6 +781,7 @@ export async function registerContext(context: V2Context) {
               readRowsFrom,
           })
         : undefined;
+    const lkgSystems = new V2LkgSystemReplay();
     let transform: ReturnType<typeof createTransform> | undefined;
     let systemPrompt: ReturnType<typeof createSystemPromptHashHandler> | undefined;
     const systemPromptRefreshSessions = new Set<string>();
@@ -1025,6 +1028,21 @@ export async function registerContext(context: V2Context) {
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
+        const systemAtEntry = structuredClone(draft.system);
+        const slotAtEntry = getSlot(draft.sessionID);
+        const restoreLkgSystem = () => {
+            if (
+                !lkgSystems.restore(
+                    draft.sessionID,
+                    getSlot(draft.sessionID),
+                    systemAtEntry,
+                    draft.system,
+                )
+            ) {
+                sessionLog(draft.sessionID, "lkg_system_state_mismatch");
+                throw new Error("LKG system identity is unavailable or changed");
+            }
+        };
         const isMagicContextSynthetic = (id: string) =>
             isAdmittedSynthetic(context, draft.sessionID, id);
         // Storing a notice in an idle OpenCode 2 session starts a turn of its own.
@@ -1387,6 +1405,7 @@ export async function registerContext(context: V2Context) {
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,
                 propagateUnexpectedErrors: true,
+                onLkgReplay: restoreLkgSystem,
             })(
                 {},
                 mapped as unknown as Parameters<
@@ -1426,6 +1445,16 @@ export async function registerContext(context: V2Context) {
                     );
                 }
             }
+            const capturedSlot = getSlot(draft.sessionID);
+            if (
+                capturedSlot &&
+                (!slotAtEntry ||
+                    capturedSlot.capturedAt !== slotAtEntry.capturedAt ||
+                    capturedSlot.captureSequence !== slotAtEntry.captureSequence ||
+                    capturedSlot.jsonPrefix !== slotAtEntry.jsonPrefix)
+            ) {
+                lkgSystems.capture(draft.sessionID, capturedSlot, systemAtEntry, draft.system);
+            }
         } catch (error) {
             if (error instanceof V2ContextRefusal) throw error;
             if (
@@ -1436,6 +1465,7 @@ export async function registerContext(context: V2Context) {
                     const mapped = adaptPayload(draft);
                     try {
                         await createMessagesTransformHandler({
+                            onLkgReplay: restoreLkgSystem,
                             magicContext: {
                                 "experimental.chat.messages.transform": async () => {
                                     throw error;

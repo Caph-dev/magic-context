@@ -46,6 +46,31 @@ function assistant(id: string, created: number, parts: unknown[] = []): MessageL
 }
 
 describe("LKG transform replay", () => {
+    test("captures entry digests before live tagging mutates the host messages", () => {
+        resetLkgSlotsForTest();
+        const raw = [user("u0", 1), user("u1", 2)];
+        const pristine = structuredClone(raw);
+        const entry = projectLkgEntry(raw);
+        (raw[0].parts[0] as { text: string }).text = "§1§ managed summary";
+        expect(
+            captureLkgSlot({
+                sessionId: "eager-input",
+                input: entry,
+                output: raw,
+                modelKey: "test/model",
+                providerKey: "test",
+            }),
+        ).toBe(true);
+        const replay = replayLkg({
+            sessionId: "eager-input",
+            messages: pristine,
+            modelKey: "test/model",
+            providerKey: "test",
+        });
+        expect(replay.ok).toBe(true);
+        if (replay.ok) expect(JSON.stringify(replay.messages)).toBe(JSON.stringify(raw));
+    });
+
     test("projects only anchor fields without retaining message parts", () => {
         const input = [
             user("u0", 1),

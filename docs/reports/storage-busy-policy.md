@@ -1,5 +1,9 @@
 # Storage contention and managed-prompt refusal
 
+> Historical initial-delivery report (`38a6a6cd`). The acquisition coverage,
+> TypeScript LKG capture, Rust completion wait, parked health gate, and v2 system
+> replay findings are corrected in [the pin follow-up](storage-busy-policy-pins.md).
+
 ## Implementation
 
 The shared acquisition helper is `beginImmediate` inside

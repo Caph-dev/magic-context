@@ -6767,6 +6767,170 @@ describe("Rust stalled transform probe", () => {
             });
         });
 
+    it("polls an applying final page until committed without another execution", async () => {
+        const sessionId = `rust-applying-replay-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const clock = fakeClock();
+        let executions = 0;
+        const pages: unknown[] = [];
+        const budgets: number[] = [];
+        const native = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "committed fold" }],
+            },
+        ];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body, timeoutMs }) => {
+                if (method !== "transform") return { ok: true };
+                pages.push(body);
+                budgets.push(timeoutMs!);
+                if (executions === 0) {
+                    executions++;
+                    throw Object.assign(new Error("request deadline"), { code: "ETIMEDOUT" });
+                }
+                if (clock.now() < 750)
+                    throw Object.assign(new Error("the final transform page is being applied"), {
+                        code: "authority_transform_page_in_progress",
+                    });
+                return { decision: "HARD", row_version: 7, native_messages: native };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            clockForTests: clock,
+        });
+        const output = { messages: [] as unknown[] };
+        const outcome = transform
+            .run(sessionId, makeMessages(sessionId), output, makeMeta(db, sessionId))
+            .then(
+                () => "served",
+                (error) => error,
+            );
+        await clock.waitForDelay(250);
+        await clock.advance(750);
+        expect(await outcome).toBe("served");
+        expect(executions).toBe(1);
+        expect(pages).toHaveLength(5);
+        for (const page of pages) expect(page).toEqual(pages[0]);
+        expect(budgets).toEqual([45000, 45000, 44750, 44500, 44250]);
+        expect(output.messages).toEqual(native);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+    });
+
+    it("in-progress final-page polling expires at one fixed completion deadline", async () => {
+        const sessionId = `rust-applying-deadline-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const clock = fakeClock();
+        let calls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (++calls === 1)
+                    throw Object.assign(new Error("request deadline"), { code: "ETIMEDOUT" });
+                throw Object.assign(new Error("still applying"), {
+                    code: "authority_transform_page_in_progress",
+                });
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            clockForTests: clock,
+        });
+        const outcome = transform
+            .run(sessionId, makeMessages(sessionId), { messages: [] }, makeMeta(db, sessionId))
+            .then(
+                () => "served",
+                (error) => error,
+            );
+        await clock.waitForDelay(250);
+        await clock.advance(45000);
+        expect(await outcome).toBeInstanceOf(EmergencyFailClosedError);
+        expect(calls).toBeGreaterThan(2);
+        expect(calls).toBeLessThanOrEqual(181);
+        expect(clock.now()).toBe(45000);
+    });
+
+    it("parked no-LKG uses a short hard health deadline but admits a healthy slow module", async () => {
+        const sessionId = `rust-park-probe-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const clock = fakeClock();
+        let phase: "failing" | "hung" | "healthy" = "failing";
+        let fullCalls = 0;
+        let probes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, timeoutMs }) => {
+                if (method === "session.status") {
+                    probes++;
+                    expect(timeoutMs).toBeLessThanOrEqual(2000);
+                    if (phase === "hung") return new Promise(() => {});
+                    return { ok: true };
+                }
+                if (method !== "transform") return { ok: true };
+                fullCalls++;
+                if (phase === "failing") throw new Error("module unavailable");
+                if (phase === "hung") return new Promise(() => {});
+                await new Promise((resolve) => clock.setTimeout(resolve, 5000));
+                return {
+                    decision: "HARD",
+                    native_messages: [
+                        {
+                            info: { id: "m1", role: "user", sessionID: sessionId },
+                            parts: [{ type: "text", text: "healthy but slow" }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            clockForTests: clock,
+        });
+        for (let i = 0; i < 3; i++)
+            await expect(
+                transform.run(
+                    sessionId,
+                    makeMessages(sessionId),
+                    { messages: [] },
+                    makeMeta(db, sessionId),
+                ),
+            ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(transform.getState(sessionId).parked).toBe(true);
+        phase = "hung";
+        const hung = transform
+            .run(sessionId, makeMessages(sessionId), { messages: [] }, makeMeta(db, sessionId))
+            .then(
+                () => "served",
+                (error) => error,
+            );
+        await clock.waitForDelay(2000);
+        await clock.advance(2000);
+        expect(await hung).toBeInstanceOf(EmergencyFailClosedError);
+        expect(fullCalls).toBe(3);
+        expect(probes).toBe(1);
+        phase = "healthy";
+        const output = { messages: [] as unknown[] };
+        const healthy = transform.run(
+            sessionId,
+            makeMessages(sessionId),
+            output,
+            makeMeta(db, sessionId),
+        );
+        await clock.waitForDelay(5000);
+        await clock.advance(5000);
+        await healthy;
+        expect(fullCalls).toBe(4);
+        expect(probes).toBeGreaterThanOrEqual(2);
+        expect(JSON.stringify(output.messages)).toContain("healthy but slow");
+        expect(transform.getState(sessionId).parked).toBe(false);
+    });
+
     it("waits for the original transform after a healthy probe without sending a duplicate", async () => {
         const sessionId = `rust-stall-probe-${Date.now()}`;
         sessions.push(sessionId);

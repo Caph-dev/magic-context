@@ -250,6 +250,8 @@ export function createMessagesTransformHandler(args: {
     /** Let the v2 hook decide whether an ordinary error needs post-fold refusal or passthrough. */
     propagateUnexpectedErrors?: boolean;
     onStorageBusyRefusal?: (sessionId: string, message: string) => Promise<void>;
+    /** Validate and restore host-owned prompt segments before adopting replayed messages. */
+    onLkgReplay?: () => void;
     internalChildSessions?: Set<string>;
     tryReopenStorage?: () => boolean | Promise<boolean>;
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
@@ -384,6 +386,7 @@ export function createMessagesTransformHandler(args: {
                                 }),
                         });
                         if (replay.ok) {
+                            args.onLkgReplay?.();
                             replaceMessagesInPlace(
                                 output,
                                 replay.messages as unknown as MessageWithParts[],

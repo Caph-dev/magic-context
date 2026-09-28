@@ -539,7 +539,8 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             const startedAt = Date.now();
             const outcome = applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome);
             expect(outcome.kind).toBe("retryable-failure");
-            expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
+            // Three acquisition attempts each get the host-store's 5-second busy timeout.
+            expect(Date.now() - startedAt).toBeGreaterThanOrEqual(15_000);
         } finally {
             locker.exec("ROLLBACK");
             closeQuietly(locker);
@@ -558,7 +559,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         ).toEqual({ n: 2 });
         closeQuietly(inspect);
         expect(getPersistedCompactionMarkerState(db, "ses-lock")).toEqual(oldState);
-    }, 10_000);
+    }, 30_000);
 
     it("rolls direct publication replacement back when insertion fails", () => {
         const dataHome = useTempDataHome("direct-marker-atomic-rollback-");

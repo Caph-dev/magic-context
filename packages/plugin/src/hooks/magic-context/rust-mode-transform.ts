@@ -1992,13 +1992,23 @@ export function createRustModeTransform(
                       },
                   )
                 : new Error("rust module request timed out");
-        const timer = clock.setTimeout(() => controller.abort(timeoutError), attemptTimeoutMs);
+        let rejectDeadline!: (error: Error) => void;
+        const deadline = new Promise<never>((_resolve, reject) => {
+            rejectDeadline = reject;
+        });
+        const timer = clock.setTimeout(() => {
+            controller.abort(timeoutError);
+            rejectDeadline(timeoutError);
+        }, attemptTimeoutMs);
         try {
-            return await options.moduleClient.call({
-                ...args,
-                signal: controller.signal,
-                timeoutMs: attemptTimeoutMs,
-            });
+            return await Promise.race([
+                options.moduleClient.call({
+                    ...args,
+                    signal: controller.signal,
+                    timeoutMs: attemptTimeoutMs,
+                }),
+                deadline,
+            ]);
         } catch (error) {
             const timedOut =
                 controller.signal.aborted ||
@@ -2016,9 +2026,27 @@ export function createRustModeTransform(
                 // no state-sync, page upload or host mutation is repeated here.
                 sessionLog(
                     args.sessionId,
-                    "rust transform deadline: retrying final page once with 45000ms budget",
+                    "rust transform deadline: waiting up to 45000ms for identical final-page completion",
                 );
-                return await callModule(args, 45_000, false);
+                const completionDeadline = clock.now() + 45_000;
+                for (;;) {
+                    const remaining = completionDeadline - clock.now();
+                    if (remaining <= 0) throw timeoutError;
+                    try {
+                        return await callModule(args, remaining, false);
+                    } catch (retryError) {
+                        if (
+                            moduleFailureCode(retryError) !== "authority_transform_page_in_progress"
+                        )
+                            throw retryError;
+                        // The original execution is still applying. Re-submit only
+                        // its identical final page after yielding, until its cached
+                        // committed result is available or this one budget expires.
+                        const wait = Math.min(250, completionDeadline - clock.now());
+                        if (wait <= 0) throw timeoutError;
+                        await new Promise<void>((resolve) => clock.setTimeout(resolve, wait));
+                    }
+                }
             }
             if (controller.signal.aborted) throw timeoutError;
             throw error;
@@ -2749,6 +2777,44 @@ export function createRustModeTransform(
                 // With no LKG, try the module now instead of refusing four turns
                 // out of five even after it has recovered.
                 decision = "pending";
+            }
+            // A parked session without a usable replay should recover immediately
+            // when the module is alive, but must not spend another full transform
+            // deadline discovering an unresponsive module on every user turn.
+            try {
+                await callModule(
+                    {
+                        sessionId,
+                        projectRoot: recoveryProjectRoot,
+                        method: "session.status",
+                        body: { method: "session.status", v: 1, session_id: sessionId },
+                        bypassSessionLane: true,
+                    },
+                    options.healthProbeTimeoutMsForTests ?? RUST_HEALTH_PROBE_TIMEOUT_MS,
+                    false,
+                );
+            } catch (error) {
+                decision = "parked";
+                if (replayLastGood(sessionId, messages, output, sessionMeta.systemPromptTokens)) {
+                    servedFrom = "lkg";
+                    finishPass(false);
+                    return;
+                }
+                if (deps.compactionOff) {
+                    serveRawFallback(error);
+                    finishPass(false);
+                    return;
+                }
+                servedFrom = "refused";
+                sessionLog(
+                    sessionId,
+                    "rust parked health probe failed; refusing without a full request",
+                    error,
+                );
+                finishPass(false, false);
+                throw new EmergencyFailClosedError(ENGINE_RECONNECTING_USER_MESSAGE, {
+                    cause: error,
+                });
             }
         }
         timings.preflight = performance.now() - passStartedAt;

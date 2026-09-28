@@ -3,6 +3,7 @@
 // REAL wrapper under Node to validate: construction, readonly mapping, the
 // transaction() shim (top-level + nested savepoint rollback), exec/prepare/
 // run/get/all, and ATTACH. Run with: node packages/plugin/scripts/smoke-node-sqlite.ts
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -117,6 +118,38 @@ try {
     }
     check("readonly open blocks writes", blocked);
     ro.close();
+
+    const writer = new Database(dbPath);
+    writer.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=50");
+    for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
+        const locker = spawn(process.execPath, ["--input-type=module", "-e", `
+            import { DatabaseSync } from 'node:sqlite';
+            const db = new DatabaseSync(${JSON.stringify(dbPath)});
+            db.exec('BEGIN IMMEDIATE');
+            console.log('LOCKED');
+            setTimeout(() => { db.exec('ROLLBACK'); db.close(); }, 650);
+        `], { stdio: ["ignore", "pipe", "pipe"] });
+        const exited = new Promise<void>((resolve, reject) => {
+            locker.once("error", reject);
+            locker.once("exit", code => code === 0 ? resolve() : reject(new Error(`locker exit ${code}`)));
+        });
+        await new Promise<void>((resolve, reject) => {
+            let output = "";
+            locker.stdout.on("data", chunk => { output += String(chunk); if (output.includes("LOCKED")) resolve(); });
+            locker.once("error", reject);
+        });
+        let callbacks = 0;
+        const callback = () => { callbacks++; writer.prepare("INSERT INTO t(v,flag) VALUES(?,?)").run(mode, 1); };
+        try {
+            if (mode === "literal") { writer.exec("BEGIN IMMEDIATE"); callback(); writer.exec("COMMIT"); }
+            else { const tx = writer.transaction(callback); if (mode === "default") tx(); else tx[mode](); }
+            check(`${mode} acquisition retries before callback under node:sqlite`, callbacks === 1);
+        } finally { await exited; }
+    }
+    writer.close();
+    const snapshot = new Database(dbPath, { readonly: true });
+    check("readonly default transaction stays a read snapshot", snapshot.transaction(() => snapshot.prepare("SELECT COUNT(*) AS n FROM t").get())() !== undefined);
+    snapshot.close();
 } finally {
     rmSync(dir, { recursive: true, force: true });
 }

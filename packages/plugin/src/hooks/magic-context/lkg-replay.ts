@@ -53,7 +53,7 @@ export interface LkgEntryProjection {
     timeCreated: number | null;
     finish: unknown;
     hasIncompleteTool: boolean;
-    /** Compute the non-enumerable digest lazily so only LKG capture or replay validation hashes message content. */
+    /** Immutable entry digest, exposed non-enumerably without retaining the live message. */
     contentDigest?: () => string | null;
 }
 
@@ -101,8 +101,11 @@ export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
             finish: info.finish,
             hasIncompleteTool,
         };
+        // Tagging and heuristic edits mutate these same objects later in the pass.
+        // Replay sees pristine host inputs, so bind the capture to those entry bytes.
+        const contentDigest = lkgContentDigest(message);
         Object.defineProperty(projection, "contentDigest", {
-            value: () => lkgContentDigest(message),
+            value: () => contentDigest,
             enumerable: false,
         });
         return projection;
