@@ -37,7 +37,7 @@ import { rebaseSessionCoordinates } from "../../features/magic-context/store-gen
 import { createTagger } from "../../features/magic-context/tagger";
 import type { PluginContext } from "../../plugin/types";
 import * as shared from "../../shared";
-import { Database } from "../../shared/sqlite";
+import { Database, withPrivilegedWriter, withSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     executeContextRecomp as executeContextRecompImpl,
@@ -1181,6 +1181,48 @@ function _getHistorianDumpContents(sessionId: string): string[] {
 }
 
 describe("runCompartmentAgent", () => {
+    it("keeps historian writes outside the foreground pass that launched it", async () => {
+        useTempDataHome("compartment-runner-background-scope-");
+        const db = openDatabase();
+        const sessionId = "ses-background-scope";
+        getOrCreateSessionMeta(db, sessionId);
+        let attempts = 0;
+        let callbacks = 0;
+        let failure: unknown;
+        await withSqliteTransformPass(async () => {
+            startCompartmentAgent(
+                {
+                    client: {} as PluginContext["client"],
+                    db,
+                    sessionId,
+                    historianChunkTokens: 10000,
+                    directory: "/tmp",
+                },
+                async () => {
+                    await Promise.resolve();
+                    const exec = spyOn(db, "exec").mockImplementation(() => {
+                        attempts++;
+                        throw Object.assign(new Error("background busy"), { code: "SQLITE_BUSY" });
+                    });
+                    const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+                    try {
+                        withPrivilegedWriter(db, () => {
+                            callbacks++;
+                        });
+                    } catch (error) {
+                        failure = error;
+                    } finally {
+                        exec.mockRestore();
+                        wait.mockRestore();
+                    }
+                },
+            );
+            await getActiveCompartmentRun(sessionId)?.promise;
+        });
+        expect(attempts).toBe(1);
+        expect(callbacks).toBe(0);
+        expect((failure as Error).message).toBe("background busy");
+    });
     it("clears compartment-in-progress when another process holds the lease", () => {
         useTempDataHome("compartment-runner-lease-denied-");
         const db = openDatabase();

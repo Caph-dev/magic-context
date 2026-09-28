@@ -46,6 +46,31 @@ function assistant(id: string, created: number, parts: unknown[] = []): MessageL
 }
 
 describe("LKG transform replay", () => {
+    test("captures entry digests before live tagging mutates the host messages", () => {
+        resetLkgSlotsForTest();
+        const raw = [user("u0", 1), user("u1", 2)];
+        const pristine = structuredClone(raw);
+        const entry = projectLkgEntry(raw);
+        (raw[0].parts[0] as { text: string }).text = "§1§ managed summary";
+        expect(
+            captureLkgSlot({
+                sessionId: "eager-input",
+                input: entry,
+                output: raw,
+                modelKey: "test/model",
+                providerKey: "test",
+            }),
+        ).toBe(true);
+        const replay = replayLkg({
+            sessionId: "eager-input",
+            messages: pristine,
+            modelKey: "test/model",
+            providerKey: "test",
+        });
+        expect(replay.ok).toBe(true);
+        if (replay.ok) expect(JSON.stringify(replay.messages)).toBe(JSON.stringify(raw));
+    });
+
     test("projects only anchor fields without retaining message parts", () => {
         const input = [
             user("u0", 1),
@@ -452,6 +477,43 @@ describe("LKG transform replay", () => {
                 ]),
             ]),
         ).toBe(false);
+    });
+
+    test("applies durable thinking strips before validating a replay candidate", () => {
+        resetLkgSlotsForTest();
+        const input = [user("u0", 1, { providerID: "anthropic", modelID: "claude-test" })];
+        const prefix = assistant("a-prefix", 2, [
+            { type: "thinking", thinking: "signed prefix", signature: "sig-a" },
+            { type: "text", text: "answer" },
+        ]);
+        captureSlot("strip-before-validate", {
+            jsonPrefix: JSON.stringify([prefix]),
+            inputIdSeq: ["u0"],
+            inputContentDigests: [lkgContentDigest(input[0])!],
+            lastInputMessageId: "u0",
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            capturedAt: 1,
+        });
+        const tail = assistant("a-tail", 3, [
+            { type: "thinking", thinking: "previously stripped", signature: "sig-b" },
+            { type: "text", text: "continued answer" },
+        ]);
+        const replay = replayLkg({
+            sessionId: "strip-before-validate",
+            messages: [...input, tail],
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            prepareReplay: (messages) => {
+                const restored = messages.find((message) => message.info.id === "a-tail")!;
+                restored.parts = restored.parts.filter(
+                    (part) => (part as { type: string }).type !== "thinking",
+                );
+            },
+        });
+        expect(replay.ok).toBe(true);
+        if (replay.ok) expect(JSON.stringify(replay.messages)).not.toContain("previously stripped");
+        expect(getSlot("strip-before-validate")).toBeDefined();
     });
 
     test("declines a new thinking run after a provider-executed tool", () => {

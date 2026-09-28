@@ -878,6 +878,18 @@ const server: Plugin = async (ctx) => {
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
+            onStorageBusyRefusal: async (sessionId, message) => {
+                const { sendStatusNotification } = await import(
+                    "./hooks/magic-context/send-session-notification"
+                );
+                const { abortSessionFailClosed } = await import(
+                    "./hooks/magic-context/transform-postprocess-phase"
+                );
+                await sendStatusNotification(ctx.client, sessionId, message, {
+                    toastDurationMs: 15000,
+                });
+                await abortSessionFailClosed(ctx.client, sessionId);
+            },
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(

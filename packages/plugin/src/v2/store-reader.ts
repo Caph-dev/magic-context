@@ -679,10 +679,12 @@ export class V2StoreReader {
     /** Include the completed checkpoint itself, matching the host history cut. */
     window(sessionID: string): StoreRow[] {
         return trackDecodeOperation("window", () =>
-            this.db.transaction(() => {
-                const cut = this.latestCompaction(sessionID);
-                return this.all(sessionID, cut ? cut.seq - 1 : -1);
-            })(),
+            this.db
+                .transaction(() => {
+                    const cut = this.latestCompaction(sessionID);
+                    return this.all(sessionID, cut ? cut.seq - 1 : -1);
+                })
+                .deferred(),
         );
     }
 

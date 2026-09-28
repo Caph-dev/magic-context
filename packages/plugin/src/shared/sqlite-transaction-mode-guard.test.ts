@@ -4,14 +4,14 @@ import { join, relative, resolve } from "node:path";
 import ts from "typescript";
 
 /**
- * A deferred transaction (`db.transaction(fn)()`, `.deferred()`, `.default()`)
- * starts with no lock. If it reads before it writes, the write must upgrade a read
+ * An explicitly deferred transaction starts with no writer lock. If it reads before it writes, the write must upgrade a read
  * snapshot to a write lock, and SQLite never runs the busy handler for that
  * upgrade: under another process's write it fails at once with SQLITE_BUSY, or
  * with SQLITE_BUSY_SNAPSHOT when another commit landed after the read, and
  * busy_timeout never applies. Many OpenCode and Pi processes share one context.db,
- * so every transaction that writes must start with `.immediate()` (or
- * `.exclusive()`), which takes the write lock at BEGIN where busy_timeout covers it.
+ * so writing transactions must acquire at BEGIN. The shared runtime defaults
+ * writable handles to IMMEDIATE; plugin/Pi call sites keep their explicit
+ * `.immediate()` / `.exclusive()` declarations as an additional intent fence.
  *
  * Only read-only transactions may stay deferred. Each one is listed here, keyed
  * by file and the nearest named enclosing function, with the reason it never
@@ -26,7 +26,7 @@ const READ_ONLY_DEFERRED_TRANSACTIONS: Record<string, string> = {
 };
 
 const REPOSITORY_ROOT = resolve(import.meta.dir, "../../../..");
-const SOURCE_ROOTS = ["packages/plugin/src", "packages/pi-plugin/src"];
+const SOURCE_ROOTS = ["packages/plugin/src", "packages/pi-plugin/src", "packages/cli/src"];
 const LOCKING_MODES = new Set(["immediate", "exclusive"]);
 
 function sourceFiles(directory: string): string[] {
@@ -56,13 +56,16 @@ function isTransactionCall(node: ts.Node): node is ts.CallExpression {
 }
 
 /** True when `node` is the receiver of a called `.immediate()` / `.exclusive()`. */
-function isCalledWithLockingMode(node: ts.Node): boolean {
+function isCalledWithLockingMode(
+    node: ts.Node,
+    modes: ReadonlySet<string> = LOCKING_MODES,
+): boolean {
     const access = node.parent;
     return (
         access !== undefined &&
         ts.isPropertyAccessExpression(access) &&
         access.expression === node &&
-        LOCKING_MODES.has(access.name.text) &&
+        modes.has(access.name.text) &&
         access.parent !== undefined &&
         ts.isCallExpression(access.parent) &&
         access.parent.expression === access
@@ -92,7 +95,11 @@ function enclosingFunctionName(node: ts.Node): string {
  * A transaction stored in a variable is locking only when every use of that
  * variable calls `.immediate()` or `.exclusive()` on it.
  */
-function storedTransactionLocks(call: ts.CallExpression, source: ts.SourceFile): boolean {
+function storedTransactionLocks(
+    call: ts.CallExpression,
+    source: ts.SourceFile,
+    modes: ReadonlySet<string> = LOCKING_MODES,
+): boolean {
     const declaration = call.parent;
     if (!ts.isVariableDeclaration(declaration) || !ts.isIdentifier(declaration.name)) return false;
     const name = declaration.name.text;
@@ -111,7 +118,7 @@ function storedTransactionLocks(call: ts.CallExpression, source: ts.SourceFile):
         ts.forEachChild(node, visit);
     };
     visit(scope);
-    return uses.length > 0 && uses.every(isCalledWithLockingMode);
+    return uses.length > 0 && uses.every((use) => isCalledWithLockingMode(use, modes));
 }
 
 interface TransactionScan {
@@ -154,8 +161,33 @@ function repositorySources(): Array<{ path: string; text: string }> {
 }
 
 describe("SQLite transaction lock mode", () => {
+    it("declares every audited read-only transaction explicitly deferred", () => {
+        const candidates: string[] = [];
+        for (const file of repositorySources()) {
+            const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true);
+            const visit = (node: ts.Node): void => {
+                if (isTransactionCall(node)) {
+                    const key = `${file.path}#${enclosingFunctionName(node)}`;
+                    if (key in READ_ONLY_DEFERRED_TRANSACTIONS) {
+                        const deferred = new Set(["deferred"]);
+                        if (
+                            !isCalledWithLockingMode(node, deferred) &&
+                            !storedTransactionLocks(node, source, deferred)
+                        )
+                            candidates.push(key);
+                    }
+                }
+                ts.forEachChild(node, visit);
+            };
+            visit(source);
+        }
+        expect(candidates.sort()).toEqual([]);
+    });
+
     it("starts every writing transaction with .immediate() or .exclusive()", () => {
-        const { deferredSites, lockingSites } = scanTransactionModes(repositorySources());
+        const { deferredSites, lockingSites } = scanTransactionModes(
+            repositorySources().filter((file) => !file.path.startsWith("packages/cli/")),
+        );
         // The scan must actually see the codebase's transactions.
         expect(lockingSites).toBeGreaterThan(50);
 

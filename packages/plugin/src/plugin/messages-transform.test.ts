@@ -11,8 +11,8 @@ import {
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
 } from "../features/magic-context/storage-meta-persisted";
-import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
+import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
 import { finalizeMessageRepresentation } from "../hooks/magic-context/transform-postprocess-phase";
 import { Database } from "../shared/sqlite";
 import { createMessagesTransformHandler } from "./messages-transform";
@@ -39,7 +39,7 @@ function makeOutput(overrides?: { agent?: string; sessionID?: string }): any {
 }
 
 describe("createMessagesTransformHandler — error boundary (issue #23)", () => {
-    it("swallows SQLITE_BUSY from inner transform so prompt loop proceeds", async () => {
+    it("refuses SQLITE_BUSY without LKG instead of sending raw", async () => {
         const handler = createMessagesTransformHandler({
             magicContext: {
                 "experimental.chat.messages.transform": async () => {
@@ -55,8 +55,7 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
         });
 
         const output = makeOutput();
-        // Should NOT throw — wrapper catches all errors.
-        await expect(handler({}, output)).resolves.toBeDefined();
+        await expect(handler({}, output)).rejects.toThrow("Magic Context's database is busy");
 
         // Messages are left untouched when transform fails.
         expect(output.messages).toHaveLength(1);
@@ -78,9 +77,7 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
         });
 
         try {
-            await expect(handler({}, makeOutput())).rejects.toBeInstanceOf(
-                EmergencyFailClosedError,
-            );
+            await expect(handler({}, makeOutput())).rejects.toBeInstanceOf(StorageBusyRefusalError);
         } finally {
             db.close();
         }
@@ -200,7 +197,7 @@ describe("createMessagesTransformHandler — fail-closed blocking (note #906)", 
         expect(calls).toBe(3);
     });
 
-    it("still passes SQLITE_BUSY through unmodified while fail-closed is unarmed", async () => {
+    it("refuses SQLITE_BUSY even while fail-closed is unarmed", async () => {
         const handler = createMessagesTransformHandler({
             magicContext: {
                 "experimental.chat.messages.transform": async () => {
@@ -213,7 +210,7 @@ describe("createMessagesTransformHandler — fail-closed blocking (note #906)", 
             failClosedBlockingEnabled: true,
         });
         const output = makeOutput();
-        await expect(handler({}, output)).resolves.toBeDefined();
+        await expect(handler({}, output)).rejects.toThrow("Magic Context's database is busy");
         expect(output.messages[0].info.id).toBe("m1");
     });
 

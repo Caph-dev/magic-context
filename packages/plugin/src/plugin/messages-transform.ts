@@ -15,16 +15,11 @@ import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
+import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { replayRustModeBindingMismatchStrips } from "../hooks/magic-context/transform-postprocess-phase";
 import { log, sessionLog } from "../shared/logger";
-
-// Error codes that SQLite raises for transient contention — should be retried
-// on next transform pass rather than surfaced as persistent failures. BUSY is
-// by far the most common in WAL mode; LOCKED is theoretically possible when a
-// shared-cache conflict occurs (extremely rare in our single-DB setup but
-// covered defensively).
-const TRANSIENT_SQLITE_CODES = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"]);
+import { isTransientSqliteError, withSqliteTransformPass } from "../shared/sqlite";
 
 export const ASSISTANT_TERMINAL_RETRY_MESSAGE =
     "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue.";
@@ -197,9 +192,8 @@ function preserveUserTerminatedTail(
 }
 
 /**
- * Top-level transform wrapper. Catches errors so OpenCode's prompt loop
- * always proceeds — without this guard, a transient DB contention event can
- * crash the user's turn through OpenCode's Effect pipeline. See issue #23:
+ * Top-level transform wrapper. Ordinary bugs remain fail-open, but unsafe
+ * storage failures deliberately refuse the turn after trying LKG. See issue #23:
  * https://github.com/cortexkit/magic-context/issues/23
  *
  * Error handling is tiered:
@@ -209,10 +203,8 @@ function preserveUserTerminatedTail(
  *   message and the turn does not silently fall through to native compaction or a
  *   provider-rejected raw prompt.
  *
- * - **SQLITE_BUSY**: Transient, expected from concurrent plugin processes
- *   (second OpenCode instance, long dreamer/historian child session, slow
- *   WAL checkpoint). Logged tersely; next pass will retry naturally. No
- *   persistent telemetry needed.
+ * - **SQLITE_BUSY / SQLITE_LOCKED**: Writer acquisition already retried before
+ *   any callback ran. Replay LKG or refuse; never retry the mutating transform.
  *
  * - **Non-BUSY errors**: Schema corruption, programming bugs, type errors.
  *   These can silently disable magic-context for the entire session if the
@@ -234,8 +226,7 @@ function preserveUserTerminatedTail(
  * blocking the user for ordinary bugs — but deterministic inoperability and an unsafe
  * assistant-terminal retry must block loudly.
  *
- * Correctness is preserved because all persistent state mutations inside
- * the inner transform are idempotent across passes.
+ * The transform is not assumed idempotent: only transaction acquisition retries.
  */
 export function createMessagesTransformHandler(args: {
     magicContext: MagicContextTransformHooks;
@@ -256,6 +247,11 @@ export function createMessagesTransformHandler(args: {
      * error it raises is converted to passthrough here.
      */
     compactionOff?: boolean;
+    /** Let the v2 hook decide whether an ordinary error needs post-fold refusal or passthrough. */
+    propagateUnexpectedErrors?: boolean;
+    onStorageBusyRefusal?: (sessionId: string, message: string) => Promise<void>;
+    /** Validate and restore host-owned prompt segments before adopting replayed messages. */
+    onLkgReplay?: () => void;
     internalChildSessions?: Set<string>;
     tryReopenStorage?: () => boolean | Promise<boolean>;
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
@@ -343,7 +339,12 @@ export function createMessagesTransformHandler(args: {
                 restoreCompactionOffInput();
                 return output.messages;
             }
-            if (!args.compactionOff && sessionId && isProviderOverflowFailClosedProven(sessionId)) {
+            if (
+                !args.compactionOff &&
+                !isTransientSqliteError(error) &&
+                sessionId &&
+                isProviderOverflowFailClosedProven(sessionId)
+            ) {
                 throw new EmergencyFailClosedError(
                     "Emergency recovery transform failed; refusing an unbounded raw fallback",
                     { cause: error },
@@ -376,18 +377,16 @@ export function createMessagesTransformHandler(args: {
                             modelKey: keys.modelKey,
                             providerKey: keys.providerKey,
                             entry,
+                            prepareReplay: (messages) =>
+                                replayRustModeBindingMismatchStrips({
+                                    db,
+                                    sessionId,
+                                    messages,
+                                    resolvedProviderID: keys.providerKey ?? undefined,
+                                }),
                         });
                         if (replay.ok) {
-                            // The stored prefix already carries the binding-mismatch
-                            // strips; the replayed tail comes from the raw input, so
-                            // apply the persisted set there too. A removed thinking
-                            // block must not return on a replayed pass.
-                            replayRustModeBindingMismatchStrips({
-                                db,
-                                sessionId,
-                                messages: replay.messages as MessageLike[],
-                                resolvedProviderID: keys.providerKey ?? undefined,
-                            });
+                            args.onLkgReplay?.();
                             replaceMessagesInPlace(
                                 output,
                                 replay.messages as unknown as MessageWithParts[],
@@ -410,15 +409,32 @@ export function createMessagesTransformHandler(args: {
             const code = (error as { code?: string } | null)?.code;
             const name = (error as { name?: string } | null)?.name;
             const message = error instanceof Error ? error.message : String(error);
-            const isTransient = typeof code === "string" && TRANSIENT_SQLITE_CODES.has(code);
+            const isTransient =
+                isTransientSqliteError(error) || error instanceof StorageBusyRefusalError;
 
             if (isTransient) {
+                if (!args.compactionOff) {
+                    const refusal =
+                        error instanceof StorageBusyRefusalError
+                            ? error
+                            : new StorageBusyRefusalError(error, "messages-transform");
+                    if (sessionId && args.onStorageBusyRefusal) {
+                        try {
+                            await args.onStorageBusyRefusal(sessionId, refusal.message);
+                        } catch (noticeError) {
+                            log("[magic-context] storage-busy host refusal failed:", noticeError);
+                        }
+                    }
+                    throw refusal;
+                }
                 log(
                     `[magic-context] transform skipped this pass — ${code} (transient; retrying next pass): ${message}`,
                 );
                 restoreCompactionOffInput();
                 return output.messages;
             }
+
+            if (args.propagateUnexpectedErrors) throw error;
 
             // Persistent non-transient errors are the real risk: silent forever
             // disable unless we surface them. Persist to session_meta so the
@@ -463,18 +479,23 @@ export function createMessagesTransformHandler(args: {
         return output.messages;
     };
 
-    return async (input, output): Promise<MessageWithParts[]> => {
-        const inputMessages = [...output.messages];
-        // Read before the transform runs: it mutates the shared message objects.
-        const inputTailRole = wireTailRole(output.messages);
-        enforcePersistedUserTerminatedTail(output.messages);
-        try {
-            return await run(input, output);
-        } finally {
-            preserveUserTerminatedTail(output.messages, inputMessages);
-            reportAssistantTerminatedTail(output.messages, inputTailRole, resolveSessionId(output));
-        }
-    };
+    return (input, output): Promise<MessageWithParts[]> =>
+        withSqliteTransformPass(async () => {
+            const inputMessages = [...output.messages];
+            // Read before the transform runs: it mutates the shared message objects.
+            const inputTailRole = wireTailRole(output.messages);
+            enforcePersistedUserTerminatedTail(output.messages);
+            try {
+                return await run(input, output);
+            } finally {
+                preserveUserTerminatedTail(output.messages, inputMessages);
+                reportAssistantTerminatedTail(
+                    output.messages,
+                    inputTailRole,
+                    resolveSessionId(output),
+                );
+            }
+        });
 }
 
 function resolveSessionId(output: MessagesTransformOutput): string | null {

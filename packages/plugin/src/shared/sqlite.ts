@@ -39,6 +39,7 @@
  * `run()` → {changes,lastInsertRowid}) is identical and was verified directly.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { statSync } from "node:fs";
 // Type import only — runtime is loaded dynamically below. @types/better-sqlite3
 // has the richest definitions and is a structural superset of the API surface
@@ -211,6 +212,70 @@ export interface SqliteMemoryStats {
 const trackedSqliteConnections = new Map<number, TrackedSqliteConnection>();
 let nextSqliteConnectionSequence = 1;
 
+/** Route native Bun and Node transaction entry through the same acquisition retry.
+ * Native Bun transaction wrappers execute BEGIN internally, bypassing an exec override,
+ * so both runtimes use this small synchronous wrapper instead. Writable handles
+ * default to IMMEDIATE; explicit deferred calls and readonly handles keep read
+ * snapshots without acquiring the writer lock. */
+function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean): void {
+    const nativeExec = db.exec.bind(db);
+    Object.defineProperty(db, "exec", {
+        configurable: true,
+        writable: true,
+        value: (sql: string) => {
+            if (/^\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
+                retryAcquisition(() => nativeExec(sql), sql.trim());
+                return db;
+            }
+            return nativeExec(sql);
+        },
+    });
+    Object.defineProperty(db, "transaction", {
+        configurable: true,
+        writable: true,
+        // biome-ignore lint/suspicious/noExplicitAny: preserve the native callback's receiver and argument types.
+        value: (fn: (...args: any[]) => any) => {
+            const make = (mode: "IMMEDIATE" | "EXCLUSIVE" | "DEFERRED") =>
+                function (this: unknown, ...args: unknown[]): unknown {
+                    const nested = isInTransaction(db);
+                    // Equal savepoint names stack LIFO, matching both native backends.
+                    const savepoint = "mc_tx_sp";
+                    db.exec(nested ? `SAVEPOINT ${savepoint}` : `BEGIN ${mode}`);
+                    try {
+                        const result = fn.apply(this, args);
+                        db.exec(nested ? `RELEASE ${savepoint}` : "COMMIT");
+                        return result;
+                    } catch (error) {
+                        if (isInTransaction(db)) {
+                            if (nested) {
+                                db.exec(`ROLLBACK TO ${savepoint}`);
+                                db.exec(`RELEASE ${savepoint}`);
+                            } else db.exec("ROLLBACK");
+                        }
+                        throw error;
+                    }
+                };
+            const defaultTransaction = make(readonly ? "DEFERRED" : "IMMEDIATE");
+            const variants = {
+                default: defaultTransaction,
+                deferred: make("DEFERRED"),
+                immediate: make("IMMEDIATE"),
+                exclusive: make("EXCLUSIVE"),
+                database: db,
+            };
+            for (const transaction of [
+                variants.default,
+                variants.deferred,
+                variants.immediate,
+                variants.exclusive,
+            ]) {
+                Object.assign(transaction, variants);
+            }
+            return defaultTransaction;
+        },
+    });
+}
+
 function trackSqliteConnection(
     db: BetterSqlite3.Database,
     filename: unknown,
@@ -232,6 +297,7 @@ function trackSqliteConnection(
             ((options as { readonly?: unknown }).readonly === true ||
                 (options as { readOnly?: unknown }).readOnly === true),
     };
+    installTransactionRouting(db, metadata.readonly);
     Object.defineProperty(db, "close", {
         configurable: true,
         value: (...args: unknown[]) => {
@@ -260,18 +326,10 @@ const TrackedDatabase = new Proxy(DatabaseImpl, {
  * Wrap node:sqlite's `DatabaseSync` so it presents the better-sqlite3/bun
  * surface the rest of the codebase calls:
  *   - translate the `{ readonly }` constructor option → node:sqlite's `readOnly`
- *   - add a `transaction(fn)` helper that matches better-sqlite3 semantics,
- *     using `db.isTransaction` to pick BEGIN (top-level) vs SAVEPOINT (nested),
- *     so it composes correctly with manual `BEGIN IMMEDIATE` blocks too.
+ * Transaction routing is installed for both runtimes by trackSqliteConnection.
  */
 // biome-ignore lint/suspicious/noExplicitAny: node:sqlite has no shipped types here; the public export is cast to the better-sqlite3 shape.
 function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
-    // Single constant savepoint name is correct for arbitrary nesting depth:
-    // SQLite savepoints with the same name stack LIFO — RELEASE / ROLLBACK TO
-    // always target the most recent. node:sqlite is synchronous + single-process
-    // per connection, so there is no concurrent-savepoint hazard.
-    const SAVEPOINT = "mc_tx_sp";
-
     class NodeSqliteDatabase extends DatabaseSync {
         constructor(filename?: string | Buffer, options?: BetterSqlite3.Options) {
             const translated: Record<string, unknown> = { ...options };
@@ -305,52 +363,6 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
                         : original(...args);
             }
             return stmt;
-        }
-
-        // biome-ignore lint/suspicious/noExplicitAny: mirrors better-sqlite3's generic transaction(fn) signature.
-        transaction<F extends (...args: any[]) => any>(fn: F): F {
-            // biome-ignore lint/suspicious/noExplicitAny: faithful pass-through of this/args to fn.
-            const self = this as any;
-            const execute = (
-                mode: "" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE",
-                receiver: unknown,
-                args: unknown[],
-            ) => {
-                const nested = self.isTransaction === true;
-                self.exec(nested ? `SAVEPOINT ${SAVEPOINT}` : `BEGIN${mode ? ` ${mode}` : ""}`);
-                try {
-                    const result = fn.apply(receiver, args);
-                    self.exec(nested ? `RELEASE ${SAVEPOINT}` : "COMMIT");
-                    return result;
-                } catch (error) {
-                    if (nested) {
-                        // ROLLBACK TO unwinds the savepoint's changes but leaves
-                        // it on the stack; RELEASE then pops it (better-sqlite3
-                        // does both).
-                        self.exec(`ROLLBACK TO ${SAVEPOINT}`);
-                        self.exec(`RELEASE ${SAVEPOINT}`);
-                    } else {
-                        self.exec("ROLLBACK");
-                    }
-                    throw error;
-                }
-            };
-            const wrapped = function (this: unknown, ...args: unknown[]): unknown {
-                return execute("", this, args);
-            };
-            wrapped.default = function (this: unknown, ...args: unknown[]): unknown {
-                return execute("", this, args);
-            };
-            wrapped.deferred = function (this: unknown, ...args: unknown[]): unknown {
-                return execute("DEFERRED", this, args);
-            };
-            wrapped.immediate = function (this: unknown, ...args: unknown[]): unknown {
-                return execute("IMMEDIATE", this, args);
-            };
-            wrapped.exclusive = function (this: unknown, ...args: unknown[]): unknown {
-                return execute("EXCLUSIVE", this, args);
-            };
-            return wrapped as unknown as F;
         }
     }
 
@@ -476,6 +488,80 @@ export type Database = BetterSqlite3.Database;
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
+const transformPassScope = new AsyncLocalStorage<{ active: boolean } | undefined>();
+
+/** Only an awaited foreground transform may spend the extra acquisition budget.
+ * The mutable lease also expires for detached descendants when that pass ends. */
+export function withSqliteTransformPass<T>(operation: () => T): T {
+    const lease = { active: true };
+    return transformPassScope.run(lease, () => {
+        try {
+            const result = operation();
+            if (result && typeof (result as { then?: unknown }).then === "function") {
+                return Promise.resolve(result).finally(() => {
+                    lease.active = false;
+                }) as T;
+            }
+            lease.active = false;
+            return result;
+        } catch (error) {
+            lease.active = false;
+            throw error;
+        }
+    });
+}
+
+/** Start detached maintenance work without borrowing a foreground pass's budget. */
+export function withoutSqliteTransformPass<T>(operation: () => T): T {
+    return transformPassScope.run(undefined, operation);
+}
+
+/** Bun names SQLite codes; node:sqlite exposes the numeric (possibly extended) errcode. */
+export function isTransientSqliteError(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const value = error as { code?: unknown; errcode?: unknown };
+    return (
+        (typeof value.code === "string" && /^(SQLITE_BUSY|SQLITE_LOCKED)(_|$)/.test(value.code)) ||
+        (typeof value.errcode === "number" && [5, 6].includes(value.errcode & 0xff))
+    );
+}
+
+export class SqliteAcquisitionBusyError extends Error {
+    readonly code = "SQLITE_BUSY";
+    readonly stage: string;
+    constructor(cause: unknown, stage = "BEGIN IMMEDIATE") {
+        super("SQLite writer acquisition remained busy after 3 attempts", { cause });
+        this.name = "SqliteAcquisitionBusyError";
+        this.stage = stage;
+    }
+}
+
+/** Retry only acquisition: no privilege flag, callback or in-memory mutation has run yet. */
+function retryAcquisition(acquire: () => unknown, stage: string): void {
+    // Maintenance writers retry on their next tick. Multiplying their native
+    // busy timeout here would stall every session sharing the host event loop.
+    if (!transformPassScope.getStore()?.active) {
+        acquire();
+        return;
+    }
+    const delays = [500, 1000];
+    for (let attempt = 0; ; attempt++) {
+        try {
+            acquire();
+            return;
+        } catch (error) {
+            // Handles created by this module already retry inside exec. Do not
+            // apply the attempt budget twice; externally supplied handles still
+            // need the acquisition retry performed by withPrivilegedWriter.
+            if (error instanceof SqliteAcquisitionBusyError || !isTransientSqliteError(error))
+                throw error;
+            if (attempt === delays.length) throw new SqliteAcquisitionBusyError(error, stage);
+            // The database API is synchronous on both hosts. With busy_timeout=5000,
+            // three attempts plus these waits bound one acquisition to 16.5 seconds.
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delays[attempt]);
+        }
+    }
+}
 
 function isInTransaction(db: Database): boolean {
     const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
@@ -501,7 +587,7 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
     if (nested) {
         db.exec(`SAVEPOINT ${savepoint}`);
     } else {
-        db.exec("BEGIN IMMEDIATE");
+        retryAcquisition(() => db.exec("BEGIN IMMEDIATE"), "BEGIN IMMEDIATE");
     }
     privilegeDepth.set(db, previousDepth + 1);
     try {

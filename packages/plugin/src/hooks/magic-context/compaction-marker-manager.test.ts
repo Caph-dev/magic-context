@@ -539,6 +539,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             const startedAt = Date.now();
             const outcome = applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome);
             expect(outcome.kind).toBe("retryable-failure");
+            // This standalone/background call gets one host-store busy timeout.
             expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
         } finally {
             locker.exec("ROLLBACK");

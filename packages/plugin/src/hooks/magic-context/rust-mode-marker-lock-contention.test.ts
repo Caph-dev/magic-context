@@ -255,7 +255,7 @@ describe("Rust-mode compaction target recording under cross-process write conten
         expect(result.drained[0]).toMatchObject({ ordinal: 7, endMessageId: "m1" });
     }, 20_000);
 
-    it("serves the module output and skips recording when the lock outlasts busy_timeout", async () => {
+    it("serves the module output and skips recording when the lock outlasts bounded acquisition retries", async () => {
         const { db, dbPath } = openFileDb();
         // A short timeout stands in for the production 5 s so the test stays fast;
         // the lock is held well past it.
@@ -271,11 +271,12 @@ describe("Rust-mode compaction target recording under cross-process write conten
                 db,
                 dbPath,
                 sessionId,
-                lockHoldMs: 3000,
+                lockHoldMs: 10000,
                 decision: "SOFT+",
             });
-            // The pass gives up after busy_timeout instead of waiting out the lock.
-            expect(result.elapsedSinceLockMs).toBeLessThan(2500);
+            // Three short busy timeouts plus acquisition backoff must still give
+            // up before the long-held lock releases, without discarding module output.
+            expect(result.elapsedSinceLockMs).toBeLessThan(9000);
             const skipCall = sessionLog.mock.calls.find(
                 ([loggedSession, message]) =>
                     loggedSession === sessionId &&
