@@ -2070,10 +2070,7 @@ mod tests {
 
         assert!(store.fence().lane_ahead());
         assert_eq!(store.writable_tables(), DOMAIN_TABLES.to_vec());
-        assert_eq!(
-            store.health_value()["fence"]["lane_ahead"],
-            json!(true)
-        );
+        assert_eq!(store.health_value()["fence"]["lane_ahead"], json!(true));
         store.publish_fold(&sample_publish()).unwrap();
     }
 

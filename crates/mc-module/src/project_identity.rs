@@ -168,7 +168,9 @@ fn git_root_commit(canonical: &Path) -> Option<String> {
         .map(|line| line.trim().chars().take(64).collect::<String>())
         .filter(|line| {
             (7..=64).contains(&line.len())
-                && line.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && line
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
         .min()
 }
@@ -213,8 +215,8 @@ impl ProjectIdentityResolver {
             }
         }
         let identity = self.resolve_uncached(&resolved)?;
-        let revalidate_at = (!identity.starts_with("git:"))
-            .then(|| Instant::now() + DIRECTORY_REVALIDATE_AFTER);
+        let revalidate_at =
+            (!identity.starts_with("git:")).then(|| Instant::now() + DIRECTORY_REVALIDATE_AFTER);
         self.cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -292,6 +294,21 @@ impl ProjectIdentityResolver {
 mod tests {
     use super::*;
 
+    /// `(input, identity)` pairs printed by the host's `resolveProjectIdentity` for paths that
+    /// do not exist, which is its `dir:` fallback of the resolved path.
+    const DIRECTORY_GOLDEN: &[(&str, &str)] = &[
+        ("/work/api", "dir:e02ef1f35c06"),
+        ("/work/api/", "dir:e02ef1f35c06"),
+        ("/work/./x/../api", "dir:e02ef1f35c06"),
+        ("/tmp/n\u{e4}me dir", "dir:93e3ea277593"),
+        ("/", "dir:6666cd76f969"),
+    ];
+
+    /// The root commit the host's `resolveProjectIdentityForSession` resolves for the fixed
+    /// repository built in the checkout test, from the repository, a subdirectory, a trailing
+    /// slash, a worktree and a symlink alike.
+    const GOLDEN_ROOT_COMMIT: &str = "5dd1e9f0bd6f4800131f7c6887d174ffceac99d6";
+
     /// Values printed by the host's own function (see the module documentation) for the
     /// same inputs. A change on either side that alters them splits every project's
     /// memories between the host and the module.
@@ -340,7 +357,14 @@ mod tests {
         let worktree = dir.path().join("worktree");
         git(
             &repo,
-            &["worktree", "add", "-q", worktree.to_str().unwrap(), "-b", "wt"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                "wt",
+            ],
         );
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&repo, &link).unwrap();
@@ -364,7 +388,10 @@ mod tests {
         let plain = dir.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         let resolver = ProjectIdentityResolver::new();
-        assert_eq!(resolver.resolve(&plain).unwrap(), directory_fallback(&plain));
+        assert_eq!(
+            resolver.resolve(&plain).unwrap(),
+            directory_fallback(&plain)
+        );
         let gone = dir.path().join("gone");
         assert!(matches!(
             resolver.resolve(&gone),
@@ -372,20 +399,3 @@ mod tests {
         ));
     }
 }
-
-/// `(input, identity)` pairs printed by the host's `resolveProjectIdentity` for paths that
-/// do not exist, which is its `dir:` fallback of the resolved path.
-#[cfg(test)]
-const DIRECTORY_GOLDEN: &[(&str, &str)] = &[
-    ("/work/api", "dir:e02ef1f35c06"),
-    ("/work/api/", "dir:e02ef1f35c06"),
-    ("/work/./x/../api", "dir:e02ef1f35c06"),
-    ("/tmp/n\u{e4}me dir", "dir:93e3ea277593"),
-    ("/", "dir:6666cd76f969"),
-];
-
-/// The root commit the host's `resolveProjectIdentityForSession` resolves for the fixed
-/// repository built in the checkout test, from the repository, a subdirectory, a trailing
-/// slash, a worktree and a symlink alike.
-#[cfg(test)]
-const GOLDEN_ROOT_COMMIT: &str = "5dd1e9f0bd6f4800131f7c6887d174ffceac99d6";

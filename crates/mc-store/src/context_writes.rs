@@ -195,13 +195,7 @@ fn upsert_compartments_tx(
                 outcome.updated += 1;
             }
             None => {
-                insert_compartment_tx(
-                    tx,
-                    session_id,
-                    compartment.sequence,
-                    compartment,
-                    harness,
-                )?;
+                insert_compartment_tx(tx, session_id, compartment.sequence, compartment, harness)?;
                 outcome.inserted += 1;
             }
         }
@@ -261,7 +255,10 @@ pub(crate) fn append_m0_mutation_tx(
 
 /// Candidates whose source range starts past the session's last remaining compartment
 /// were derived from compartments that no longer exist.
-fn delete_candidates_past_tail_tx(tx: &rusqlite::Connection, session_id: &str) -> rusqlite::Result<()> {
+fn delete_candidates_past_tail_tx(
+    tx: &rusqlite::Connection,
+    session_id: &str,
+) -> rusqlite::Result<()> {
     for table in ["primer_candidates", "user_memory_candidates"] {
         tx.execute(
             &format!(
@@ -364,13 +361,7 @@ fn apply_lineage_copy_tx(
         params![target_key, source_key],
     )?;
     let harness = session_harness_tx(tx, target_key)?;
-    insert_compartment_tx(
-        tx,
-        target_key,
-        placeholder.sequence,
-        placeholder,
-        &harness,
-    )?;
+    insert_compartment_tx(tx, target_key, placeholder.sequence, placeholder, &harness)?;
     Ok(())
 }
 
@@ -392,8 +383,12 @@ fn apply_pending_tx(
             let mut deleted = 0;
             for (_, stored) in read_session_compartments(tx, session_id)? {
                 if !keep.contains(&stored.sequence) {
-                    deleted +=
-                        delete_compartments_where_tx(tx, session_id, "sequence = ?2", stored.sequence)?;
+                    deleted += delete_compartments_where_tx(
+                        tx,
+                        session_id,
+                        "sequence = ?2",
+                        stored.sequence,
+                    )?;
                 }
             }
             if upsert.updated + deleted > 0 {
@@ -403,7 +398,11 @@ fn apply_pending_tx(
         }
         PendingContextWrite::ClearSession { now_ms } => {
             let deleted = delete_compartments_where_tx(tx, session_id, "sequence >= ?2", i64::MIN)?;
-            for table in ["compartment_events", "primer_candidates", "user_memory_candidates"] {
+            for table in [
+                "compartment_events",
+                "primer_candidates",
+                "user_memory_candidates",
+            ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE session_id = ?1"),
                     params![session_id],

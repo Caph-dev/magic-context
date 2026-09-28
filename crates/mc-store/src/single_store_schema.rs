@@ -378,7 +378,6 @@ pub fn read_memory_render_snapshot(
                     updated_at: row.get(8)?,
                     last_seen_at: row.get(9)?,
                     verified_at: row.get(10)?,
-                    ..Default::default()
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

@@ -91,7 +91,9 @@ impl SqliteContextDomain {
         };
         let writer = open().map_err(context_sql_error)?;
         writer
-            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0))
+            .query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(context_sql_error)?;
         let reader = open().map_err(context_sql_error)?;
         Ok(Self {

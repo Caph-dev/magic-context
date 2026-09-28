@@ -734,7 +734,8 @@ mod tests {
             8_000.0,
             100.0,
             true,
-            |_| 21,)
+            |_| 21,
+        )
         .unwrap();
         assert!(exact.body.contains("- exact-quarter"), "{}", exact.body);
         assert!(exact.profile_rendered);
@@ -753,7 +754,8 @@ mod tests {
             8_000.0,
             100.0,
             true,
-            |_| 22,)
+            |_| 22,
+        )
         .unwrap();
         assert_eq!(over.body, M1_PLACEHOLDER);
         assert!(!over.profile_rendered);
@@ -772,7 +774,8 @@ mod tests {
             8_000.0,
             1.0,
             true,
-            |_| 1,)
+            |_| 1,
+        )
         .unwrap();
         assert_eq!(empty.body, M1_PLACEHOLDER);
         assert!(!empty.profile_rendered);
@@ -876,7 +879,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
 
         assert_eq!(m1.body, M1_PLACEHOLDER);
@@ -904,7 +908,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert_eq!(m1.body, M1_PLACEHOLDER, "no delta → the placeholder body");
         assert_eq!(m1.new_coverage, None);
@@ -930,7 +935,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
 
         // C2 rides m1 at P1, and coverage extends 10 → 20 (the SOFT advances the anchor)
@@ -964,7 +970,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
 
         assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
@@ -1057,7 +1064,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
 
         let late_source = store
@@ -1089,7 +1097,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         let reconciled = crate::m0_compose::compose_m0_from_store(
             store,
@@ -1128,7 +1137,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
 
         let expected: serde_json::Value =
@@ -1220,7 +1230,8 @@ mod tests {
                 8_000.0,
                 4_000.0,
                 true,
-                no_estimate,)
+                no_estimate,
+            )
             .unwrap();
             assert!(m1.body.contains("<memory-updates>"), "{case}: {}", m1.body);
             assert_eq!(
@@ -1273,7 +1284,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         let replay = compose_m1_from_store(
             store,
@@ -1286,7 +1298,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
 
         assert!(
@@ -1338,7 +1351,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert_eq!(
             m1.body.matches("deduplicated correction").count(),
@@ -1395,7 +1409,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(m1.body.contains("own workspace correction"), "{}", m1.body);
         assert!(
@@ -1469,7 +1484,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(
             m1.body
@@ -1515,7 +1531,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(
             chain
@@ -1552,7 +1569,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(
             cycle
@@ -1593,7 +1611,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(
             m1.body.contains(&format!("<removed id=\"{source}\"/>")),
@@ -1640,7 +1659,8 @@ mod tests {
             .unwrap()
             .normalized_hash;
         store
-            .set_memory_classification(foreign,
+            .set_memory_classification(
+                foreign,
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash.clone(),
@@ -1665,13 +1685,15 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(grant.body.contains("foreign below max"), "{}", grant.body);
         assert_eq!(grant.body.matches("foreign below max").count(), 1);
 
         store
-            .set_memory_classification(foreign,
+            .set_memory_classification(
+                foreign,
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash,
@@ -1693,7 +1715,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(
             revoke
@@ -1746,7 +1769,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
         assert!(m1.body.contains("brand new"), "{}", m1.body);
@@ -1790,7 +1814,8 @@ mod tests {
             8_000.0,
             4_000.0,
             true,
-            no_estimate,)
+            no_estimate,
+        )
         .unwrap();
         assert!(
             m1.body.contains("own arch rule"),

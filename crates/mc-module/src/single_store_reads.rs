@@ -176,12 +176,16 @@ fn read_context_flag(conn: &Connection) -> rusqlite::Result<Option<ContextFlag>>
 /// - Both recording the migration with different stamps is `single_store_state_split`.
 ///
 /// Any pending `context.db` write a previous process left behind lands before this returns.
-pub fn attach(store: &McStore, context_path: &Path) -> Result<Arc<ModuleContextDomain>, McStoreError> {
-    let marker = store.single_store_marker()?.ok_or_else(|| {
-        McStoreError::SingleStoreStateSplit {
-            detail: "store.db is at migration 61 without its single-store marker".to_string(),
-        }
-    })?;
+pub fn attach(
+    store: &McStore,
+    context_path: &Path,
+) -> Result<Arc<ModuleContextDomain>, McStoreError> {
+    let marker =
+        store
+            .single_store_marker()?
+            .ok_or_else(|| McStoreError::SingleStoreStateSplit {
+                detail: "store.db is at migration 61 without its single-store marker".to_string(),
+            })?;
     let domain = Arc::new(ModuleContextDomain::open(context_path)?);
     let mut flag = None;
     domain.read(&mut |conn| {
@@ -237,7 +241,9 @@ pub fn attach(store: &McStore, context_path: &Path) -> Result<Arc<ModuleContextD
     store.install_context_domain(Arc::clone(&domain) as Arc<dyn ContextDomain>);
     let resumed = store.resume_all_pending_context_writes()?;
     if resumed > 0 {
-        tracing::info!("mc-module: finished {resumed} pending context.db write(s) left by an earlier process");
+        tracing::info!(
+            "mc-module: finished {resumed} pending context.db write(s) left by an earlier process"
+        );
     }
     Ok(domain)
 }
@@ -329,7 +335,9 @@ mod tests {
             matches!(error, McStoreError::SingleStoreStateSplit { .. }),
             "{error:?}"
         );
-        assert!(error.to_string().starts_with(SINGLE_STORE_STATE_SPLIT_REASON));
+        assert!(error
+            .to_string()
+            .starts_with(SINGLE_STORE_STATE_SPLIT_REASON));
         assert!(!store.has_context_domain());
         assert_eq!(context_flag(&context), ("migrated".to_string(), Some(1)));
     }
@@ -340,7 +348,10 @@ mod tests {
         let context = context_db(dir.path(), Some(("migrated", Some(7))));
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         attach(&store, &context).unwrap();
-        assert_eq!(store.single_store_marker().unwrap().unwrap().set_at_ms, Some(7));
+        assert_eq!(
+            store.single_store_marker().unwrap().unwrap().set_at_ms,
+            Some(7)
+        );
     }
 
     #[test]
@@ -350,7 +361,9 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         // Not a fresh install: the marker was written by the migration itself.
         store.adopt_single_store_stamp(5).unwrap();
-        store.set_single_store_marker_build_for_test("ck-mc 0.44.0").unwrap();
+        store
+            .set_single_store_marker_build_for_test("ck-mc 0.44.0")
+            .unwrap();
         let error = attach(&store, &context).err().expect("refused");
         assert!(
             error

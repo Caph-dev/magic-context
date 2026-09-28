@@ -33,6 +33,14 @@ async fn single_store_drill_post_migration_passes() {
         },
     };
 
+    // The writer epoch lives in the lease file next to the live store, which a specimen
+    // copy does not carry, so a fresh open here claims a lower epoch than the one the
+    // copied fence row records. Clear the fence of this throwaway copy so this process
+    // may write, as the live module's own lease would allow.
+    rusqlite::Connection::open(&store_path)
+        .unwrap()
+        .execute("DELETE FROM cortexkit_fence", [])
+        .unwrap();
     let store = Arc::new(McStore::open(&descriptor).expect("a migrated store opens"));
     single_store_reads::attach(&store, &context_path).expect("context.db attaches");
     let handler = McHandler::with_producer_factory_config_resolver(
@@ -56,14 +64,13 @@ async fn single_store_drill_post_migration_passes() {
             ck("m2", 2, "drill follow-up"),
         ]
     };
-    let first = call_transform_request(&handler, request_with_usage(messages(), 1_000, 50_000)).await;
+    let first =
+        call_transform_request(&handler, request_with_usage(messages(), 1_000, 50_000)).await;
     println!(
         "DRILL warm action={} reason={} rendered_memory_ids={}",
         first["action"],
         first["materialize_reason"],
-        first["rendered_memory_ids"]
-            .as_array()
-            .map_or(0, Vec::len)
+        first["rendered_memory_ids"].as_array().map_or(0, Vec::len)
     );
 
     // The migration's cache reset, exactly as the engine applies it to every session.
@@ -73,7 +80,8 @@ async fn single_store_drill_post_migration_passes() {
     drop(reset);
     println!("DRILL cache reset rows={reset_rows}");
 
-    let hard = call_transform_request(&handler, request_with_usage(messages(), 1_000, 50_000)).await;
+    let hard =
+        call_transform_request(&handler, request_with_usage(messages(), 1_000, 50_000)).await;
     println!(
         "DRILL pass1 action={} reason={} rendered_memory_ids={}",
         hard["action"],

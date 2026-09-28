@@ -6636,7 +6636,8 @@ impl<'a> FacadeMutationTxn<'a> {
         rows: &[VerificationUpdate],
         now_ms: i64,
     ) -> Result<VerificationApplyResult, String> {
-        set_memory_verification_tx(self.tx, project, rows, now_ms).map_err(|error| error.to_string())
+        set_memory_verification_tx(self.tx, project, rows, now_ms)
+            .map_err(|error| error.to_string())
     }
 
     pub fn set_memory_mural_cue(
@@ -6877,18 +6878,13 @@ impl<'a> FacadeMutationTxn<'a> {
         // A session note the host wrote carries no project; the session is its owner.
         let project_matches = current.project_path == project_path
             || (current.type_name == "session" && current.project_path.is_empty());
-        if !project_matches
-            || (current.type_name != "smart" && current.session_id != session_id)
-        {
+        if !project_matches || (current.type_name != "smart" && current.session_id != session_id) {
             return Ok((NoteDismissOutcome::NotOwned, None));
         }
         if current.status == "dismissed" {
             return Ok((NoteDismissOutcome::AlreadyDismissed, Some(current)));
         }
-        if !matches!(
-            current.status.as_str(),
-            "active" | "pending" | "ready"
-        ) {
+        if !matches!(current.status.as_str(), "active" | "pending" | "ready") {
             return Ok((NoteDismissOutcome::AlreadyDismissed, Some(current)));
         }
         let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
@@ -7207,9 +7203,7 @@ fn register_legacy_trigger_functions(conn: &rusqlite::Connection) -> rusqlite::R
         "mc_facade_authority_domain",
         "mc_facade_authority_route",
     ] {
-        conn.create_scalar_function(name, 0, FunctionFlags::SQLITE_UTF8, |_| {
-            Ok(String::new())
-        })?;
+        conn.create_scalar_function(name, 0, FunctionFlags::SQLITE_UTF8, |_| Ok(String::new()))?;
     }
     Ok(())
 }
@@ -7255,7 +7249,10 @@ impl McStore {
 
     /// The project identity the host recorded for `session_id` in `context.db`'s
     /// `session_projects`, if it recorded one.
-    pub fn session_project_identity(&self, session_id: &str) -> Result<Option<String>, McStoreError> {
+    pub fn session_project_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, McStoreError> {
         self.context_read(|conn| {
             conn.query_row(
                 "SELECT project_path FROM session_projects
@@ -7336,7 +7333,9 @@ impl McStore {
         let mut output = None;
         let mut failure = None;
         let outcome = domain.write(tables, &mut |tx| {
-            let write = write.take().expect("a context write runs its callback once");
+            let write = write
+                .take()
+                .expect("a context write runs its callback once");
             match write(tx) {
                 Ok(value) => {
                     output = Some(value);
@@ -7408,7 +7407,11 @@ impl McStore {
     /// Replace the host's user profile in `context.db` with `lines` (active, promoted in
     /// order) and set the global profile version, as the host's dreamer does.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn seed_user_profile_for_test(&self, lines: &[String], version: u64) -> Result<(), McStoreError> {
+    pub fn seed_user_profile_for_test(
+        &self,
+        lines: &[String],
+        version: u64,
+    ) -> Result<(), McStoreError> {
         self.with_context_conn_for_test(|tx| {
             tx.execute("DELETE FROM user_memories", [])?;
             for (index, line) in lines.iter().enumerate() {
@@ -7431,7 +7434,11 @@ impl McStore {
     /// Set a project's `project_memory_epoch` in `context.db`, as the host's identity and
     /// workspace writers do.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn set_project_memory_epoch_for_test(&self, project_path: &str, epoch: i64) -> Result<(), McStoreError> {
+    pub fn set_project_memory_epoch_for_test(
+        &self,
+        project_path: &str,
+        epoch: i64,
+    ) -> Result<(), McStoreError> {
         self.with_context_conn_for_test(|tx| {
             tx.execute(
                 "INSERT INTO project_state (project_path, project_memory_epoch, project_user_profile_version, updated_at)
@@ -9900,7 +9907,9 @@ impl McStore {
         rows: &[MuralCueUpdate],
         now_ms: i64,
     ) -> Result<MuralCueApplyResult, McStoreError> {
-        self.context_write(&["memories"], |tx| set_memory_mural_cue_tx(tx, project, rows, now_ms))
+        self.context_write(&["memories"], |tx| {
+            set_memory_mural_cue_tx(tx, project, rows, now_ms)
+        })
     }
 
     /// Apply verification updates only when their content hash still matches the value used
@@ -9912,7 +9921,9 @@ impl McStore {
         rows: &[VerificationUpdate],
         now_ms: i64,
     ) -> Result<VerificationApplyResult, McStoreError> {
-        self.context_write(&["memories"], |tx| set_memory_verification_tx(tx, project, rows, now_ms))
+        self.context_write(&["memories"], |tx| {
+            set_memory_verification_tx(tx, project, rows, now_ms)
+        })
     }
 
     /// Store the complete file set reported by map-memories as `memory_verifications` rows,
@@ -9923,7 +9934,9 @@ impl McStore {
         rows: &[MappingUpdate],
         now_ms: i64,
     ) -> Result<MappingApplyResult, McStoreError> {
-        self.context_write(&["memories"], |tx| set_memory_mapping_tx(tx, project, rows, now_ms))
+        self.context_write(&["memories"], |tx| {
+            set_memory_mapping_tx(tx, project, rows, now_ms)
+        })
     }
 
     /// Record a terminal wrapup outcome only while the cache row still matches the
@@ -12156,40 +12169,46 @@ impl McStore {
         self.resume_pending_context_write(session_id)?;
         // What the truncation removes and what survives is read from context.db before
         // the store.db transaction; the removal itself runs after that transaction commits.
-        let (dropped_count, dropped_min, dropped_max, surviving_tail, surviving_head_id, surviving_end) =
-            self.context_read(|conn| {
-                let (count, min, max): (i64, Option<i64>, Option<i64>) = conn.query_row(
-                    "SELECT COUNT(*), MIN(sequence), MAX(sequence)
+        let (
+            dropped_count,
+            dropped_min,
+            dropped_max,
+            surviving_tail,
+            surviving_head_id,
+            surviving_end,
+        ) = self.context_read(|conn| {
+            let (count, min, max): (i64, Option<i64>, Option<i64>) = conn.query_row(
+                "SELECT COUNT(*), MIN(sequence), MAX(sequence)
                      FROM compartments WHERE session_id = ?1 AND sequence > ?2",
-                    params![session_id, keep_through_seq],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )?;
-                let tail = conn
-                    .query_row(
-                        "SELECT sequence, COALESCE(end_message_id, '') FROM compartments
+                params![session_id, keep_through_seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let tail = conn
+                .query_row(
+                    "SELECT sequence, COALESCE(end_message_id, '') FROM compartments
                          WHERE session_id = ?1 AND sequence <= ?2
                          ORDER BY sequence DESC LIMIT 1",
-                        params![session_id, keep_through_seq],
-                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-                    )
-                    .optional()?;
-                let head = conn
-                    .query_row(
-                        "SELECT COALESCE(start_message_id, '') FROM compartments
+                    params![session_id, keep_through_seq],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let head = conn
+                .query_row(
+                    "SELECT COALESCE(start_message_id, '') FROM compartments
                          WHERE session_id = ?1 AND sequence <= ?2
                          ORDER BY sequence ASC LIMIT 1",
-                        params![session_id, keep_through_seq],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()?;
-                let end: i64 = conn.query_row(
-                    "SELECT COALESCE(MAX(end_message), -1) FROM compartments
-                     WHERE session_id = ?1 AND sequence <= ?2",
                     params![session_id, keep_through_seq],
-                    |r| r.get(0),
-                )?;
-                Ok((count, min, max, tail, head, end))
-            })?;
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let end: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(end_message), -1) FROM compartments
+                     WHERE session_id = ?1 AND sequence <= ?2",
+                params![session_id, keep_through_seq],
+                |r| r.get(0),
+            )?;
+            Ok((count, min, max, tail, head, end))
+        })?;
         let write = context_writes::PendingContextWrite::TruncateAfter {
             keep_through_seq,
             now_ms: current_time_ms(),
@@ -12626,57 +12645,57 @@ impl McStore {
         now_ms: i64,
     ) -> Result<Option<Vec<i64>>, McStoreError> {
         self.context_write(&["memories"], |tx| {
-                let mut memories = Vec::with_capacity(ids.len());
-                for id in ids {
-                    let Some(memory) = load_memory_full_tx(tx, *id)? else {
-                        return Ok(None);
-                    };
-                    if memory.project_path != project_path
-                        || memory.superseded_by_memory_id.is_some()
-                        || !matches!(memory.status.as_str(), "active" | "permanent" | "archived")
-                    {
-                        return Ok(None);
-                    }
-                    memories.push(memory);
+            let mut memories = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(memory) = load_memory_full_tx(tx, *id)? else {
+                    return Ok(None);
+                };
+                if memory.project_path != project_path
+                    || memory.superseded_by_memory_id.is_some()
+                    || !matches!(memory.status.as_str(), "active" | "permanent" | "archived")
+                {
+                    return Ok(None);
                 }
+                memories.push(memory);
+            }
 
-                let trimmed_reason = reason.map(str::trim).filter(|value| !value.is_empty());
-                let mut archived = Vec::new();
-                for memory in memories {
-                    if memory.status == "archived" {
-                        continue;
-                    }
-                    if let Some(reason) = trimmed_reason {
-                        let metadata_json =
-                            merge_archive_reason(memory.metadata_json.as_deref(), reason);
-                        tx.execute(
-                            "UPDATE memories
+            let trimmed_reason = reason.map(str::trim).filter(|value| !value.is_empty());
+            let mut archived = Vec::new();
+            for memory in memories {
+                if memory.status == "archived" {
+                    continue;
+                }
+                if let Some(reason) = trimmed_reason {
+                    let metadata_json =
+                        merge_archive_reason(memory.metadata_json.as_deref(), reason);
+                    tx.execute(
+                        "UPDATE memories
                                 SET status = 'archived', metadata_json = ?1, updated_at = ?2
                               WHERE id = ?3",
-                            params![metadata_json, now_ms, memory.id],
-                        )?;
-                    } else {
-                        tx.execute(
+                        params![metadata_json, now_ms, memory.id],
+                    )?;
+                } else {
+                    tx.execute(
                         "UPDATE memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
                         params![now_ms, memory.id],
                     )?;
-                    }
-                    append_memory_mutation_tx(
-                        tx,
-                        MemoryMutationAppend {
-                            project_path: &memory.project_path,
-                            mutation_type: "archive",
-                            target_memory_id: memory.id,
-                            superseded_by_id: None,
-                            category: None,
-                            new_content: None,
-                            queued_at: now_ms,
-                        },
-                    )?;
-                    archived.push(memory.id);
                 }
-                Ok(Some(archived))
-            })
+                append_memory_mutation_tx(
+                    tx,
+                    MemoryMutationAppend {
+                        project_path: &memory.project_path,
+                        mutation_type: "archive",
+                        target_memory_id: memory.id,
+                        superseded_by_id: None,
+                        category: None,
+                        new_content: None,
+                        queued_at: now_ms,
+                    },
+                )?;
+                archived.push(memory.id);
+            }
+            Ok(Some(archived))
+        })
     }
 
     /// Merge owned primary source memories into an owned primary target in one fenced
@@ -13633,7 +13652,9 @@ impl McStore {
                         category: r.get(2)?,
                         content: r.get(3)?,
                         importance: r.get(4)?,
-                        status: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "active".to_string()),
+                        status: r
+                            .get::<_, Option<String>>(5)?
+                            .unwrap_or_else(|| "active".to_string()),
                         expires_at: r.get(6)?,
                         superseded_by_memory_id: r.get(7)?,
                         updated_at: r.get(8)?,
@@ -13855,7 +13876,7 @@ impl McStore {
 
     /// Load render-eligible memories across a workspace UNION: every member's `active` +
     /// `permanent` non-expired memories, but a FOREIGN member's only in the shared
-    /// categories (`share_categories`); the OWN project sees all its own. 
+    /// categories (`share_categories`); the OWN project sees all its own.
     pub fn load_workspace_union_memories(
         &self,
         membership: &WorkspaceMembership,
@@ -13875,7 +13896,7 @@ impl McStore {
 
         let rows = self.context_read(|conn| {
             let sql = format!(
-"SELECT id, {path_column}, category, content, importance, status, expires_at,
+                "SELECT id, {path_column}, category, content, importance, status, expires_at,
                          superseded_by_memory_id, updated_at, last_seen_at, verified_at
                    FROM {table}
                   WHERE {pool_filter}
@@ -13890,7 +13911,9 @@ impl McStore {
                         category: r.get(2)?,
                         content: r.get(3)?,
                         importance: r.get(4)?,
-                        status: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "active".to_string()),
+                        status: r
+                            .get::<_, Option<String>>(5)?
+                            .unwrap_or_else(|| "active".to_string()),
                         expires_at: r.get(6)?,
                         superseded_by_memory_id: r.get(7)?,
                         updated_at: r.get(8)?,
@@ -14171,13 +14194,13 @@ impl McStore {
 
     fn note_by_id(&self, note_id: i64) -> Result<Option<StoredNote>, McStoreError> {
         self.context_read(|conn| {
-                conn.query_row(
-                    &format!("SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE id = ?1"),
-                    params![note_id],
-                    stored_note_from_row,
-                )
-                .optional()
-            })
+            conn.query_row(
+                &format!("SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE id = ?1"),
+                params![note_id],
+                stored_note_from_row,
+            )
+            .optional()
+        })
     }
 
     fn require_note_project(&self, project_path: &str, note_id: i64) -> Result<(), McStoreError> {
@@ -14202,18 +14225,18 @@ impl McStore {
         note_id: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
         self.context_read(|conn| {
-                conn.query_row(
-                    &format!(
-                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes
+            conn.query_row(
+                &format!(
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM notes
                          WHERE id = ?1
                            AND (project_path = ?2 OR (project_path IS NULL AND type = 'session'))
                            AND (type = 'smart' OR session_id = ?3)"
-                    ),
-                    params![note_id, project_path, session_id],
-                    stored_note_from_row,
-                )
-                .optional()
-            })
+                ),
+                params![note_id, project_path, session_id],
+                stored_note_from_row,
+            )
+            .optional()
+        })
     }
 
     /// Page the notes visible to one session: all project smart notes plus that session's
@@ -14246,20 +14269,20 @@ impl McStore {
              ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
         );
         self.context_read(|conn| {
-                let mut stmt = conn.prepare(&sql)?;
-                let mut values = Vec::with_capacity(statuses.len() + 3);
-                values.push(SqlValue::Text(project_path.to_string()));
-                for status in &statuses {
-                    values.push(SqlValue::Text((*status).to_string()));
-                }
-                values.push(SqlValue::Text(session_id.to_string()));
-                values.push(SqlValue::Integer(limit));
-                values.push(SqlValue::Integer(offset));
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
-                    .collect::<Result<Vec<_>, _>>();
-                rows
-            })
+            let mut stmt = conn.prepare(&sql)?;
+            let mut values = Vec::with_capacity(statuses.len() + 3);
+            values.push(SqlValue::Text(project_path.to_string()));
+            for status in &statuses {
+                values.push(SqlValue::Text((*status).to_string()));
+            }
+            values.push(SqlValue::Text(session_id.to_string()));
+            values.push(SqlValue::Integer(limit));
+            values.push(SqlValue::Integer(offset));
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
+                .collect::<Result<Vec<_>, _>>();
+            rows
+        })
     }
 
     pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, McStoreError> {
@@ -14387,22 +14410,22 @@ impl McStore {
              ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
         );
         self.context_read(|conn| {
-                let mut stmt = conn.prepare(&sql)?;
-                let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 4);
-                values.push(SqlValue::Text(project_path.to_string()));
-                for status in &statuses {
-                    values.push(SqlValue::Text((*status).to_string()));
-                }
-                if let Some(session_id) = session_id {
-                    values.push(SqlValue::Text(session_id.to_string()));
-                }
-                values.push(SqlValue::Integer(limit));
-                values.push(SqlValue::Integer(offset));
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
-                    .collect::<Result<Vec<_>, _>>();
-                rows
-            })
+            let mut stmt = conn.prepare(&sql)?;
+            let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 4);
+            values.push(SqlValue::Text(project_path.to_string()));
+            for status in &statuses {
+                values.push(SqlValue::Text((*status).to_string()));
+            }
+            if let Some(session_id) = session_id {
+                values.push(SqlValue::Text(session_id.to_string()));
+            }
+            values.push(SqlValue::Integer(limit));
+            values.push(SqlValue::Integer(offset));
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
+                .collect::<Result<Vec<_>, _>>();
+            rows
+        })
     }
 
     pub fn read_smart_notes(
@@ -14430,19 +14453,19 @@ impl McStore {
              ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
         );
         self.context_read(|conn| {
-                let mut statement = conn.prepare(&sql)?;
-                let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 3);
-                values.push(SqlValue::Text(project_path.to_string()));
-                for status in statuses {
-                    values.push(SqlValue::Text(status.to_string()));
-                }
-                values.push(SqlValue::Integer(limit));
-                values.push(SqlValue::Integer(offset));
-                let rows = statement
-                    .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
+            let mut statement = conn.prepare(&sql)?;
+            let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 3);
+            values.push(SqlValue::Text(project_path.to_string()));
+            for status in statuses {
+                values.push(SqlValue::Text(status.to_string()));
+            }
+            values.push(SqlValue::Integer(limit));
+            values.push(SqlValue::Integer(offset));
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     /// Every note the glance shows, unpaged and newest-first. The glance needs
@@ -14546,7 +14569,10 @@ impl McStore {
             .collect::<Vec<_>>()
             .join(", ");
         let (project_clause, session_clause) = if session_id.is_some() {
-            ("(project_path = ? OR project_path IS NULL)", " AND session_id = ?")
+            (
+                "(project_path = ? OR project_path IS NULL)",
+                " AND session_id = ?",
+            )
         } else {
             ("project_path = ?", "")
         };
@@ -14554,23 +14580,23 @@ impl McStore {
             "SELECT COUNT(*) FROM notes WHERE {project_clause} AND type = ? AND status IN ({placeholders}){session_clause}"
         );
         self.context_read(|conn| {
-                let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 3);
-                values.push(SqlValue::Text(project_path.to_string()));
-                values.push(SqlValue::Text(type_name.to_string()));
-                for status in statuses {
-                    values.push(SqlValue::Text(status.to_string()));
-                }
-                if let Some(session_id) = session_id {
-                    values.push(SqlValue::Text(session_id.to_string()));
-                }
-                conn.query_row(&sql, rusqlite::params_from_iter(values), |row| {
-                    row.get::<_, i64>(0)
-                })
+            let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 3);
+            values.push(SqlValue::Text(project_path.to_string()));
+            values.push(SqlValue::Text(type_name.to_string()));
+            for status in statuses {
+                values.push(SqlValue::Text(status.to_string()));
+            }
+            if let Some(session_id) = session_id {
+                values.push(SqlValue::Text(session_id.to_string()));
+            }
+            conn.query_row(&sql, rusqlite::params_from_iter(values), |row| {
+                row.get::<_, i64>(0)
             })
-            .and_then(|count| {
-                usize::try_from(count)
-                    .map_err(|_| McStoreError::Serde("note count exceeds usize".to_string()))
-            })
+        })
+        .and_then(|count| {
+            usize::try_from(count)
+                .map_err(|_| McStoreError::Serde("note count exceeds usize".to_string()))
+        })
     }
 
     pub fn update_note_content(
@@ -14582,12 +14608,8 @@ impl McStore {
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
         let current = self.get_note_by_id(project_path, session_id, note_id)?;
-        let current = current.filter(|note| {
-            matches!(
-                note.status.as_str(),
-                "active" | "pending" | "ready"
-            )
-        });
+        let current =
+            current.filter(|note| matches!(note.status.as_str(), "active" | "pending" | "ready"));
         let Some(current) = current else {
             return Ok(None);
         };
@@ -14696,12 +14718,7 @@ impl McStore {
             };
             let owned = current.project_path == project_path
                 || (current.type_name == "session" && current.project_path.is_empty());
-            if !owned
-                || !matches!(
-                    current.status.as_str(),
-                    "active" | "pending" | "ready"
-                )
-            {
+            if !owned || !matches!(current.status.as_str(), "active" | "pending" | "ready") {
                 return Ok(None);
             }
             let content = resolution
@@ -14840,10 +14857,7 @@ impl McStore {
         now_ms: i64,
     ) -> Result<NoteCasOutcome, McStoreError> {
         self.require_note_project(project_path, note_id)?;
-        if !matches!(
-            to_status,
-            "active" | "pending" | "ready" | "dismissed"
-        ) {
+        if !matches!(to_status, "active" | "pending" | "ready" | "dismissed") {
             return Err(McStoreError::Serde(format!(
                 "invalid note transition target {to_status}"
             )));
@@ -14897,12 +14911,15 @@ impl McStore {
                    WHERE id = ?2 AND project_path = ?3 AND status = 'pending' AND updated_at = ?4",
                 params![now_ms, note.id, project_path, note.status_version],
             )?;
-            if changed == 0 { return Ok(None); }
+            if changed == 0 {
+                return Ok(None);
+            }
             tx.query_row(
                 &format!("SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE id = ?1"),
                 params![note.id],
                 stored_note_from_row,
-            ).map(Some)
+            )
+            .map(Some)
         })
     }
 
@@ -15101,9 +15118,8 @@ impl McStore {
             .collect::<Vec<_>>()
             .join(", ");
         let max = self.context_read(|conn| {
-            let sql = format!(
-                "SELECT COALESCE(MAX(id), 0) FROM memories WHERE project_path IN ({ph})"
-            );
+            let sql =
+                format!("SELECT COALESCE(MAX(id), 0) FROM memories WHERE project_path IN ({ph})");
             let v: i64 =
                 conn.query_row(&sql, rusqlite::params_from_iter(projects.iter()), |r| {
                     r.get(0)
@@ -15777,11 +15793,10 @@ fn promote_facts_tx(
         }
     }
 
-    let mut next_nonce: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(id), 0) + 1 FROM memories",
-        [],
-        |r| r.get(0),
-    )?;
+    let mut next_nonce: i64 =
+        tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM memories", [], |r| {
+            r.get(0)
+        })?;
     let mut promoted = Vec::new();
 
     for fact in facts {
@@ -16387,10 +16402,7 @@ fn set_memory_mural_cue_tx(
         )?;
         accepted.push(update.memory_id);
     }
-    Ok(MuralCueApplyResult {
-        accepted,
-        rejected,
-    })
+    Ok(MuralCueApplyResult { accepted, rejected })
 }
 
 fn set_memory_verification_tx(
@@ -16519,10 +16531,7 @@ fn set_memory_verification_tx(
         }
         accepted.push(update.memory_id);
     }
-    Ok(VerificationApplyResult {
-        accepted,
-        rejected,
-    })
+    Ok(VerificationApplyResult { accepted, rejected })
 }
 
 fn set_memory_mapping_tx(
@@ -16594,10 +16603,7 @@ fn set_memory_mapping_tx(
         }
         accepted.push(update.memory_id);
     }
-    Ok(MappingApplyResult {
-        accepted,
-        rejected,
-    })
+    Ok(MappingApplyResult { accepted, rejected })
 }
 
 struct MemoryMutationAppend<'a> {
@@ -18652,7 +18658,8 @@ mod tests {
     }
 
     #[test]
-    fn facade_mutation_command_crash_between_files_leaves_the_mutation_and_a_retry_does_not_duplicate_it() {
+    fn facade_mutation_command_crash_between_files_leaves_the_mutation_and_a_retry_does_not_duplicate_it(
+    ) {
         // The mutation commits in context.db before its ledger row commits in store.db.
         // Dying between the two leaves the mutation applied and no ledger row; the retry
         // of the same command runs again and must not add a second row.
@@ -18883,9 +18890,7 @@ mod tests {
 
         // The compartment covers m1-m2, queued drops cover m3-m4, and m5-m6 remain active.
         // The status total must cross both the durable coverage boundary and the requested page.
-        let snapshot = store
-            .load_session_status_snapshot(session_id)
-            .unwrap();
+        let snapshot = store.load_session_status_snapshot(session_id).unwrap();
         assert_eq!(snapshot.loaded.meta.coverage_ordinal, Some(4));
         assert_eq!(snapshot.compartment_count, 1);
         assert_eq!(snapshot.pending_drop_count, 2);
@@ -20829,8 +20834,13 @@ mod tests {
         let descriptor = descriptor(dir.path());
 
         let first = McStore::open_for_test(&descriptor).unwrap();
-        let marker = first.single_store_marker().unwrap().expect("a fresh store is marked");
-        assert!(marker.set_by.ends_with(single_store_schema::FRESH_INSTALL_MARKER_SUFFIX));
+        let marker = first
+            .single_store_marker()
+            .unwrap()
+            .expect("a fresh store is marked");
+        assert!(marker
+            .set_by
+            .ends_with(single_store_schema::FRESH_INSTALL_MARKER_SUFFIX));
         drop(first);
 
         let second = McStore::open_for_test(&descriptor).unwrap();
@@ -21446,10 +21456,7 @@ mod tests {
             .unwrap();
         store
             .with_context_conn_for_test(|tx| {
-                tx.execute(
-                    "UPDATE memories SET status = 'archived' WHERE id = 17",
-                    [],
-                )?;
+                tx.execute("UPDATE memories SET status = 'archived' WHERE id = 17", [])?;
                 Ok(())
             })
             .unwrap();

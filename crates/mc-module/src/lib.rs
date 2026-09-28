@@ -87,9 +87,8 @@ use mc_store::{
     NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
     PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
     StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
-    StoredCompartment, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
-    VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
-    STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
+    StoredCompartment, StoredNote, TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate,
+    WrapupCommandRecord, LATEST_MIGRATION_VERSION, STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -8120,16 +8119,15 @@ impl McHandler {
                 .map(|session| (Arc::as_ptr(&session.token) as usize, session.rounds))
         };
         let latch_before = sample_wrapup_latch();
-        let mut snapshot =
-            match store.load_session_status_snapshot(&session_id) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "store_load_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            };
+        let mut snapshot = match store.load_session_status_snapshot(&session_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                };
+            }
+        };
         #[cfg(test)]
         if let Some(hook) = self
             .status_snapshot_hook
@@ -11980,11 +11978,7 @@ impl McHandler {
                 "set_mural_cue",
                 command_id,
                 |tx| {
-                    let result = tx.set_memory_mural_cue(
-                        memory_project,
-                        &updates,
-                        now,
-                    )?;
+                    let result = tx.set_memory_mural_cue(memory_project, &updates, now)?;
                     serde_json::to_vec(&json!({
                         "ok": true,
                         "accepted": result.accepted,
@@ -12078,11 +12072,7 @@ impl McHandler {
                 "set_verification",
                 command_id,
                 |tx| {
-                    let result = tx.set_memory_verification(
-                        memory_project,
-                        &updates,
-                        now,
-                    )?;
+                    let result = tx.set_memory_verification(memory_project, &updates, now)?;
                     serde_json::to_vec(&json!({
                         "ok": true,
                         "accepted": result.accepted,
@@ -12183,11 +12173,7 @@ impl McHandler {
                 "set_mapping",
                 command_id,
                 |tx| {
-                    let result = tx.set_memory_mapping(
-                        memory_project,
-                        &updates,
-                        now,
-                    )?;
+                    let result = tx.set_memory_mapping(memory_project, &updates, now)?;
                     serde_json::to_vec(&json!({
                         "ok": true,
                         "accepted": result.accepted,
@@ -12542,45 +12528,41 @@ impl McHandler {
                         "Error: 'content' is required when action is 'write'.",
                     );
                 };
-                facade_command_outcome(
-                    store.with_facade_command(
-                        facade_scope.route_project_root.as_str(),
-                        memory_project,
-                        "memories",
-                        conversation_key,
-                        "ctx_memory",
-                        action,
-                        command_id.as_deref(),
-                        |tx| {
-                            let id = tx
-                                .insert_memory(InsertMemoryInput {
-                                    project_path: memory_project,
-                                    route_project_root: Some(
-                                        facade_scope.route_project_root.as_str(),
-                                    ),
-                                    category,
-                                    content,
-                                    source_session_id: Some(conversation_key),
-                                    source_type: Some("agent"),
-                                    importance: Some(50),
-                                    expires_at: None,
-                                    metadata_json: None,
-                                    now_ms: now_ms(),
-                                })
-                                .map_err(|error| {
-                                    request_context.render_mutation_error(
-                                        FacadeMemoryMutationError::Storage(error),
-                                    )
-                                })?;
-                            let text = format!("Saved memory [ID: {id}] in {category}.");
-                            mcp_memory_result(
-                                text,
-                                false,
-                                json!({ "action": "write", "module_id": id, "category": category }),
-                            )
-                        },
-                    ),
-                )
+                facade_command_outcome(store.with_facade_command(
+                    facade_scope.route_project_root.as_str(),
+                    memory_project,
+                    "memories",
+                    conversation_key,
+                    "ctx_memory",
+                    action,
+                    command_id.as_deref(),
+                    |tx| {
+                        let id = tx
+                            .insert_memory(InsertMemoryInput {
+                                project_path: memory_project,
+                                route_project_root: Some(facade_scope.route_project_root.as_str()),
+                                category,
+                                content,
+                                source_session_id: Some(conversation_key),
+                                source_type: Some("agent"),
+                                importance: Some(50),
+                                expires_at: None,
+                                metadata_json: None,
+                                now_ms: now_ms(),
+                            })
+                            .map_err(|error| {
+                                request_context.render_mutation_error(
+                                    FacadeMemoryMutationError::Storage(error),
+                                )
+                            })?;
+                        let text = format!("Saved memory [ID: {id}] in {category}.");
+                        mcp_memory_result(
+                            text,
+                            false,
+                            json!({ "action": "write", "module_id": id, "category": category }),
+                        )
+                    },
+                ))
             }
             "update" => {
                 let category = match memory_tool::validate_update_category(non_empty_string_arg(
@@ -12599,36 +12581,25 @@ impl McHandler {
                         "Error: 'content' is required when action is 'update'.",
                     );
                 };
-                facade_command_outcome(
-                    store.with_facade_command(
-                        facade_scope.route_project_root.as_str(),
-                        memory_project,
-                        "memories",
-                        conversation_key,
-                        "ctx_memory",
-                        action,
-                        command_id.as_deref(),
-                        |tx| {
-                            let memory = tx
-                                .update_memory_content(
-                                    memory_project,
-                                    id,
-                                    content,
-                                    category,
-                                    now_ms(),
-                                )
-                                .map_err(|error| request_context.render_mutation_error(error))?;
-                            let rendered_id = memory.id;
-                            facade_text_response(
-                                format!(
-                                    "Updated memory [ID: {rendered_id}] in {}.",
-                                    memory.category
-                                ),
-                                false,
-                            )
-                        },
-                    ),
-                )
+                facade_command_outcome(store.with_facade_command(
+                    facade_scope.route_project_root.as_str(),
+                    memory_project,
+                    "memories",
+                    conversation_key,
+                    "ctx_memory",
+                    action,
+                    command_id.as_deref(),
+                    |tx| {
+                        let memory = tx
+                            .update_memory_content(memory_project, id, content, category, now_ms())
+                            .map_err(|error| request_context.render_mutation_error(error))?;
+                        let rendered_id = memory.id;
+                        facade_text_response(
+                            format!("Updated memory [ID: {rendered_id}] in {}.", memory.category),
+                            false,
+                        )
+                    },
+                ))
             }
             "archive" => {
                 let ids = memory_ids(args, "archive");
@@ -12638,34 +12609,32 @@ impl McHandler {
                     );
                 }
                 let reason = non_empty_string_arg(args, "reason");
-                facade_command_outcome(
-                    store.with_facade_command(
-                        facade_scope.route_project_root.as_str(),
-                        memory_project,
-                        "memories",
-                        conversation_key,
-                        "ctx_memory",
-                        action,
-                        command_id.as_deref(),
-                        |tx| {
-                            let archived = tx
-                                .archive_memories(memory_project, &ids, reason, now_ms())
-                                .map_err(|error| request_context.render_mutation_error(error))?;
-                            if archived.is_empty() {
-                                facade_text_response(
-                                    "No active memories needed archiving.".to_string(),
-                                    false,
-                                )
-                            } else {
-                                let rendered_ids = archived;
-                                facade_text_response(
-                                    format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
-                                    false,
-                                )
-                            }
-                        },
-                    ),
-                )
+                facade_command_outcome(store.with_facade_command(
+                    facade_scope.route_project_root.as_str(),
+                    memory_project,
+                    "memories",
+                    conversation_key,
+                    "ctx_memory",
+                    action,
+                    command_id.as_deref(),
+                    |tx| {
+                        let archived = tx
+                            .archive_memories(memory_project, &ids, reason, now_ms())
+                            .map_err(|error| request_context.render_mutation_error(error))?;
+                        if archived.is_empty() {
+                            facade_text_response(
+                                "No active memories needed archiving.".to_string(),
+                                false,
+                            )
+                        } else {
+                            let rendered_ids = archived;
+                            facade_text_response(
+                                format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
+                                false,
+                            )
+                        }
+                    },
+                ))
             }
             "merge" => {
                 let category = match memory_tool::validate_update_category(non_empty_string_arg(
@@ -13271,8 +13240,8 @@ impl McHandler {
                                     .map_err(|error| error.to_string())?;
                                 note_write_response(
                                     format!(
-                                        "Created smart note {}. Dreamer will evaluate the condition during nightly runs:\n- Content: {}\n- Condition: {}",
-                                        format!("#{}", note.id),
+                                        "Created smart note #{}. Dreamer will evaluate the condition during nightly runs:\n- Content: {}\n- Condition: {}",
+                                        note.id,
                                         note.content,
                                         condition
                                     ),
@@ -13282,39 +13251,34 @@ impl McHandler {
                         ),
                     )
                 } else {
-                    facade_command_outcome(
-                        store.with_facade_command(
-                            facade_scope.route_project_root.as_str(),
-                            project,
-                            "notes",
-                            session,
-                            "ctx_note",
-                            action,
-                            command_id.as_deref(),
-                            |tx| {
-                                let note = tx
-                                    .insert_note(NoteInput {
-                                        project_path: project,
-                                        route_project_root: Some(
-                                            facade_scope.route_project_root.as_str(),
-                                        ),
-                                        session_id: session,
-                                        content,
-                                        surface_condition: None,
-                                        anchor_block_id: anchor.as_deref(),
-                                        now_ms: now,
-                                    })
-                                    .map_err(|error| error.to_string())?;
-                                let tray = tx
-                                    .active_session_note_tray(project, session)
-                                    .map_err(|error| error.to_string())?;
-                                note_write_response(
-                                    format_write_reply(note.id, tray, now),
-                                    note.id,
-                                )
-                            },
-                        ),
-                    )
+                    facade_command_outcome(store.with_facade_command(
+                        facade_scope.route_project_root.as_str(),
+                        project,
+                        "notes",
+                        session,
+                        "ctx_note",
+                        action,
+                        command_id.as_deref(),
+                        |tx| {
+                            let note = tx
+                                .insert_note(NoteInput {
+                                    project_path: project,
+                                    route_project_root: Some(
+                                        facade_scope.route_project_root.as_str(),
+                                    ),
+                                    session_id: session,
+                                    content,
+                                    surface_condition: None,
+                                    anchor_block_id: anchor.as_deref(),
+                                    now_ms: now,
+                                })
+                                .map_err(|error| error.to_string())?;
+                            let tray = tx
+                                .active_session_note_tray(project, session)
+                                .map_err(|error| error.to_string())?;
+                            note_write_response(format_write_reply(note.id, tray, now), note.id)
+                        },
+                    ))
                 }
             }
             "read" => {
@@ -13322,7 +13286,9 @@ impl McHandler {
                     let mut notes = Vec::with_capacity(requested.len());
                     for note_id in requested {
                         let row = match store.get_note_by_id(project, session, *note_id) {
-                            Ok(Some(note)) => NoteByIdRow::Found(Box::new(present_note_status(note))),
+                            Ok(Some(note)) => {
+                                NoteByIdRow::Found(Box::new(present_note_status(note)))
+                            }
                             Ok(None) => NoteByIdRow::Missing,
                             Err(error) => return tool_error_result(format!("Error: {error}")),
                         };
@@ -13463,47 +13429,39 @@ impl McHandler {
                 let requested = note_ids.as_deref().unwrap_or(&[]);
                 if requested.len() > 1 {
                     let module_note_ids = requested.to_vec();
-                    return facade_command_outcome(
-                        store.with_facade_command(
-                            facade_scope.route_project_root.as_str(),
-                            project,
-                            "notes",
-                            session,
-                            "ctx_note",
-                            action,
-                            command_id.as_deref(),
-                            |tx| {
-                                let outcomes = tx
-                                    .dismiss_notes(
-                                        project,
-                                        session,
-                                        &module_note_ids,
-                                        resolution,
-                                        now,
-                                    )
-                                    .map_err(|error| error.to_string())?;
-                                let mut dismissed_count = 0usize;
-                                let mut details = Vec::with_capacity(outcomes.len());
-                                for (note_id, outcome) in &outcomes {
-                                    if *outcome == NoteDismissOutcome::Dismissed {
-                                        dismissed_count += 1;
-                                    }
-                                    details.push(format!(
-                                        "- Note #{note_id}: {}",
-                                        note_dismiss_outcome_text(*outcome)
-                                    ));
+                    return facade_command_outcome(store.with_facade_command(
+                        facade_scope.route_project_root.as_str(),
+                        project,
+                        "notes",
+                        session,
+                        "ctx_note",
+                        action,
+                        command_id.as_deref(),
+                        |tx| {
+                            let outcomes = tx
+                                .dismiss_notes(project, session, &module_note_ids, resolution, now)
+                                .map_err(|error| error.to_string())?;
+                            let mut dismissed_count = 0usize;
+                            let mut details = Vec::with_capacity(outcomes.len());
+                            for (note_id, outcome) in &outcomes {
+                                if *outcome == NoteDismissOutcome::Dismissed {
+                                    dismissed_count += 1;
                                 }
-                                facade_text_response(
-                                    format!(
-                                        "Dismissed {dismissed_count} of {} notes.\n{}",
-                                        outcomes.len(),
-                                        details.join("\n")
-                                    ),
-                                    false,
-                                )
-                            },
-                        ),
-                    );
+                                details.push(format!(
+                                    "- Note #{note_id}: {}",
+                                    note_dismiss_outcome_text(*outcome)
+                                ));
+                            }
+                            facade_text_response(
+                                format!(
+                                    "Dismissed {dismissed_count} of {} notes.\n{}",
+                                    outcomes.len(),
+                                    details.join("\n")
+                                ),
+                                false,
+                            )
+                        },
+                    ));
                 }
                 let note_id = requested.first().copied().unwrap_or(0);
                 let module_note_id = note_id;
@@ -14826,7 +14784,10 @@ fn test_host_replaces_compartments(
 ) {
     store
         .with_context_conn_for_test(|tx| {
-            tx.execute("DELETE FROM compartments WHERE session_id = ?1", [session_id])?;
+            tx.execute(
+                "DELETE FROM compartments WHERE session_id = ?1",
+                [session_id],
+            )?;
             Ok(())
         })
         .expect("test host clears the session's compartments");
@@ -16826,8 +16787,7 @@ fn refuse_retired_note_id_lane(args: &Map<String, Value>) -> Result<(), String> 
         None | Some("module") => {}
         Some(_) => {
             return Err(
-                "note_id_lane is retired: note ids are context.db ids; send them as is"
-                    .to_string(),
+                "note_id_lane is retired: note ids are context.db ids; send them as is".to_string(),
             )
         }
     }
@@ -16858,8 +16818,8 @@ fn format_glance_row(note: &StoredNote, now_ms: i64) -> String {
         format!(" · {}", markers.join(" · "))
     };
     format!(
-        "{} · {} · {}{}",
-        format!("#{}", note.id),
+        "#{} · {} · {}{}",
+        note.id,
         format_note_age(touched_at, now_ms),
         clip_note_title(&note.content, GLANCE_TITLE_MAX),
         suffix
@@ -16930,8 +16890,8 @@ fn format_note_body(note: &StoredNote, now_ms: i64) -> String {
         .map(|ordinal| format!(" ↳ @msg {ordinal}"))
         .unwrap_or_default();
     let head = format!(
-        "- **{}** · {} · {}: {}{}",
-        format!("#{}", note.id),
+        "- **#{}** · {} · {}: {}{}",
+        note.id,
         format_note_age(touched_at, now_ms),
         note.status,
         note.content,
@@ -17088,18 +17048,14 @@ impl MemoryFacadeRequestContext {
     fn render_mutation_error(&self, error: FacadeMemoryMutationError) -> String {
         match error {
             FacadeMemoryMutationError::Storage(error) => error,
-            FacadeMemoryMutationError::Unavailable { id } => {
-                self.rendered_id(id).map_or_else(
-                    || "memory was not found".to_string(),
-                    |id| format!("memory {id} was not found"),
-                )
-            }
-            FacadeMemoryMutationError::DuplicateContent { id } => {
-                self.rendered_id(id).map_or_else(
-                    || "memory content already exists".to_string(),
-                    |id| format!("memory content already exists as ID {id}"),
-                )
-            }
+            FacadeMemoryMutationError::Unavailable { id } => self.rendered_id(id).map_or_else(
+                || "memory was not found".to_string(),
+                |id| format!("memory {id} was not found"),
+            ),
+            FacadeMemoryMutationError::DuplicateContent { id } => self.rendered_id(id).map_or_else(
+                || "memory content already exists".to_string(),
+                |id| format!("memory content already exists as ID {id}"),
+            ),
             FacadeMemoryMutationError::InvalidMerge => "memories could not be merged".to_string(),
         }
     }
@@ -17125,12 +17081,10 @@ impl MemoryFacadeRequestContext {
                     |id| format!("duplicate source memory id {id}"),
                 )
             }
-            memory_tool::MemoryToolError::NotFound { id } => {
-                self.rendered_id(id).map_or_else(
-                    || "memory was not found".to_string(),
-                    |id| format!("memory {id} was not found"),
-                )
-            }
+            memory_tool::MemoryToolError::NotFound { id } => self.rendered_id(id).map_or_else(
+                || "memory was not found".to_string(),
+                |id| format!("memory {id} was not found"),
+            ),
             memory_tool::MemoryToolError::Inactive { id, status } => {
                 self.rendered_id(id).map_or_else(
                     || format!("memory is not mutable in status {status}"),
@@ -17166,7 +17120,9 @@ fn refuse_retired_memory_id_lane(args: &Map<String, Value>) -> Result<(), String
         }
     }
     if args.get("host_ids").is_some() {
-        return Err("host_ids is retired: memory ids are context.db ids; send them as is".to_string());
+        return Err(
+            "host_ids is retired: memory ids are context.db ids; send them as is".to_string(),
+        );
     }
     Ok(())
 }
@@ -18195,9 +18151,9 @@ mod tests {
     // read as one argument instead of being scattered through this module.
     mod broca_contract;
     mod gate_a1_b0;
-    mod single_store_drill;
     mod gate_a1_b0_baseline_probe;
     mod gate_a2;
+    mod single_store_drill;
     // The per-harness default runner, driven through real passes.
     mod default_runner;
 
@@ -19828,8 +19784,9 @@ mod tests {
                 std::fs::create_dir_all(std::path::Path::new(&target).parent().unwrap()).unwrap();
                 std::fs::copy(&seed, &target).unwrap();
             }
-            let store =
-                Arc::new(McStore::open_for_test(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
+            let store = Arc::new(
+                McStore::open_for_test(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap(),
+            );
             let handler = McHandler::with_producer_factory_config_resolver(
                 Arc::new(TestProducerFactory { state }),
                 default_test_config(),
@@ -20537,8 +20494,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
-        let store =
-            Arc::new(McStore::open_for_test(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
+        let store = Arc::new(
+            McStore::open_for_test(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap(),
+        );
         let handler = McHandler::with_producer_factory_config_resolver(
             Arc::new(TestProducerFactory { state }),
             config,
@@ -21109,7 +21067,7 @@ mod tests {
         content: &str,
         now: i64,
     ) -> i64 {
-        let id = store
+        store
             .insert_memory(InsertMemoryInput {
                 project_path: project,
                 route_project_root: None,
@@ -21122,8 +21080,7 @@ mod tests {
                 metadata_json: None,
                 now_ms: now,
             })
-            .unwrap();
-        id
+            .unwrap()
     }
 
     /// Key a route root by a project identity, the way a host-recorded session project
@@ -28239,75 +28196,6 @@ mod tests {
         assert_eq!(reply, "Saved session note #2. 2 active, oldest 2d.");
     }
 
-    /// The id collision a host-backed session hit: the agent was shown host note #2,
-    /// whose module row is #3, while module row #2 is a different note. On the host
-    /// id lane every request must reach module row #3 and never touch row #2.
-    async fn assert_host_lane_collision_is_harmless(colliding_project: &str) {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
-
-        let now = now_ms();
-        insert_session_note_at(&store, "filler", now);
-        let colliding = store
-            .insert_note(NoteInput {
-                project_path: colliding_project,
-                route_project_root: None,
-                session_id: "session",
-                content: "colliding note that must never be touched",
-                surface_condition: None,
-                anchor_block_id: None,
-                now_ms: now,
-            })
-            .unwrap()
-            .id;
-        let announced = insert_session_note_at(&store, "announced note", now);
-        assert_eq!((colliding, announced), (2, 3));
-        // The host sends only host↔module pairs mirrored for this project, so a row of
-        // another project can never be resolved through the map.
-        let map = if colliding_project == "/repo" {
-            json!([[2, 3], [7, 2]])
-        } else {
-            json!([[2, 3]])
-        };
-
-        let read = tool_text(
-            call_facade(
-                &handler,
-                "ctx_note",
-                json!({"action": "read", "note_ids": [2], "note_id_lane": "host", "note_id_map": map}),
-            )
-            .await,
-        );
-        assert!(
-            read.contains("- **#2** · 0m · active: announced note"),
-            "{read}"
-        );
-        assert!(!read.contains("colliding"), "{read}");
-
-        let dismissed = tool_text(
-            call_facade(
-                &handler,
-                "ctx_note",
-                json!({"action": "dismiss", "note_ids": [2], "note_id_lane": "host", "note_id_map": map}),
-            )
-            .await,
-        );
-        assert_eq!(dismissed, "Note #2 dismissed.");
-        let status = |id: i64, project: &str| {
-            store
-                .get_note_by_id(project, "session", id)
-                .unwrap()
-                .unwrap()
-                .status
-        };
-        assert_eq!(status(3, "/repo"), "dismissed");
-        assert_eq!(status(2, colliding_project), "active");
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn note_facade_uses_context_ids_and_refuses_the_retired_id_lane_fields() {
         let producer = Arc::new(ProducerState::default());
@@ -32301,10 +32189,13 @@ mod tests {
         let session_id = "ccm-8518e338-extra";
         handler.bind_route(7, binding(project.to_str().unwrap(), session_id));
         store
-            .replace_compartments(session_id, &[
+            .replace_compartments(
+                session_id,
+                &[
                     stored_comp(1, 1, 5, "m5", "first"),
                     stored_comp(2, 6, 10, "m10", "second"),
-                ])
+                ],
+            )
             .unwrap();
         let loaded = store.load(session_id).unwrap();
         let mut core = loaded.core.clone();
@@ -36840,16 +36731,6 @@ mod tests {
             1,
             "a probed defer must not emit an unprobed-bust diagnostic"
         );
-    }
-
-    fn live_harness_ids(response: &Value) -> Vec<String> {
-        response["ck_messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|message| message["meta"]["synthetic"] != json!(true))
-            .map(|message| message["meta"]["harness_id"].as_str().unwrap().to_string())
-            .collect()
     }
 
     #[tokio::test]
