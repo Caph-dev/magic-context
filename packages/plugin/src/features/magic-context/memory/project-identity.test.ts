@@ -133,10 +133,8 @@ describe("resolveProjectIdentity directory fallback", () => {
                 execFileSync: returningRootCommit("def5678"),
                 homeDirectory: () => fakeHome,
             });
-            const expectedHomeIdentity = `dir:${createHash("md5")
-                .update(realpathSync.native(fakeHome), "utf8")
-                .digest("hex")
-                .slice(0, 12)}`;
+            // Opt-in permits memory, not a second identity for the home repository.
+            const expectedHomeIdentity = "git:def5678";
 
             expect(resolveProjectIdentityForSession(fakeHome)).toBeUndefined();
             expect(resolveProjectIdentityForSession(child)).toBeUndefined();

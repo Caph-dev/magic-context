@@ -10,7 +10,6 @@ import {
 } from "../../features/magic-context/context-authority";
 import {
     isLinkedGitWorktree,
-    resolveProjectIdentity,
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
@@ -1889,7 +1888,7 @@ export function createTransform(deps: TransformDeps) {
         // first call per directory in a new process spawns `git rev-list`.
         const memoryProjectDirectory = compartmentDirectory || process.cwd();
         const projectIdentity = deps.memoryConfig?.enabled
-            ? resolveProjectIdentity(memoryProjectDirectory)
+            ? resolveProjectIdentityForSession(memoryProjectDirectory, deps.allowHomeProject)
             : undefined;
         if (deps.memoryConfig?.enabled) {
             maybeSendProjectIdentityWarning(
@@ -1911,7 +1910,9 @@ export function createTransform(deps: TransformDeps) {
         // (session dir == launch dir) costs nothing extra.
         const sessionProjectIdentity =
             projectIdentity ??
-            (sessionDirectory ? resolveProjectIdentity(sessionDirectory) : deps.projectPath);
+            (sessionDirectory
+                ? resolveProjectIdentityForSession(sessionDirectory, deps.allowHomeProject)
+                : deps.projectPath);
         const sessionIdentityForBinding = sessionDirectory
             ? resolveProjectIdentityForSession(sessionDirectory, deps.allowHomeProject)
             : undefined;

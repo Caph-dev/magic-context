@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path, { join } from "node:path";
 import {
@@ -9,10 +9,12 @@ import {
     __clearProjectIdentityTransientCooldownForTests,
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
+    isUserHomeDirectory,
     normalizeStoredProjectPath,
     ProjectIdentityError,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
+    resolveProjectIdentityOrFallback,
     resolveProjectIdentityStrict,
     storedPathBelongsToIdentity,
     takeDubiousOwnershipProjectIdentityWarning,
@@ -163,7 +165,7 @@ describe("project identity", () => {
         expect(filesystemProbes).toBe(0);
     });
 
-    it("revalidates a session directory fallback when its cooldown expires", () => {
+    it("invalidates a session directory fallback immediately when git metadata appears", () => {
         const directory = makeTempDir("project-identity-session-revalidate-");
         let now = 1_000;
         let filesystemProbes = 0;
@@ -175,11 +177,11 @@ describe("project identity", () => {
             },
         });
 
-        const fallback = resolveProjectIdentityForSession(directory);
+        expect(resolveProjectIdentityForSession(directory)).toBe(expectedDirIdentity(directory));
         mkdirSync(join(directory, ".git"));
         filesystemProbes = 0;
-        expect(resolveProjectIdentityForSession(directory)).toBe(fallback);
-        expect(filesystemProbes).toBe(0);
+        expect(resolveProjectIdentityForSession(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
+        expect(filesystemProbes).toBeGreaterThan(0);
 
         now += 5 * 60 * 1000 + 1;
         expect(resolveProjectIdentityForSession(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
@@ -253,7 +255,7 @@ describe("project identity", () => {
         expect(execMock).toHaveBeenCalledTimes(3);
     });
 
-    it("classifies dubious ownership and falls back until the cooldown expires", () => {
+    it("classifies dubious ownership and defers until the cooldown expires", () => {
         const directory = makeRepoWithGitMetadata("project-identity-dubious-");
         let now = 1_000;
         let recovered = false;
@@ -275,14 +277,14 @@ describe("project identity", () => {
         );
         expect(strictError.errorClass).toBe("dubious_ownership");
 
-        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(() => resolveProjectIdentity(directory)).toThrow(ProjectIdentityError);
         expect(takeDubiousOwnershipProjectIdentityWarning(directory)).toContain(
             "git config --global --add safe.directory",
         );
         expect(takeDubiousOwnershipProjectIdentityWarning(directory)).toBeNull();
 
         recovered = true;
-        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(() => resolveProjectIdentity(directory)).toThrow(ProjectIdentityError);
         expect(execMock).toHaveBeenCalledTimes(2);
 
         now += 5 * 60 * 1000 + 1;
@@ -297,8 +299,8 @@ describe("project identity", () => {
         });
         __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
 
-        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
-        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(() => resolveProjectIdentity(directory)).toThrow(ProjectIdentityError);
+        expect(() => resolveProjectIdentity(directory)).toThrow(ProjectIdentityError);
         expect(execMock).toHaveBeenCalledTimes(1);
     });
 
@@ -311,7 +313,7 @@ describe("project identity", () => {
         });
         __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
 
-        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(() => resolveProjectIdentity(directory)).toThrow(ProjectIdentityError);
         recovered = true;
         __clearProjectIdentityTransientCooldownForTests(directory);
 
@@ -368,4 +370,59 @@ describe("project identity", () => {
         expect(error.rawDirectory).toBe("/raw/path");
         expect(error.cause).toBe(cause);
     });
+});
+
+it("recovers a durable git identity after restart despite dubious ownership", () => {
+    const directory = makeRepoWithGitMetadata("identity-restart-");
+    __setProjectIdentityTestHooks({ execFileSync: returningRootCommit(FIRST_ROOT_COMMIT) });
+    expect(resolveProjectIdentity(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
+    __resetProjectIdentityForTests();
+    __setProjectIdentityTestHooks({
+        execFileSync: (() => {
+            throw makeGitFailure({ stderr: "detected dubious ownership" });
+        }) as typeof execFileSync,
+    });
+    expect(resolveProjectIdentity(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
+    expect(resolveProjectIdentityForSession(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
+});
+
+it("cold git failure refuses both fallback APIs and pauses session memory", () => {
+    const directory = makeRepoWithGitMetadata("identity-cold-");
+    __setProjectIdentityTestHooks({
+        execFileSync: (() => {
+            throw makeGitFailure({ code: "ETIMEDOUT" });
+        }) as typeof execFileSync,
+    });
+    const nested = join(directory, "nested");
+    mkdirSync(nested);
+    const linked = makeTempDir("identity-linked-cold-");
+    writeFileSync(
+        join(linked, ".git"),
+        `gitdir: ${join(directory, ".git", "worktrees", "linked")}\n`,
+    );
+    for (const candidate of [directory, nested, linked]) {
+        expect(() => resolveProjectIdentity(candidate)).toThrow(ProjectIdentityError);
+        expect(() => resolveProjectIdentityOrFallback(candidate)).toThrow(ProjectIdentityError);
+        expect(resolveProjectIdentityForSession(candidate)).toBeUndefined();
+    }
+});
+
+it("recognizes Windows home spellings without filesystem access", () => {
+    __setProjectIdentityTestHooks({ homeDirectory: () => "C:\\Users\\Phoenix" });
+    for (const directory of [
+        "c:/Users/Phoenix",
+        "C:\\Users\\Phoenix\\",
+        "\\\\?\\C:\\Users\\Phoenix",
+        "c:/users/phoenix/.",
+    ]) {
+        expect(isUserHomeDirectory(directory)).toBe(true);
+        expect(() => resolveProjectIdentityStrict(directory)).toThrow(
+            "Home project memory is disabled",
+        );
+        expect(resolveProjectIdentityForSession(directory)).toBeUndefined();
+        expect(() => resolveProjectIdentityOrFallback(directory)).toThrow(
+            "Home project memory is disabled",
+        );
+    }
+    expect(isUserHomeDirectory("C:/Users/Phoenix/project")).toBe(false);
 });
