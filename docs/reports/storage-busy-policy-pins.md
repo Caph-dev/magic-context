@@ -96,7 +96,7 @@ poll carries the identical content-addressed final-page body and only the
 window is never restarted by an `in_progress` answer.
 
 The test waits through three `in_progress` answers, then accepts the committed
-array, asserts identical request bodies, one execution, decreasing budgets, and
+array, asserts identical detached request-body snapshots, one execution, decreasing budgets, and
 zero failure/parking count. A separate manual-clock test keeps returning
 `in_progress` and verifies refusal at exactly the fixed 45-second deadline.
 No state sync, upload series, or host mutation is repeated.
@@ -209,7 +209,8 @@ records the final all-lane rerun and gate outcomes.
   0 failed**. It covers 7-second lock recovery, 60-second no-LKG refusal, and
   60-second lock LKG replay with identical prior message-prefix and system bytes.
   The CLI path/version and lsof evidence are printed for each run.
-- **11 new mutation proofs**, including real-host F2 and F6 reversions. Each named
+- **12 new mutation proofs**, including real-host F2 and F6 reversions and a
+  changed-final-page-ID control checked against detached request snapshots. Each named
   test alone reddened; every mutation was restored from the staged live source
   and followed by an empty working-tree diff. Full records live in the worktree's
   `.cache/storage-busy-task/pin-mutations.json` and the delivery declaration.

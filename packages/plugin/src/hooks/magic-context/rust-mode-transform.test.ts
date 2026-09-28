@@ -5003,7 +5003,7 @@ describe("Rust mode authority adapter", () => {
         const moduleClient: RustModeModuleClient = {
             call: async ({ method, body, timeoutMs }) => {
                 if (method !== "transform") return { ok: true };
-                calls.push({ body, timeoutMs });
+                calls.push({ body: structuredClone(body), timeoutMs });
                 if (calls.length === 1)
                     throw Object.assign(new Error("request deadline"), { code: "ETIMEDOUT" });
                 return {
@@ -6785,7 +6785,7 @@ describe("Rust stalled transform probe", () => {
         const moduleClient: RustModeModuleClient = {
             call: async ({ method, body, timeoutMs }) => {
                 if (method !== "transform") return { ok: true };
-                pages.push(body);
+                pages.push(structuredClone(body));
                 budgets.push(timeoutMs!);
                 if (executions === 0) {
                     executions++;
