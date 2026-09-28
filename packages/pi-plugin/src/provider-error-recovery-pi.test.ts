@@ -276,16 +276,19 @@ describe("Pi provider failure recovery", () => {
 				role: "assistant",
 				provider: "ninfer",
 				model: "qwen3.8-27b",
-				errorMessage: "AI_APICallError: prepared prompt exceeds Engine max_context 262144",
+				errorMessage:
+					"AI_APICallError: prepared prompt exceeds Engine max_context 262144",
 			},
 		});
 		expect(event).toMatchObject({ kind: "overflow", reportedLimit: 262144 });
 		for (const errorMessage of ["Rate limit exceeded", "Invalid API key"]) {
-			expect(handlePiProviderFailure({
-				db: database,
-				sessionId: `${sessionId}-${errorMessage}`,
-				message: { role: "assistant", errorMessage },
-			})).toEqual({ kind: "none" });
+			expect(
+				handlePiProviderFailure({
+					db: database,
+					sessionId: `${sessionId}-${errorMessage}`,
+					message: { role: "assistant", errorMessage },
+				}),
+			).toEqual({ kind: "none" });
 		}
 	});
 
