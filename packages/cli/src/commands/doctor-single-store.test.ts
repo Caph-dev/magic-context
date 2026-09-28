@@ -195,6 +195,10 @@ test("engine receives fixed flags and report prints counts backup and undo", () 
         "source 3 / copied 1 / updated 1 / kept 1 / deleted 0 / orphans_kept 0",
     );
     expect(output()).toContain("To undo: quit every host");
+    expect(output()).toContain(
+        "This restores the unmigrated stores. Keep the current plugin and ck-mc: TypeScript mode works as before, and Rust mode will refuse with MC-C14 until you run this command again.",
+    );
+    expect(output()).not.toContain("reinstall the previous plugin");
     expect(output()).toContain("Backup: /backup/pair");
     expect(output()).toContain("Render check: sampled 2, passed true, seed 7");
     expect(output()).toContain("Sessions reset: 2; store.db bytes: 100 -> 50");

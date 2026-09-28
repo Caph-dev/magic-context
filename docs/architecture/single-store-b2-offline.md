@@ -148,7 +148,7 @@ Slice A reached the module over subc (`window/b2-slice-b1:packages/cli/src/comma
 To undo: quit every host, then
   rm -f <data>/context.db-wal <data>/context.db-shm <data>/store.db-wal <data>/store.db-shm
   cp <backup>/context.db <backup>/store.db <data>/
-and reinstall the previous plugin and ck-mc (both refuse the migrated files).
+This restores the unmigrated stores. Keep the current plugin and ck-mc: TypeScript mode works as before, and Rust mode will refuse with MC-C14 until you run this command again.
 ```
 
 The backup is the rollback. Nothing else is (section 2.9).
