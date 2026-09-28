@@ -114,7 +114,7 @@ Reuse, once the per-project marker becomes one store-level flag:
 The command has two halves.
 
 1. **`magic-context doctor single-store migrate` (TypeScript, `packages/cli`)** runs the preflight (2.2) and opens `context.db` with the plugin's own opener, which applies `context.db` v92 like any host start. It then runs the engine and prints the report.
-2. **The engine, `ck-mc single-store-migrate --context-db <p> --store-db <p> --backup-root <dir> [--dry-run] [--skip-foreign] [--prefer <project>=store|context]... [--accept-id-change]` (Rust).** It is a pre-dispatch argument of the `ck-mc` binary, like `--version` (`crates/mc-module/src/main.rs:20-23`), so it runs without subc and without the module serving.
+2. **The engine, `ck-mc single-store-migrate --context-db <p> --store-db <p> --backup-dir <dir> [--dry-run] [--skip-foreign] [--prefer <project>=store|context]... [--accept-id-change]` (Rust).** It is a pre-dispatch argument of the `ck-mc` binary, like `--version` (`crates/mc-module/src/main.rs:20-23`), so it runs without subc and without the module serving.
 
 The engine is Rust for three reasons:
 
@@ -140,8 +140,10 @@ Slice A reached the module over subc (`window/b2-slice-b1:packages/cli/src/comma
 
 ### 2.3 Backup
 
-- Both files are copied with the SQLite online backup API (`rusqlite::backup::Backup`) into `<data-dir>/backups/single-store-<UTC stamp>/`, or `--backup-root`.
-- Each copy gets `PRAGMA quick_check`, and a `MANIFEST.tsv` records name, source path, schema version and sha256, as `scripts/backup-live-stores.sh:55-80` does.
+- Both files are copied with `VACUUM INTO` (a consistent snapshot of each, read-only on the source) into the exact directory `--backup-dir` names. That directory must not exist yet; if it does, the engine refuses `single_store_backup_dir_exists`.
+- Each copy gets `PRAGMA quick_check`, and a `MANIFEST.tsv` records name, source path, schema version and sha256, as `scripts/backup-live-stores.sh:55-80` does. The check and the hash each read the whole copy, so they run side by side.
+- **Where the time goes.** On the 5.2 specimen, verifying the 6.9 GB `context.db` copy is most of the run. The copy, the one transaction and `VACUUM` take seconds to a minute or so. The engine prints each step and its duration on stderr, so a long run is visibly moving. Measured with a release `ck-mc` on a machine at load average about 250 (other builds running): 7 min 56 s wall and 57 s of user CPU. That was 93 s to copy `context.db` and 289 s to check and hash it, then 32 s for the transaction and 21 s for `VACUUM`. A debug build spends about 8 CPU minutes on the two sha256 digests alone, so drills should use a release build.
+- **Paths.** The engine refuses `single_store_path_mismatch` unless `--context-db` is the file the module itself would open (`resolve_context_db_path`: `MAGIC_CONTEXT_STORAGE_DIR`, else `XDG_DATA_HOME`/`~/.local/share` under `cortexkit/magic-context`). A drill therefore lays its copy out as `<root>/cortexkit/magic-context/{context,store}.db` and sets both `MAGIC_CONTEXT_STORAGE_DIR=<root>/cortexkit/magic-context` and `XDG_DATA_HOME=<root>` for the engine.
 - The command prints the directory and the restore command, before any write:
 
 ```
@@ -260,7 +262,7 @@ CREATE TABLE IF NOT EXISTS single_store_state (
 INSERT OR IGNORE INTO single_store_state(id, state) VALUES (1, 'required');
 ```
 
-- It is additive, so a plugin that starts before the doctor runs does no harm. Rust mode stays refused (3.5) and TS mode works.
+- It is additive, so a plugin that starts before the doctor runs does no harm. Rust mode stays refused (3.6) and TS mode works.
 - It bumps `LATEST_SUPPORTED_VERSION` (`storage-db:109`) and `BUILT_CONTEXT_FENCE_VERSION` (`host_store:67`) to 92.
 - Older plugins then fail closed at their fence (`docs/architecture/storage.md:30`).
 - The copy needs no other `context.db` schema change. Dates go to the `store.db` cache, and every copied column already exists.
@@ -280,7 +282,7 @@ The tables are dropped here, not in a later cleanup:
 
 The engine runs `VACUUM` on `store.db` after the commit and reports the size before and after.
 
-`McStore::open` must never apply 61 to a store that still holds rows. Before migrating, if the recorded version is 60 or lower and any moved table has a row, `open` refuses `single_store_migration_required` (3.5). A store with no domain rows (a fresh install) gets 61 applied by `open` as usual. The engine applies 61's statements inside its own transaction and writes the version row itself, so 61 is kept as named statement constants shared by `MIGRATIONS` and the engine.
+`McStore::open` must never apply 61 to a store that still holds rows. Before migrating, if the recorded version is 60 or lower and any moved table has a row, `open` refuses `single_store_migration_required` (3.6). A store with no domain rows (a fresh install) gets 61 applied by `open` as usual. The engine applies 61's statements inside its own transaction and writes the version row itself, so 61 is kept as named statement constants shared by `MIGRATIONS` and the engine.
 
 `SINGLE_STORE_CAPABLE` flips to `true` (`store:3098`). A marked store is now the normal case, and the check is inverted.
 
@@ -291,7 +293,7 @@ What older builds do:
 - **Older plugins** refuse `context.db` v92 at the fence.
 - **The module's `context.db` fence is reported, not enforced** (`BUILT_CONTEXT_FENCE_VERSION`, `host_store:61-67`; per-table fingerprints decide writability). So an old `ck-mc` is stopped by `store.db` (store-ahead and the marker), not by `context.db` v92.
 
-The two flags carry the same stamp: `single_store_state.migrated_at = mc_privilege_state.single_store_set_at_ms`. The module compares them at start (3.5), which binds this `store.db` to this `context.db`.
+The two flags carry the same stamp: `single_store_state.migrated_at = mc_privilege_state.single_store_set_at_ms`. The module compares them at start (3.6), which binds this `store.db` to this `context.db`.
 
 **Fresh installs.** When `McStore::open` applies 61 to an empty store, the module then writes `single_store_state` to `migrated` with the same stamp and an empty report, in one `BEGIN IMMEDIATE` on `context.db`. It also clears the `authority_managed` and mirror rows. Nothing needs moving, so a new Rust-mode user never has to run the doctor.
 
@@ -329,8 +331,9 @@ The report prints, per project: the winner, the per-table counts, orphans kept, 
 
 ### 3.1 Connections and transactions
 
+- **The seam.** `McStore` does not own `context.db`. The module opens it and installs a `ContextDomain` (`crates/mc-store/src/single_store_domain.rs`) on the store: `read` runs a callback in one read transaction, `write` runs one in one `BEGIN IMMEDIATE` and names the tables it writes so the module can fence them. `McStore` holds the SQL for the domain rows; the module's implementation (`ModuleContextDomain`, `crates/mc-module/src/single_store_reads.rs`) supplies the reader connection and the fenced writer below. Tests and tools use `SqliteContextDomain`, a plain two-connection implementation.
 - **Writer.** The module keeps one writer connection to `context.db`: `HostStore`, opened with `open_with_fence` (`host_store:754`), 5 s busy timeout (`host_store:77`). Every write is one `BEGIN IMMEDIATE` transaction (`host_store:892`), as project memory #20181 requires for multi-process SQLite writers, with the in-transaction fingerprint recheck (`host_store:897`).
-- **Reader.** It keeps one reader connection, slice-B1's `ContextDomainReader`. A read that needs a consistent set (the revision heads with the rows they describe) runs in one read transaction, as `load_memory_render_snapshot` does today (`store:14776`).
+- **Reader.** It keeps one reader connection, the read half of `ModuleContextDomain` (slice B1's `ContextDomainReader` was never merged into this tree). A read that needs a consistent set (the revision heads with the rows they describe) runs in one read transaction, as `load_memory_render_snapshot` does today (`store:14776`).
 - **`store.db`.** It keeps its own connection for cache rows only.
 - **Busy.**
   - Transform passes only read `context.db`, and WAL readers do not wait on writers.
@@ -352,13 +355,18 @@ Other writers share `context.db`: TypeScript-mode sessions of the same project, 
 | Project identity or workspace change | `migrate-session` (`packages/cli/src/commands/migrate-session.ts:473`), identity merge (`packages/plugin/src/features/magic-context/storage-identity-merge.ts:487`), workspaces (`packages/plugin/src/features/magic-context/workspaces.ts:361`) | `project_state.project_memory_epoch` and the workspace fingerprint (`workspaces.ts:299-312`) | eager HARD, through the existing lane (`transform:2917-2920`, `:2984-2986`) |
 | User profile | dreamer, dashboard (`db.rs:5556`) | `project_state['__global__'].project_user_profile_version` | m1 delta (unchanged) |
 | New compartment | module fold; TS historian in TS-mode passes | `MAX(compartments.sequence)` per session (`inject-compartments.ts:1230-1242`) | m1 delta (unchanged) |
-| Compartment rewritten in place | TS recomp (`packages/plugin/src/hooks/magic-context/compartment-runner-recomp.ts:117-133`, logs at `:125`); module recomp, revert and rewrite | `MAX(m0_mutation_log.id)` per session, the TS `maxMutationId` marker (`packages/plugin/src/features/magic-context/storage-m0-mutation-log.ts:117`) | eager HARD |
+| Compartment rewritten in place | TS recomp (`packages/plugin/src/hooks/magic-context/compartment-runner-recomp.ts:117-133`, logs at `:125`); module recomp, revert and rewrite | `MAX(m0_mutation_log.id)` per session, the TS `maxMutationId` marker (`packages/plugin/src/features/magic-context/storage-m0-mutation-log.ts:117`), skipping the module's own rows (below) | eager HARD |
 | Notes | TS `ctx_note`, dashboard, dreamer | nothing | Notes are not a prefix input (`crates/mc-module/src/m1_compose.rs:60-62`) |
+
+**Ready smart notes.** The module surfaces nothing for a ready note: not in m1 (since `d0edf4016d`), not in the tail, not as a reminder. It never had a caller for a delivery API, and that dead API is deleted. `context.db` has no `surfacing`/`surfaced` states; the migration lands module notes in those states as `ready` (2.6). In OpenCode Rust mode the TypeScript note nudger owns surfacing (`armNoteNudgeOnRustPublish`, `packages/plugin/src/hooks/magic-context/rust-mode-transform.ts:756`, then `onNoteTrigger`, with its per-session cooldown and trigger state in `context.db` `session_meta`). `a_ready_note_is_never_injected_and_defers_replay_while_it_stays_ready` pins the module side.
+
+**Known parity gap:** Claude Code sessions driven directly by the module get no ready-note surfacing at all, and never had it. Closing it is a separate feature with its own cache rules.
 
 How the values enter the revision:
 
 - The memory head, mutation head, compartment head and profile version feed `in_session_revision` (`m1_compose.rs:63`) as they do now. They are read from `context.db` in one snapshot.
-- `project_memory_epoch`, which today arrives through state sync (`store:4629-4634`), and the session's `m0_mutation_log` head are folded into the external revision next to the workspace fingerprint. A change there is already an eager HARD (`transform:2917-2919`), so both use a lane that exists. No new column is needed: `meta.m1_external_revision` stores the combined value.
+- `project_memory_epoch`, which used to arrive through state sync, and the session's `m0_mutation_log` head are read from `context.db` in the same snapshot and folded into the external revision next to the workspace fingerprint (`m1_revision_signal_parts_for_pass_timed`, `crates/mc-module/src/m1_compose.rs`). The profile version is read the same way, from `project_state['__global__']`.
+- **The module's own `m0_mutation_log` rows.** The module appends a row whenever it rewrites a session's compartments, so TypeScript-mode readers of the session see the change. The module does not read those rows back: it stamps them `target_id = -1` (`MODULE_M0_MUTATION_TARGET`, `crates/mc-store/src/context_writes.rs`), and its head read skips them. It already handles its own rewrites through its boundary machinery, and counting them would force a HARD on the pass after every module recomp or revert. No reader uses `target_id` as a row reference; TypeScript compares only `MAX(id)`. A change there is already an eager HARD (`transform:2917-2919`), so both use a lane that exists. No new column is needed: `meta.m1_external_revision` stores the combined value.
 - `commit_transform` (`store:10889`) keeps its `row_version` CAS on `mc_cache_state`. It stops re-reading domain heads inside the `store.db` transaction, because those tables are gone. That is sound because the revision it stores is the one the pass rendered from, read in one `context.db` snapshot. A write that lands after that snapshot shows up as a changed head on the next pass, which is pending work, exactly like a write that lands just after a commit today.
 
 Blocker 3 of the synthesis (in-place compartment rewrites invisible to `MAX(sequence)`) is covered by `m0_mutation_log`, a mechanism TypeScript already uses, instead of a new trigger-maintained generation. The gap: every writer that deletes or rewrites existing compartments of a session must append an `m0_mutation_log` row in the same transaction. TS recomp does. The module's rewriters (`replace_compartments`, `reset_session_for_recomp`, `truncate_compartments_for_revert`, `store:12833`, `:12862`, `:12964`) must start doing so. Slice S2 also audits every TypeScript `DELETE FROM compartments` / `UPDATE compartments` writer and adds the row where it is missing. That is the smallest addition: a row in a table that exists, read by a marker TypeScript already compares.
@@ -366,16 +374,17 @@ Blocker 3 of the synthesis (in-place compartment rewrites invisible to `MAX(sequ
 ### 3.3 The module's writes
 
 - **Fold publish.** The historian's publish touches both files, because historian phase and coverage live in `mc_cache_state`:
-  1. **`store.db` transaction.** It does today's checks (row version, phase, revert epoch; `publish_historian_chunk`, `store:13835`), writes the `mc_single_store_pending_publish` row carrying the `FoldPublish`, writes `mc_compartment_dates`, and commits. The chunk plan is checked before this transaction, so a fold too big for the visibility chunk (`host_store:145`) is refused without leaving a pending row.
-  2. **`publish_fold` on `context.db`** (`host_store:1598`). The visibility chunk first compares what is at or above the fold's first sequence with the fold. If it is equal, it writes nothing. That makes a resume a no-op instead of a delete-and-reinsert, which would churn ids and drop chunk embeddings (synthesis blocker 5). It then appends the `m0_mutation_log` row only if it replaced existing sequences.
+  1. **`store.db` transaction.** It does the checks (row version, phase, revert epoch; `publish_historian_chunk`), writes `mc_compartment_dates`, records the `context.db` half as a tagged `PendingContextWrite` row in `mc_single_store_pending_publish`, and commits.
+  2. **One `context.db` transaction** (`apply_pending_tx`, `crates/mc-store/src/context_writes.rs`). The fold's compartments are compared with what is stored at their sequences: an equal row is left alone, a different one is updated in place (keeping its id and so its chunk embeddings, synthesis blocker 5), and a missing one is inserted. The `m0_mutation_log` row is appended only when an existing sequence changed. Promoted facts dedupe on the project's active content. The side channels (events, primer candidates, user observations) are written only when the fold added or changed a compartment. When every compartment was already in place, the fold has been applied before, and writing them again would duplicate them.
   3. **`store.db`.** It deletes the pending row.
-  4. **Crash between steps.** The next pass for the session, or the boot sweep, re-runs step 2 from the row, then step 3. New fires for that session are refused while the row exists.
+  4. **Crash between steps.** Every write for the session, the next pass and the module's start first finish a pending row: step 2 from the row, then step 3. A crash before step 2 committed replays the whole fold once. A crash after it replays nothing. Both windows are pinned by `a_fold_resumed_after_either_crash_window_lands_its_side_channels_exactly_once`.
 - **Compartment rewriters** (`replace_compartments`, recomp reset, revert truncate, `append_compartments` at `store:13116`) use the same three steps with a tagged pending row.
 - **Facade writes** (`ctx_memory` and `ctx_note` from direct callers such as Claude Code):
   - They use the context writer, not `mc_memories`/`mc_notes`.
-  - The idempotency ledger stays in `store.db` (`mc_facade_mutation_ledger`, `store:2066`; `with_facade_command`, `store:8004`). A pending entry records the intent and its `now_ms` before the context write, and the final reply replaces it afterwards.
-  - The context write is skipped entirely when a `memory_mutation_log` row with `(target_memory_id, mutation_type, queued_at = now_ms)` already exists. That covers the update and archive case of synthesis blocker 4 without a receipt table: a retry never re-applies over a later update.
-  - Inserts are idempotent on the natural key.
+  - The idempotency ledger stays in `store.db` (`mc_facade_mutation_ledger`; `with_facade_command`). A command with a recorded reply returns it without running again.
+  - The ledger row cannot be written in the `context.db` transaction, so it is written after it. A process that stops between the two leaves the mutation applied and no ledger row. The retry runs the command again. That is safe only because of how each write is shaped, not because of the ledger:
+    - inserts are idempotent on the natural key `(project_path, category, normalized_hash)`, so the retry finds the row and inserts no twin (`facade_mutation_command_crash_between_files_leaves_the_mutation_and_a_retry_does_not_duplicate_it`);
+    - an update or archive re-applies the same values. It appends one more `memory_mutation_log` row with the same content, which the m1 render coalesces. A retry that lands after a later update by someone else would re-apply the older values; there is no receipt table to prevent that (synthesis blocker 4 stays open for this window).
   - A note update compares `updated_at` and `content` together, which closes the within-a-millisecond ABA the synthesis raised.
 - **OpenCode Rust mode stops routing `ctx_memory` and `ctx_note` to the module.** The host's own TypeScript tools write `context.db` directly, as in TS mode, and the module sees those writes through 3.2. This removes the tool id translation completely.
 - **Dreamer metadata routes** (`memory.set_classification`, `set_mural_cue`, `set_verification`, `set_mapping`, `module:13113-13121`) write the same columns in `context.db`, and `memory_verifications` for mappings, in one `BEGIN IMMEDIATE` each. The `MODULE` authority gate on them goes.
@@ -389,7 +398,17 @@ Every memory and note id the module renders, accepts or returns is a `context.db
 - `memory_id_lane` and `note_id_lane` are removed. A caller that still sends `memory_id_lane: "host"` or a `note_id_map` gets `invalid_params`.
 - A lookup by id always carries the project predicate (`WHERE id = ? AND project_path = ?`), so a foreign id reads as not found, as `load_owned_memory` (`crates/mc-module/src/memory_tool.rs:575`) answers today.
 
-### 3.5 The refusal on an unmigrated store
+### 3.5 Which project a route reads
+
+Memories and notes are keyed by the host's project identity (`git:<root commit>` or `dir:<hash>`). A route is bound to a filesystem root, and the table that mapped roots to identities (`mc_authority_route_bindings`) is dropped by migration 61. The module resolves a bound route's project (`route_project_identity`, `crates/mc-module/src/lib.rs`) as:
+
+1. the `session_projects.project_path` the host recorded for the bound session in `context.db`, newest first; else
+2. the identity of the route root, computed the way the host computes it (`crates/mc-module/src/project_identity.rs`, a port of `resolveProjectIdentity` / `resolveProjectIdentityForSession`, golden-tested against values the TypeScript functions printed); else
+3. a refusal by name. A root with no computable identity never reads under a key nobody writes.
+
+Claude Code sessions driven directly by the module have no `session_projects` row, so they take step 2. A facade write whose `memory_project` names another project is refused `facade_project_vocabulary_mismatch`.
+
+### 3.6 The refusal on an unmigrated store
 
 - **Code.** `single_store_migration_required`, a new constant next to `STORE_AHEAD_OF_BINARY_REFUSAL_REASON` (`store:3116`). User-facing code `MC-C14`, the next free one after `MC-C13` (`packages/plugin/src/shared/user-facing-codes.ts:207-212`).
 - **Sentence.** "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)"
@@ -466,7 +485,7 @@ A `ck-mc single-store-migrate` fixture builds `store.db` through the real chain 
 - a store-wins project with twins found each way (identity row, seeded id, natural key);
 - a context-wins project with a store-only memory and a differing twin;
 - supersede chains and `merged_from` across store-only rows;
-- notes in `surfacing`/`surfaced`;
+- notes in the module-only `surfacing`/`surfaced` states, which `context.db` does not have, so they arrive as `ready` (see 3.2, Ready smart notes);
 - compartments where context has a stale copy and extra sequences;
 - context-only events (unchanged, superseded, orphan) and candidates;
 - mappings, including a null array.
@@ -498,7 +517,7 @@ Specimen: `~/.local/share/cortexkit/magic-context/specimens/b2-pair-20260927/`, 
 - `mc_authority` names 5 `MODULE` projects and 1 `TS` project under this file's uuid, and 2 `MODULE` projects under a foreign uuid.
 - 4,092 store memories have no `host_row_id`.
 
-The drill copies the pair (scrubbed of message content if it is not already) to `$TMPDIR/magic-context/<task>/drill` and runs the doctor against it via `MAGIC_CONTEXT_STORAGE_DIR`. It never touches the live stores. It must:
+The drill copies the pair (scrubbed of message content if it is not already) to `$TMPDIR/magic-context/<task>/<root>/cortexkit/magic-context/` (the layout 2.3's path rule requires) and runs the doctor against it with `MAGIC_CONTEXT_STORAGE_DIR` and `XDG_DATA_HOME` set to that root. It never touches the live stores. The specimen's `context.db` carries `memories.content_version`, a column from an old development build; the engine refuses on it and names the `ALTER TABLE memories DROP COLUMN content_version;` to run first. The runtime half is the ignored test `single_store_drill` (`crates/mc-module/src/tests/single_store_drill.rs`), pointed at the migrated copy with `MC_DRILL_DIR` and `MC_DRILL_PROJECT`. It never touches the live stores. It must:
 
 - first refuse `single_store_foreign_context` for the two foreign projects;
 - pass with `--skip-foreign`;
