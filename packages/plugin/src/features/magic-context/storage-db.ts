@@ -17,6 +17,7 @@ import {
     getMagicContextStorageDir,
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
+import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     classifyProcessKind,
@@ -869,17 +870,28 @@ function finishDatabaseOpen(
     // SQLite errors, and per-session failures are logged but
     // never fail-close the plugin. Lazy adoption covers rows the backfill could
     // not reach.
+    //
+    // The tool-owner and message-time backfills fill context.db rows from
+    // OpenCode's session store, which only an OpenCode process may read. In a Pi
+    // process they would walk every OpenCode session of every project, and the
+    // message-time pass would also advance its shared durable cursor past rows
+    // that the OpenCode process still has to fill. The rowid-map backfill reads
+    // only context.db and runs in every harness.
     if (!explicitDbPath) {
+        const readsOpenCodeStore = harnessOwnsOpenCodeStore();
         const runBackfills = () => {
-            try {
-                runToolOwnerBackfill(db);
-            } catch (error) {
-                log(
-                    `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
-                );
+            if (readsOpenCodeStore) {
+                try {
+                    runToolOwnerBackfill(db);
+                } catch (error) {
+                    log(
+                        `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
+                    );
+                }
             }
             void startMessageFtsRowidMapBackfill(db)
                 .then(async () => {
+                    if (!readsOpenCodeStore) return;
                     const [
                         { readRawSessionMessagePage, readRawSessionMessages },
                         { startMessageTimeBackfill },

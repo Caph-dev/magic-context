@@ -1,3 +1,4 @@
+import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     assertOpenCodeStoreGeneration,
@@ -42,9 +43,13 @@ export interface LatestPersistedMessage {
     error?: unknown;
 }
 
-/** Whether the resolved OpenCode session database currently exists. */
+/**
+ * Whether this process may read the OpenCode session database and it exists.
+ * A Pi or OMP process never reads OpenCode's store (see harnessOwnsOpenCodeStore),
+ * so it reports the store as absent there, exactly as on a Pi-only install.
+ */
 export function openCodeDbExists(): boolean {
-    return openCodeDbPathExists(resolveOpenCodeDbPath());
+    return harnessOwnsOpenCodeStore() && openCodeDbPathExists(resolveOpenCodeDbPath());
 }
 
 let cachedReadOnlyDb: { path: string; db: Database } | null = null;
@@ -64,6 +69,11 @@ function closeCachedReadOnlyDb(): void {
 }
 
 function getReadOnlySessionDb(): Database {
+    if (!harnessOwnsOpenCodeStore()) {
+        throw new Error(
+            "OpenCode session database is not readable from a Pi-compatible process; its history lives in Pi sessions",
+        );
+    }
     const resolution = resolveOpenCodeDbPath();
     const dbPath = resolution.path;
     if (!openCodeDbPathExists(resolution)) {
@@ -332,6 +342,7 @@ function resolvedDbIsAvailable(): {
     available: boolean;
 } {
     const resolution = resolveOpenCodeDbPath();
+    if (!harnessOwnsOpenCodeStore()) return { resolution, available: false };
     const available = openCodeDbPathExists(resolution);
     if (available) clearOpenCodeDbReadFailure(resolution.path);
     else logProbeFailureOnce(resolution, "opencode_db_missing");
@@ -566,7 +577,7 @@ export function getMessageTimesFromOpenCodeDb(
     messageIds: readonly string[],
 ): Map<string, number> {
     const result = new Map<string, number>();
-    if (messageIds.length === 0) return result;
+    if (messageIds.length === 0 || !harnessOwnsOpenCodeStore()) return result;
 
     try {
         withReadOnlySessionDb((db) => {
@@ -594,6 +605,7 @@ export function getMessageTimesFromOpenCodeDb(
 export function findLastAssistantModelFromOpenCodeDb(
     sessionId: string,
 ): { providerID: string; modelID: string; agent?: string } | null {
+    if (!harnessOwnsOpenCodeStore()) return null;
     const resolution = resolveOpenCodeDbPath();
     try {
         if (!openCodeDbPathExists(resolution)) {

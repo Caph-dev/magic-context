@@ -2,6 +2,7 @@ import type { PiThinkingLevel } from "../../../config/schema/magic-context";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import type { Database } from "../../../shared/sqlite";
+import { isUsableProjectIdentity } from "../memory/project-identity";
 import { nextDueAtMs } from "./cron";
 import {
     acquireLeaseWithAcquisition,
@@ -520,6 +521,7 @@ export async function runManualDream(
         backlogAfter: {},
     };
 
+    if (!isUsableProjectIdentity(deps.projectIdentity)) return result;
     let selected: readonly DreamTaskRuntimeConfig[];
     let forceGate = false;
     if (deps.task) {
@@ -614,6 +616,9 @@ export async function runManualDream(
  * number of tasks actually executed (for logging/tests).
  */
 export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<number> {
+    // A blank identity is an unresolved directory, not a project; running tasks
+    // for it would read and write project-scoped rows under the key "".
+    if (!isUsableProjectIdentity(deps.projectIdentity)) return 0;
     const now = deps.now ?? Date.now();
     const due = planDueTasks(deps.db, deps.projectIdentity, deps.tasks, now);
     if (due.length === 0) return 0;

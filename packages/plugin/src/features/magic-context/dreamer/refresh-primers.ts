@@ -17,17 +17,12 @@ import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
-import {
-    getActivePrimers,
-    getPrimerCandidatesByIds,
-    type Primer,
-    updatePrimerAnswer,
-} from "../storage-primers";
+import { getActivePrimers, type Primer, updatePrimerAnswer } from "../storage-primers";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
-import { buildPrimerSeed } from "./primer-seed";
+import { buildPrimerSeed, selectPrimerOriginCandidate } from "./primer-seed";
 import { PRIMER_INVESTIGATOR_SYSTEM_PROMPT } from "./task-prompts";
 
 const REFRESH_PRIMERS_PER_RUN = 5;
@@ -370,12 +365,8 @@ async function refreshOnePrimer(
 }
 
 function originSessionIdForPrimer(args: RefreshPrimersArgs, primer: Primer): string | null {
-    // Cheap lookup: the most-recent candidate's session id, without rendering.
-    const candidates = getPrimerCandidatesByIds(args.db, primer.sourceCandidateIds);
-    const mostRecent = candidates
-        .slice()
-        .sort((a, b) => b.sourceMessageTime - a.sourceMessageTime || b.id - a.id)[0];
-    return mostRecent?.sessionId ?? null;
+    // Cheap lookup without rendering; the same same-project candidate the seed uses.
+    return selectPrimerOriginCandidate(args.db, primer)?.sessionId ?? null;
 }
 
 function recordInvocation(

@@ -44,7 +44,10 @@ import {
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
 import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	isUsableProjectIdentity,
+	resolveProjectIdentityForSession,
+} from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	clearSessionTracking,
 	scheduleIncrementalIndex,
@@ -890,12 +893,16 @@ export function trackSessionForProject(
 	// (Set preserves insertion order; re-inserting refreshes recency).
 	activeContextHandlerSessions.delete(sessionId);
 	activeContextHandlerSessions.add(sessionId);
-	let sessions = sessionsByProject.get(projectIdentity);
-	if (!sessions) {
-		sessions = new Set();
-		sessionsByProject.set(projectIdentity, sessions);
+	// A session outside any project (empty identity) still gets its caches
+	// tracked for eviction, but is never filed under a blank project key.
+	if (isUsableProjectIdentity(projectIdentity)) {
+		let sessions = sessionsByProject.get(projectIdentity);
+		if (!sessions) {
+			sessions = new Set();
+			sessionsByProject.set(projectIdentity, sessions);
+		}
+		sessions.add(sessionId);
 	}
-	sessions.add(sessionId);
 
 	// Evict the oldest tracked sessions beyond the cap. clearContextHandlerSession
 	// removes the evicted id from activeContextHandlerSessions, so the loop

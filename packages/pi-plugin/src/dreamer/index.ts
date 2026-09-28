@@ -17,6 +17,7 @@ import {
 	type ManualRunResult,
 	runManualDream,
 } from "@magic-context/core/features/magic-context/dreamer/task-scheduler";
+import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
 import { log } from "@magic-context/core/shared/logger";
@@ -218,6 +219,10 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 	const directory = resolve(opts.projectDir);
 	if (
 		opts.config.disable === true ||
+		// A directory the identity resolver refuses (home, or a folder inside a
+		// dotfiles repository rooted at home) arrives with an empty identity.
+		// It is not a project, so nothing may be scheduled under that key.
+		!isUsableProjectIdentity(opts.projectIdentity) ||
 		directory === parse(directory).root ||
 		directory === homedir()
 	) {

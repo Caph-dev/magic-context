@@ -48,6 +48,7 @@ import {
     embedUnembeddedMemoriesForProject,
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
+import { isUsableProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { sweepOrphanedOpenCodeMessageIndexes } from "../features/magic-context/message-index";
 import {
     drainCommitBacklogForProject,
@@ -198,6 +199,16 @@ function openTimerDatabaseOrNull(context: string): Database | null {
     }
     return db;
 }
+const refusedEmptyIdentityDirectories = new Set<string>();
+
+function logEmptyIdentityRefusalOnce(directory: string): void {
+    if (refusedEmptyIdentityDirectories.has(directory)) return;
+    refusedEmptyIdentityDirectories.add(directory);
+    log(
+        `[dreamer] not registering ${directory}: it has no project identity, so no project-scoped work runs for it`,
+    );
+}
+
 /** All projects that have called startDreamScheduleTimer in this process,
  *  keyed by directory so re-registration of the same directory is idempotent. */
 const registeredProjects = new Map<string, ProjectRegistration>();
@@ -232,6 +243,15 @@ function stopDreamScheduleTimerIfIdle(): void {
 export async function startDreamScheduleTimer(
     args: ProjectRegistration,
 ): Promise<(() => void) | undefined> {
+    // An unresolved directory (home, filesystem root) has no project identity.
+    // Every per-project stage keys its work by this identity, so a blank one
+    // would run dreamer tasks, embedding sweeps, and commit indexing for a
+    // project named "". Hosts are expected to skip registration themselves;
+    // this is the last line of defense.
+    if (!isUsableProjectIdentity(args.projectIdentity)) {
+        logEmptyIdentityRefusalOnce(args.directory);
+        return undefined;
+    }
     beginBootQuietPeriod();
     const db = openTimerDatabaseOrNull("schedule timer registration");
     if (!db) return;

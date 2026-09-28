@@ -54,6 +54,7 @@ import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
+import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type {
 	UnifiedSearchOptions,
 	UnifiedSearchResult,
@@ -339,6 +340,9 @@ export async function runAutoSearchHintForPi(args: {
 	// Persisted decisions were replayed above because replay is byte restoration,
 	// not a new mutation.
 	if (found.index !== messages.length - 1) return messages;
+	// A directory outside any project has no identity to search memories,
+	// commits or history embeddings under; never search the blank key.
+	if (!isUsableProjectIdentity(options.projectPath)) return messages;
 
 	await args.ensureProjectRegistered?.();
 

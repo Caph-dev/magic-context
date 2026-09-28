@@ -198,11 +198,35 @@ export function readRawSessionMessagePageFromDb(
     limit: number,
     finalWatermark = Number.MAX_SAFE_INTEGER,
 ): RawMessage[] {
+    const messageRows = readRawMessagePageRows(db, sessionId, afterOrdinal, limit, finalWatermark);
+    if (messageRows.length === 0) return [];
+
+    const placeholders = messageRows.map(() => "?").join(", ");
+    const partRows = db
+        .prepare(
+            `SELECT message_id, data, time_updated
+             FROM part
+             WHERE +session_id = ?
+               AND likelihood(message_id IN (${placeholders}), 0.000001)
+             ORDER BY message_id ASC, time_created ASC, id ASC`,
+        )
+        .all(sessionId, ...messageRows.map((row) => row.id))
+        .filter(isRawPartRow);
+    return assembleRawMessagePage(messageRows, partRows);
+}
+
+function readRawMessagePageRows(
+    db: Database,
+    sessionId: string,
+    afterOrdinal: number,
+    limit: number,
+    finalWatermark: number,
+): PagedRawMessageRow[] {
     const remaining = Math.max(0, Math.floor(finalWatermark) - Math.floor(afterOrdinal));
     const pageSize = Math.min(Math.max(1, Math.floor(limit)), remaining);
     if (pageSize === 0) return [];
 
-    const messageRows = db
+    return db
         .prepare(
             `SELECT id, data, time_created, time_updated
              FROM message
@@ -226,20 +250,12 @@ export function readRawSessionMessagePageFromDb(
                 ordinal: Math.floor(afterOrdinal) + index + 1,
             }),
         );
+}
 
-    if (messageRows.length === 0) return [];
-
-    const placeholders = messageRows.map(() => "?").join(", ");
-    const partRows = db
-        .prepare(
-            `SELECT message_id, data, time_updated
-             FROM part
-             WHERE +session_id = ?
-               AND likelihood(message_id IN (${placeholders}), 0.000001)
-             ORDER BY message_id ASC, time_created ASC, id ASC`,
-        )
-        .all(sessionId, ...messageRows.map((row) => row.id))
-        .filter(isRawPartRow);
+function assembleRawMessagePage(
+    messageRows: readonly PagedRawMessageRow[],
+    partRows: readonly RawPartRow[],
+): RawMessage[] {
     const partsByMessageId = new Map<string, unknown[]>();
     for (const part of partRows) {
         const list = partsByMessageId.get(part.message_id) ?? [];
@@ -258,6 +274,84 @@ export function readRawSessionMessagePageFromDb(
             version: row.time_updated ?? null,
         };
     });
+}
+
+/** Longest text a summary page keeps from one text part or one tool key argument. */
+export const RAW_SUMMARY_TEXT_MAX_CHARS = 8192;
+const RAW_SUMMARY_ARG_MAX_CHARS = 512;
+
+/** Tool input keys the `TC:` summary line reads (see extractToolCallSummaries). */
+const RAW_SUMMARY_TOOL_INPUT_KEYS = [
+    "description",
+    "filePath",
+    "path",
+    "pattern",
+    "query",
+    "symbol",
+    "module",
+    "action",
+] as const;
+
+function summaryStringField(jsonPath: string): string {
+    return `CASE WHEN json_type(data, '${jsonPath}') = 'text' THEN substr(json_extract(data, '${jsonPath}'), 1, ${RAW_SUMMARY_ARG_MAX_CHARS}) END`;
+}
+
+/**
+ * Part projection for summary pages, computed inside SQLite so the JavaScript
+ * heap never holds a whole tool output. A text part keeps its fields with the
+ * text cut to RAW_SUMMARY_TEXT_MAX_CHARS. A tool part is rebuilt from its name,
+ * call id, status, the input keys a `TC:` line uses, and the metadata
+ * description; its output, full metadata (LSP diagnostics and the like), and
+ * bulky inputs such as written file contents are never read into JavaScript.
+ */
+const RAW_SUMMARY_PART_DATA_SQL = `CASE
+    WHEN json_extract(data, '$.type') = 'text'
+        THEN json_set(data, '$.text', substr(json_extract(data, '$.text'), 1, ${RAW_SUMMARY_TEXT_MAX_CHARS}))
+    ELSE json_object(
+        'type', 'tool',
+        'tool', ${summaryStringField("$.tool")},
+        'callID', ${summaryStringField("$.callID")},
+        'state', json_object(
+            'status', ${summaryStringField("$.state.status")},
+            'input', json_object(${RAW_SUMMARY_TOOL_INPUT_KEYS.map(
+                (key) => `'${key}', ${summaryStringField(`$.state.input.${key}`)}`,
+            ).join(", ")}),
+            'metadata', json_object('description', ${summaryStringField("$.state.metadata.description")})
+        )
+    )
+END`;
+
+/**
+ * Read one bounded page in the same ordinal space as
+ * {@link readRawSessionMessagePageFromDb}, keeping only text and tool parts in
+ * their summary projection. For callers that render `U:` / `TC:` lines and
+ * never need tool outputs, reasoning, or file payloads: peak memory is one page
+ * of small projected parts, whatever the session or tool-output size.
+ */
+export function readRawSessionMessageSummaryPageFromDb(
+    db: Database,
+    sessionId: string,
+    afterOrdinal: number,
+    limit: number,
+    finalWatermark = Number.MAX_SAFE_INTEGER,
+): RawMessage[] {
+    const messageRows = readRawMessagePageRows(db, sessionId, afterOrdinal, limit, finalWatermark);
+    if (messageRows.length === 0) return [];
+
+    const placeholders = messageRows.map(() => "?").join(", ");
+    const partRows = db
+        .prepare(
+            `SELECT message_id, ${RAW_SUMMARY_PART_DATA_SQL} AS data, time_updated
+             FROM part
+             WHERE +session_id = ?
+               AND likelihood(message_id IN (${placeholders}), 0.000001)
+               AND json_valid(data) = 1
+               AND json_extract(data, '$.type') IN ('text', 'tool')
+             ORDER BY message_id ASC, time_created ASC, id ASC`,
+        )
+        .all(sessionId, ...messageRows.map((row) => row.id))
+        .filter(isRawPartRow);
+    return assembleRawMessagePage(messageRows, partRows);
 }
 
 export function countRawSessionMessageOrdinalsFromDb(db: Database, sessionId: string): number {

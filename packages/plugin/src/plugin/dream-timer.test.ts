@@ -100,6 +100,30 @@ describe("dream-timer registration cleanup", () => {
         }
     });
 
+    // An unresolved project (home directory, filesystem root) has no identity.
+    // Registering it under "" would run every per-project task for a blank
+    // project key, so the timer refuses the registration outright.
+    test("refuses a registration whose project identity is empty", async () => {
+        const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-empty-identity-"));
+        const setIntervalSpy = spyOn(globalThis, "setInterval");
+        try {
+            for (const projectIdentity of ["", "  "]) {
+                const cleanup = await startDreamScheduleTimer({
+                    directory,
+                    projectIdentity,
+                    harness: "pi" as const,
+                    client: {} as never,
+                    ensureRegistered: async () => undefined,
+                });
+                expect(cleanup).toBeUndefined();
+            }
+            expect(setIntervalSpy).not.toHaveBeenCalled();
+        } finally {
+            setIntervalSpy.mockRestore();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     test("picks up a durable Rust deletion from the cold-boot startup tick", async () => {
         const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-rust-delete-"));
         const timerHandle = {

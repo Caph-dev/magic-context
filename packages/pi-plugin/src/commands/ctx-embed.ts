@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	embedSessionCompartmentChunks,
 	getEmbeddingCoverageStatus,
@@ -260,6 +261,9 @@ export function maybeAutoEmbedPiSession(
 	projectDir: string,
 	projectIdentity: string,
 ): void {
+	// Embeddings are stored per project; a session outside any project (empty
+	// identity) has nothing to embed under.
+	if (!isUsableProjectIdentity(projectIdentity)) return;
 	if (autoEmbedAttemptedBySession.has(sessionId)) return;
 	if (embedPauseBySession.has(sessionId)) return;
 	autoEmbedAttemptedBySession.add(sessionId);

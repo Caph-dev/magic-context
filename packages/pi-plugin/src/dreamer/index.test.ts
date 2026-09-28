@@ -291,6 +291,29 @@ describe("Pi dreamer wiring", () => {
 			);
 		expect(starts).toBe(0);
 	});
+
+	// A directory the identity resolver refuses (the home directory, or a folder
+	// inside a dotfiles repository rooted at home) resolves to no identity. The
+	// empty string must never become a dreamer project key: every task would run
+	// against project "" and log "registered project " with a blank name.
+	test("does not register a project with an empty identity", () => {
+		db = createDb();
+		const dir = mkdtempSync(join(tmpdir(), "mc-pi-dreamer-empty-identity-"));
+		try {
+			let starts = 0;
+			__test.setStartDreamScheduleTimerFactory(async () => {
+				starts++;
+				return () => {};
+			});
+			for (const projectIdentity of ["", "   "])
+				registerPiDreamerProject(
+					dreamerOptions({ database: db, projectIdentity, projectDir: dir }),
+				);
+			expect(starts).toBe(0);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 	test("classifies a provider refusal surfaced by a Pi child runner", async () => {
 		db = createDb();
 		const projectIdentity = "git:pi-dreamer-provider-refusal";

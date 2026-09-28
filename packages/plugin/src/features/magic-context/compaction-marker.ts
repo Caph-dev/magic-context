@@ -29,6 +29,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     assertOpenCodeStoreGeneration,
@@ -161,6 +162,9 @@ function isOpenCodeSchemaCompatible(db: Database, dbPath: string): boolean {
 }
 
 function getWritableOpenCodeDb(): Database {
+    if (!harnessOwnsOpenCodeStore()) {
+        throw new Error("OpenCode database is not writable from a Pi-compatible process");
+    }
     const resolution = resolveOpenCodeDbPath();
     const dbPath = resolution.path;
     if (cachedWriteDb?.path === dbPath) {

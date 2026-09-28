@@ -1397,6 +1397,20 @@
             ]
         },
         {
+            "path": "tests/pi-home-directory-identity.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Pi 0.87.1 started in its home directory registers no project and never opens OpenCode's session store",
+            "contract_refs": ["PI-HARNESS"],
+            "hosts": ["pi"],
+            "behavior": true,
+            "divergences": [
+                { "host": "opencode", "reason": "OpenCode owns its session store and skips the dream timer without an identity at its own entry point", "contract_ref": "PI-HARNESS" },
+                { "host": "opencode2", "reason": "OpenCode 2 owns its session store; the Pi-process store fence does not apply", "contract_ref": "PI-HARNESS" },
+                { "host": "omp", "reason": "OMP shares the Pi code path but uses a different host version and home layout", "contract_ref": "PI-HARNESS" }
+            ]
+        },
+        {
             "path": "tests/pi-cross-harness.test.ts",
             "tier": "ts-only",
             "invocation": {
