@@ -1,6 +1,6 @@
 {
     "schema": 1,
-    "header": "Pull-request and ordinary master CI intentionally run only the manifest-derived TS invocation. The tag release workflow runs the Rust invocation through scripts/run-rust-hermetic-e2e.sh on an explicitly enabled private-source runner; it requires sibling path-deps (../commons and ../subconscious).",
+    "header": "CI push workflows run the manifest-derived TypeScript suites and the Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh. The tag release workflow also runs the Rust invocation; both Rust lanes require public sibling path dependencies (../commons and ../subconscious).",
     "entries": [
         {
             "path": "tests/adv-identical-bytes-hard.test.ts",

@@ -5,9 +5,8 @@ on:
     # train/** runs the same checks on a train branch before it is fast-forwarded
     # onto master; required status checks on master are satisfied by that run.
     branches: [master, main, "train/**"]
-  # This private-source drift leg runs only on the default branch's workflow
-  # revision, never against untrusted branch code: nightly, or by hand on master
-  # so a fix to the leg itself can be verified without waiting for the cron.
+  # The nightly run checks sibling repositories at their default-branch heads;
+  # workflow_dispatch remains available for an operator-triggered run.
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -22,7 +21,6 @@ env:
 #   e2e-opencode, e2e-opencode2, e2e-pi, e2e-omp           (Docker install + smoke, parallel — gated by unit)
 #   e2e-host-opencode, e2e-host-opencode2, e2e-host-pi, e2e-host-omp (host-behavior lanes from the mode manifest)
 #                  ↓
-#   e2e-host-opencode, e2e-host-pi                         (host behavior suite from packages/e2e-tests, parallel — gated by Docker)
 #
 # Two e2e layers cover different concerns:
 #   - Docker e2e: fresh-install smoke (plugin loads, doctor clean, one mock turn writes DB rows
@@ -34,14 +32,13 @@ env:
 #
 # Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding it here means
 # every master/main push exercises the full unit → Docker → host gauntlet. The
-# scheduled Rust legs additionally check the current private sibling sources; they never
-# run on untrusted branch code:
+# Rust jobs run on every push and scheduled run, checking the current public sibling sources:
 #
 #   rust-crates          cargo fmt / clippy --all-targets / cargo test, including every
 #                        integration target under crates/*/tests
-#   e2e-rust-hermetic    the hermetic drift harness
+#   e2e-rust-hermetic-build → e2e-rust-hermetic (4 shards)
 #
-# Both need ../commons and ../subconscious, which push and pull_request CI cannot have.
+# Both check out ../commons and ../subconscious from their public default branches.
 
 jobs:
   check-plugin:
@@ -353,10 +350,8 @@ jobs:
           MC_E2E_HOST: opencode
         run: |
           # The mode validator independently checks tests/**/*.test.ts and
-          # derives this OpenCode list. Rust is intentionally absent from PR and
-          # ordinary master CI because it requires private ../commons and
-          # ../subconscious source. The scheduled hosted drift job below covers
-          # that private-source lane; never add it to pull_request.
+          # derives this OpenCode list. Rust coverage runs in the dedicated crate
+          # and hermetic jobs below, including on pushes.
           cd packages/e2e-tests
           # A validator failure must fail the job, never fall through to an empty
           # list: `bun test` with no files runs every file in the package.
@@ -531,61 +526,17 @@ jobs:
           # shellcheck disable=SC2086 # The repository-controlled file list must expand into Bun arguments.
           bun test --timeout 600000 $files
 
-  rust-e2e-preflight:
-    name: Rust hermetic E2E drift credential preflight
-    # Scheduled workflows use the default branch, and a manual dispatch is only
-    # honoured on master. Both keep the private-source App token away from
-    # untrusted branch code.
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      enabled: ${{ steps.credentials.outputs.enabled }}
-    steps:
-      - id: credentials
-        name: Report private-source credential state
-        env:
-          CK_CI_APP_ID: ${{ secrets.CK_CI_APP_ID }}
-          CK_CI_APP_PRIVATE_KEY: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          missing_secrets=()
-          [[ -n "$CK_CI_APP_ID" ]] || missing_secrets+=("CK_CI_APP_ID")
-          [[ -n "$CK_CI_APP_PRIVATE_KEY" ]] || missing_secrets+=("CK_CI_APP_PRIVATE_KEY")
-
-          if (( ${#missing_secrets[@]} > 0 )); then
-            missing_prerequisite="$(IFS=','; echo "${missing_secrets[*]}")"
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Rust hermetic E2E skipped::Missing prerequisite: Actions secret(s) ${missing_prerequisite}. Configure the cortexkit-ci GitHub App secrets documented in .github/RUST_E2E_CI.md."
-            {
-              echo "## Rust hermetic E2E drift"
-              echo "SKIPPED: Missing prerequisite: Actions secret(s) ${missing_prerequisite}."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "Rust hermetic E2E drift is SKIPPED: cortexkit-ci GitHub App secrets are absent. This scheduled run does not claim the Rust suite passed."
-          else
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Rust hermetic E2E credentials are available for the hosted drift runner."
-          fi
-
   rust-crates:
     name: Rust (crates)
-    # The Rust workspace does not build without the private ../commons and
-    # ../subconscious sources, so this job carries the same scoped cortexkit-ci App
-    # token as the hermetic drift leg below and is gated exactly the same way:
-    # scheduled, or dispatched by hand on master. That is why it is absent from
-    # push and pull_request CI (see the note in the OpenCode host job), and it is
-    # why a broken crate can sit on master for a day before anything says so.
+    # Public sibling workspaces are checked out at their default-branch heads,
+    # so each push validates the crates against the current shared sources.
     #
     # It exists because NOTHING ran `cargo test` in this workflow: the drift leg
     # below builds the crates only as a side effect of the hermetic harness, so an
     # integration test under crates/*/tests could fail unobserved. It depends on the
-    # preflight alone, not on the e2e chain, so a Rust regression is reported even
+    # no other suite, so a Rust regression is reported even
     # when an unrelated host suite is red.
-    if: ${{ needs.rust-e2e-preflight.outputs.enabled == 'true' }}
     runs-on: ubuntu-latest
-    needs: [rust-e2e-preflight]
     timeout-minutes: 45
     permissions:
       contents: read
@@ -596,30 +547,17 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Create scoped cortexkit-ci GitHub App token
-        id: cortexkit-ci-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious,commons
-
       - name: Check out commons
         uses: actions/checkout@v5
         with:
           repository: cortexkit/commons
-          token: ${{ steps.cortexkit-ci-token.outputs.token }}
           path: .siblings/commons
-          persist-credentials: false
 
       - name: Check out subconscious
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
-          token: ${{ steps.cortexkit-ci-token.outputs.token }}
           path: .siblings/subconscious
-          persist-credentials: false
 
       # actions/checkout refuses a path outside $GITHUB_WORKSPACE, so the siblings
       # land inside the workspace and are linked to the ../ paths the Rust workspace
@@ -633,7 +571,7 @@ jobs:
           test -f "$GITHUB_WORKSPACE/../commons/Cargo.toml"
           test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
 
-      - name: Record private sibling revisions
+      - name: Record public sibling revisions
         shell: bash
         run: |
           set -euo pipefail
@@ -663,11 +601,8 @@ jobs:
 
   e2e-rust-hermetic-build:
     name: E2E (Rust hermetic drift build)
-    # This job uses private sibling source with a scoped cortexkit-ci GitHub App
-    # token. It must remain scheduled-only and never run on untrusted branch code.
-    if: ${{ needs.rust-e2e-preflight.outputs.enabled == 'true' }}
+    # Public sibling workspaces are checked out at their default-branch heads.
     runs-on: ubuntu-latest
-    needs: [rust-e2e-preflight]
     timeout-minutes: 120
     permissions:
       contents: read
@@ -680,34 +615,21 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Create scoped cortexkit-ci GitHub App token
-        id: cortexkit-ci-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious,commons
-
-      # actions/checkout refuses a path outside $GITHUB_WORKSPACE (the scheduled drift
-      # run failed on exactly that), so the siblings land inside the workspace and are
+      # actions/checkout requires sibling checkouts inside $GITHUB_WORKSPACE, so they land
+      # inside the workspace and are
       # linked to the ../ paths the Rust workspace and the hermetic harness expect.
       # Same shape as release.yml.
       - name: Check out commons
         uses: actions/checkout@v5
         with:
           repository: cortexkit/commons
-          token: ${{ steps.cortexkit-ci-token.outputs.token }}
           path: .siblings/commons
-          persist-credentials: false
 
       - name: Check out subconscious
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
-          token: ${{ steps.cortexkit-ci-token.outputs.token }}
           path: .siblings/subconscious
-          persist-credentials: false
 
       - name: Link siblings at the expected relative paths
         shell: bash
@@ -718,7 +640,7 @@ jobs:
           test -f "$GITHUB_WORKSPACE/../commons/Cargo.toml"
           test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
 
-      - name: Record private sibling revisions
+      - name: Record public sibling revisions
         shell: bash
         run: |
           set -euo pipefail
@@ -784,26 +706,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - name: Create scoped cortexkit-ci GitHub App token
-        id: cortexkit-ci-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious,commons
       - uses: actions/checkout@v5
         with:
           repository: cortexkit/commons
-          token: ${{ steps.cortexkit-ci-token.outputs.token }}
           path: .siblings/commons
-          persist-credentials: false
       - uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
-          token: ${{ steps.cortexkit-ci-token.outputs.token }}
           path: .siblings/subconscious
-          persist-credentials: false
       - name: Link sibling workspaces
         run: |
           ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"

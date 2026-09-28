@@ -15,7 +15,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Only the trusted base checkout runs with the App token, never PR code.
+      # Only the trusted base checkout runs; the token can update advisory comments.
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
