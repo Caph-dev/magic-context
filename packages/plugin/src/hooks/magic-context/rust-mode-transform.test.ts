@@ -747,7 +747,12 @@ describe("Rust mode authority adapter", () => {
         const ttls: unknown[] = [];
         const moduleClient: RustModeModuleClient = {
             call: async ({ method, body }) => {
-                if (method === "transform") ttls.push(body?.cache_ttl);
+                if (method === "transform") {
+                    ttls.push([
+                        body?.cache_ttl,
+                        (body?.pass_inputs as Record<string, unknown>)?.cache_ttl,
+                    ]);
+                }
                 return method === "transform"
                     ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
                     : { ok: true };
@@ -771,7 +776,11 @@ describe("Rust mode authority adapter", () => {
             { messages: [...messages] },
             makeMeta(db, sessionId),
         );
-        expect(ttls).toEqual(["30m", "30m"]);
+        expect(ttls).toEqual([
+            ["30m", "30m"],
+            ["30m", "30m"],
+        ]);
+        expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("30m");
     });
 
     it("copies caveman settings onto the authority wire", () => {
