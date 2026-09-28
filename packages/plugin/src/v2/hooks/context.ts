@@ -107,7 +107,7 @@ import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
 import { runV2SessionProjectBackfill } from "./session-project-backfill";
-import { createV2StorageGate } from "./storage-gate";
+import { createV2StorageGate, probeV2StorageAtBoot } from "./storage-gate";
 import {
     dropStorageNotices,
     formatStorageRecoveryNotice,
@@ -488,7 +488,9 @@ export async function registerContext(context: V2Context) {
             log(`[magic-context] v2 storage unavailable: ${message}`);
         },
     });
-    let db: ReturnType<typeof openDatabase> | undefined = storage.probe();
+    // Let slow healthy storage finish before fixing the tool list for this host.
+    // Discovery yields to HTTP while setup waits, with a bounded degraded fallback.
+    let db: ReturnType<typeof openDatabase> | undefined = await probeV2StorageAtBoot(storage);
     const storageOpenedAtBoot = db !== undefined;
     let storageRecoveryAnnounced = false;
     const storageNoticeBySession = new Map<string, string>();
@@ -797,6 +799,9 @@ export async function registerContext(context: V2Context) {
     ): Promise<boolean> => {
         let unsafe = false;
         try {
+            // A turn may await the one in-flight recovery; unlike setup it needs
+            // durable state before transforming. Process discovery yields meanwhile.
+            await storage.probe();
             db = storage.require();
             getOrCreateSessionMeta(db, draft.sessionID);
             const reader = new V2StoreReader(
@@ -1482,6 +1487,13 @@ export async function registerContext(context: V2Context) {
         config,
         client: undefined,
         liveSessionState: rpcLiveSessionState,
+        getDatabase: () => {
+            try {
+                return storage.require();
+            } catch {
+                return null;
+            }
+        },
         rustModeModuleClient,
         hiddenCompletionExecutor: storageOpenedAtBoot
             ? hiddenCompletionExecutor

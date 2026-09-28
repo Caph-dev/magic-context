@@ -1413,9 +1413,11 @@ export function registerRpcHandlers(
         hiddenCompletionExecutor?: HiddenCompletionExecutor;
         storageDir?: string;
         getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
+        getDatabase?: () => Database | null;
     },
 ): void {
     const { directory, config, liveSessionState, rustModeModuleClient } = args;
+    const readDatabase = args.getDatabase ?? getDb;
     // Resolve mode once at the RPC boundary. The TUI receives this data and
     // never reads the config itself.
     const compactionEnabled = isCompactionEnabled(config);
@@ -1448,7 +1450,7 @@ export function registerRpcHandlers(
     rpcServer.handle("sidebar-snapshot", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
@@ -1475,7 +1477,7 @@ export function registerRpcHandlers(
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
-        const db = getDb();
+        const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
@@ -1510,7 +1512,7 @@ export function registerRpcHandlers(
     rpcServer.handle("embed-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         try {
             return buildEmbedDetail(db, sessionId, dir, liveSessionState) as unknown as Record<
@@ -1526,7 +1528,7 @@ export function registerRpcHandlers(
     rpcServer.handle("compartment-count", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        const db = readDatabase();
         if (!db || !sessionId) return { count: 0 };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
@@ -1594,7 +1596,7 @@ export function registerRpcHandlers(
         if (config.transform_mode === "rust") {
             return executeRustRecompRpc(rustModeModuleClient, sessionId, dir);
         }
-        const db = getDb();
+        const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
         const { runManagedRecomp } = await import("../hooks/magic-context/recomp-orchestrator");
@@ -1655,7 +1657,7 @@ export function registerRpcHandlers(
                 return { ok: false, error: renderCapabilityRefusal("context_cleanup") };
             }
         } else {
-            const db = getDb();
+            const db = readDatabase();
             if (!db) return { ok: false, error: "db unavailable" };
             message = executeFlush(db, sessionId);
         }
@@ -1678,7 +1680,7 @@ export function registerRpcHandlers(
         if (config.transform_mode === "rust") {
             return { ok: false, error: renderCapabilityRefusal("history_compression") };
         }
-        const db = getDb();
+        const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
         const { runManagedWrapup } = await import("../hooks/magic-context/wrapup-orchestrator");
@@ -1716,7 +1718,7 @@ export function registerRpcHandlers(
     rpcServer.handle("embed", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
-        const db = getDb();
+        const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
         const action = String(params.action ?? "status");
         const embedDeps: EmbedHistoryDeps = {
