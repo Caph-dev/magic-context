@@ -208,6 +208,7 @@ export type SubagentRunResult =
     | {
           ok: false;
           reason:
+              | "step_limit"
               | "invalid_prompt"
               | "timeout"
               | "abort"
