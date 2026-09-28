@@ -889,6 +889,10 @@ struct PendingReferences {
     context_id: i64,
     superseded_store: SqlValue,
     merged_from_store: SqlValue,
+    /// The store row was seeded from a `context.db` row and paired with a twin. Seeding
+    /// copied `merged_from` verbatim, so such a row's list already holds `context.db` ids
+    /// when it still equals its twin's.
+    seeded_twin: bool,
 }
 
 struct Copier<'a> {
@@ -908,6 +912,10 @@ struct Copier<'a> {
     highest_inserted: BTreeMap<String, i64>,
     reports: BTreeMap<String, ProjectReport>,
     dangling: Vec<String>,
+    /// Every memory id `store.db` holds, in any project.
+    store_memory_ids: HashSet<i64>,
+    /// Mappings whose memory no longer exists in `store.db`; not copied.
+    orphan_mappings: usize,
 }
 
 impl<'a> Copier<'a> {
@@ -1084,6 +1092,8 @@ impl<'a> Copier<'a> {
                     context_id,
                     superseded_store: get(row, "superseded_by_memory_id"),
                     merged_from_store: get(row, "merged_from"),
+                    seeded_twin: twin != Twin::Missing
+                        && as_i64(&get(row, "context_row_id")).is_some(),
                 });
             }
         }
@@ -1198,15 +1208,19 @@ impl<'a> Copier<'a> {
                     .map_or(SqlValue::Null, SqlValue::Integer),
                 None => SqlValue::Null,
             };
-            let merged_from = match as_text(&pending.merged_from_store) {
-                Some(raw) => SqlValue::Text(self.remap_merged_from(&pending.project, raw)?),
-                None => pending.merged_from_store.clone(),
-            };
             let current: (SqlValue, SqlValue) = self.conn.query_row(
                 "SELECT superseded_by_memory_id, merged_from FROM ctx.memories WHERE id = ?1",
                 params![pending.context_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
+            let merged_from = if pending.seeded_twin && current.1 == pending.merged_from_store {
+                pending.merged_from_store.clone()
+            } else {
+                match as_text(&pending.merged_from_store) {
+                    Some(raw) => SqlValue::Text(self.remap_merged_from(&pending.project, raw)?),
+                    None => pending.merged_from_store.clone(),
+                }
+            };
             if current != (superseded.clone(), merged_from.clone()) {
                 self.conn.execute(
                     "UPDATE ctx.memories SET superseded_by_memory_id = ?1, merged_from = ?2 WHERE id = ?3",
@@ -1419,6 +1433,12 @@ impl<'a> Copier<'a> {
             let Some(store_id) = as_i64(&get(row, "memory_id")) else {
                 continue;
             };
+            // mc_memory_mappings has no foreign key, so a mapping can outlive its memory.
+            // Such a row maps nothing; it stays only in the backup.
+            if !self.store_memory_ids.contains(&store_id) {
+                self.orphan_mappings += 1;
+                continue;
+            }
             let Some(context_id) = self.remap(project, store_id, "memory mapping")? else {
                 continue;
             };
@@ -2879,6 +2899,12 @@ fn migrate_in_transaction(
         highest_inserted: BTreeMap::new(),
         reports: BTreeMap::new(),
         dangling: Vec::new(),
+        store_memory_ids: source
+            .memories
+            .iter()
+            .filter_map(|row| as_i64(&get(row, "id")))
+            .collect(),
+        orphan_mappings: 0,
     };
     for (project, decision) in &decided {
         let Classification::Wins(winner) = *decision else {
@@ -2897,6 +2923,12 @@ fn migrate_in_transaction(
     }
     if !copier.dangling.is_empty() {
         copier.write_references()?;
+    }
+    if copier.orphan_mappings > 0 {
+        eprintln!(
+            "{} memory mapping(s) name a memory store.db no longer has; they stay only in the backup",
+            copier.orphan_mappings
+        );
     }
     let mut skipped_sessions = BTreeSet::new();
     let mut copied_sessions = BTreeSet::new();

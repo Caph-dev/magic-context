@@ -172,7 +172,8 @@ impl Fixture {
             .execute_batch(
                 "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
                  VALUES (4, 'git:store-wins', '[\"a.rs\",\"b.rs\"]', 4000),
-                        (5, 'git:store-wins', 'null', 4000);
+                        (5, 'git:store-wins', 'null', 4000),
+                        (98, 'git:store-wins', '[\"gone.rs\"]', 4000);
                  UPDATE mc_privilege_state SET note_caller_project = 'git:store-wins' WHERE id = 1;
                  INSERT INTO mc_notes(type, project_path, session_id, content, status, created_at_ms, updated_at_ms)
                  VALUES ('session', 'git:store-wins', 'ses_store', 'a surfacing note', 'surfacing', 3000, 3000);
@@ -415,6 +416,37 @@ fn references_name_the_new_ids() {
         format!("[5,{five}]"),
         "store 1 is context 5, store 5 is context {five}"
     );
+}
+
+/// Seeding copied `merged_from` verbatim from the context row, so a seeded store row whose
+/// list still equals its twin's already holds context ids. Translating it as store ids
+/// would point it at other memories (here store 1 is context 5, not context 1).
+#[test]
+fn a_seeded_twins_merged_from_is_already_in_context_ids_and_kept() {
+    let fixture = Fixture::new(Extras::default());
+    fixture
+        .store()
+        .execute(
+            "UPDATE mc_memories SET merged_from = '[1]' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+    let context = fixture.context();
+    context
+        .execute_batch(
+            "UPDATE context_privilege_state SET enabled = 1;
+             UPDATE memories SET merged_from = '[1]' WHERE id = 6;
+             UPDATE context_privilege_state SET enabled = 0;",
+        )
+        .unwrap();
+    fixture.migrate();
+    let merged: String = fixture
+        .context()
+        .query_row("SELECT merged_from FROM memories WHERE id = 6", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(merged, "[1]");
 }
 
 #[test]
