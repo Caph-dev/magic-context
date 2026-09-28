@@ -14,12 +14,13 @@ const MAX_BYTES = 4 * 1024 * 1024; // per file, per invocation
 const AGENT_ID = "agent_b613e5cf2ee55b8c";
 type Kind = "p90" | "single" | "timeout" | "park" | "refusal" | "module_climb";
 type Pass = { at: number; elapsed: number; module: number | null };
-type Session = { passes: Pass[]; trend: Pass[]; lastAt: number };
+type Session = { passes: Pass[]; trend: Pass[]; lastAt: number; declines?: Record<string, Record<string, number>> };
+export type LkgDeclineSummary = { sessionId: string; hour: string; reasons: Record<string, number> };
 type Cursor = { dev: number; ino: number; offset: number };
 type Sent = { at: number; severity: number };
 type State = { version: 1; files: Record<string, Cursor>; sessions: Record<string, Session>; sent: Record<string, Sent> };
-export type LatencyAlert = { kind: Kind; sessionId: string; name: string; at: string; detail: string; count: number; p50: number; p90: number; max: number; moduleP50: number | null; moduleP90: number | null; moduleMax: number | null; pluginP50: number | null; pluginP90: number | null; pluginMax: number | null; load: number[]; loadSampledAt: string };
-export type LatencyOptions = { files: string[]; stateFile: string; db: string; peerDb?: string; connectionFile: string; send: boolean; now?: () => number; load?: () => number[]; wake?: (content: string, id: string) => Promise<void>; stdout?: (line: string) => void; stderr?: (line: string) => void; since?: number; until?: number; replay?: boolean };
+export type LatencyAlert = { kind: Kind; sessionId: string; name: string; at: string; detail: string; lkgDeclines: Record<string, number>; count: number; p50: number; p90: number; max: number; moduleP50: number | null; moduleP90: number | null; moduleMax: number | null; pluginP50: number | null; pluginP90: number | null; pluginMax: number | null; load: number[]; loadSampledAt: string };
+export type LatencyOptions = { files: string[]; stateFile: string; db: string; peerDb?: string; connectionFile: string; send: boolean; now?: () => number; load?: () => number[]; wake?: (content: string, id: string) => Promise<void>; stdout?: (line: string) => void; stderr?: (line: string) => void; since?: number; until?: number; replay?: boolean; summary?: boolean };
 const empty = (): State => ({ version: 1, files: {}, sessions: {}, sent: {} });
 const quantile = (values: number[], fraction: number) => values.length ? [...values].sort((a, b) => a - b)[Math.ceil(values.length * fraction) - 1] : 0;
 
@@ -53,10 +54,16 @@ export function readNewLines(path: string, cursor: Cursor | undefined, maxBytes 
     } finally { closeSync(fd); }
 }
 
-function parse(line: string): { sessionId: string; at: number; pass?: Pass; kind?: Kind; detail?: string } | null {
+const LKG_DECLINE = /^lkg_(?:model_mismatch|invalidated_reshape|content_mismatch|unsafe_seam|seam_invalid|anthropic_reasoning_run_invalid)$/;
+const hourKey = (at: number) => new Date(Math.floor(at / HOUR) * HOUR).toISOString();
+
+function parse(line: string): { sessionId: string; at: number; pass?: Pass; kind?: Kind; detail?: string; decline?: string } | null {
     const at = Date.parse(line.match(/(?:\[)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z)/)?.[1] ?? "");
     const sessionId = line.match(/\[magic-context\]\[([^\]]+)\]/)?.[1] ?? line.match(/\bsession=(ses_[\w-]+)/)?.[1];
     if (!sessionId || !Number.isFinite(at)) return null;
+    // Release diagnostics can mention a decline again as `reason=lkg_*`; count only lines whose logged event is the decline code.
+    const decline = line.match(/\] (lkg_[a-z_]+)(?:\s|$)/)?.[1];
+    if (decline && LKG_DECLINE.test(decline)) return { sessionId, at, decline };
     const rust = line.match(/rust pass:.*?\belapsed=([\d.]+) ms module=([\d.]+) ms/);
     const ts = line.match(/transform completed in ([\d.]+)ms/);
     if (rust || ts) {
@@ -77,6 +84,10 @@ function addLine(state: State, line: string, load: () => number[]): LatencyAlert
     const { sessionId, at } = event;
     const session = state.sessions[sessionId] ??= { passes: [], trend: [], lastAt: at };
     session.lastAt = at;
+    if (event.decline) {
+        const reasons = (session.declines ??= {})[hourKey(at)] ??= {};
+        reasons[event.decline] = (reasons[event.decline] ?? 0) + 1;
+    }
     if (event.pass) {
         session.passes.push(event.pass);
         session.passes = session.passes.filter((p) => p.at > at - WINDOW).slice(-10);
@@ -92,7 +103,8 @@ function addLine(state: State, line: string, load: () => number[]): LatencyAlert
         const previous = state.sent[key];
         if (previous && at - previous.at < 6 * HOUR && severity < previous.severity * 1.5) return null;
         state.sent[key] = { at, severity };
-        return { kind, sessionId, name: sessionId, at: new Date(at).toISOString(), detail, count: passes.length,
+        return { kind, sessionId, name: sessionId, at: new Date(at).toISOString(), detail,
+            lkgDeclines: kind === "refusal" ? { ...session.declines?.[hourKey(at)] } : {}, count: passes.length,
             p50: quantile(elapsed, .5), p90: quantile(elapsed, .9), max: Math.max(0, ...elapsed),
             moduleP50: modules.length ? quantile(modules, .5) : null,
             moduleP90: modules.length ? quantile(modules, .9) : null,
@@ -176,7 +188,9 @@ export function formatAlerts(alerts: LatencyAlert[]): string {
         const worst = group.alerts.reduce((a, b) => (b.max > a.max ? b : a));
         const p90 = Math.max(...group.alerts.map((alert) => alert.p90));
         const who = key.startsWith("project:") ? `${group.label} (${group.sessions.size} unnamed session${group.sessions.size > 1 ? "s" : ""})` : group.label;
-        return `- ${who}: ${kinds}; worst pass ${seconds(worst.max)} (module ${seconds(worst.moduleMax)}); p90 up to ${seconds(p90)}`;
+        const declines = group.alerts.filter((alert) => alert.kind === "refusal")
+            .flatMap((alert) => Object.entries(alert.lkgDeclines).map(([reason, count]) => `${count} ${reason}`));
+        return `- ${who}: ${kinds}; worst pass ${seconds(worst.max)} (module ${seconds(worst.moduleMax)}); p90 up to ${seconds(p90)}${declines.length ? `; LKG declines ${declines.join(", ")}` : ""}`;
     });
     const load = alerts[0]?.load.map((value) => value.toFixed(0)).join("/") ?? "?";
     const from = alerts.map((alert) => alert.at).sort()[0];
@@ -195,9 +209,9 @@ async function deliver(options: LatencyOptions, content: string, id: string, urg
     } finally { client.close(); }
 }
 
-export async function runLatencySentinel(options: LatencyOptions): Promise<{ alerts: LatencyAlert[]; examined: number; bounded: boolean; files: Record<string, Cursor> }> {
+export async function runLatencySentinel(options: LatencyOptions): Promise<{ alerts: LatencyAlert[]; declines: LkgDeclineSummary[]; examined: number; bounded: boolean; files: Record<string, Cursor> }> {
     const now = (options.now ?? Date.now)();
-    const state = options.replay ? empty() : readState(options.stateFile);
+    const state = options.replay || options.summary ? empty() : readState(options.stateFile);
     const alerts: LatencyAlert[] = [];
     let examined = 0;
     let bounded = false;
@@ -213,21 +227,29 @@ export async function runLatencySentinel(options: LatencyOptions): Promise<{ ale
                 if ((options.since !== undefined && at < options.since) || (options.until !== undefined && at >= options.until) || at > now) continue;
                 alerts.push(...addLine(state, line, options.load ?? loadavg));
             }
-            if (!options.replay || !result.bounded || result.lines.length === 0) break;
+            if (!(options.replay || options.summary) || !result.bounded || result.lines.length === 0) break;
         } while (true);
     }
-    for (const [id, session] of Object.entries(state.sessions)) if (session.lastAt < now - 24 * HOUR) delete state.sessions[id];
+    const declines = Object.entries(state.sessions).flatMap(([sessionId, session]) =>
+        Object.entries(session.declines ?? {}).map(([hour, reasons]) => ({ sessionId, hour, reasons }))
+    ).sort((a, b) => a.hour.localeCompare(b.hour) || a.sessionId.localeCompare(b.sessionId));
+    for (const [id, session] of Object.entries(state.sessions)) {
+        if (session.lastAt < now - 24 * HOUR) delete state.sessions[id];
+        else for (const hour of Object.keys(session.declines ?? {}))
+            if (Date.parse(hour) < now - 24 * HOUR) delete session.declines![hour];
+    }
     for (const [key, sent] of Object.entries(state.sent)) if (sent.at < now - 6 * HOUR) delete state.sent[key];
     names(options.db, options.peerDb, alerts);
-    if (!options.replay) saveState(options.stateFile, state);
-    if (alerts.length) {
+    if (!(options.replay || options.summary)) saveState(options.stateFile, state);
+    if (options.summary) (options.stdout ?? console.log)(JSON.stringify({ kind: "lkg_decline_summary", declines }));
+    else if (alerts.length) {
         const content = formatAlerts(alerts);
         const id = `mc-transform-latency-${now}-${examined}`;
         if (options.send) await deliver(options, content, id, alertUrgency(alerts));
         else (options.stdout ?? console.log)(JSON.stringify({ delivery_id: id, alerts }));
     }
     (options.stderr ?? console.error)(JSON.stringify({ kind: "transform_latency_sentinel_summary", examined, alerts: alerts.length, bounded, watermark: state.files }));
-    return { alerts, examined, bounded, files: state.files };
+    return { alerts, declines, examined, bounded, files: state.files };
 }
 
 if (import.meta.main) {
@@ -236,21 +258,22 @@ if (import.meta.main) {
         const values = new Map<string, string>();
         const flags = new Set(["--opencode-log", "--pi-log", "--module-log", "--db", "--peer-db", "--state-file", "--connection-file", "--since", "--until"]);
         for (let i = 0; i < args.length; i++) {
-            if (args[i] === "--once" || args[i] === "--send" || args[i] === "--replay") continue;
+            if (args[i] === "--once" || args[i] === "--send" || args[i] === "--replay" || args[i] === "--summary") continue;
             if (!flags.has(args[i]) || !args[i + 1] || args[i + 1].startsWith("--")) throw new Error(`invalid argument: ${args[i]}`);
             values.set(args[i], args[++i]);
         }
         const replay = args.includes("--replay");
-        if (replay && args.includes("--send")) throw new Error("replay cannot send alerts");
+        if ((replay || args.includes("--summary")) && args.includes("--send")) throw new Error("replay and summary cannot send alerts");
         const storage = getMagicContextStorageDir();
         const date = new Date().toISOString().slice(0, 10);
+        const opencodeLog = values.get("--opencode-log") ?? join(tmpdir(), "opencode/magic-context/magic-context.log");
         const options: LatencyOptions = {
-            files: [values.get("--opencode-log") ?? join(tmpdir(), "opencode/magic-context/magic-context.log"), values.get("--pi-log") ?? join(tmpdir(), "pi/magic-context/magic-context.log"), values.get("--module-log") ?? join(homedir(), `.local/share/cortexkit/magic-context/logs/magic-context.${date}.log`)],
+            files: [args.includes("--summary") ? `${opencodeLog}.1` : "", opencodeLog, values.get("--pi-log") ?? join(tmpdir(), "pi/magic-context/magic-context.log"), values.get("--module-log") ?? join(homedir(), `.local/share/cortexkit/magic-context/logs/magic-context.${date}.log`)],
             db: values.get("--db") ?? join(storage, "context.db"), peerDb: values.get("--peer-db") ?? join(getDataDir(), "cortexkit/prefrontal-core/store.db"), stateFile: values.get("--state-file") ?? join(storage, "transform-latency-sentinel-state.json"),
-            connectionFile: values.get("--connection-file") ?? join(getDataDir(), "cortexkit/run/subc-connection.json"), send: args.includes("--send"), replay,
+            connectionFile: values.get("--connection-file") ?? join(getDataDir(), "cortexkit/run/subc-connection.json"), send: args.includes("--send"), replay, summary: args.includes("--summary"),
             since: values.has("--since") ? Date.parse(values.get("--since")!) : undefined, until: values.has("--until") ? Date.parse(values.get("--until")!) : undefined,
         };
         if (options.since !== undefined && !Number.isFinite(options.since) || options.until !== undefined && !Number.isFinite(options.until)) throw new Error("invalid UTC range");
-        do { await runLatencySentinel(options); if (args.includes("--once") || replay) break; await Bun.sleep(300_000); } while (true);
+        do { await runLatencySentinel(options); if (args.includes("--once") || replay || options.summary) break; await Bun.sleep(300_000); } while (true);
     } catch (error) { console.error(error); process.exitCode = 1; }
 }
