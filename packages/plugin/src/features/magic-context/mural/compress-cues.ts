@@ -658,8 +658,7 @@ async function applyCuesThroughModule(
                 name: "memory.set_mural_cue",
                 arguments: {
                     memory_project: args.projectIdentity,
-                    context_store_uuid: route.moduleContextStoreUuid,
-                    authority_generation: route.moduleAuthorityGeneration,
+
                     command_id: commandId,
                     rows: updates.map((update) => ({
                         memory_id: update.moduleId,

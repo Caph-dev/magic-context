@@ -176,7 +176,6 @@ async function runPassUnderLock(args: {
         sessionDirectoryBySession: new Map(),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
         compactionMarkerStrategy: {
             applyDeferred: (markerDb, markerSessionId) => {
                 drained.push(getPendingCompactionMarkerState(markerDb, markerSessionId));
@@ -198,7 +197,6 @@ async function runPassUnderLock(args: {
 
     const transform = createRustModeTransform(deps, {
         moduleClient,
-        allowAuthorityProtocolBypassForTests: true,
         scheduleLkgCapture: (capture) => capture(),
     });
     const input = inputMessages(sessionId);

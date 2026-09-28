@@ -14,28 +14,7 @@ export {
     getMaxCompressionDepth,
     incrementCompressionDepth,
 } from "./compression-depth-storage";
-export {
-    AUTHORITY_DOMAINS,
-    type AuthorityDomain,
-    type AuthorityManagedMarker,
-    type AuthorityModuleClient,
-    type AuthorityState,
-    type AuthorityStatus,
-    applyMirrorPage,
-    type ChangefeedPage,
-    type ChangefeedRow,
-    ensureContextStoreUuid,
-    getAuthorityManagedMarker,
-    getContextStoreUuid,
-    getMirrorCursor,
-    installAuthorityManagedMarker,
-    listAuthorityManagedMarkers,
-    type PrepareAuthorityArgs,
-    prepareAuthority,
-    pullAndApplyMirrorPage,
-    reconcileAuthorityMarker,
-    removeAuthorityManagedMarker,
-} from "./context-authority";
+export { ensureContextStoreUuid, getContextStoreUuid } from "./context-store-uuid";
 export {
     clearIndexedMessages,
     deleteIndexedMessage,

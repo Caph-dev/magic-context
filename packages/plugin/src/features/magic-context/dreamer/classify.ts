@@ -46,7 +46,6 @@ import {
 import { readFailedChildMessages } from "./failed-invocation-evidence";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
-import { getModuleMemoryIdentities } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
@@ -135,12 +134,10 @@ export interface ClassifyArgs {
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
     language?: string;
-    /** Present only for rust-mode projects whose memories authority is MODULE. */
+    /** Optional Rust writer for the shared context.db rows. */
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
     moduleProjectRoot?: string;
-    moduleContextStoreUuid?: string;
-    moduleAuthorityGeneration?: number;
     moduleCommandId?: string;
     onProgress?: (processed: number) => void;
 }
@@ -155,9 +152,9 @@ export interface ClassifyResult {
 }
 
 interface ClassifyCandidate {
-    /** The context.db row used for mirrored prompt content and local identity. */
+    /** The shared row used for prompt content. */
     contextMemory: Memory;
-    /** The id and hash understood by the module authority, or the TS row values. */
+    /** The shared row id and content hash used by either writer. */
     id: number;
     normalizedHash: string;
 }
@@ -166,49 +163,16 @@ function isModuleRoute(args: ClassifyArgs): boolean {
     return (
         args.moduleClient !== undefined &&
         args.moduleSessionId !== undefined &&
-        args.moduleProjectRoot !== undefined &&
-        args.moduleContextStoreUuid !== undefined &&
-        args.moduleAuthorityGeneration !== undefined
+        args.moduleProjectRoot !== undefined
     );
 }
 
-/**
- * Build the classify pool in the authority's id space. The context rows are still the
- * prompt source, but module classification must use the mirrored module id and hash.
- * The live mirror hash is preferred over recomputing it in TypeScript because it is
- * the exact value checked by memory.set_classification.
- */
 function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
-    const active = getMemoriesByProject(args.db, args.projectIdentity);
-    if (!isModuleRoute(args) || active.length === 0) {
-        return active.map((memory) => ({
-            contextMemory: memory,
-            id: memory.id,
-            normalizedHash: memory.normalizedHash,
-        }));
-    }
-
-    const mappedByContextId = getModuleMemoryIdentities(
-        args.db,
-        args.projectIdentity,
-        active.map((memory) => memory.id),
-    );
-    const candidates = active.flatMap((contextMemory) => {
-        const mapped = mappedByContextId.get(contextMemory.id);
-        return mapped
-            ? [{ contextMemory, id: mapped.moduleId, normalizedHash: mapped.normalizedHash }]
-            : [];
-    });
-    if (candidates.length !== active.length) {
-        const mappedContextIds = new Set(mappedByContextId.keys());
-        const withoutIdentity = active.filter((memory) => !mappedContextIds.has(memory.id)).length;
-        const withoutLiveHash = active.length - candidates.length - withoutIdentity;
-        log(
-            `[dreamer] classify: excluded ${active.length - candidates.length} module candidates for ${args.projectIdentity}` +
-                ` (${withoutIdentity} without mirror_identity, ${withoutLiveHash} without live module hash)`,
-        );
-    }
-    return candidates;
+    return getMemoriesByProject(args.db, args.projectIdentity).map((memory) => ({
+        contextMemory: memory,
+        id: memory.id,
+        normalizedHash: memory.normalizedHash,
+    }));
 }
 
 function toPromptMemory(candidate: ClassifyCandidate): ClassifyPromptMemory {
@@ -538,9 +502,7 @@ async function classifyOneChunk(
     }
 }
 
-/** Run the module classifier and apply its manifest in module id space. The
- *  mirror-back changefeed refreshes the context rows, including classified_at;
- *  this path must not write the context rows a second time. */
+/** The module writes classification to the shared rows; the host must not apply it a second time. */
 async function runClassifyThroughModule(
     args: ClassifyArgs,
     chunk: ClassifyCandidate[],
@@ -576,7 +538,6 @@ async function runClassifyThroughModule(
                 // chunk's literal id list can exceed the module's 256-byte command-id cap,
                 // so the membership rides as a digest.
                 command_id: commandId,
-                authority_generation: args.moduleAuthorityGeneration,
                 // Always sent, even when empty: the module has no chain of its own and
                 // refuses a request without one, while an empty chain reports "no models".
                 model_chain: resolvedModelChain,
@@ -646,8 +607,6 @@ async function runClassifyThroughModule(
                 name: "memory.set_classification",
                 arguments: {
                     memory_project: args.projectIdentity,
-                    context_store_uuid: args.moduleContextStoreUuid,
-                    authority_generation: args.moduleAuthorityGeneration,
                     rows,
                 },
             },
@@ -695,9 +654,8 @@ async function runClassifyThroughModule(
         throw new Error(`module rejected classification (${[...known, ...unknown].join(", ")})`);
     }
 
-    // Module ids are translated back only to identify the context rows whose
-    // mirror-back updates will satisfy the local classified_at run-gate. Do not
-    // call setMemoryClassification here: the authority feed owns that write.
+    // Validate the module's accepted ids against the submitted chunk. Its write
+    // already updated classified_at in context.db, so there is no local replay.
     const byModuleId = new Map(chunk.map((candidate) => [candidate.id, candidate]));
     const acceptedContextIds = acceptedIds.map((moduleId) => {
         const candidate = byModuleId.get(moduleId);

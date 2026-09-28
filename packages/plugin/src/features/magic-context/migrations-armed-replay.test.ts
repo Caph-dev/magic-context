@@ -8,10 +8,9 @@ import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
-    applyMirrorPage,
     ensureContextStoreUuid,
     installAuthorityManagedMarker,
-} from "./context-authority";
+} from "./legacy-authority-fixture.test-support";
 import { getMemoriesByProject, insertMemory } from "./memory/storage-memory";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { recordSessionProjectIdentity } from "./session-project-storage";
@@ -464,58 +463,25 @@ function assertV91EmbeddingWatermarkArm(db: DatabaseType): void {
 }
 
 function populateModuleOwnedRows(db: DatabaseType, version: number, state: ReplayState): void {
-    if (!state.contextStoreUuid) throw new Error("armed replay has no context store identity");
-
     const memoryContent = `module memory populated after v${version}`;
     const noteContent = `module note populated after v${version}`;
-    const nextCursor = state.memoryMirrorCursor + 1;
-    applyMirrorPage({
-        db,
-        page: {
-            domain: "memories",
-            cursor: state.memoryMirrorCursor,
-            next_cursor: nextCursor,
-            has_more: false,
-            rows: [
-                {
-                    feed_seq: nextCursor,
-                    domain: "memories",
-                    op: "insert",
-                    module_row_id: state.nextModuleMemoryId,
-                    content_hash: `module-memory-hash-v${version}`,
-                    full_row_snapshot: {
-                        context_store_uuid: state.contextStoreUuid,
-                        project_path: PROJECT_PATH,
-                        category: "CONSTRAINTS",
-                        content: memoryContent,
-                        normalized_hash: `module-memory-hash-v${version}`,
-                        importance: 50,
-                        scope: "project",
-                        shareable: 0,
-                        source_type: "historian",
-                        seen_count: 1,
-                        retrieval_count: 0,
-                        first_seen_at: version,
-                        created_at: version,
-                        updated_at: version,
-                        last_seen_at: version,
-                        status: "active",
-                        verification_status: "unverified",
-                    },
-                },
-            ],
-        },
-    });
     withPrivilegedWriter(db, () => {
+        db.prepare(`INSERT INTO memories(project_path, category, content, normalized_hash, source_type, first_seen_at, last_seen_at, created_at, updated_at)
+            VALUES (?, 'CONSTRAINTS', ?, ?, 'historian', ?, ?, ?, ?)`).run(
+            PROJECT_PATH,
+            memoryContent,
+            `module-memory-hash-v${version}`,
+            version,
+            version,
+            version,
+            version,
+        );
         addNote(db, "smart", {
             projectPath: PROJECT_PATH,
             content: noteContent,
             surfaceCondition: "always",
         });
     });
-
-    state.memoryMirrorCursor = nextCursor;
-    state.nextModuleMemoryId += 1;
     state.expectedMemoryContents.add(memoryContent);
     state.expectedNoteContents.add(noteContent);
     assertPrivilegeClosed(db);

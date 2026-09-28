@@ -191,7 +191,6 @@ function makeOffTransform(args: {
         rustModeModuleClient: args.rustModuleCall
             ? ({ call: args.rustModuleCall } as never)
             : undefined,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
     });
     return { db, transform };
 }

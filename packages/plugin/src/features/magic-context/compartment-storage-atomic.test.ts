@@ -10,6 +10,7 @@ import {
     promoteRecompStaging,
     replaceAllCompartmentState,
     replaceAllCompartmentStateAndBumpDepth,
+    replaceAllCompartments,
     saveRecompStagingPass,
 } from "./compartment-storage";
 import {
@@ -134,4 +135,63 @@ describe("atomic compartment state publish", () => {
         expect(getCompartments(db, sessionId).map((c) => c.title)).toEqual(["new"]);
         closeQuietly(db);
     });
+});
+
+it("logs every compartment replacement atomically without marking an initial insert", () => {
+    for (const kind of ["rows", "state", "depth", "staging", "leased-staging"] as const) {
+        const db = makeDb();
+        const sessionId = `mutation-${kind}`;
+        try {
+            const head = () =>
+                (
+                    db
+                        .prepare(
+                            "SELECT COUNT(*) AS count FROM m0_mutation_log WHERE session_id = ?",
+                        )
+                        .get(sessionId) as { count: number }
+                ).count;
+            replaceAllCompartmentState(db, sessionId, [compartment(0, 1, 2, "old")], []);
+            expect(head()).toBe(0);
+            expect(acquireCompartmentLease(db, sessionId, "holder")).not.toBeNull();
+            const replace = () => {
+                const rows = [compartment(0, 1, 3, "new")];
+                if (kind === "rows") replaceAllCompartments(db, sessionId, rows);
+                else if (kind === "state") replaceAllCompartmentState(db, sessionId, rows, []);
+                else if (kind === "depth")
+                    expect(
+                        replaceAllCompartmentStateAndBumpDepth(
+                            db,
+                            "holder",
+                            sessionId,
+                            rows,
+                            [],
+                            1,
+                            3,
+                        ),
+                    ).toBe(true);
+                else {
+                    saveRecompStagingPass(db, sessionId, 1, rows, []);
+                    expect(
+                        promoteRecompStaging(
+                            db,
+                            sessionId,
+                            kind === "leased-staging" ? "holder" : undefined,
+                        ),
+                    ).not.toBeNull();
+                }
+            };
+            db.exec(
+                "CREATE TRIGGER reject_mutation BEFORE INSERT ON m0_mutation_log BEGIN SELECT RAISE(ABORT, 'mutation rejected'); END",
+            );
+            expect(replace).toThrow("mutation rejected");
+            expect(getCompartments(db, sessionId).map((row) => row.title)).toEqual(["old"]);
+            expect(head()).toBe(0);
+            db.exec("DROP TRIGGER reject_mutation");
+            replace();
+            expect(getCompartments(db, sessionId).map((row) => row.title)).toEqual(["new"]);
+            expect(head()).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    }
 });

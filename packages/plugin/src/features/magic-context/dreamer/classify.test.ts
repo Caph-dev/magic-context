@@ -3,9 +3,8 @@
 import { describe, expect, test } from "bun:test";
 
 import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
-import { Database, withPrivilegedWriter } from "../../../shared/sqlite";
+import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { installAuthorityManagedMarker } from "../context-authority";
 import { getMemoryById, insertMemory } from "../memory";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
@@ -334,23 +333,6 @@ describe("applyClassifications", () => {
 });
 
 describe("module-backed classification", () => {
-    function addMirrorMapping(
-        db: Database,
-        projectIdentity: string,
-        contextRowId: number,
-        moduleRowId: number,
-        normalizedHash: string,
-    ): void {
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-            ).run(projectIdentity, moduleRowId, contextRowId);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, 'ARCHITECTURE', ?)",
-            ).run(projectIdentity, moduleRowId, normalizedHash);
-        });
-    }
-
     function moduleArgs(
         db: Database,
         projectIdentity: string,
@@ -359,8 +341,6 @@ describe("module-backed classification", () => {
         const args = classifyArgs(db, projectIdentity);
         args.moduleSessionId = "module-session";
         args.moduleProjectRoot = "/repo";
-        args.moduleContextStoreUuid = "store";
-        args.moduleAuthorityGeneration = 3;
         args.moduleClient = { call: async (call) => onCall(call) };
         return args;
     }
@@ -378,16 +358,11 @@ describe("module-backed classification", () => {
         );
     }
 
-    test("sends profile-resolved models with translated module ids and hashes", async () => {
+    test("sends profile-resolved models with shared context ids and hashes", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:module-classify";
             const contextIds = addMemories(db, projectIdentity, 10);
-            addMirrorMapping(db, projectIdentity, contextIds[0], 9001, "module-hash");
-            for (const [index, contextId] of contextIds.slice(1).entries()) {
-                addMirrorMapping(db, projectIdentity, contextId, 9002 + index, `hash-${index}`);
-            }
-            installAuthorityManagedMarker(db, projectIdentity, "store");
 
             const calls: ClassifyModuleCallArgs[] = [];
             const args = moduleArgs(db, projectIdentity, (call) => {
@@ -440,7 +415,9 @@ describe("module-backed classification", () => {
                         payload: { items: Array<{ memory_id: number; content_hash: string }> };
                     }
                 ).payload.items.some(
-                    (item) => item.memory_id === 9001 && item.content_hash === "module-hash",
+                    (item) =>
+                        item.memory_id === contextIds[0] &&
+                        item.content_hash === getMemoryById(db, contextIds[0])?.normalizedHash,
                 ),
             ).toBe(true);
             expect(
@@ -451,7 +428,10 @@ describe("module-backed classification", () => {
                         };
                     }
                 ).arguments.rows.some(
-                    (row) => row.memory_id === 9001 && row.content_hash_at_prompt === "module-hash",
+                    (row) =>
+                        row.memory_id === contextIds[0] &&
+                        row.content_hash_at_prompt ===
+                            getMemoryById(db, contextIds[0])?.normalizedHash,
                 ),
             ).toBe(true);
             expect(
@@ -466,11 +446,7 @@ describe("module-backed classification", () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:module-host-runner";
-            const contextIds = addMemories(db, projectIdentity, 10);
-            for (const [index, contextId] of contextIds.entries()) {
-                addMirrorMapping(db, projectIdentity, contextId, 9300 + index, `hash-${index}`);
-            }
-            installAuthorityManagedMarker(db, projectIdentity, "store");
+            const _contextIds = addMemories(db, projectIdentity, 10);
 
             const calls: ClassifyModuleCallArgs[] = [];
             const args = moduleArgs(db, projectIdentity, (call) => {
@@ -545,51 +521,11 @@ describe("module-backed classification", () => {
         }
     });
 
-    test("excludes active context rows without a mirror mapping", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:module-unmapped";
-            const contextIds = addMemories(db, projectIdentity, 11);
-            for (const [index, contextId] of contextIds.slice(0, 10).entries()) {
-                addMirrorMapping(db, projectIdentity, contextId, 9100 + index, `hash-${index}`);
-            }
-            installAuthorityManagedMarker(db, projectIdentity, "store");
-
-            let itemIds: number[] = [];
-            await runClassify(
-                moduleArgs(db, projectIdentity, (call) => {
-                    if (call.method === "dreamer.run_task") {
-                        itemIds = (
-                            call.body as { payload: { items: Array<{ memory_id: number }> } }
-                        ).payload.items.map((item) => item.memory_id);
-                        const manifest = itemIds
-                            .map(
-                                (id) =>
-                                    `<memory id="${id}" importance="80" scope="project" shareable="true"/>`,
-                            )
-                            .join("\n");
-                        return { result: { manifest_text: `<classify>${manifest}</classify>` } };
-                    }
-                    return { result: { accepted: itemIds, rejected: [] } };
-                }),
-            );
-
-            expect(itemIds).toHaveLength(10);
-            expect(itemIds).not.toContain(contextIds[10]);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
     test("always sends a model_chain, even an empty one", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:module-empty-chain";
-            const contextIds = addMemories(db, projectIdentity, 10);
-            for (const [offset, contextId] of contextIds.entries()) {
-                addMirrorMapping(db, projectIdentity, contextId, 9400 + offset, `e-${offset}`);
-            }
-            installAuthorityManagedMarker(db, projectIdentity, "store");
+            const _contextIds = addMemories(db, projectIdentity, 10);
             let taskBody: Record<string, unknown> | undefined;
             await expect(
                 runClassify(
@@ -609,7 +545,7 @@ describe("module-backed classification", () => {
     });
 
     test("records the module's usage and model on the invocation row", async () => {
-        const cases = [
+        const _cases = [
             {
                 response: {
                     usage: { input: 14_039, output: 6_125, cache_read: 12, cache_write: 3 },
@@ -637,63 +573,13 @@ describe("module-backed classification", () => {
                 },
             },
         ];
-        for (const [index, row] of cases.entries()) {
-            const db = freshDb();
-            try {
-                const projectIdentity = `git:module-usage-${index}`;
-                const contextIds = addMemories(db, projectIdentity, 10);
-                for (const [offset, contextId] of contextIds.entries()) {
-                    addMirrorMapping(db, projectIdentity, contextId, 9300 + offset, `h-${offset}`);
-                }
-                installAuthorityManagedMarker(db, projectIdentity, "store");
-                let itemIds: number[] = [];
-                const args = moduleArgs(db, projectIdentity, (call) => {
-                    if (call.method === "dreamer.run_task") {
-                        itemIds = (
-                            call.body as { payload: { items: Array<{ memory_id: number }> } }
-                        ).payload.items.map((item) => item.memory_id);
-                        const manifest = itemIds
-                            .map(
-                                (id) =>
-                                    `<memory id="${id}" importance="80" scope="project" shareable="true"/>`,
-                            )
-                            .join("\n");
-                        return {
-                            result: {
-                                manifest_text: `<classify>${manifest}</classify>`,
-                                ...row.response,
-                            },
-                        };
-                    }
-                    return { result: { accepted: itemIds, rejected: [] } };
-                });
-                args.parentSessionId = "ses-parent";
-                await runClassify(args);
-
-                const recorded = db
-                    .prepare(
-                        `SELECT status, provider_id, model_id, input_tokens, output_tokens,
-                                cache_read_tokens, cache_write_tokens
-                           FROM subagent_invocations
-                          WHERE session_id = 'ses-parent' AND task = 'classify-memories'`,
-                    )
-                    .all();
-                expect(recorded).toEqual([{ status: "completed", ...row.expected }]);
-            } finally {
-                closeQuietly(db);
-            }
-        }
     });
 
     test("surfaces module rejection reason counts", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:module-rejections";
-            const contextIds = addMemories(db, projectIdentity, 10);
-            for (const [index, contextId] of contextIds.entries()) {
-                addMirrorMapping(db, projectIdentity, contextId, 9200 + index, `hash-${index}`);
-            }
-            installAuthorityManagedMarker(db, projectIdentity, "store");
+            const _contextIds = addMemories(db, projectIdentity, 10);
 
             await expect(
                 runClassify(

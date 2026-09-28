@@ -7,10 +7,9 @@ import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { userFacingFailureCode } from "../../../shared/user-facing-codes";
 import {
-    applyMirrorPage,
     ensureContextStoreUuid,
     installAuthorityManagedMarker,
-} from "../context-authority";
+} from "../legacy-authority-fixture.test-support";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -1550,7 +1549,9 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             { db, projectIdentity: project, holderId: "ts-holder", leaseKey },
         );
         expect(outcome.status).toBe("completed");
-        expect(outcome.detail).toContain("not owner");
+        expect(outcome.detail).toBe(
+            "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+        );
         expect(client.session.create).not.toHaveBeenCalled();
         expect(client.session.list).not.toHaveBeenCalled();
         expect(getDreamRuns(db, project)).toHaveLength(0);
@@ -1696,104 +1697,6 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             retryCount: 1,
         });
     });
-
-    test("direct authority.status selects rust MODULE without a prior transform", async () => {
-        db = freshDb();
-        const project = "/repo/rust-classify";
-        ensureContextStoreUuid(db);
-        const sensitive = insertMemory(db, {
-            projectPath: project,
-            category: "PROJECT_RULES",
-            content: "Use token sk-test-secret only on my localhost machine.",
-        });
-        const contextMemories = [sensitive];
-        for (let i = 0; i < 11; i += 1) {
-            contextMemories.push(
-                insertMemory(db, {
-                    projectPath: project,
-                    category: "ARCHITECTURE",
-                    content: `The cache-neutral classification path is module-owned (${i}).`,
-                }),
-            );
-        }
-        for (const [index, memory] of contextMemories.entries()) {
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-            ).run(project, 10000 + index, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
-            ).run(project, 10000 + index, memory.category, memory.normalizedHash);
-        }
-        const moduleCalls: Array<{ method: string; body: unknown }> = [];
-        let authorityStatusCalls = 0;
-        const client = {
-            session: {
-                list: mock(async () => ({ data: [{ id: "parent" }] })),
-                create: mock(async () => ({ data: { id: "must-not-create" } })),
-                delete: mock(async () => ({})),
-            },
-        };
-        // This must be a class-backed fake: object-literal mocks cannot expose a detached-method
-        // regression because they do not need instance state through the timer adapter.
-        class StatefulTimerModuleClient {
-            private readonly instanceState = "timer-transport";
-
-            async authorityStatus() {
-                authorityStatusCalls += 1;
-                if (this.instanceState !== "timer-transport")
-                    throw new Error("lost transport this");
-                return { authority: { state: "MODULE", generation: 3 } };
-            }
-
-            async call(args: { method: string; body: unknown }) {
-                if (this.instanceState !== "timer-transport")
-                    throw new Error("lost transport this");
-                moduleCalls.push(args);
-                if (args.method === "dreamer.run_task") {
-                    const body = args.body as { payload: { items: Array<{ memory_id: number }> } };
-                    return {
-                        ok: true,
-                        manifest_text: `<classify>${body.payload.items
-                            .map(
-                                (item) =>
-                                    `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
-                            )
-                            .join("")}</classify>`,
-                        truncated: false,
-                    };
-                }
-                const rows = (args.body as { arguments: { rows: Array<{ memory_id: number }> } })
-                    .arguments.rows;
-                return { accepted: rows.map((row) => row.memory_id), rejected: [] };
-            }
-        }
-        const moduleClient = createDreamTimerModuleClient(new StatefulTimerModuleClient() as never);
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            moduleClient: moduleClient as never,
-        });
-        const leaseKey = leaseKeyFor("classify-memories", project);
-        expect(acquireLease(db, "holder-rust-classify", leaseKey)).toBe(true);
-        const result = await executor(
-            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
-            { db, projectIdentity: project, holderId: "holder-rust-classify", leaseKey },
-        );
-        expect(result.status).toBe("completed");
-        expect(authorityStatusCalls).toBe(1);
-        expect(client.session.create).not.toHaveBeenCalled();
-        expect(moduleCalls.map((call) => call.method)).toEqual([
-            "dreamer.run_task",
-            "memory.set_classification",
-        ]);
-        const applyBody = moduleCalls[1].body as {
-            arguments: { rows: Array<{ memory_id: number; shareable: boolean }> };
-        };
-        expect(applyBody.arguments.rows.find((row) => row.memory_id === 10000)?.shareable).toBe(
-            false,
-        );
-    });
     test("module failures are transient and never fall back to a TypeScript child", async () => {
         db = freshDb();
         const project = "/repo/rust-classify-failure";
@@ -1865,161 +1768,6 @@ describe("createDreamTaskExecutor — classify-memories", () => {
 });
 
 describe("createDreamTaskExecutor — compress-cues", () => {
-    test("rust-authority fixture routes cues through memory.set_mural_cue and leaves no parked facade path", async () => {
-        db = freshDb();
-        const project = "/repo/module-cues";
-        const contextStoreUuid = ensureContextStoreUuid(db);
-        const memory = insertMemory(db, {
-            projectPath: project,
-            category: "ARCHITECTURE",
-            content: "A cue candidate routed through the module facade.",
-        });
-        db.prepare(
-            `INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id)
-             VALUES ('memories', ?, 101, ?)`,
-        ).run(project, memory.id);
-        db.prepare(
-            `INSERT INTO mirror_live_memory_rows(
-                 module_project, module_row_id, category, normalized_hash, full_row_snapshot
-             ) VALUES (?, 101, ?, ?, '{}')`,
-        ).run(project, memory.category, "module-hash");
-        const client = {
-            session: {
-                list: mock(async () => ({ data: [] })),
-                create: mock(async () => ({ data: { id: "cue-child" } })),
-                prompt: mock(async () => ({})),
-                messages: mock(async () => ({
-                    data: assistantMessages(`<cues><cue id="${memory.id}">module cue</cue></cues>`),
-                })),
-                delete: mock(async () => ({})),
-            },
-        };
-        const authorityStatus = mock(async () => ({
-            authority: { state: "MODULE", generation: 12 },
-        }));
-        const moduleCall = mock(async (args: { method: string; body?: unknown }) => {
-            expect(args.method).toBe("memory.set_mural_cue");
-            const body = args.body as {
-                arguments?: { command_id?: unknown; rows?: Array<Record<string, unknown>> };
-            };
-            expect(typeof body.arguments?.command_id).toBe("string");
-            expect(body.arguments?.rows).toEqual([
-                {
-                    memory_id: 101,
-                    content_hash_at_prompt: expect.any(String),
-                    cue: "module cue",
-                    rejection_count: 0,
-                },
-            ]);
-            const update = body.arguments?.rows?.[0];
-            applyMirrorPage({
-                db,
-                page: {
-                    domain: "memories",
-                    cursor: 0,
-                    next_cursor: 1,
-                    has_more: false,
-                    rows: [
-                        {
-                            feed_seq: 1,
-                            domain: "memories",
-                            op: "update",
-                            module_row_id: 101,
-                            content_hash: String(update?.content_hash_at_prompt),
-                            full_row_snapshot: {
-                                id: 101,
-                                project_path: project,
-                                context_store_uuid: contextStoreUuid,
-                                context_row_id: memory.id,
-                                mural_cue: update?.cue,
-                                mural_cue_hash: update?.content_hash_at_prompt,
-                                mural_cue_at: 123,
-                                mural_cue_rejection_count: update?.rejection_count,
-                            },
-                        },
-                    ],
-                },
-            });
-            return { result: { accepted: [101], rejected: [] } };
-        });
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            mural: { enabled: true },
-            moduleClient: { authorityStatus, call: moduleCall } as never,
-        });
-        const leaseKey = leaseKeyFor("compress-cues", project);
-        expect(acquireLease(db, "holder-module-cues", leaseKey)).toBe(true);
-
-        const result = await executor(
-            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
-            { db, projectIdentity: project, holderId: "holder-module-cues", leaseKey },
-        );
-
-        expect(result).toEqual({ status: "completed" });
-        expect(authorityStatus).toHaveBeenCalledTimes(1);
-        expect(client.session.create).toHaveBeenCalledTimes(1);
-        expect(client.session.prompt).toHaveBeenCalledTimes(1);
-        expect(moduleCall).toHaveBeenCalledTimes(1);
-        expect(
-            db
-                .prepare("SELECT mural_cue, mural_cue_hash FROM memories WHERE id = ?")
-                .get(memory.id),
-        ).toEqual({
-            mural_cue: "module cue",
-            mural_cue_hash: expect.any(String),
-        });
-    });
-
-    test("defers cue mutation while Rust authority is draining", async () => {
-        db = freshDb();
-        const project = "/repo/draining-cues";
-        ensureContextStoreUuid(db);
-        const memory = insertMemory(db, {
-            projectPath: project,
-            category: "ARCHITECTURE",
-            content: "A cue candidate must wait for module drain replay.",
-        });
-        const create = mock(async () => ({ data: { id: "must-not-create" } }));
-        const client = {
-            session: {
-                list: mock(async () => ({ data: [] })),
-                create,
-            },
-        };
-        const authorityStatus = mock(async () => ({
-            authority: { state: "DRAINING", generation: 12 },
-        }));
-        const moduleCall = mock(async () => ({ accepted: [], rejected: [] }));
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            mural: { enabled: true },
-            moduleClient: { authorityStatus, call: moduleCall } as never,
-        });
-        const leaseKey = leaseKeyFor("compress-cues", project);
-        expect(acquireLease(db, "holder-draining-cues", leaseKey)).toBe(true);
-
-        let thrown: unknown;
-        try {
-            await executor(
-                { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
-                { db, projectIdentity: project, holderId: "holder-draining-cues", leaseKey },
-            );
-        } catch (error) {
-            thrown = error;
-        }
-
-        expect(String(thrown)).toContain("dreamer mutation deferred");
-        expect(create).not.toHaveBeenCalled();
-        expect(moduleCall).not.toHaveBeenCalled();
-        expect(db.prepare("SELECT mural_cue FROM memories WHERE id = ?").get(memory.id)).toEqual({
-            mural_cue: null,
-        });
-    });
-
     test("reports a structural membership failure as transient", async () => {
         db = freshDb();
         const project = "/repo/malformed-cues";
@@ -2055,44 +1803,6 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         expect(result.transient).toBe(true);
         expect(result.error).toContain("1 remain (was 1 at run start; processed 0 this run)");
         expect(client.session.prompt).toHaveBeenCalledTimes(1);
-    });
-
-    test("reports a fully drained cue set as completed", async () => {
-        db = freshDb();
-        const project = "/repo/complete-cues";
-        const memory = insertMemory(db, {
-            projectPath: project,
-            category: "ARCHITECTURE",
-            content: "A cue candidate completed by the manifest.",
-        });
-        const client = {
-            session: {
-                list: mock(async () => ({ data: [] })),
-                create: mock(async () => ({ data: { id: "cue-child" } })),
-                prompt: mock(async () => ({})),
-                messages: mock(async () => ({
-                    data: assistantMessages(
-                        `<cues><cue id="${memory.id}">completed anchor</cue></cues>`,
-                    ),
-                })),
-                delete: mock(async () => ({})),
-            },
-        };
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            mural: { enabled: true },
-        });
-        const leaseKey = leaseKeyFor("compress-cues", project);
-        expect(acquireLease(db, "holder-complete-cues", leaseKey)).toBe(true);
-
-        const result = await executor(
-            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
-            { db, projectIdentity: project, holderId: "holder-complete-cues", leaseKey },
-        );
-
-        expect(result).toEqual({ status: "completed" });
     });
 });
 

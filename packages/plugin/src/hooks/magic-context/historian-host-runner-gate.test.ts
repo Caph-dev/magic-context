@@ -570,12 +570,10 @@ describe("host runner project binding at the transform seam", () => {
             sessionDirectoryBySession: new Map([[sessionId, project]]),
             transformMode: "rust",
             rustModeModuleClient: moduleClient,
-            rustModeAllowAuthorityProtocolBypassForTests: true,
             historianRunner: "host",
         };
         const transform = createRustModeTransform(deps, {
             moduleClient,
-            allowAuthorityProtocolBypassForTests: true,
             scheduleLkgCapture: (capture) => capture(),
             projectRoot: project,
         });

@@ -5,16 +5,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
-import {
-    type AuthorityStatus,
-    ensureContextStoreUuid,
-    getAuthorityManagedMarker,
-    resetAuthorityRoutingObservationsForTest,
-    TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET,
-} from "../../features/magic-context/context-authority";
 import { insertMemory } from "../../features/magic-context/memory";
-import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { ensureMuralRendered } from "../../features/magic-context/mural/render-trigger";
 import {
@@ -60,7 +51,7 @@ import * as logger from "../../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { createPromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
-import { Database, withPrivilegedWriter } from "../../shared/sqlite";
+import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
@@ -97,7 +88,6 @@ const createRustModeTransform = (
 ) =>
     createRustModeTransformImpl(deps, {
         ...options,
-        allowAuthorityProtocolBypassForTests: true,
         modulePageMaxBytes: 512 * 1024,
         scheduleLkgCapture: options.scheduleLkgCapture ?? ((capture) => capture()),
     });
@@ -256,7 +246,6 @@ function makeDeps(db: ContextDatabase, moduleClient: RustModeModuleClient): Tran
         sessionDirectoryBySession: new Map(),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
         // These fixtures assert the exact module calls a pass makes for the
         // authority protocol. Naming Broca keeps the historian pull loop, which an
         // unset runner builds on OpenCode, out of those call lists; the loop has
@@ -330,117 +319,6 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 }
 
 describe("Rust mode authority adapter", () => {
-    it("uses the resolved session directory instead of the plugin launch directory for authority routes", async () => {
-        const sessionId = "ses-directory-root";
-        installRawProvider(sessionId);
-        const db = makeDb();
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'seed me', 'seed-hash', 0, 0, 0, 0)",
-            ).run("git:identity");
-        });
-        const authorityRoots: string[] = [];
-        const statuses = new Map<string, AuthorityStatus>();
-        const module: RustModeModuleClient = {
-            call: async () => {
-                throw new Error("stop after authority preparation");
-            },
-            authorityStatus: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                return { authority: statuses.get(args.domain) ?? null };
-            },
-            authorityPrepare: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                const domain = String(args.domain) as "memories" | "notes";
-                const phase = String(args.phase);
-                const base = {
-                    context_store_uuid: String(args.context_store_uuid),
-                    project: String(args.project),
-                    domain,
-                    generation: 1,
-                };
-                if (phase === "begin") {
-                    const authority = { ...base, state: "PREPARING" as const };
-                    statuses.set(domain, authority);
-                    return { authority };
-                }
-                if (phase === "complete") {
-                    const checksum = String(args.checksum_expected);
-                    const authority = {
-                        ...base,
-                        state: "PREPARING" as const,
-                        checksum_expected: checksum,
-                        checksum_actual: checksum,
-                        checksum_ok: true,
-                    };
-                    statuses.set(domain, authority);
-                    return { authority };
-                }
-                if (phase === "ack") {
-                    const authority = { ...base, state: "MODULE" as const };
-                    statuses.set(domain, authority);
-                    return { authority };
-                }
-                const authority = { ...base, state: "TS" as const };
-                statuses.set(domain, authority);
-                return { authority };
-            },
-            authoritySeed: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                const rows = Array.isArray(args.rows) ? args.rows : [];
-                return { seeded: rows.length, module_row_ids: rows.map((_, index) => index + 1) };
-            },
-            mirrorPull: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const deps = makeDeps(db, module);
-        deps.directory = "/launch/root-a";
-        deps.projectPath = "git:identity";
-        deps.sessionDirectoryBySession?.set(sessionId, "/session/root-b");
-        const runner = createRustModeTransformImpl(deps, { moduleClient: module });
-        const messages = makeMessages(sessionId);
-        resetAuthorityRoutingObservationsForTest();
-        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
-        try {
-            await runner.run(
-                sessionId,
-                messages,
-                { messages: [...messages] },
-                makeMeta(db, sessionId),
-            );
-
-            expect(authorityRoots.length).toBeGreaterThan(0);
-            expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
-            expect(
-                db
-                    .prepare(
-                        "SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'opencode'",
-                    )
-                    .get(sessionId),
-            ).toEqual({
-                project_path: resolveProjectIdentityForSession("/session/root-b", false),
-            });
-            expect(
-                logSpy.mock.calls.filter(([message]) =>
-                    String(message).includes("authority → MODULE: host backends → MODULE"),
-                ),
-            ).toHaveLength(1);
-        } finally {
-            logSpy.mockRestore();
-            resetAuthorityRoutingObservationsForTest();
-        }
-    });
-
     it("transports the host-resolved output_reserve as Rust usable_soft", () => {
         const resolved = deriveWindowGeometry(
             "openai-codex",
@@ -574,47 +452,6 @@ describe("Rust mode authority adapter", () => {
         });
     });
 
-    it("copies the resolved history budget onto the authority wire", () => {
-        const body = __rustModeTransformTest.buildTransformBody({
-            sessionId: "budget-wire",
-            input: [],
-            nativeMessages: [],
-            passInputs: { history_budget_tokens: 42_000 },
-            usage: {},
-            modelKey: null,
-            providerId: null,
-        });
-        expect(body.history_budget_tokens).toBe(42_000);
-    });
-
-    it("copies the profile-resolved historian chain onto the authority wire", () => {
-        const historianModelChain = __rustModeTransformTest.resolvedHistorianModelChain({
-            historianModel: { model: "anthropic/profile-historian", qualifier: "high" },
-            fallbackModels: [
-                { model: "openai/profile-fallback", qualifier: "low" },
-                "anthropic/profile-historian",
-            ],
-        });
-        const body = __rustModeTransformTest.buildTransformBody({
-            sessionId: "profile-model-wire",
-            input: [],
-            nativeMessages: [],
-            passInputs: { historian_model_chain: historianModelChain },
-            usage: {},
-            modelKey: null,
-            providerId: null,
-        });
-
-        expect(body.historian_model_chain).toEqual([
-            "anthropic/profile-historian",
-            "openai/profile-fallback",
-        ]);
-        const limits = __rustModeTransformTest.resolvedHistorianModelLimits(historianModelChain);
-        expect(Object.keys(limits)).toEqual(body.historian_model_chain);
-        expect(limits["anthropic/profile-historian"]).toBeDefined();
-        expect(limits["openai/profile-fallback"]).toBeDefined();
-    });
-
     it("sends each historian chain model's resolved window and output ceiling", async () => {
         const root = mkdtempSync(join(tmpdir(), "mc-historian-model-limits-"));
         const previous = process.env.XDG_DATA_HOME;
@@ -737,20 +574,6 @@ describe("Rust mode authority adapter", () => {
             constituents,
             compaction_observed: true,
         });
-    });
-
-    it("copies caveman settings onto the authority wire", () => {
-        const body = __rustModeTransformTest.buildTransformBody({
-            sessionId: "caveman-wire",
-            input: [],
-            nativeMessages: [],
-            passInputs: { caveman_enabled: true, caveman_min_chars: 240 },
-            usage: {},
-            modelKey: null,
-            providerId: null,
-        });
-        expect(body.caveman_enabled).toBe(true);
-        expect(body.caveman_min_chars).toBe(240);
     });
 
     it("serves 2048-message SOFT+, SOFT and HARD native wires with the original SHA256", async () => {
@@ -1737,31 +1560,6 @@ describe("Rust mode authority adapter", () => {
         expect(transform.getState(sessionId).seedPassPending).toBe(false);
     });
 
-    it("fails after the second authority mismatch in one transform pass", async () => {
-        const sessionId = `rust-adopt-once-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const messages = makeMessages(sessionId);
-        const methods: string[] = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) => {
-                methods.push(method);
-                if (method === "state_sync") throw authoritySeqMismatch(4);
-                return { decision: "SOFT+", native_messages: [] };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const output = { messages: messages as unknown[] };
-
-        await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
-
-        expect(methods).toEqual(["state_sync", "state_sync"]);
-        expect(transform.getState(sessionId).lastAckedSeq).toBe(4);
-        expect(transform.getState(sessionId).lastAckedWatermarks).toBeNull();
-        expect(output.messages).toBe(messages);
-    });
-
     it("gates the transform before any TypeScript mutation", async () => {
         const sessionId = `rust-gate-${Date.now()}`;
         sessions.push(sessionId);
@@ -2225,611 +2023,6 @@ describe("Rust mode authority adapter", () => {
         expect(transformRequest?.prompt_surface_guidance_override).not.toBe(
             deps.promptSurface.guidance_override_path,
         );
-    });
-
-    it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {
-        const sessionId = `rust-memory-visibility-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const memory = insertMemory(db, {
-            projectPath: "/tmp/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "The rust-rendered memory must not be returned twice.",
-        });
-        const meta = makeMeta(db, sessionId);
-        db.exec(`
-            CREATE TABLE memory_manifest_updates (count INTEGER NOT NULL);
-            INSERT INTO memory_manifest_updates (count) VALUES (0);
-            CREATE TRIGGER count_memory_manifest_updates
-            AFTER UPDATE OF memory_block_ids, memory_block_count ON session_meta
-            BEGIN
-                UPDATE memory_manifest_updates SET count = count + 1;
-            END;
-        `);
-        let renderedMemoryIds = [memory.id];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          native_messages: makeMessages(sessionId),
-                          rendered_memory_ids: renderedMemoryIds,
-                      }
-                    : { ok: true },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            await transform.run(sessionId, messages, { messages: [...messages] }, meta);
-        };
-
-        await run();
-        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id]));
-        const tools = createCtxSearchTools({
-            db,
-            resolveProjectPath: () => "/tmp/project",
-            memoryEnabled: true,
-            embeddingEnabled: false,
-            readMessages: () => [],
-        });
-        const search = await tools.ctx_search.execute(
-            { query: `#${memory.id}`, sources: ["memory"] },
-            { sessionID: sessionId, directory: "/tmp/project" } as never,
-        );
-        expect(search).toContain(
-            `Memories: 1 match found, all already visible in your project-memory block (ids ${memory.id}).`,
-        );
-
-        await run();
-        expect(
-            db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
-        ).toEqual({ count: 1 });
-
-        renderedMemoryIds = [memory.id + 1];
-        await run();
-        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id + 1]));
-        expect(
-            db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
-        ).toEqual({ count: 2 });
-    });
-
-    it("preserves the receiver for a class-backed compartment mirror client", async () => {
-        const sessionId = `rust-class-compartments-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-
-        class ClassBackedModuleClient {
-            private readonly title = "receiver-bound compartment";
-
-            async call({ method }: Parameters<RustModeModuleClient["call"]>[0]) {
-                return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
-                    : { ok: true };
-            }
-
-            async getCompartmentsAfter(_sessionId: string, _afterSequence: number) {
-                if (this.title !== "receiver-bound compartment") {
-                    throw new Error("class receiver was detached");
-                }
-                return {
-                    max_sequence: 1,
-                    compartments: [
-                        {
-                            sequence: 1,
-                            start_message: 0,
-                            end_message: 0,
-                            start_message_id: "m1",
-                            end_message_id: "m1",
-                            title: this.title,
-                            content: "summary",
-                        },
-                    ],
-                };
-            }
-        }
-
-        const moduleClient: RustModeModuleClient = new ClassBackedModuleClient();
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const messages = makeMessages(sessionId);
-        await transform.run(
-            sessionId,
-            messages,
-            { messages: [...messages] },
-            makeMeta(db, sessionId),
-        );
-
-        expect(
-            db.prepare("SELECT title FROM compartments WHERE session_id = ?").get(sessionId),
-        ).toEqual({ title: "receiver-bound compartment" });
-    });
-
-    it("does not block transform completion on a compartment mirror backlog", async () => {
-        const sessionId = `rust-compartment-backlog-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let releaseMirror!: () => void;
-        const mirrorBacklog = new Promise<void>((resolve) => {
-            releaseMirror = resolve;
-        });
-        let mirrorCompleted = false;
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform" ? { decision: "HARD", native_messages: [] } : { ok: true },
-            getCompartmentsAfter: async () => {
-                await mirrorBacklog;
-                mirrorCompleted = true;
-                return { max_sequence: 0, compartments: [] };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const messages = makeMessages(sessionId);
-        const run = transform.run(
-            sessionId,
-            messages,
-            { messages: [...messages] },
-            makeMeta(db, sessionId),
-        );
-
-        const disposition = await Promise.race([
-            run.then(() => "served" as const),
-            Bun.sleep(500).then(() => "blocked" as const),
-        ]);
-        expect(disposition).toBe("served");
-        expect(mirrorCompleted).toBe(false);
-        releaseMirror();
-        await run;
-        await Bun.sleep(20);
-        expect(mirrorCompleted).toBe(true);
-    });
-
-    it("drains every memory mirror page before stamping the transform projection", async () => {
-        const sessionId = `rust-memory-mirror-drain-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let memoryPulls = 0;
-        let transform!: ReturnType<typeof createRustModeTransform>;
-        const projectionKeysDuringPull: Array<string | null> = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 7,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                projectionKeysDuringPull.push(
-                    transform.getState(sessionId).memoryMirrorProjectionKey,
-                );
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor + 1,
-                        has_more: memoryPulls < 4,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const messages = makeMessages(sessionId);
-
-        await transform.run(
-            sessionId,
-            messages,
-            { messages: [...messages] },
-            makeMeta(db, sessionId),
-        );
-        await Bun.sleep(20);
-
-        expect(memoryPulls).toBe(4);
-        expect(projectionKeysDuringPull).toEqual([null, null, null, null]);
-        expect(transform.getState(sessionId).memoryMirrorProjectionKey).toBe(
-            JSON.stringify([7, null, null, []]),
-        );
-    });
-
-    it("leaves a budget-exhausted memory mirror projection unstamped for the next pass", async () => {
-        const sessionId = `rust-memory-mirror-budget-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const mirrorPageBudget = TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET;
-        let memoryPulls = 0;
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 8,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor + 1,
-                        has_more: true,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            await transform.run(
-                sessionId,
-                messages,
-                { messages: [...messages] },
-                makeMeta(db, sessionId),
-            );
-            await Bun.sleep(20);
-        };
-
-        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
-        try {
-            await run();
-            expect(memoryPulls).toBe(mirrorPageBudget);
-            expect(transform.getState(sessionId).memoryMirrorProjectionKey).toBeNull();
-
-            await run();
-            expect(memoryPulls).toBe(mirrorPageBudget * 2);
-            expect(transform.getState(sessionId).memoryMirrorProjectionKey).toBeNull();
-            const backlogLogs = logSpy.mock.calls.filter(
-                ([loggedSession, message]) =>
-                    loggedSession === sessionId &&
-                    message.includes("rows_applied=0 backlog_remaining=true pages=20"),
-            );
-            expect(backlogLogs).toHaveLength(2);
-        } finally {
-            logSpy.mockRestore();
-        }
-    });
-
-    it("does not repoll a completely drained memory mirror on stable passes", async () => {
-        const sessionId = `rust-memory-mirror-stable-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let memoryPulls = 0;
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 9,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            await transform.run(
-                sessionId,
-                messages,
-                { messages: [...messages] },
-                makeMeta(db, sessionId),
-            );
-            await Bun.sleep(20);
-        };
-
-        await run();
-        await run();
-        await run();
-        await run();
-
-        expect(memoryPulls).toBe(1);
-        expect(transform.getState(sessionId).memoryMirrorProjectionKey).toBe(
-            JSON.stringify([9, null, null, []]),
-        );
-    });
-
-    it("resumes an interrupted multi-page mirror on later transform passes", async () => {
-        const sessionId = `rust-memory-mirror-interrupted-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const feedHead = 2_500;
-        let failSecondPage = true;
-        const cursorSamples: Array<{ cursor: number; updated_at: number }> = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 10,
-                          memory_mirror_head: feedHead,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                if (failSecondPage && args.cursor === 1_000) {
-                    failSecondPage = false;
-                    throw new Error("injected mirror page interruption");
-                }
-                const nextCursor = Math.min(feedHead, args.cursor + args.limit);
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: nextCursor,
-                        has_more: nextCursor < feedHead,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            await transform.run(
-                sessionId,
-                messages,
-                { messages: [...messages] },
-                makeMeta(db, sessionId),
-            );
-            await Bun.sleep(20);
-            cursorSamples.push(
-                db
-                    .prepare(
-                        "SELECT cursor, updated_at FROM mirror_cursors WHERE domain = 'memories'",
-                    )
-                    .get() as { cursor: number; updated_at: number },
-            );
-        };
-
-        await run();
-        await run();
-        await run();
-        await run();
-
-        expect(cursorSamples[0]?.cursor).toBe(1_000);
-        expect(cursorSamples.slice(1).map((sample) => sample.cursor)).toEqual([
-            feedHead,
-            feedHead,
-            feedHead,
-        ]);
-        expect(cursorSamples[1]?.updated_at).toBeGreaterThan(cursorSamples[0]?.updated_at ?? 0);
-        expect(cursorSamples[2]?.updated_at).toBe(cursorSamples[1]?.updated_at);
-        expect(cursorSamples[3]?.updated_at).toBe(cursorSamples[2]?.updated_at);
-    });
-
-    it("uses the module feed frontier to resume without polling a caught-up mirror", async () => {
-        const sessionId = `rust-memory-mirror-frontier-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let feedHead = 1;
-        let memoryPulls = 0;
-        const servedBytes: string[] = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 11,
-                          memory_mirror_head: feedHead,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: feedHead,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            const output = { messages: [...messages] };
-            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
-            await Bun.sleep(20);
-            servedBytes.push(JSON.stringify(output.messages));
-        };
-
-        await run();
-        await run();
-        await run();
-        expect(memoryPulls).toBe(1);
-        expect(new Set(servedBytes).size).toBe(1);
-
-        feedHead = 2;
-        await run();
-        expect(memoryPulls).toBe(2);
-        expect(
-            db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
-        ).toEqual({ cursor: 2 });
-        expect(new Set(servedBytes).size).toBe(1);
-
-        await run();
-        expect(memoryPulls).toBe(2);
-    });
-
-    it("keeps defer bytes stable while one bounded memory mirror pull is in flight", async () => {
-        const sessionId = `rust-memory-mirror-cache-neutral-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let releasePull!: () => void;
-        const pullGate = new Promise<void>((resolve) => {
-            releasePull = resolve;
-        });
-        let mirrorPullCalls = 0;
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 4,
-                          memory_mirror_head: 7,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                mirrorPullCalls += 1;
-                await pullGate;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: 7,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const hashes: string[] = [];
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            const output = { messages: [...messages] };
-            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
-            hashes.push(createHash("sha256").update(JSON.stringify(output.messages)).digest("hex"));
-        };
-
-        await run();
-        await run();
-        await run();
-        await run();
-        expect(mirrorPullCalls).toBe(1);
-        expect(new Set(hashes).size).toBe(1);
-
-        releasePull();
-        await Bun.sleep(20);
-        expect(
-            db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
-        ).toEqual({ cursor: 7 });
-    });
-
-    it("caches mural bytes and pulls mirrors only when the module projection moves", async () => {
-        const sessionId = `rust-mural-mirror-generation-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let rowVersion = 1;
-        let muralResolves = 0;
-        let memoryPulls = 0;
-        let compartmentPulls = 0;
-        let memoryCursor = 0;
-        const transformMuralHashes: string[] = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method, body }) => {
-                if (method !== "transform") return { ok: true };
-                const mural = (body as { mural?: { content_hash?: string } }).mural;
-                transformMuralHashes.push(mural?.content_hash ?? "none");
-                return {
-                    decision: "SOFT+",
-                    row_version: rowVersion,
-                    rendered_memory_ids: [],
-                    native_messages: makeMessages(sessionId),
-                };
-            },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                const nextCursor = memoryPulls >= 2 ? 1 : memoryCursor;
-                memoryCursor = nextCursor;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: nextCursor,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-            getCompartmentsAfter: async () => {
-                compartmentPulls += 1;
-                return { max_sequence: -1, compartment_count: 0, compartments: [] };
-            },
-        };
-        const deps = makeDeps(db, moduleClient);
-        deps.muralEnabled = true;
-        const transform = createRustModeTransform(deps, {
-            moduleClient,
-            muralResolverForTests: () => {
-                muralResolves += 1;
-                return {
-                    enabled: true,
-                    supportsVision: true,
-                    dataUrl: `data:image/png;base64,mural-${muralResolves}`,
-                    contentHash: `mural-${muralResolves}`,
-                };
-            },
-        });
-        const servedDigests: string[] = [];
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            const output = { messages: [...messages] as unknown[] };
-            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
-            servedDigests.push(
-                createHash("sha256").update(JSON.stringify(output.messages)).digest("hex"),
-            );
-            await Bun.sleep(20);
-        };
-
-        await run();
-        await run();
-        expect(muralResolves).toBe(1);
-        expect(memoryPulls).toBe(1);
-        expect(compartmentPulls).toBe(1);
-
-        rowVersion = 2;
-        await run();
-        expect(memoryPulls).toBe(2);
-        expect(compartmentPulls).toBe(2);
-        await run();
-        await run();
-
-        expect(muralResolves).toBe(2);
-        expect(memoryPulls).toBe(2);
-        expect(compartmentPulls).toBe(2);
-        expect(transformMuralHashes).toEqual([
-            "mural-1",
-            "mural-1",
-            "mural-1",
-            "mural-2",
-            "mural-2",
-        ]);
-        expect(new Set(servedDigests)).toEqual(new Set([servedDigests[0]]));
     });
 
     it("sends the resolved historian timeout and default on the transform request", async () => {
@@ -4088,8 +3281,8 @@ describe("Rust mode authority adapter", () => {
             const before = await measure("before", true);
             const after = await measure("after", false);
             expect(after.hash).toBe(before.hash);
-            expect(after.memoryPulls).toBeLessThan(before.memoryPulls);
-            expect(after.compartmentPulls).toBeLessThan(before.compartmentPulls);
+            expect(after.memoryPulls).toBe(0);
+            expect(after.compartmentPulls).toBe(0);
             if (process.env.MAGIC_CONTEXT_HOTPATH_MEASURE === "1") {
                 console.log(`HOTPATH_MEASUREMENT ${JSON.stringify({ before, after })}`);
             }
@@ -5214,6 +4407,75 @@ describe("Rust mode authority adapter", () => {
         }
     });
 
+    it("refuses migration-required turns without LKG replay or parking", async () => {
+        const sessionId = `rust-single-store-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let moduleCalls = 0;
+        let toastCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async () => {
+                moduleCalls += 1;
+                throw Object.assign(new Error("storage open refused"), {
+                    code: "single_store_migration_required",
+                    detail: {
+                        reason_code: "single_store_migration_required",
+                    },
+                });
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+                moduleClient,
+                notifyParked: () => {
+                    toastCalls += 1;
+                },
+            });
+            // Four passes is more than RUST_FAILURE_PARK_THRESHOLD, the number of consecutive
+            // failures that would park an ordinary failing session into fallback serving. A
+            // refused store must keep failing visibly instead.
+            for (let pass = 0; pass < 4; pass += 1) {
+                const input = makeMessages(sessionId);
+                const callsBefore = moduleCalls;
+                const failure = transform
+                    .run(
+                        sessionId,
+                        input,
+                        { messages: input as unknown[] },
+                        makeMeta(db, sessionId),
+                    )
+                    .then(
+                        () => null,
+                        (error: unknown) => error,
+                    );
+                const error = await failure;
+                expect(error).toBeInstanceOf(EmergencyFailClosedError);
+                expect((error as Error).message).toBe(
+                    "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+                );
+                expect(moduleCalls).toBeGreaterThan(callsBefore);
+            }
+            expect(transform.getState(sessionId).parked).toBe(false);
+            expect(toastCalls).toBe(0);
+            const messages = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => String(message));
+            expect(
+                messages.some((message) =>
+                    message.startsWith(
+                        "mc_rust_single_store_refusal reason=single_store_migration_required",
+                    ),
+                ),
+            ).toBe(true);
+            expect(messages.some((message) => message.includes("lkg_replay_served"))).toBe(false);
+            expect(messages.some((message) => message.includes("served_from=raw"))).toBe(false);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {
         const sessionId = `rust-failure-${Date.now()}`;
         sessions.push(sessionId);
@@ -5559,472 +4821,6 @@ describe("Rust mode authority adapter", () => {
         ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
 
         expect(output.messages).toEqual([]);
-    });
-});
-
-describe("prepareRustMemoryAuthority mixed restore", () => {
-    it("resumes a schema-57 DRAINING restart through the real prepare path", async () => {
-        const db = makeDb();
-        const projectPath = "git:schema-57-restart";
-        const projectRoot = "/worktrees/schema-57-restart";
-        db.exec(`
-            DROP TABLE mirror_live_staging;
-            DROP TABLE mirror_resnapshot_state;
-            DROP TABLE mirror_live_memory_rows;
-            DELETE FROM schema_migrations WHERE version >= 58;
-        `);
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (9395, ?, 'CONFIG_VALUES', 'drive model', 'same-hash', 0, 0, 0, 0)",
-            ).run(projectPath);
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', '/legacy', 100, 9395)",
-            ).run();
-            db.prepare(
-                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 20, 0)",
-            ).run();
-        });
-        runMigrations(db);
-        db.prepare(
-            "UPDATE mirror_resnapshot_state SET status = 'resnapshotting' WHERE domain = 'memories'",
-        ).run();
-        db.prepare(
-            "INSERT INTO mirror_live_staging VALUES ('abandoned', '/stale', 1, 'CONSTRAINTS', 'stale', NULL)",
-        ).run();
-
-        const calls: Array<{ liveOnly?: boolean; cursor: number }> = [];
-        const statuses = new Map<string, AuthorityStatus | null>([
-            [
-                "memories",
-                {
-                    context_store_uuid: "store",
-                    project: projectPath,
-                    domain: "memories",
-                    state: "DRAINING",
-                    generation: 3,
-                    captured_upper_bound: 21,
-                    coordinator_token: "restart-token",
-                },
-            ],
-            [
-                "notes",
-                {
-                    context_store_uuid: "store",
-                    project: projectPath,
-                    domain: "notes",
-                    state: "TS",
-                    generation: 1,
-                },
-            ],
-        ]);
-        const memoryRow = (id: number, sourceProject: string) => ({
-            id,
-            project_path: sourceProject,
-            category: "CONFIG_VALUES",
-            content: "drive model",
-            normalized_hash: "same-hash",
-            status: "active",
-        });
-        const module: RustModeModuleClient = {
-            call: async () => ({ ok: true }),
-            authorityStatus: async (args) => ({ authority: statuses.get(args.domain) ?? null }),
-            authorityPrepare: async () => {
-                throw new Error("prepare should not run during DRAINING recovery");
-            },
-            authoritySeed: async () => ({ seeded: 0 }),
-            authorityDrain: async (args) => {
-                if (args.action === "finish") {
-                    statuses.set("memories", {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: "TS",
-                        generation: 4,
-                    });
-                }
-                return {
-                    authority: {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: args.action === "finish" ? "TS" : "DRAINING",
-                        generation: args.action === "finish" ? 4 : 3,
-                        captured_upper_bound: 21,
-                        coordinator_token: "restart-token",
-                    },
-                };
-            },
-            mirrorPull: async (args) => {
-                calls.push({ liveOnly: args.live_only, cursor: args.cursor });
-                return args.live_only
-                    ? {
-                          page: {
-                              domain: "memories",
-                              cursor: 0,
-                              next_cursor: 200,
-                              has_more: false,
-                              rows: [
-                                  {
-                                      feed_seq: 0,
-                                      domain: "memories",
-                                      op: "insert",
-                                      module_row_id: 200,
-                                      full_row_snapshot: memoryRow(200, projectPath),
-                                      content_hash: "same-hash",
-                                  },
-                              ],
-                          },
-                      }
-                    : {
-                          page: {
-                              domain: "memories",
-                              cursor: args.cursor,
-                              next_cursor: 21,
-                              has_more: false,
-                              rows: [
-                                  {
-                                      feed_seq: 21,
-                                      domain: "memories",
-                                      op: "tombstone",
-                                      module_row_id: 100,
-                                      full_row_snapshot: memoryRow(100, "/legacy"),
-                                      content_hash: "same-hash",
-                                  },
-                              ],
-                          },
-                      };
-            },
-        };
-        const state = {
-            initialized: false,
-            consecutiveFailures: 0,
-            passCount: 0,
-            parked: false,
-            passesSincePark: 0,
-            warningSent: false,
-            ordinalMemoAnchor: null,
-            ordinalMemoStoredCount: null,
-            ordinalMemoCanonicalCount: 0,
-            seedPassPending: true,
-            failureCount: 0,
-            parkCount: 0,
-            moduleGeneration: 0,
-            lastAckedSeq: 0,
-            lastAckedWatermarks: null,
-            idOrdinalMemoGeneration: 0,
-            idOrdinalMemo: new Map(),
-            syntheticTurnCount: 0,
-            lastObservedUserMessageId: null,
-            syntheticLoopBreakerLogged: false,
-            memoryAuthorityProject: null as string | null,
-            memoryAuthorityRoot: null as string | null,
-            memoryAuthorityReady: false,
-        };
-
-        await __rustModeTransformTest.prepareRustMemoryAuthority({
-            db,
-            module,
-            projectPath,
-            projectRoot,
-            state,
-        });
-
-        expect(calls.map((call) => call.liveOnly)).toEqual([true, undefined]);
-        expect(
-            db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
-        ).toEqual({
-            cursor: 21,
-        });
-        expect(db.prepare("SELECT id FROM memories WHERE id = 9395").get()).toEqual({ id: 9395 });
-        expect(db.prepare("SELECT status FROM mirror_resnapshot_state").get()).toEqual({
-            status: "complete",
-        });
-        expect(db.prepare("SELECT COUNT(*) AS count FROM mirror_live_staging").get()).toEqual({
-            count: 0,
-        });
-        expect(state.memoryAuthorityReady).toBe(true);
-    });
-
-    it("reconciles remaining MODULE domains after a DRAINING resume before tools open", async () => {
-        const db = makeDb();
-        const projectPath = "git:mixed-restore";
-        const projectRoot = "/worktrees/mixed-restore";
-        const authorityRoots: string[] = [];
-        const statuses = new Map<string, AuthorityStatus | null>([
-            [
-                "memories",
-                {
-                    context_store_uuid: "store",
-                    project: projectPath,
-                    domain: "memories",
-                    state: "DRAINING",
-                    generation: 3,
-                    coordinator_token: "tok-a",
-                    captured_upper_bound: 0,
-                },
-            ],
-            [
-                "notes",
-                {
-                    context_store_uuid: "store",
-                    project: projectPath,
-                    domain: "notes",
-                    state: "MODULE",
-                    generation: 2,
-                },
-            ],
-        ]);
-        const module: RustModeModuleClient = {
-            call: async () => ({ ok: true }),
-            authorityStatus: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                return { authority: statuses.get(args.domain) ?? null };
-            },
-            authorityPrepare: async () => {
-                throw new Error("prepare should not run on mixed DRAINING resume");
-            },
-            authoritySeed: async () => ({ seeded: 0 }),
-            authorityDrain: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                if (args.action === "begin") {
-                    return {
-                        authority: {
-                            context_store_uuid: "store",
-                            project: projectPath,
-                            domain: "memories",
-                            state: "DRAINING",
-                            generation: 3,
-                            coordinator_token: "tok-a",
-                            captured_upper_bound: 0,
-                        },
-                    };
-                }
-                if (args.action === "finish") {
-                    statuses.set("memories", {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: "TS",
-                        generation: 4,
-                    });
-                    return {
-                        authority: {
-                            context_store_uuid: "store",
-                            project: projectPath,
-                            domain: "memories",
-                            state: "TS",
-                            generation: 4,
-                            coordinator_token: "tok-a",
-                        },
-                    };
-                }
-                return {
-                    authority: {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: "DRAINING",
-                        generation: 3,
-                        coordinator_token: "tok-a",
-                    },
-                };
-            },
-            mirrorPull: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const state = {
-            initialized: false,
-            consecutiveFailures: 0,
-            passCount: 0,
-            parked: false,
-            passesSincePark: 0,
-            warningSent: false,
-            ordinalMemoAnchor: null,
-            ordinalMemoStoredCount: null,
-            ordinalMemoCanonicalCount: 0,
-            seedPassPending: true,
-            failureCount: 0,
-            parkCount: 0,
-            moduleGeneration: 0,
-            lastAckedSeq: 0,
-            lastAckedWatermarks: null,
-            idOrdinalMemoGeneration: 0,
-            idOrdinalMemo: new Map(),
-            syntheticTurnCount: 0,
-            lastObservedUserMessageId: null,
-            syntheticLoopBreakerLogged: false,
-            memoryAuthorityProject: null as string | null,
-            memoryAuthorityRoot: null as string | null,
-            memoryAuthorityReady: false,
-        };
-        const preparedProjects: string[] = [];
-        await __rustModeTransformTest.prepareRustMemoryAuthority({
-            db,
-            module,
-            projectPath,
-            projectRoot,
-            state,
-            onProjectPrepared: (prepared) => preparedProjects.push(prepared),
-        });
-        expect(state.memoryAuthorityReady).toBe(true);
-        // Hosts hang per-project services (the smart-note evaluator bridge) off this
-        // callback, so it must fire with the RESOLVED project — a session that resolves
-        // a project other than the plugin's launch directory still gets its bridge.
-        expect(preparedProjects).toEqual([projectPath]);
-        expect(authorityRoots.length).toBeGreaterThan(0);
-        expect(authorityRoots.every((root) => root === projectRoot)).toBe(true);
-        expect(getAuthorityManagedMarker(db, projectPath)).not.toBeNull();
-        statuses.set("memories", {
-            context_store_uuid: "store",
-            project: projectPath,
-            domain: "memories",
-            state: "MODULE",
-            generation: 4,
-        });
-        const secondRoot = "/worktrees/mixed-restore-two";
-        await __rustModeTransformTest.prepareRustMemoryAuthority({
-            db,
-            module,
-            projectPath,
-            projectRoot: secondRoot,
-            state,
-        });
-        expect(authorityRoots).toContain(secondRoot);
-        expect(state.memoryAuthorityRoot).toBe(secondRoot);
-
-        expect(() =>
-            db
-                .prepare(
-                    "INSERT INTO notes(type, status, content, project_path, session_id, created_at, updated_at) VALUES ('plain', 'active', 'blocked', ?, 's', 0, 0)",
-                )
-                .run(projectPath),
-        ).toThrow("managed by the Rust module");
-    });
-
-    it("keeps MODULE memory and note values over conflicting TS rows during delta-cache recovery", async () => {
-        const sessionId = `rust-authority-conflict-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const projectPath = "/tmp/project";
-        const contextStoreUuid = ensureContextStoreUuid(db);
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                `INSERT INTO memories (
-                    id, project_path, category, content, normalized_hash,
-                    first_seen_at, created_at, updated_at, last_seen_at
-                ) VALUES (501, ?, 'CONSTRAINTS', 'stale TS memory', 'ts-memory', 0, 0, 0, 0)`,
-            ).run(projectPath);
-            db.prepare(
-                `INSERT INTO notes (
-                    id, type, status, content, project_path, session_id, created_at, updated_at
-                ) VALUES (601, 'smart', 'active', 'stale TS note', ?, ?, 0, 0)`,
-            ).run(projectPath, sessionId);
-        });
-        const stateSyncBodies: unknown[] = [];
-        let transformCalls = 0;
-        const moduleClient: RustModeModuleClient = {
-            authorityStatus: async (args) => ({
-                authority: {
-                    context_store_uuid: contextStoreUuid,
-                    project: projectPath,
-                    domain: args.domain,
-                    state: "MODULE",
-                    generation: 1,
-                },
-            }),
-            authorityPrepare: async () => {
-                throw new Error("MODULE authority must not prepare from TS");
-            },
-            authoritySeed: async () => ({ seeded: 0 }),
-            mirrorPull: async (args) => ({
-                page: {
-                    domain: args.domain,
-                    cursor: args.cursor,
-                    next_cursor: 1,
-                    has_more: false,
-                    rows:
-                        args.domain === "memories"
-                            ? [
-                                  {
-                                      feed_seq: 1,
-                                      domain: "memories",
-                                      op: "update",
-                                      module_row_id: 51,
-                                      full_row_snapshot: {
-                                          context_store_uuid: contextStoreUuid,
-                                          context_row_id: 501,
-                                          project_path: projectPath,
-                                          category: "CONSTRAINTS",
-                                          content: "MODULE memory wins",
-                                          normalized_hash: "module-memory",
-                                          status: "active",
-                                          created_at_ms: 0,
-                                          updated_at_ms: 1,
-                                      },
-                                      content_hash: "module-memory",
-                                  },
-                              ]
-                            : [
-                                  {
-                                      feed_seq: 1,
-                                      domain: "notes",
-                                      op: "update",
-                                      module_row_id: 61,
-                                      full_row_snapshot: {
-                                          context_store_uuid: contextStoreUuid,
-                                          context_row_id: 601,
-                                          type: "smart",
-                                          project_path: projectPath,
-                                          session_id: sessionId,
-                                          content: "MODULE note wins",
-                                          status: "active",
-                                          created_at_ms: 0,
-                                          updated_at_ms: 1,
-                                      },
-                                      content_hash: null,
-                                  },
-                              ],
-                },
-            }),
-            call: async ({ method, body }) => {
-                if (method === "state_sync") {
-                    stateSyncBodies.push(structuredClone(body));
-                    return { ok: true };
-                }
-                if (method !== "transform") return { ok: true };
-                transformCalls += 1;
-                if (transformCalls === 1) return { status: "need_full_sync" };
-                return {
-                    decision: "HARD",
-                    row_version: 2,
-                    native_messages: makeMessages(sessionId),
-                };
-            },
-        };
-        const transform = createRustModeTransformImpl(makeDeps(db, moduleClient), { moduleClient });
-        const input = makeMessages(sessionId);
-        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
-
-        expect(stateSyncBodies).toHaveLength(1);
-        expect(JSON.stringify(stateSyncBodies)).not.toContain("stale TS memory");
-        expect(JSON.stringify(stateSyncBodies)).not.toContain("stale TS note");
-        expect(db.prepare("SELECT content FROM memories WHERE id = 501").get()).toEqual({
-            content: "MODULE memory wins",
-        });
-        expect(db.prepare("SELECT content FROM notes WHERE id = 601").get()).toEqual({
-            content: "MODULE note wins",
-        });
     });
 });
 
@@ -7441,94 +6237,6 @@ describe("raw fallback refusal copy and early abort", () => {
     });
 });
 
-describe("authoritySeedRows — supersede pointer resolution (issue #377)", () => {
-    // The store records a pending memory reference for any seeded row whose
-    // superseded_by_memory_id it cannot resolve, and authority_finish_prepare
-    // rejects the memories-domain handoff while any pending references exist.
-    // A target outside the seed set can never resolve, so the pending survives
-    // the resolution sweep and blocks rust mode permanently.
-    function seedDb(): ContextDatabase {
-        const db = new Database(":memory:") as ContextDatabase;
-        initializeDatabase(db);
-        return db;
-    }
-
-    function insert(db: ContextDatabase, project: string, content: string, status: string): number {
-        const now = Date.now();
-        db.prepare(
-            `INSERT INTO memories
-               (project_path, category, content, normalized_hash, source_type,
-                seen_count, retrieval_count, first_seen_at, created_at, updated_at,
-                last_seen_at, status)
-             VALUES (?, 'ARCHITECTURE', ?, ?, 'agent', 1, 0, ?, ?, ?, ?, ?)`,
-        ).run(project, content, `hash-${content}`, now, now, now, now, status);
-        return Number((db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id);
-    }
-
-    it("drops a supersede pointer whose target is absent from the seed set", () => {
-        const db = seedDb();
-        try {
-            const project = "git:seed-test";
-            const survivor = insert(db, project, "survivor", "active");
-            const superseded = insert(db, project, "superseded", "archived");
-            const orphaned = insert(db, project, "orphaned", "archived");
-
-            // Resolvable: target is in the same seed set.
-            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
-                survivor,
-                superseded,
-            );
-            // Unresolvable: target id never existed in this project.
-            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
-                999_999,
-                orphaned,
-            );
-
-            const rows = __rustModeTransformTest.authoritySeedRows(db, project, "memories");
-            const byId = new Map(
-                rows.map((row) => [
-                    Number((row as { source_row_id: unknown }).source_row_id),
-                    (row as { snapshot: Record<string, unknown> }).snapshot,
-                ]),
-            );
-
-            // The dead link is dropped so the module never records a pending reference.
-            expect(byId.get(orphaned)?.superseded_by_memory_id).toBeNull();
-            // The resolvable pointer is preserved verbatim — this must stay surgical,
-            // not a blanket null of the column.
-            expect(byId.get(superseded)?.superseded_by_memory_id).toBe(survivor);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    it("drops a supersede pointer whose target belongs to another project", () => {
-        const db = seedDb();
-        try {
-            const project = "git:seed-a";
-            const foreign = insert(db, "git:seed-b", "foreign-target", "active");
-            const local = insert(db, project, "local", "archived");
-            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
-                foreign,
-                local,
-            );
-
-            const rows = __rustModeTransformTest.authoritySeedRows(db, project, "memories");
-            const snapshot = (
-                rows.find(
-                    (row) => Number((row as { source_row_id: unknown }).source_row_id) === local,
-                ) as { snapshot: Record<string, unknown> }
-            ).snapshot;
-
-            // The seed set is project-scoped, so a cross-project target is
-            // equally unresolvable module-side.
-            expect(snapshot.superseded_by_memory_id).toBeNull();
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
 describe("rust-mode wire transport (protected_tokens_effective)", () => {
     it("transports resolved floor scalar protected_tokens_effective on the wire alongside effective_execute_threshold and never sends protected_tags", async () => {
         const sessionId = `rust-floor-wire-${Date.now()}`;
@@ -7903,4 +6611,210 @@ describe("proactive thinking strip on a released frozen replay", () => {
             logSpy.mockRestore();
         }
     });
+});
+
+it("copies the resolved history budget onto the authority wire", () => {
+    const body = __rustModeTransformTest.buildTransformBody({
+        sessionId: "budget-wire",
+        input: [],
+        nativeMessages: [],
+        passInputs: { history_budget_tokens: 42_000 },
+        usage: {},
+        modelKey: null,
+        providerId: null,
+    });
+    expect(body.history_budget_tokens).toBe(42_000);
+});
+
+it("copies the profile-resolved historian chain onto the authority wire", () => {
+    const historianModelChain = __rustModeTransformTest.resolvedHistorianModelChain({
+        historianModel: { model: "anthropic/profile-historian", qualifier: "high" },
+        fallbackModels: [
+            { model: "openai/profile-fallback", qualifier: "low" },
+            "anthropic/profile-historian",
+        ],
+    });
+    const body = __rustModeTransformTest.buildTransformBody({
+        sessionId: "profile-model-wire",
+        input: [],
+        nativeMessages: [],
+        passInputs: { historian_model_chain: historianModelChain },
+        usage: {},
+        modelKey: null,
+        providerId: null,
+    });
+
+    expect(body.historian_model_chain).toEqual([
+        "anthropic/profile-historian",
+        "openai/profile-fallback",
+    ]);
+    const limits = __rustModeTransformTest.resolvedHistorianModelLimits(historianModelChain);
+    expect(Object.keys(limits)).toEqual(body.historian_model_chain);
+    expect(limits["anthropic/profile-historian"]).toBeDefined();
+    expect(limits["openai/profile-fallback"]).toBeDefined();
+});
+
+it("copies caveman settings onto the authority wire", () => {
+    const body = __rustModeTransformTest.buildTransformBody({
+        sessionId: "caveman-wire",
+        input: [],
+        nativeMessages: [],
+        passInputs: { caveman_enabled: true, caveman_min_chars: 240 },
+        usage: {},
+        modelKey: null,
+        providerId: null,
+    });
+    expect(body.caveman_enabled).toBe(true);
+    expect(body.caveman_min_chars).toBe(240);
+});
+
+it("fails after the second authority mismatch in one transform pass", async () => {
+    const sessionId = `rust-adopt-once-${Date.now()}`;
+    sessions.push(sessionId);
+    const db = makeDb();
+    installRawProvider(sessionId);
+    const messages = makeMessages(sessionId);
+    const methods: string[] = [];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method }) => {
+            methods.push(method);
+            if (method === "state_sync") throw authoritySeqMismatch(4);
+            return { decision: "SOFT+", native_messages: [] };
+        },
+    };
+    const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+    const output = { messages: messages as unknown[] };
+
+    await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+    expect(methods).toEqual(["state_sync", "state_sync"]);
+    expect(transform.getState(sessionId).lastAckedSeq).toBe(4);
+    expect(transform.getState(sessionId).lastAckedWatermarks).toBeNull();
+    expect(output.messages).toBe(messages);
+});
+
+it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {
+    const sessionId = `rust-memory-visibility-${Date.now()}`;
+    sessions.push(sessionId);
+    const db = makeDb();
+    installRawProvider(sessionId);
+    const memory = insertMemory(db, {
+        projectPath: "/tmp/project",
+        category: "ARCHITECTURE_DECISIONS",
+        content: "The rust-rendered memory must not be returned twice.",
+    });
+    const meta = makeMeta(db, sessionId);
+    db.exec(`
+            CREATE TABLE memory_manifest_updates (count INTEGER NOT NULL);
+            INSERT INTO memory_manifest_updates (count) VALUES (0);
+            CREATE TRIGGER count_memory_manifest_updates
+            AFTER UPDATE OF memory_block_ids, memory_block_count ON session_meta
+            BEGIN
+                UPDATE memory_manifest_updates SET count = count + 1;
+            END;
+        `);
+    let renderedMemoryIds = [memory.id];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method }) =>
+            method === "transform"
+                ? {
+                      decision: "SOFT+",
+                      native_messages: makeMessages(sessionId),
+                      rendered_memory_ids: renderedMemoryIds,
+                  }
+                : { ok: true },
+    };
+    const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+    const run = async () => {
+        const messages = makeMessages(sessionId);
+        await transform.run(sessionId, messages, { messages: [...messages] }, meta);
+    };
+
+    await run();
+    expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id]));
+    const tools = createCtxSearchTools({
+        db,
+        resolveProjectPath: () => "/tmp/project",
+        memoryEnabled: true,
+        embeddingEnabled: false,
+        readMessages: () => [],
+    });
+    const search = await tools.ctx_search.execute({ query: `#${memory.id}`, sources: ["memory"] }, {
+        sessionID: sessionId,
+        directory: "/tmp/project",
+    } as never);
+    expect(search).toContain(
+        `Memories: 1 match found, all already visible in your project-memory block (ids ${memory.id}).`,
+    );
+
+    await run();
+    expect(
+        db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
+    ).toEqual({ count: 1 });
+
+    renderedMemoryIds = [memory.id + 1];
+    await run();
+    expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id + 1]));
+    expect(
+        db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
+    ).toEqual({ count: 2 });
+});
+
+it("rechecks mural candidates on bootstrap, pressure and flush but not ordinary defers", async () => {
+    const sessionId = `mural-opportunities-${Date.now()}`;
+    sessions.push(sessionId);
+    const db = makeDb();
+    installRawProvider(sessionId);
+    const muralHashes: unknown[] = [];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method, body }) => {
+            if (method !== "transform") return { ok: true };
+            muralHashes.push((body.mural as { content_hash?: string } | undefined)?.content_hash);
+            return { decision: "PASSTHROUGH", native_messages: makeMessages(sessionId) };
+        },
+    };
+    const deps = makeDeps(db, moduleClient);
+    deps.muralEnabled = true;
+    let resolutions = 0;
+    let cue = "a";
+    const transform = createRustModeTransform(deps, {
+        moduleClient,
+        muralResolverForTests: () => {
+            resolutions++;
+            return {
+                enabled: true,
+                supportsVision: true,
+                dataUrl: `data:image/png;base64,${cue}`,
+                contentHash: cue,
+            };
+        },
+    });
+    const run = async () => {
+        const input = makeMessages(sessionId);
+        await transform.run(sessionId, input, { messages: input }, makeMeta(db, sessionId));
+    };
+    await run();
+    expect(resolutions).toBe(1);
+    cue = "b";
+    await run();
+    expect(resolutions).toBe(1);
+    expect(muralHashes.at(-1)).toBe("a");
+    deps.contextUsageMap.set(sessionId, {
+        usage: { inputTokens: 100_000, percentage: 90 },
+        updatedAt: Date.now(),
+    });
+    await run();
+    expect(resolutions).toBe(2);
+    expect(muralHashes.at(-1)).toBe("b");
+    deps.contextUsageMap.set(sessionId, {
+        usage: { inputTokens: 100, percentage: 1 },
+        updatedAt: Date.now(),
+    });
+    cue = "c";
+    await run();
+    expect(resolutions).toBe(2);
+    deps.pendingMaterializationSessions.add(sessionId);
+    await run();
+    expect(resolutions).toBe(3);
+    expect(muralHashes.at(-1)).toBe("c");
 });

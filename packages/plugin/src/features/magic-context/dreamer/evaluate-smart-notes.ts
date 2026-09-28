@@ -9,7 +9,7 @@ import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
-import { getModuleNoteEvaluationBridge } from "../context-authority";
+
 import { createSmartNoteCapabilities } from "../smart-notes/capabilities";
 import { compileSmartNoteCheck } from "../smart-notes/compiler";
 import { runDueCompiledSmartNoteChecks } from "../smart-notes/runner";
@@ -111,8 +111,6 @@ export async function evaluateSmartNotes(
     }
 
     const projectRoot = args.sessionDirectory ?? args.projectIdentity;
-    const moduleBridge = getModuleNoteEvaluationBridge(args.projectIdentity);
-    await moduleBridge?.sync();
     const pendingNotes = () =>
         getPendingSmartNotes(args.db, args.projectIdentity).filter(
             (note) => !args.retinaHandoff || note.compileStatus !== "compiled",
@@ -149,37 +147,6 @@ export async function evaluateSmartNotes(
     let surfaced = 0;
     let didWork = false;
     try {
-        if (moduleBridge) {
-            const candidates = pendingNotes().slice(0, MAX_COMPILE_PER_RUN);
-            for (const note of candidates) {
-                if (Date.now() >= args.deadline) break;
-                assertLeaseHeld("module evaluation start");
-                const sessionId = note.sessionId ?? args.parentSessionId;
-                if (!sessionId) {
-                    throw new Error(
-                        `Smart-note evaluation unavailable: note #${note.id} has no module session binding`,
-                    );
-                }
-                didWork = true;
-                const met = await confirmReadOnly(
-                    args,
-                    note.id,
-                    note.content,
-                    note.surfaceCondition,
-                    leaseAbortController.signal,
-                );
-                assertLeaseHeld("module evaluation commit");
-                await moduleBridge.evaluate({
-                    contextNoteId: note.id,
-                    sessionId,
-                    verdict: met,
-                });
-                if (met) surfaced += 1;
-            }
-            await moduleBridge.sync();
-            const pending = pendingNotes().length;
-            return { surfaced, pending, ran: didWork };
-        }
         const dueRun = await runDueCompiledSmartNoteChecks({
             db: args.db,
             projectIdentity: args.projectIdentity,

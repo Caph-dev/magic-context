@@ -600,7 +600,7 @@ async function applyParsedBatchMappings(
             if (!identity)
                 throw new DreamerModuleFailureError(
                     "memory.set_mapping",
-                    new Error(`missing mirror identity for ${item.id}`),
+                    new Error(`shared memory no longer belongs to the project: ${item.id}`),
                 );
             return {
                 memory_id: identity.moduleId,
@@ -619,8 +619,6 @@ async function applyParsedBatchMappings(
                     name: "memory.set_mapping",
                     arguments: {
                         memory_project: args.projectIdentity,
-                        context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
-                        authority_generation: args.moduleRoute.moduleAuthorityGeneration,
                         command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256")
                             .update(rows.map((row) => row.memory_id).join(","))
                             .digest("hex")

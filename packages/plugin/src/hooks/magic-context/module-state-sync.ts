@@ -1,26 +1,14 @@
 import { createHmac, randomUUID } from "node:crypto";
 
-import type { Compartment } from "../../features/magic-context/compartment-storage";
-import { getModuleNoteEvaluationBridge } from "../../features/magic-context/context-authority";
-import {
-    buildWorkspaceMemorySqlFilter,
-    getMaxMemoryIdForProjects,
-    getMemoriesByProject,
-    getMemoriesByProjects,
-    readNewMemoriesForM1Union,
-} from "../../features/magic-context/memory/storage-memory";
+import { getMaxMemoryIdForProjects } from "../../features/magic-context/memory/storage-memory";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
-    getCompartments,
     getOrCreateSessionMeta,
     getProcessedImageStrippedIds,
     getStaleReduceStrippedIds,
     getStrippedPlaceholderIds,
 } from "../../features/magic-context/storage";
-import {
-    getMaxMemoryMutationIdForProjects,
-    getMemoryMutationsForRenderByProjects,
-} from "../../features/magic-context/storage-memory-mutation-log";
+import { getMaxMemoryMutationIdForProjects } from "../../features/magic-context/storage-memory-mutation-log";
 import {
     getAutoSearchHintDecisions,
     getChannel2NudgeState,
@@ -39,14 +27,12 @@ import {
     getTagsByNumbers,
 } from "../../features/magic-context/storage-tags";
 import type { TagEntry } from "../../features/magic-context/types";
-import { getActiveUserMemories } from "../../features/magic-context/user-memory/storage-user-memory";
 import {
     computeWorkspaceEpochFingerprint,
     expandWorkspaceIdentitySetWithAliases,
     resolveWorkspaceIdentitySet,
     resolveWorkspaceShareCategories,
 } from "../../features/magic-context/workspaces";
-import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
@@ -54,13 +40,11 @@ import { StateSyncTiming, timedStateSyncDatabase } from "./module-state-sync-tim
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import { MODULE_PAGE_MAX_BYTES, moduleRawBlockMappings, moduleWireBodyBytes } from "./module-wire";
 import {
-    readRawSessionMessageIdOrdinalsForRange,
     readRawSessionMessageOrdinalById,
     readRawSessionMessagePartsById,
     readRawSessionSeedTail,
 } from "./read-session-chunk";
 import type { RawMessageParts } from "./read-session-raw";
-import { formatDate } from "./temporal-awareness";
 
 export interface ModuleWatermarks {
     compartment_sequence: number;
@@ -158,14 +142,7 @@ export interface ModuleStateSyncPayload {
         seed_batch_total?: number;
         seed_complete?: boolean;
         seed_boundary_id?: string | null;
-        compartments: unknown[];
-        memories?: unknown[];
-        memory_mutations?: unknown[];
-        user_profile?: string[];
-        workspace?: ModuleWorkspacePayload | null;
         last_todo_state?: string;
-        project_memory_epoch?: number;
-        user_profile_version?: number;
         acked_watermarks?: ModuleWatermarks;
         drop_seeds?: ModuleDropSeed[];
         drop_seed_skipped?: number;
@@ -194,7 +171,6 @@ export interface ModuleStateSyncState {
     idOrdinalMemoGeneration: number;
     idOrdinalMemo: Map<string, number>;
     seedPassPending?: boolean;
-    authorityMemorySyncSkipLogged?: boolean;
 }
 
 export interface ModuleStateSyncPass {
@@ -207,11 +183,7 @@ export interface ModuleStateSyncPass {
 export interface ModuleStateSyncOptions {
     timing?: StateSyncTiming;
     seedInventory?: { maxCompartmentSequence: number; boundaryId: string | null };
-    beforeSerializeCompartment?: () => void;
-    yieldEveryCompartments?: number;
     shouldAbortSeed?: () => boolean;
-    /** Cached authority state used only to avoid sending rows the module already owns. */
-    authorityState?: "TS" | "PREPARING" | "MODULE" | "DRAINING";
     /** Enable the authority sender's one-time durable-sequence adoption. */
     authority?: boolean;
     /** Set only after the module status/hello advertises state_sync_deltas. */
@@ -224,308 +196,6 @@ export interface ModuleStateSyncOptions {
      */
     knownWatermarksUnchanged?: boolean;
     noteEvaluationProjectPath?: string;
-}
-
-export interface ModuleCompartmentMirrorRow {
-    sequence: number;
-    start_message: number;
-    end_message: number;
-    start_message_id: string;
-    end_message_id: string;
-    title: string;
-    content: string;
-    p1?: string | null;
-    p2?: string | null;
-    p3?: string | null;
-    p4?: string | null;
-    importance?: number | null;
-    episode_type?: string | null;
-    legacy?: number | null;
-    created_at?: number;
-}
-
-export interface ModuleCompartmentMirrorResponse {
-    max_sequence: number;
-    compartments: ModuleCompartmentMirrorRow[];
-    /** Present on session.status; a count of 0 after a non-empty cursor is a set wipe. */
-    compartment_count?: number;
-    /** Incremented when the published set is rebuilt, recomputed, or restored. Those rewrites can replace existing rows without advancing max_sequence. */
-    revert_epoch?: number;
-    /** Optional flag that the published set was rewritten in place. Older responses omit it. */
-    set_changed?: boolean;
-}
-
-/**
- * The module owns its SQLite file, so TS cannot read rows directly. This narrow
- * reader is the seam for the module's future `session.status` compartment page.
- * It deliberately returns typed rows instead of pretending the TS database is
- * authoritative for module-published content.
- */
-export interface ModuleCompartmentReader {
-    getCompartmentsAfter(
-        sessionId: string,
-        afterSequence: number,
-    ): Promise<ModuleCompartmentMirrorResponse>;
-}
-
-interface CompartmentMirrorCursor {
-    lastMaxSequence: number;
-    lastCompartmentCount?: number;
-    lastRevertEpoch?: number;
-}
-
-class MagicContextCompartmentMirrorHeapHolder {
-    readonly cursors = new Map<string, CompartmentMirrorCursor>();
-}
-
-const compartmentMirrorHeapHolder = new MagicContextCompartmentMirrorHeapHolder();
-
-export function clearCompartmentMirrorCursor(sessionId: string): void {
-    compartmentMirrorHeapHolder.cursors.delete(sessionId);
-}
-
-export function resetCompartmentMirrorCursorsForTest(): void {
-    compartmentMirrorHeapHolder.cursors.clear();
-}
-
-/** Live compartment-mirror holder count used by the opt-in heap diagnostic RPC. */
-export function getCompartmentMirrorHeapStats(): {
-    entries: number;
-    sessionIds: string[];
-} {
-    return {
-        entries: compartmentMirrorHeapHolder.cursors.size,
-        sessionIds: [...compartmentMirrorHeapHolder.cursors.keys()],
-    };
-}
-
-function validateMirrorRow(
-    compartment: ModuleCompartmentMirrorRow,
-    afterSequence: number,
-    maxSequence: number,
-): void {
-    if (
-        !Number.isSafeInteger(compartment.sequence) ||
-        compartment.sequence <= afterSequence ||
-        compartment.sequence > maxSequence ||
-        !Number.isSafeInteger(compartment.start_message) ||
-        !Number.isSafeInteger(compartment.end_message) ||
-        typeof compartment.start_message_id !== "string" ||
-        typeof compartment.end_message_id !== "string" ||
-        typeof compartment.title !== "string" ||
-        typeof compartment.content !== "string"
-    ) {
-        throw new Error("module compartment mirror returned an invalid authoritative row");
-    }
-}
-
-function validateMirrorPage(
-    published: ModuleCompartmentMirrorResponse,
-    maxSequence: number | null,
-): void {
-    if (
-        !Number.isSafeInteger(published.max_sequence) ||
-        published.max_sequence < -1 ||
-        (maxSequence !== null && published.max_sequence !== maxSequence)
-    ) {
-        throw new Error("module compartment mirror changed while its authoritative set was read");
-    }
-}
-
-function compartmentMirrorSetChanged(
-    published: ModuleCompartmentMirrorResponse,
-    cursor: CompartmentMirrorCursor,
-): boolean {
-    if (published.set_changed === true) return true;
-    if (
-        published.revert_epoch !== undefined &&
-        cursor.lastRevertEpoch !== undefined &&
-        published.revert_epoch !== cursor.lastRevertEpoch
-    ) {
-        return true;
-    }
-    // session.status reports max_sequence = after_sequence when the table is empty,
-    // so a wipe is invisible to the sequence cursor. A zero count is the set change.
-    if (
-        published.compartment_count === 0 &&
-        cursor.lastMaxSequence >= 0 &&
-        published.compartments.length === 0
-    ) {
-        return true;
-    }
-    if (
-        published.compartment_count !== undefined &&
-        published.compartments.length === 0 &&
-        published.max_sequence === cursor.lastMaxSequence &&
-        published.compartment_count !== (cursor.lastCompartmentCount ?? cursor.lastMaxSequence)
-    ) {
-        return true;
-    }
-    return false;
-}
-
-function rememberCompartmentMirrorCursor(
-    sessionId: string,
-    maxSequence: number,
-    published: ModuleCompartmentMirrorResponse,
-    authoritativeCount: number,
-): void {
-    compartmentMirrorHeapHolder.cursors.set(sessionId, {
-        lastMaxSequence: maxSequence,
-        lastCompartmentCount: published.compartment_count ?? authoritativeCount,
-        lastRevertEpoch: published.revert_epoch,
-    });
-}
-
-async function resyncModuleCompartmentsFromAuthoritative(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    reader: ModuleCompartmentReader;
-}): Promise<number> {
-    const authoritative: ModuleCompartmentMirrorRow[] = [];
-    let afterSequence = -1;
-    let maxSequence: number | null = null;
-    let lastPublished: ModuleCompartmentMirrorResponse | undefined;
-
-    for (;;) {
-        const published = await args.reader.getCompartmentsAfter(args.sessionId, afterSequence);
-        validateMirrorPage(published, maxSequence);
-        maxSequence ??= published.max_sequence;
-        lastPublished = published;
-
-        let pageAdvanced = false;
-        for (const compartment of published.compartments) {
-            validateMirrorRow(compartment, afterSequence, maxSequence);
-            authoritative.push(compartment);
-            afterSequence = compartment.sequence;
-            pageAdvanced = true;
-        }
-
-        if (afterSequence >= maxSequence) break;
-        if (!pageAdvanced) {
-            throw new Error("module compartment mirror returned an incomplete authoritative set");
-        }
-    }
-
-    const local = args.db
-        .prepare(
-            "SELECT sequence, end_message FROM compartments WHERE session_id = ? ORDER BY sequence ASC",
-        )
-        .all(args.sessionId) as Array<{ sequence: number; end_message: number }>;
-    let firstDifference = 0;
-    while (
-        firstDifference < local.length &&
-        firstDifference < authoritative.length &&
-        local[firstDifference]?.sequence === authoritative[firstDifference]?.sequence &&
-        local[firstDifference]?.end_message === authoritative[firstDifference]?.end_message
-    ) {
-        firstDifference += 1;
-    }
-    const localDifference = local[firstDifference]?.sequence;
-    const authoritativeDifference = authoritative[firstDifference]?.sequence;
-    const divergentSequence =
-        localDifference === undefined
-            ? authoritativeDifference
-            : authoritativeDifference === undefined
-              ? localDifference
-              : Math.min(localDifference, authoritativeDifference);
-
-    const upsert = args.db.prepare(
-        `INSERT INTO compartments
-            (session_id, sequence, start_message, end_message, start_message_id, end_message_id,
-             title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(session_id, sequence) DO UPDATE SET
-             start_message = excluded.start_message,
-             end_message = excluded.end_message,
-             start_message_id = excluded.start_message_id,
-             end_message_id = excluded.end_message_id,
-             title = excluded.title,
-             content = excluded.content,
-             p1 = excluded.p1,
-             p2 = excluded.p2,
-             p3 = excluded.p3,
-             p4 = excluded.p4,
-             importance = excluded.importance,
-             episode_type = excluded.episode_type,
-             legacy = excluded.legacy,
-             created_at = excluded.created_at,
-             harness = excluded.harness`,
-    );
-    const now = Date.now();
-    args.db
-        .transaction(() => {
-            if (divergentSequence !== undefined) {
-                args.db
-                    .prepare("DELETE FROM compartments WHERE session_id = ? AND sequence >= ?")
-                    .run(args.sessionId, divergentSequence);
-            }
-            for (const compartment of authoritative) {
-                upsert.run(
-                    args.sessionId,
-                    compartment.sequence,
-                    compartment.start_message,
-                    compartment.end_message,
-                    compartment.start_message_id,
-                    compartment.end_message_id,
-                    compartment.title,
-                    compartment.content,
-                    compartment.p1 ?? null,
-                    compartment.p2 ?? null,
-                    compartment.p3 ?? null,
-                    compartment.p4 ?? null,
-                    compartment.importance ?? 50,
-                    compartment.episode_type ?? null,
-                    compartment.legacy ?? (compartment.p1 ? 0 : 1),
-                    compartment.created_at ?? now,
-                    getHarness(),
-                );
-            }
-        })
-        .immediate();
-    rememberCompartmentMirrorCursor(
-        args.sessionId,
-        maxSequence,
-        lastPublished ?? { max_sequence: maxSequence, compartments: [] },
-        authoritative.length,
-    );
-    return maxSequence;
-}
-
-export async function mirrorModuleCompartments(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    reader: ModuleCompartmentReader;
-}): Promise<number> {
-    // A process-local cursor avoids re-reading the full authoritative set on every
-    // pass. The first call, a max_sequence regression, a sequence gap, or a set
-    // change the cursor cannot express still walks from -1.
-    const cursor = compartmentMirrorHeapHolder.cursors.get(args.sessionId);
-    if (cursor !== undefined) {
-        const published = await args.reader.getCompartmentsAfter(
-            args.sessionId,
-            cursor.lastMaxSequence,
-        );
-        validateMirrorPage(published, null);
-        for (const compartment of published.compartments) {
-            validateMirrorRow(compartment, cursor.lastMaxSequence, published.max_sequence);
-        }
-        const firstNew = published.compartments[0];
-        const hasGap = firstNew !== undefined && firstNew.sequence !== cursor.lastMaxSequence + 1;
-        const regressed = published.max_sequence < cursor.lastMaxSequence;
-        const setChanged = compartmentMirrorSetChanged(published, cursor);
-        if (
-            !regressed &&
-            !hasGap &&
-            !setChanged &&
-            published.compartments.length === 0 &&
-            published.max_sequence === cursor.lastMaxSequence
-        ) {
-            return published.max_sequence;
-        }
-    }
-
-    return resyncModuleCompartmentsFromAuthoritative(args);
 }
 
 interface ModuleWorkspaceContext {
@@ -558,10 +228,6 @@ function effectiveLastTodoState(
     const verdict = resolveTodowriteAvailability(sessionId);
     if (verdict.frozen && !verdict.callable) return "";
     return sessionMeta.lastTodoState ?? "";
-}
-
-function yieldToEventLoop(): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function resolveModuleWorkspaceContext(
@@ -642,7 +308,7 @@ export function loadModuleWatermarks(args: {
     const memoryMutationId = args.projectPath
         ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
         : 0;
-    const evaluationProject = args.noteEvaluationProjectPath ?? args.projectPath;
+    const _evaluationProject = args.noteEvaluationProjectPath ?? args.projectPath;
     return {
         compartment_sequence: compartmentRow?.max_sequence ?? -1,
         memory_id: memoryId,
@@ -657,9 +323,7 @@ export function loadModuleWatermarks(args: {
             0,
         workspace_fingerprint: workspace.workspace?.fingerprint ?? null,
         reasoning_cleared_through_tag: sessionMeta.clearedReasoningThroughTag ?? 0,
-        note_evaluation_available: evaluationProject
-            ? getModuleNoteEvaluationBridge(evaluationProject) !== undefined
-            : false,
+        note_evaluation_available: true,
     };
 }
 
@@ -682,7 +346,7 @@ export function moduleWatermarksEqual(
     );
 }
 
-function flatBlockIdForRawMessage(
+function _flatBlockIdForRawMessage(
     messageId: string,
     raw: RawMessageParts | null,
     edge: "start" | "end",
@@ -715,117 +379,6 @@ export function canonicalOrdinalForMessageId(args: {
     if (canonical === null || canonical < 1) return null;
     args.state.idOrdinalMemo.set(args.messageId, canonical);
     return canonical;
-}
-
-let boundaryDiagnosticObserverForTest: ((message: string) => void) | null = null;
-
-function logBoundaryDiagnostic(sessionId: string, message: string): void {
-    sessionLog(sessionId, message);
-    boundaryDiagnosticObserverForTest?.(message);
-}
-
-interface CompartmentBoundaryResolution {
-    startRaw: RawMessageParts | null;
-    endRaw: RawMessageParts | null;
-    startOrdinal: number | null | "mismatch";
-    endOrdinal: number | null | "mismatch";
-}
-
-function readCompartmentBoundaryResolution(args: {
-    compartment: ReturnType<typeof getCompartments>[number];
-    sessionId: string;
-    readRawById: (messageId: string) => RawMessageParts | null;
-    state: ModuleStateSyncState;
-}): CompartmentBoundaryResolution {
-    const startRaw = args.readRawById(args.compartment.startMessageId);
-    const endRaw = args.readRawById(args.compartment.endMessageId);
-    return {
-        startRaw,
-        endRaw,
-        startOrdinal: canonicalOrdinalForMessageId({
-            sessionId: args.sessionId,
-            raw: startRaw,
-            messageId: args.compartment.startMessageId,
-            generation: args.state.moduleGeneration,
-            state: args.state,
-        }),
-        endOrdinal: canonicalOrdinalForMessageId({
-            sessionId: args.sessionId,
-            raw: endRaw,
-            messageId: args.compartment.endMessageId,
-            generation: args.state.moduleGeneration,
-            state: args.state,
-        }),
-    };
-}
-
-function serializeCompartment(args: {
-    compartment: ReturnType<typeof getCompartments>[number];
-    startRaw: RawMessageParts | null;
-    endRaw: RawMessageParts | null;
-    startOrdinal: number;
-    endOrdinal: number;
-}): unknown {
-    const startCreatedAt = args.startRaw?.createdAt;
-    const endCreatedAt = args.endRaw?.createdAt;
-    const dateRange =
-        typeof startCreatedAt === "number" && typeof endCreatedAt === "number"
-            ? { start_date: formatDate(startCreatedAt), end_date: formatDate(endCreatedAt) }
-            : {};
-    return {
-        sequence: args.compartment.sequence,
-        start_message: args.startOrdinal,
-        end_message: args.endOrdinal,
-        start_message_id: flatBlockIdForRawMessage(
-            args.compartment.startMessageId,
-            args.startRaw,
-            "start",
-        ),
-        end_message_id: flatBlockIdForRawMessage(args.compartment.endMessageId, args.endRaw, "end"),
-        ...dateRange,
-        title: args.compartment.title,
-        content: args.compartment.content,
-        p1: args.compartment.p1,
-        p2: args.compartment.p2,
-        p3: args.compartment.p3,
-        p4: args.compartment.p4,
-        importance: args.compartment.importance,
-        episode_type: args.compartment.episodeType,
-        legacy: args.compartment.legacy,
-        created_at: args.compartment.createdAt,
-    };
-}
-
-function adjacentCompartmentBoundaryId(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    sequence: number;
-    direction: "previous" | "next";
-}): string | null {
-    const previous = args.direction === "previous";
-    const row = args.db
-        .prepare(
-            `SELECT ${previous ? "end_message_id" : "start_message_id"} AS message_id
-               FROM compartments
-              WHERE session_id = ? AND sequence ${previous ? "<" : ">"} ?
-              ORDER BY sequence ${previous ? "DESC" : "ASC"}
-              LIMIT 1`,
-        )
-        .get(args.sessionId, args.sequence) as { message_id?: unknown } | undefined;
-    return typeof row?.message_id === "string" && row.message_id.length > 0 ? row.message_id : null;
-}
-
-function seedBoundaryFromSerializedCompartments(compartments: unknown[]): string | null {
-    const serialized = compartments
-        .filter(isRecord)
-        .filter(
-            (compartment) =>
-                typeof compartment.sequence === "number" &&
-                typeof compartment.end_message_id === "string",
-        );
-    serialized.sort((left, right) => (left.sequence as number) - (right.sequence as number));
-    const tail = serialized.at(-1);
-    return typeof tail?.end_message_id === "string" ? tail.end_message_id : null;
 }
 
 function canonicalSeedJson(value: unknown): string {
@@ -1070,101 +623,11 @@ function buildStripSeeds(args: { db: ContextDatabase; sessionId: string }): Modu
 }
 
 type SeedItem =
-    | { kind: "compartment"; value: unknown }
-    | { kind: "memory"; value: unknown }
-    | { kind: "memory_mutation"; value: unknown }
     | { kind: "drop_seed"; value: ModuleDropSeed }
     | { kind: "pending_agent_drop"; value: ModulePendingDropSeed }
     | { kind: "note_nudge_anchor"; value: ModuleNoteNudgeAnchorSeed }
     | { kind: "auto_search_hint"; value: ModuleAutoSearchHintSeed }
-    | { kind: "strip_seed"; value: ModuleStripSeed }
-    | { kind: "user_profile"; value: string };
-
-function readCompartmentsAfterSequence(
-    db: ContextDatabase,
-    sessionId: string,
-    afterSequence: number,
-): Compartment[] {
-    const rows = db
-        .prepare(
-            `SELECT id, session_id, sequence, start_message, end_message,
-                    start_message_id, end_message_id, title, content,
-                    p1, p2, p3, p4, importance, episode_type, legacy, created_at,
-                    rebase_status
-               FROM compartments
-              WHERE session_id = ? AND sequence > ?
-              ORDER BY sequence ASC`,
-        )
-        .all(sessionId, afterSequence) as Array<Record<string, unknown>>;
-    return rows
-        .filter(
-            (row) =>
-                typeof row.id === "number" &&
-                typeof row.session_id === "string" &&
-                typeof row.sequence === "number" &&
-                typeof row.start_message === "number" &&
-                typeof row.end_message === "number" &&
-                typeof row.start_message_id === "string" &&
-                typeof row.end_message_id === "string" &&
-                typeof row.title === "string" &&
-                typeof row.content === "string" &&
-                typeof row.created_at === "number",
-        )
-        .map((row) => ({
-            id: row.id as number,
-            sessionId: row.session_id as string,
-            sequence: row.sequence as number,
-            startMessage: row.start_message as number,
-            endMessage: row.end_message as number,
-            startMessageId: row.start_message_id as string,
-            endMessageId: row.end_message_id as string,
-            title: row.title as string,
-            content: row.content as string,
-            p1: typeof row.p1 === "string" ? row.p1 : null,
-            p2: typeof row.p2 === "string" ? row.p2 : null,
-            p3: typeof row.p3 === "string" ? row.p3 : null,
-            p4: typeof row.p4 === "string" ? row.p4 : null,
-            importance: typeof row.importance === "number" ? row.importance : 50,
-            episodeType: typeof row.episode_type === "string" ? row.episode_type : null,
-            legacy: typeof row.legacy === "number" ? row.legacy : 0,
-            createdAt: row.created_at as number,
-            rebaseStatus: (row.rebase_status === "unresolved" ? "unresolved" : "ok") as
-                | "ok"
-                | "unresolved",
-        }));
-}
-
-function readRenderedMemoryIds(args: {
-    db: ContextDatabase;
-    projectPath?: string;
-    workspace: ModuleWorkspaceContext;
-    nowMs: number;
-}): number[] {
-    if (!args.projectPath) return [];
-    const identities =
-        args.workspace.expandedIdentities.length > 0
-            ? args.workspace.expandedIdentities
-            : [args.projectPath];
-    const filter = buildWorkspaceMemorySqlFilter({
-        identities,
-        ownIdentities: args.workspace.ownIdentities,
-        shareCategories: args.workspace.shareCategories,
-        tableName: "m",
-    });
-    const placeholders = identities.map(() => "?").join(", ");
-    const rows = args.db
-        .prepare(
-            `SELECT m.id
-               FROM memories AS m
-              WHERE m.project_path IN (${placeholders})
-                AND m.status IN ('active', 'permanent')
-                AND (m.expires_at IS NULL OR m.expires_at > ?)
-                ${filter.clause}
-              ORDER BY m.id ASC`,
-        )
-        .all(...identities, args.nowMs, ...filter.params) as Array<{ id?: unknown }>;
-    return rows.flatMap((row) => (typeof row.id === "number" ? [row.id] : []));
-}
+    | { kind: "strip_seed"; value: ModuleStripSeed };
 
 function encodedSeedItemBytes(item: SeedItem): number {
     const encoded = JSON.stringify(item.value);
@@ -1177,9 +640,6 @@ export function buildPagedModuleStateSyncPayloads(
         expectedShadowSeq: number;
         seedId: string;
         seedBoundaryId: string | null;
-        compartments: unknown[];
-        memories: unknown[];
-        memoryMutations: unknown[];
         dropSeeds?: ModuleDropSeed[];
         dropSeedSkipped?: number;
         pendingDropSeeds?: ModulePendingDropSeed[];
@@ -1194,22 +654,12 @@ export function buildPagedModuleStateSyncPayloads(
         stripSeeds?: ModuleStripSeed[];
         stripSeedSkipped?: number;
         reasoningClearedThroughTag?: number;
-        userProfile: string[];
-        workspace: ModuleWorkspacePayload | null;
         lastTodoState: string;
         watermarks: ModuleWatermarks;
-        omitAuthorityMemorySections?: boolean;
     },
     maxPageBytes = MODULE_PAGE_MAX_BYTES,
 ): ModuleStateSyncPayload[] {
     const items: SeedItem[] = [
-        ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
-        ...(args.omitAuthorityMemorySections
-            ? []
-            : args.memories.map((value) => ({ kind: "memory", value }) as const)),
-        ...(args.omitAuthorityMemorySections
-            ? []
-            : args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const)),
         ...(args.dropSeeds ?? []).map((value) => ({ kind: "drop_seed", value }) as const),
         ...(args.pendingDropSeeds ?? []).map(
             (value) => ({ kind: "pending_agent_drop", value }) as const,
@@ -1221,57 +671,40 @@ export function buildPagedModuleStateSyncPayloads(
             (value) => ({ kind: "auto_search_hint", value }) as const,
         ),
         ...(args.stripSeeds ?? []).map((value) => ({ kind: "strip_seed", value }) as const),
-        ...args.userProfile.map((value) => ({ kind: "user_profile", value }) as const),
     ];
 
     type SeedBatch = {
-        compartments: unknown[];
-        memories: unknown[];
-        memoryMutations: unknown[];
         dropSeeds: ModuleDropSeed[];
         pendingAgentDrops: ModulePendingDropSeed[];
         noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
         autoSearchHintDecisions: ModuleAutoSearchHintSeed[];
         stripSeeds: ModuleStripSeed[];
-        userProfile: string[];
     };
 
     const emptyBatch = (): SeedBatch => ({
-        compartments: [],
-        memories: [],
-        memoryMutations: [],
         dropSeeds: [],
         pendingAgentDrops: [],
         noteNudgeAnchors: [],
         autoSearchHintDecisions: [],
         stripSeeds: [],
-        userProfile: [],
     });
 
     const appendItem = (batch: SeedBatch, item: SeedItem): void => {
-        if (item.kind === "compartment") batch.compartments.push(item.value);
-        else if (item.kind === "memory") batch.memories.push(item.value);
-        else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
-        else if (item.kind === "drop_seed") batch.dropSeeds.push(item.value);
+        if (item.kind === "drop_seed") batch.dropSeeds.push(item.value);
         else if (item.kind === "pending_agent_drop") batch.pendingAgentDrops.push(item.value);
         else if (item.kind === "note_nudge_anchor") batch.noteNudgeAnchors.push(item.value);
         else if (item.kind === "auto_search_hint") batch.autoSearchHintDecisions.push(item.value);
         else if (item.kind === "strip_seed") batch.stripSeeds.push(item.value);
-        else batch.userProfile.push(item.value);
     };
 
     const makePayload = (input: {
         index: number;
         total: number;
         complete: boolean;
-        compartments: unknown[];
-        memories: unknown[];
-        memoryMutations: unknown[];
         dropSeeds?: ModuleDropSeed[];
         pendingAgentDrops: ModulePendingDropSeed[];
         noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
         autoSearchHintDecisions: ModuleAutoSearchHintSeed[];
-        userProfile: string[];
         dropSeedSkipped?: number;
         pendingDropSkipped?: number;
         autoSearchHintSkipped?: number;
@@ -1289,14 +722,6 @@ export function buildPagedModuleStateSyncPayloads(
             seed_batch_index: input.index,
             seed_batch_total: input.total,
             seed_complete: input.complete,
-            compartments: input.compartments,
-            ...(args.omitAuthorityMemorySections
-                ? {}
-                : {
-                      memories: input.memories,
-                      memory_mutations: input.memoryMutations,
-                  }),
-            user_profile: input.userProfile,
             ...(args.dropSeeds !== undefined ? { drop_seeds: input.dropSeeds } : {}),
             ...(args.pendingDropSeeds !== undefined
                 ? { pending_agent_drops: input.pendingAgentDrops }
@@ -1311,10 +736,7 @@ export function buildPagedModuleStateSyncPayloads(
             ...(input.complete
                 ? {
                       seed_boundary_id: args.seedBoundaryId,
-                      workspace: args.workspace,
                       last_todo_state: args.lastTodoState,
-                      project_memory_epoch: args.watermarks.project_memory_epoch,
-                      user_profile_version: args.watermarks.project_user_profile_version,
                       acked_watermarks: args.watermarks,
                       note_evaluation_available: args.watermarks.note_evaluation_available ?? false,
                       ...(args.dropSeedSkipped !== undefined
@@ -1436,9 +858,6 @@ export async function buildModuleStateSyncPayload(args: {
         };
     const workspace = resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath);
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
-    // One authority pool has one writer. While MODULE owns memories, this sender only mirrors
-    // module changes back to TypeScript and must not send the TypeScript view in the other direction.
-    const omitAuthorityMemorySections = args.options?.authorityState === "MODULE";
     const currentWatermarks = loadModuleWatermarks({
         db: args.pass.db,
         sessionId: args.pass.sessionId,
@@ -1447,17 +866,10 @@ export async function buildModuleStateSyncPayload(args: {
         sessionMeta,
         noteEvaluationProjectPath: args.options?.noteEvaluationProjectPath,
     });
-    if (
-        !args.force &&
-        args.state.lastAckedWatermarks &&
-        currentWatermarks.m0_mutation_id > args.state.lastAckedWatermarks.m0_mutation_id
-    ) {
-        return "m0_mutation";
-    }
     if (!args.force && moduleWatermarksEqual(args.state.lastAckedWatermarks, currentWatermarks)) {
         return null;
     }
-    const acked = args.force
+    const _acked = args.force
         ? {
               compartment_sequence: -1,
               memory_id: 0,
@@ -1535,262 +947,6 @@ export async function buildModuleStateSyncPayload(args: {
         }
         return rawById.get(messageId) ?? null;
     };
-    const compartmentsChanged =
-        args.force || currentWatermarks.compartment_sequence > acked.compartment_sequence;
-    const memoryChanged =
-        !omitAuthorityMemorySections &&
-        (args.force ||
-            currentWatermarks.memory_id > acked.memory_id ||
-            currentWatermarks.project_memory_epoch !== acked.project_memory_epoch);
-    const memoryMutationsChanged =
-        !omitAuthorityMemorySections &&
-        (args.force || currentWatermarks.memory_mutation_id > acked.memory_mutation_id);
-    const profileChanged =
-        args.force ||
-        currentWatermarks.project_user_profile_version !== acked.project_user_profile_version;
-    const workspaceFingerprintChanged =
-        args.force ||
-        !Object.hasOwn(acked, "workspace_fingerprint") ||
-        (currentWatermarks.workspace_fingerprint ?? null) !== (acked.workspace_fingerprint ?? null);
-    const useStateSyncDeltas = args.options?.stateSyncDeltas === true;
-    const includeUserProfile = !useStateSyncDeltas || profileChanged;
-    const includeWorkspace = !useStateSyncDeltas || workspaceFingerprintChanged;
-
-    const compartments: unknown[] = [];
-    let serializedCount = 0;
-    const compartmentsToSerialize = compartmentsChanged
-        ? args.force
-            ? inventory
-                ? readCompartmentsAfterSequence(
-                      args.pass.db,
-                      args.pass.sessionId,
-                      inventory.maxCompartmentSequence,
-                  )
-                : getCompartments(args.pass.db, args.pass.sessionId)
-            : readCompartmentsAfterSequence(
-                  args.pass.db,
-                  args.pass.sessionId,
-                  acked.compartment_sequence,
-              )
-        : [];
-    const boundaryResolutions = new Map<number, CompartmentBoundaryResolution>();
-    const resolveBoundary = (
-        compartment: (typeof compartmentsToSerialize)[number],
-    ): CompartmentBoundaryResolution => {
-        const cached = boundaryResolutions.get(compartment.sequence);
-        if (cached) return cached;
-        const resolved = readCompartmentBoundaryResolution({
-            compartment,
-            sessionId: args.pass.sessionId,
-            readRawById,
-            state: args.state,
-        });
-        boundaryResolutions.set(compartment.sequence, resolved);
-        return resolved;
-    };
-    const canonicalOrdinalForAdjacentId = (
-        messageId: string | null,
-    ): number | null | "mismatch" => {
-        if (!messageId) return null;
-        const raw = readRawById(messageId);
-        return canonicalOrdinalForMessageId({
-            sessionId: args.pass.sessionId,
-            raw,
-            messageId,
-            generation: args.state.moduleGeneration,
-            state: args.state,
-        });
-    };
-    let firstRawOrdinal: number | null | undefined;
-    for (const [index, compartment] of compartmentsToSerialize.entries()) {
-        args.options?.beforeSerializeCompartment?.();
-        if (args.options?.shouldAbortSeed?.()) return "seed_budget";
-        const boundary = resolveBoundary(compartment);
-        if (boundary.startOrdinal === "mismatch" || boundary.endOrdinal === "mismatch") {
-            return "mismatch";
-        }
-        const startMissing = boundary.startOrdinal === null;
-        const endMissing = boundary.endOrdinal === null;
-        if (startMissing && endMissing) {
-            logBoundaryDiagnostic(
-                args.pass.sessionId,
-                `state-sync compartment skipped session=${args.pass.sessionId} sequence=${compartment.sequence} missing_start_id=${compartment.startMessageId} missing_end_id=${compartment.endMessageId} method=both_boundaries_dangling`,
-            );
-            continue;
-        }
-
-        let startOrdinal = boundary.startOrdinal;
-        if (startOrdinal === null) {
-            const previous = compartmentsToSerialize[index - 1];
-            const previousBoundaryId = previous
-                ? previous.endMessageId
-                : adjacentCompartmentBoundaryId({
-                      db: args.pass.db,
-                      sessionId: args.pass.sessionId,
-                      sequence: compartment.sequence,
-                      direction: "previous",
-                  });
-            const previousEnd = previous
-                ? resolveBoundary(previous).endOrdinal
-                : canonicalOrdinalForAdjacentId(previousBoundaryId);
-            if (previousEnd === "mismatch") return "mismatch";
-            if (typeof previousEnd === "number") {
-                startOrdinal = previousEnd + 1;
-                logBoundaryDiagnostic(
-                    args.pass.sessionId,
-                    `state-sync boundary repaired session=${args.pass.sessionId} sequence=${compartment.sequence} side=start missing_id=${compartment.startMessageId} resolved_ordinal=${startOrdinal} method=previous_compartment_end_plus_one`,
-                );
-            } else if (previousBoundaryId === null) {
-                if (firstRawOrdinal === undefined) {
-                    firstRawOrdinal =
-                        readRawSessionMessageIdOrdinalsForRange(args.pass.sessionId, 1, 1)
-                            .values()
-                            .next().value ?? null;
-                }
-                startOrdinal = firstRawOrdinal;
-                if (startOrdinal !== null) {
-                    logBoundaryDiagnostic(
-                        args.pass.sessionId,
-                        `state-sync boundary repaired session=${args.pass.sessionId} sequence=${compartment.sequence} side=start missing_id=${compartment.startMessageId} resolved_ordinal=${startOrdinal} method=raw_store_first_ordinal`,
-                    );
-                }
-            }
-        }
-
-        let endOrdinal = boundary.endOrdinal;
-        if (endOrdinal === null) {
-            const next = compartmentsToSerialize[index + 1];
-            const nextStart = next
-                ? resolveBoundary(next).startOrdinal
-                : canonicalOrdinalForAdjacentId(
-                      adjacentCompartmentBoundaryId({
-                          db: args.pass.db,
-                          sessionId: args.pass.sessionId,
-                          sequence: compartment.sequence,
-                          direction: "next",
-                      }),
-                  );
-            if (nextStart === "mismatch") return "mismatch";
-            if (typeof nextStart === "number") {
-                endOrdinal = nextStart - 1;
-                logBoundaryDiagnostic(
-                    args.pass.sessionId,
-                    `state-sync boundary repaired session=${args.pass.sessionId} sequence=${compartment.sequence} side=end missing_id=${compartment.endMessageId} resolved_ordinal=${endOrdinal} method=next_compartment_start_minus_one`,
-                );
-            }
-        }
-
-        if (startOrdinal === null || endOrdinal === null || startOrdinal > endOrdinal) {
-            logBoundaryDiagnostic(
-                args.pass.sessionId,
-                `state-sync compartment skipped session=${args.pass.sessionId} sequence=${compartment.sequence} missing_start_id=${startMissing ? compartment.startMessageId : "none"} missing_end_id=${endMissing ? compartment.endMessageId : "none"} method=${startOrdinal !== null && endOrdinal !== null ? "invalid_repaired_range" : "no_adjacent_canonical_boundary"}`,
-            );
-            continue;
-        }
-        compartments.push(
-            serializeCompartment({
-                compartment,
-                startRaw: boundary.startRaw,
-                endRaw: boundary.endRaw,
-                startOrdinal,
-                endOrdinal,
-            }),
-        );
-        serializedCount += 1;
-        const yieldEvery = Math.max(1, args.options?.yieldEveryCompartments ?? 10);
-        if (serializedCount % yieldEvery === 0) {
-            await yieldToEventLoop();
-            if (args.options?.shouldAbortSeed?.()) return "seed_budget";
-        }
-    }
-
-    const allMemories =
-        args.force && !omitAuthorityMemorySections && args.pass.projectPath
-            ? workspace.workspace
-                ? getMemoriesByProjects(
-                      args.pass.db,
-                      workspace.expandedIdentities,
-                      ["active", "permanent"],
-                      args.pass.nowMs,
-                      workspace.ownIdentities,
-                      workspace.shareCategories,
-                  )
-                : getMemoriesByProject(
-                      args.pass.db,
-                      args.pass.projectPath,
-                      ["active", "permanent"],
-                      args.pass.nowMs,
-                  )
-            : [];
-    const incrementalMemories =
-        memoryChanged && !args.force && args.pass.projectPath
-            ? readNewMemoriesForM1Union(
-                  args.pass.db,
-                  workspace.expandedIdentities,
-                  acked.memory_id,
-                  args.pass.nowMs,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : [];
-    const memoryRows = args.force ? allMemories : incrementalMemories;
-    const memories = memoryRows.map((memory) => ({
-        id: memory.id,
-        project_path: memory.projectPath,
-        category: memory.category,
-        content: memory.content,
-        normalized_hash: memory.normalizedHash,
-        importance: memory.importance,
-        scope: memory.scope,
-        shareable: memory.shareable,
-        source_session_id: memory.sourceSessionId,
-        source_type: memory.sourceType,
-        seen_count: memory.seenCount,
-        retrieval_count: memory.retrievalCount,
-        first_seen_at: memory.firstSeenAt,
-        created_at: memory.createdAt,
-        updated_at: memory.updatedAt,
-        last_seen_at: memory.lastSeenAt,
-        last_retrieved_at: memory.lastRetrievedAt,
-        status: memory.status,
-        expires_at: memory.expiresAt,
-        verification_status: memory.verificationStatus,
-        verified_at: memory.verifiedAt,
-        superseded_by_memory_id: memory.supersededByMemoryId,
-        merged_from: memory.mergedFrom,
-        metadata_json: memory.metadataJson,
-    }));
-    const renderedMemoryIds = memoryMutationsChanged
-        ? args.force
-            ? allMemories.map((memory) => memory.id)
-            : readRenderedMemoryIds({
-                  db: args.pass.db,
-                  projectPath: args.pass.projectPath,
-                  workspace,
-                  nowMs: args.pass.nowMs,
-              })
-        : [];
-    const userProfile = includeUserProfile
-        ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
-        : [];
-    const memoryMutations =
-        memoryMutationsChanged && args.pass.projectPath
-            ? getMemoryMutationsForRenderByProjects(
-                  args.pass.db,
-                  workspace.expandedIdentities,
-                  acked.memory_mutation_id,
-                  renderedMemoryIds,
-              ).map((row) => ({
-                  id: row.id,
-                  project_path: row.projectPath,
-                  mutation_type: row.mutationType,
-                  target_memory_id: row.targetMemoryId,
-                  superseded_by_id: row.supersededById,
-                  category: row.category,
-                  new_content: row.newContent,
-                  queued_at: row.queuedAt,
-              }))
-            : [];
     const pendingDropSeedState = args.force
         ? buildPendingDropSeeds({
               db: args.pass.db,
@@ -1875,13 +1031,7 @@ export async function buildModuleStateSyncPayload(args: {
         moduleGeneration: args.state.moduleGeneration,
         expectedShadowSeq: args.state.lastAckedSeq,
         seedId: args.seedId ?? randomUUID(),
-        seedBoundaryId:
-            args.state.seedPassPending === true
-                ? seedBoundaryFromSerializedCompartments(compartments)
-                : null,
-        compartments,
-        memories,
-        memoryMutations,
+        seedBoundaryId: inventory?.boundaryId ?? null,
         dropSeeds:
             dropSeedState && dropSeedState.seeds.length > 0 ? dropSeedState.seeds : undefined,
         dropSeedSkipped:
@@ -1914,11 +1064,8 @@ export async function buildModuleStateSyncPayload(args: {
         stripSeeds: stripSeeds && stripSeeds.length > 0 ? stripSeeds : undefined,
         stripSeedSkipped: undefined,
         reasoningClearedThroughTag: sessionMeta.clearedReasoningThroughTag,
-        userProfile,
-        workspace: workspace.workspace,
         lastTodoState: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
         watermarks: currentWatermarks,
-        omitAuthorityMemorySections,
     };
     if (args.force) {
         const pageStarted = performance.now();
@@ -1931,13 +1078,7 @@ export async function buildModuleStateSyncPayload(args: {
         params: {
             shadow_generation: args.state.moduleGeneration,
             expected_shadow_seq: args.state.lastAckedSeq,
-            compartments,
-            ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
-            ...(includeUserProfile ? { user_profile: userProfile } : {}),
-            ...(includeWorkspace ? { workspace: workspace.workspace } : {}),
             last_todo_state: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
-            project_memory_epoch: currentWatermarks.project_memory_epoch,
-            user_profile_version: currentWatermarks.project_user_profile_version,
             acked_watermarks: currentWatermarks,
             note_evaluation_available: currentWatermarks.note_evaluation_available ?? false,
             ...(pendingCompactionMarker !== undefined
@@ -1991,11 +1132,6 @@ export interface ModuleStateSyncClient {
         bypassSessionLane?: boolean;
         timeoutMs?: number;
     }): Promise<unknown>;
-}
-
-function responseMemoriesSkipped(response: unknown): boolean {
-    const value = isRecord(response) && isRecord(response.result) ? response.result : response;
-    return isRecord(value) && value.memories_skipped === true;
 }
 
 function isHistorianCompartmentSyncBusy(error: unknown): boolean {
@@ -2087,8 +1223,7 @@ export async function syncModuleState(args: {
             !force &&
             args.options?.knownWatermarksUnchanged === true &&
             args.state.lastAckedWatermarks !== null &&
-            (args.state.lastAckedWatermarks.note_evaluation_available ?? false) ===
-                (getModuleNoteEvaluationBridge(args.projectRoot) !== undefined)
+            args.state.lastAckedWatermarks.note_evaluation_available === true
         ) {
             return { status: "no_change" };
         }
@@ -2265,7 +1400,7 @@ export async function syncModuleState(args: {
                     timing.serialize += performance.now() - encodeStarted;
                     timing.bytes += pageBytes;
                     timing.pages += 1;
-                    timing.compartments += batch.params.compartments.length;
+
                     timing.tags += batch.params.drop_seeds?.length ?? 0;
                     const transportStarted = performance.now();
                     const response = await args.client
@@ -2295,17 +1430,6 @@ export async function syncModuleState(args: {
                         stateSyncDeltas = await resolveStateSyncDeltas(true);
                         continue syncLoop;
                     }
-                    if (
-                        args.options?.authority === true &&
-                        responseMemoriesSkipped(response) &&
-                        !args.state.authorityMemorySyncSkipLogged
-                    ) {
-                        args.state.authorityMemorySyncSkipLogged = true;
-                        sessionLog(
-                            args.pass.sessionId,
-                            "authority state sync skipped module-owned memory sections",
-                        );
-                    }
                 }
             } catch (error) {
                 if (isHistorianCompartmentSyncBusy(error)) {
@@ -2334,9 +1458,6 @@ export async function syncModuleState(args: {
 }
 
 export const __moduleStateSyncTest = {
-    setBoundaryDiagnosticObserver(observer: ((message: string) => void) | null): void {
-        boundaryDiagnosticObserverForTest = observer;
-    },
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
     canonicalOrdinalForMessageId,

@@ -146,12 +146,10 @@ function createFixture(
         sessionDirectoryBySession: new Map([[sessionId, project]]),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
         muralEnabled: true,
     };
     const transform = createRustModeTransform(deps, {
         moduleClient,
-        allowAuthorityProtocolBypassForTests: true,
         disableHotPathIoCachesForTests: disableCache,
         muralResolverForTests,
         scheduleLkgCapture: (capture) => capture(),
@@ -162,6 +160,7 @@ function createFixture(
         muralHashOnPass,
         modelOnPass,
         async run() {
+            deps.pendingMaterializationSessions.add(sessionId);
             const input = structuredClone(messages);
             await transform.run(
                 sessionId,
@@ -267,16 +266,21 @@ test("an updated durable artifact reaches the next HARD response instead of the 
     }
 });
 
-test("unchanged vision verdict keeps the PNG cached across catalog refreshes and HARD responses", async () => {
+test("HARD opportunities recheck unchanged cues while preserving the stored artifact", async () => {
     const fixture = createFixture("mural-cache-stable-verdict");
     const render = spyOn(muralRenderer, "renderMural");
     try {
+        let renderedAt: number | undefined;
         for (let pass = 0; pass < 5; pass++) {
             await refreshCatalog(true);
             await fixture.run();
+            const artifact = getMural(fixture.db, project);
+            expect(artifact).not.toBeNull();
+            renderedAt ??= artifact!.renderedAt;
+            expect(artifact!.renderedAt).toBe(renderedAt);
         }
         expect(fixture.muralOnPass).toEqual([true, true, true, true, true]);
-        expect(render).toHaveBeenCalledTimes(1);
+        expect(render).toHaveBeenCalledTimes(5);
     } finally {
         render.mockRestore();
         fixture.dispose();

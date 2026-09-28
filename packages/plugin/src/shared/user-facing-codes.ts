@@ -204,6 +204,11 @@ export const USER_FACING_FAILURES = {
         sentence: "Magic Context is temporarily unavailable.",
         action: "Retry in a moment.",
     },
+    single_store_migration_required: {
+        code: "MC-C14",
+        sentence: "Magic Context's Rust mode needs a one-time migration of its store.",
+        action: "Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`.",
+    },
     store_ahead_of_binary: {
         code: "MC-C13",
         sentence:

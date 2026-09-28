@@ -236,125 +236,6 @@ test("production verification paths normalize tracked files in a real git projec
     expect(result.gitRoot).toBe(realpathSync.native(dir));
 });
 
-describe("verify authority applier", () => {
-    test("writes through memory.set_verification under MODULE authority without mutating the mirror", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:module-verify";
-            const dir = tempProject();
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "ARCHITECTURE",
-                content: "The module owns this verified memory.",
-            });
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, 202, ?)",
-            ).run(projectIdentity, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, 202, ?, ?)",
-            ).run(projectIdentity, memory.category, memory.normalizedHash);
-            const calls: Array<{ method: string; body: unknown }> = [];
-            const args = verifyArgs(db, dir, projectIdentity);
-            args.normalizeFiles = async (files) => [...files];
-            args.moduleRoute = {
-                moduleClient: {
-                    call: async (request) => {
-                        calls.push(request);
-                        return { accepted: [202], rejected: [] };
-                    },
-                },
-                moduleSessionId: "ses-module-verify",
-                moduleProjectRoot: dir,
-                moduleContextStoreUuid: "store-fixture",
-                moduleAuthorityGeneration: 9,
-                moduleCommandId: "verify-command",
-            };
-
-            expect(
-                await applyVerifyManifest(
-                    args,
-                    [
-                        {
-                            id: memory.id,
-                            category: memory.category,
-                            content: memory.content,
-                            mappedFiles: ["src/old.ts"],
-                        },
-                    ],
-                    `<verify><verified id="${memory.id}" files="src/old.ts"/></verify>`,
-                ),
-            ).toEqual({ verified: 1, updated: 0, archived: 0, skipped: 0, refused: 0 });
-            expect(calls).toHaveLength(1);
-            expect(calls[0]).toMatchObject({
-                method: "memory.set_verification",
-                body: {
-                    arguments: {
-                        memory_project: projectIdentity,
-                        authority_generation: 9,
-                        rows: [
-                            {
-                                memory_id: 202,
-                                content_hash_at_prompt: memory.normalizedHash,
-                                verification_status: "verified",
-                            },
-                        ],
-                    },
-                },
-            });
-            expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("refuses a directive archive before the MODULE authority call", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:module-verify-directive";
-            const dir = tempProject();
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "PROJECT_RULES",
-                content: "Never archive workflow rules because a named file omits them.",
-            });
-            const calls: unknown[] = [];
-            const args = verifyArgs(db, dir, projectIdentity);
-            args.moduleRoute = {
-                moduleClient: {
-                    call: async (request) => {
-                        calls.push(request);
-                        return { accepted: [], rejected: [] };
-                    },
-                },
-                moduleSessionId: "ses-module-verify-directive",
-                moduleProjectRoot: dir,
-                moduleContextStoreUuid: "store-fixture",
-                moduleAuthorityGeneration: 10,
-                moduleCommandId: "verify-directive-command",
-            };
-
-            expect(
-                await applyVerifyManifest(
-                    args,
-                    [
-                        {
-                            id: memory.id,
-                            category: memory.category,
-                            content: memory.content,
-                            mappedFiles: ["src/old.ts"],
-                        },
-                    ],
-                    `<verify><archive id="${memory.id}" reason="file does not corroborate it"/></verify>`,
-                ),
-            ).toEqual({ verified: 0, updated: 0, archived: 0, skipped: 0, refused: 1 });
-            expect(calls).toEqual([]);
-            expect(getMemoryById(db, memory.id)?.status).toBe("active");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
 describe("runVerify disposition", () => {
     test("banks a completed batch and reports the deadline remainder", async () => {
         const db = freshDb();
@@ -1456,6 +1337,114 @@ describe("applyVerifyManifest", () => {
             const state = getMemoryVerifications(db, [memory.id]).get(memory.id);
             expect(state?.files).toEqual(["src/old.ts"]);
             expect(state?.verifiedAt).toBe(1_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("verify module applier", () => {
+    test("writes through memory.set_verification using shared context row ids", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-verify";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "The module owns this verified memory.",
+            });
+            const calls: Array<{ method: string; body: unknown }> = [];
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.normalizeFiles = async (files) => [...files];
+            args.moduleRoute = {
+                moduleClient: {
+                    call: async (request) => {
+                        calls.push(request);
+                        return { accepted: [memory.id], rejected: [] };
+                    },
+                },
+                moduleSessionId: "ses-module-verify",
+                moduleProjectRoot: dir,
+                moduleCommandId: "verify-command",
+            };
+
+            expect(
+                await applyVerifyManifest(
+                    args,
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            mappedFiles: ["src/old.ts"],
+                        },
+                    ],
+                    `<verify><verified id="${memory.id}" files="src/old.ts"/></verify>`,
+                ),
+            ).toEqual({ verified: 1, updated: 0, archived: 0, skipped: 0, refused: 0 });
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).toMatchObject({
+                method: "memory.set_verification",
+                body: {
+                    arguments: {
+                        memory_project: projectIdentity,
+                        rows: [
+                            {
+                                memory_id: memory.id,
+                                content_hash_at_prompt: memory.normalizedHash,
+                                verification_status: "verified",
+                            },
+                        ],
+                    },
+                },
+            });
+            expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses a directive archive before the MODULE authority call", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-verify-directive";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "PROJECT_RULES",
+                content: "Never archive workflow rules because a named file omits them.",
+            });
+            const calls: unknown[] = [];
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.moduleRoute = {
+                moduleClient: {
+                    call: async (request) => {
+                        calls.push(request);
+                        return { accepted: [], rejected: [] };
+                    },
+                },
+                moduleSessionId: "ses-module-verify-directive",
+                moduleProjectRoot: dir,
+                moduleCommandId: "verify-directive-command",
+            };
+
+            expect(
+                await applyVerifyManifest(
+                    args,
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            mappedFiles: ["src/old.ts"],
+                        },
+                    ],
+                    `<verify><archive id="${memory.id}" reason="file does not corroborate it"/></verify>`,
+                ),
+            ).toEqual({ verified: 0, updated: 0, archived: 0, skipped: 0, refused: 1 });
+            expect(calls).toEqual([]);
+            expect(getMemoryById(db, memory.id)?.status).toBe("active");
         } finally {
             closeQuietly(db);
         }
