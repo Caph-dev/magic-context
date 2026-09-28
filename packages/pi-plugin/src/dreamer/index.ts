@@ -131,6 +131,7 @@ const modelAvailability = new WeakMap<object, Map<string, boolean>>();
 export function validatePiDreamerModels(
 	tasks: DreamTaskRuntimeConfig[],
 	registry: NonNullable<PiDreamerOptions["modelRegistry"]>,
+	harness: PiDreamerOptions["harness"] = "pi",
 ): DreamTaskRuntimeConfig[] {
 	let resolved = modelAvailability.get(registry);
 	if (!resolved) {
@@ -143,6 +144,9 @@ export function validatePiDreamerModels(
 		);
 		const valid = entries.filter((entry) => {
 			const model = typeof entry === "string" ? entry : entry.model;
+			// OMP expands role selectors in the child CLI, not in the model registry.
+			// Keep this outside the cache so Pi never inherits OMP's alias exemption.
+			if (harness === "omp" && model.startsWith("@")) return true;
 			let available = resolved.get(model);
 			if (available === undefined) {
 				const separator = model.indexOf("/");
@@ -288,7 +292,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		client,
 		dreamerConfig: opts.config,
 		validateTaskModels: modelRegistry
-			? (tasks) => validatePiDreamerModels(tasks, modelRegistry)
+			? (tasks) => validatePiDreamerModels(tasks, modelRegistry, opts.harness)
 			: undefined,
 		sampleDreamRun: opts.sampleDreamRun,
 		language: opts.language,
@@ -363,6 +367,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 							mural?.model,
 						),
 						manualOpts.modelRegistry,
+						manualOpts.harness,
 					)
 				: buildDreamTaskRuntimeConfigs(
 						dreamerConfig,

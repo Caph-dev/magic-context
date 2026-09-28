@@ -948,6 +948,7 @@ export function resolveHistorianFromConfig(
 						},
 					],
 					modelRegistry,
+					harness,
 				)[0]
 			: undefined;
 	const primary = validated
@@ -1777,6 +1778,7 @@ async function startPiMagicContextRuntime(
 							current.config.mural.model,
 						),
 						registry,
+						PI_HARNESS_KIND,
 					);
 					const empty: string[] = tasks
 						.filter((task) => task.modelChainUnavailable)

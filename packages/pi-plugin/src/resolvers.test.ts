@@ -100,6 +100,36 @@ describe("Pi config resolvers", () => {
 		).toBeUndefined();
 	});
 
+	it("preserves an OMP historian primary role without enabling configured role fallbacks", () => {
+		const config = MagicContextConfigSchema.parse({
+			historian: {
+				omp: {
+					model: "@historian",
+					thinking_level: "high",
+					fallback_models: ["@cheap", "mock/missing", "mock/known"],
+				},
+			},
+		});
+		const registry = {
+			find: (provider: string, model: string) =>
+				provider === "mock" && model === "known" ? {} : undefined,
+		};
+		expect(resolveHistorianFromConfig(config, "omp", registry)).toMatchObject({
+			model: "@historian",
+			thinkingLevel: "high",
+			fallbackModels: [{ model: "mock/known" }],
+		});
+		const aliasOnly = MagicContextConfigSchema.parse({
+			historian: { pi: { model: "@historian" } },
+		});
+		expect(resolveHistorianFromConfig(aliasOnly, "omp", registry)?.model).toBe(
+			"@historian",
+		);
+		expect(
+			resolveHistorianFromConfig(aliasOnly, "pi", registry),
+		).toBeUndefined();
+	});
+
 	it("returns undefined for historian and dreamer when disabled", () => {
 		const config = MagicContextConfigSchema.parse({
 			historian: { disable: true, model: "test/historian" },
