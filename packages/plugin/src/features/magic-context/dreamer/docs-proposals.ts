@@ -53,6 +53,7 @@ export function hasCurrentDocsProposal(projectDir: string): boolean {
 
 function git(projectDir: string, args: string[]): string {
     return execFileSync("git", args, {
+        windowsHide: true,
         cwd: projectDir,
         encoding: "utf8",
         timeout: 10000,
@@ -152,7 +153,7 @@ function diff(name: string, before: string, after: string): string {
             return execFileSync(
                 "git",
                 ["diff", "--no-index", "--", join(dir, "before"), join(dir, "after")],
-                { encoding: "utf8" },
+                { windowsHide: true, encoding: "utf8" },
             );
         } catch (error) {
             return (

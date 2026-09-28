@@ -214,6 +214,7 @@ function selfVersion(): string {
 function getLatestNpmVersion(packageName: string): string | null {
     try {
         return execFileSync("npm", ["view", packageName, "version"], {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "ignore"],
             timeout: 10_000,
@@ -1098,6 +1099,7 @@ function repair(plan: RepairPlan, prompts: PromptIO): number {
 function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult {
     if (args[0] === "issue") {
         const result = deps.spawnSync("gh", args, {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "pipe"],
         });
@@ -1110,6 +1112,7 @@ function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult
 
     try {
         const output = deps.execFileSync("gh", args, {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "pipe"],
         });

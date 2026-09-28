@@ -126,7 +126,7 @@ describe("compiled smart-note QuickJS runner", () => {
         const dir = await mkdtemp(path.join(tmpdir(), "mc-smart-note-fifo-"));
         try {
             const fifo = path.join(dir, "events.fifo");
-            const created = spawnSync("mkfifo", [fifo]);
+            const created = spawnSync("mkfifo", [fifo], { windowsHide: true });
             if (created.error || created.status !== 0) return;
 
             const controller = new AbortController();

@@ -85,7 +85,7 @@ describe("docs proposals", () => {
     test("host changeset omits docs, tests and lockfiles and prompt never requests bash", () => {
         const dir = fixture();
         const git = (...args: string[]) =>
-            execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+            execFileSync("git", args, { windowsHide: true, cwd: dir, encoding: "utf8" }).trim();
         git("init", "-q");
         git("config", "user.email", "test@example.com");
         git("config", "user.name", "Test");

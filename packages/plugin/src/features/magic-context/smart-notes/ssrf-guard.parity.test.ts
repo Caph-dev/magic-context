@@ -53,7 +53,11 @@ console.log(JSON.stringify({ allowed, blocked }));
 `,
                 "utf8",
             );
-            const proc = Bun.spawn(["node", script], { stdout: "pipe", stderr: "pipe" });
+            const proc = Bun.spawn(["node", script], {
+                stdout: "pipe",
+                stderr: "pipe",
+                windowsHide: true,
+            });
             const [stdout, stderr, exitCode] = await Promise.all([
                 new Response(proc.stdout).text(),
                 new Response(proc.stderr).text(),

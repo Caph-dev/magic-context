@@ -181,6 +181,7 @@ describe("compartment state lease", () => {
                     stdin: "pipe",
                     stdout: "pipe",
                     stderr: "pipe",
+                    windowsHide: true,
                 }),
             );
             type Outcome = { outcome: "won" | "lost" | "error"; error?: string };

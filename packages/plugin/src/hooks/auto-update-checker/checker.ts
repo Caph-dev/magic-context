@@ -355,6 +355,7 @@ function runHostPluginInstall(
         signal?.addEventListener("abort", onAbort, { once: true });
         try {
             const proc = spawn("opencode", ["plugin", spec, "--global", "--force"], {
+                windowsHide: true,
                 stdio: "ignore",
             });
             processStarted = true;

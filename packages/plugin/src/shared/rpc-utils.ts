@@ -118,6 +118,7 @@ const RPC_IDENTITY_SKEW_TOLERANCE_MS = 120_000;
 const LINUX_CLOCK_TICKS_PER_SECOND = 100;
 const PS_PROBE_TIMEOUT_MS = 1_000;
 const WINDOWS_CIM_PROBE_TIMEOUT_MS = 5_000;
+const WINDOWS_PROCESS_SNAPSHOT_TTL_MS = 2_000;
 const MAX_ANCESTOR_WALK_DEPTH = 16;
 const OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
 const TASKLIST_NO_TASKS_PATTERN =
@@ -184,6 +185,7 @@ function readPsProcessStartTime(pid: number): number | null {
             encoding: "utf8",
             timeout: PS_PROBE_TIMEOUT_MS,
             stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
         });
         const processStartTime = Date.parse(String(output).trim());
         return Number.isFinite(processStartTime) ? processStartTime : null;
@@ -232,6 +234,7 @@ interface ProcessSnapshot {
 }
 
 let windowsProcessFactsCache: Map<number, ProcessFacts> | null = null;
+let windowsProcessSnapshotCache: { snapshot: ProcessSnapshot; at: number } | null = null;
 
 function rememberWindowsProcessFacts(facts: ProcessFacts[]): void {
     windowsProcessFactsCache = new Map(facts.map((fact) => [fact.pid, fact]));
@@ -239,6 +242,7 @@ function rememberWindowsProcessFacts(facts: ProcessFacts[]): void {
 
 function clearWindowsProcessFactsCache(): void {
     windowsProcessFactsCache = null;
+    windowsProcessSnapshotCache = null;
 }
 
 function parseCsvLine(line: string): string[] | null {
@@ -292,6 +296,7 @@ function readWindowsProcess(pid: number): { state: PidLiveness; command?: string
             encoding: "utf8",
             timeout: PS_PROBE_TIMEOUT_MS,
             stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
         });
         const entries = parseTasklistOutput(String(output));
         if (entries === null) return { state: "inconclusive" };
@@ -325,6 +330,7 @@ function readPsProcessCommand(pid: number): string | null {
             encoding: "utf8",
             timeout: PS_PROBE_TIMEOUT_MS,
             stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
         });
         return String(output);
     } catch {
@@ -521,6 +527,7 @@ function execProcessList(
             encoding: "utf8",
             timeout,
             stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
         }),
     );
 }
@@ -773,8 +780,14 @@ export function inspectLivePiProcesses(): PiProcessDiscovery {
             // Prefer one CIM query (pid, parent, command line, start time).
             // tasklist is image-name-only, so it is a fallback and never a
             // verified live-harness source.
-            const cim = tryReadWindowsCimSnapshot(rpcProcessListExecFileSync);
-            const snapshot = cim ?? tryReadWindowsTasklistSnapshot();
+            const now = rpcIdentityNowMs();
+            const cached = windowsProcessSnapshotCache;
+            // A brief reuse avoids spawning PowerShell on every blocker scan.
+            const snapshot =
+                cached && now >= cached.at && now - cached.at < WINDOWS_PROCESS_SNAPSHOT_TTL_MS
+                    ? cached.snapshot
+                    : (tryReadWindowsCimSnapshot(rpcProcessListExecFileSync) ??
+                      tryReadWindowsTasklistSnapshot());
             if (!snapshot) {
                 return {
                     state: "unreadable",
@@ -782,6 +795,7 @@ export function inspectLivePiProcesses(): PiProcessDiscovery {
                     error: "process list unavailable",
                 };
             }
+            if (snapshot !== cached?.snapshot) windowsProcessSnapshotCache = { snapshot, at: now };
             rememberWindowsProcessFacts(snapshot.facts);
             return classifyLivePiSnapshot(snapshot);
         }

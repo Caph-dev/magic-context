@@ -395,7 +395,11 @@ describe("migration race tolerance", () => {
                 db.exec("COMMIT");
                 db.close();
             `;
-            holder = Bun.spawn(["bun", "-e", holderScript], { stdout: "pipe", stderr: "inherit" });
+            holder = Bun.spawn(["bun", "-e", holderScript], {
+                stdout: "pipe",
+                stderr: "inherit",
+                windowsHide: true,
+            });
             await holder.stdout?.getReader().read();
 
             const db = new Database(path);

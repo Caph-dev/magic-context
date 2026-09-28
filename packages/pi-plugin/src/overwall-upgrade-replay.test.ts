@@ -338,6 +338,7 @@ for (const native of [false, true]) {
 		try {
 			for (const mode of ["mint", "replay"]) {
 				const child = Bun.spawnSync({
+					windowsHide: true,
 					cmd: [
 						process.execPath,
 						"test",

@@ -155,6 +155,7 @@ describe("ADV Pi: SIGKILL between the HARD fold commit and the lane decision", (
 					process.execPath,
 					["test", import.meta.path, "--timeout", "60000"],
 					{
+						windowsHide: true,
 						env: {
 							...process.env,
 							ADV_PI_LANE_CHILD: `${trigger}:${variant}`,

@@ -291,6 +291,7 @@ describe("shared schedule reconciliation contract", () => {
                     "does not re-arm a consumed civil minute",
                 ],
                 {
+                    windowsHide: true,
                     env: { ...process.env, TZ: "Europe/Madrid", MC_DREAMER_DST_CHILD: "1" },
                     encoding: "utf8",
                     timeout: 20_000,

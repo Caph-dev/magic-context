@@ -212,6 +212,7 @@ export function checkConfiguredVariantCatalog(
         cwd: string,
     ) => { stdout: string; status: number | null; error?: Error } = (args, cwd) =>
         spawnSync("opencode", args, {
+            windowsHide: true,
             cwd,
             encoding: "utf8",
             timeout: hostGeneration === "v2" ? 90_000 : 45_000,
@@ -587,13 +588,16 @@ function compareVersions(a: string, b: string): number {
 function openBrowser(url: string): void {
     try {
         if (process.platform === "darwin") {
-            const child = spawnSync("open", [url], { stdio: "ignore" });
+            const child = spawnSync("open", [url], { windowsHide: true, stdio: "ignore" });
             if (child.status === 0) return;
         } else if (process.platform === "linux") {
-            const child = spawnSync("xdg-open", [url], { stdio: "ignore" });
+            const child = spawnSync("xdg-open", [url], { windowsHide: true, stdio: "ignore" });
             if (child.status === 0) return;
         } else if (process.platform === "win32") {
-            const child = spawnSync("cmd", ["/c", "start", "", url], { stdio: "ignore" });
+            const child = spawnSync("cmd", ["/c", "start", "", url], {
+                windowsHide: true,
+                stdio: "ignore",
+            });
             if (child.status === 0) return;
         }
     } catch {

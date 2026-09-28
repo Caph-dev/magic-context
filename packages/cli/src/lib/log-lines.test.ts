@@ -254,6 +254,7 @@ describe("parseLogLine", () => {
                      sessionLog("ses_opaque", ${JSON.stringify(body)}); flushLogger();`,
                     ],
                     {
+                        windowsHide: true,
                         env: {
                             ...process.env,
                             NODE_ENV: "development",

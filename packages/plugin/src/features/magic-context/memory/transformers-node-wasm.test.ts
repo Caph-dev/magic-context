@@ -7,6 +7,7 @@ const pluginRoot = resolve(import.meta.dir, "../../../..");
 
 function run(cmd: string[]): { exitCode: number; stderr: string; stdout: string } {
     const result = Bun.spawnSync({
+        windowsHide: true,
         cmd,
         cwd: pluginRoot,
         stdout: "pipe",
