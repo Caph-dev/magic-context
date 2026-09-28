@@ -42,9 +42,6 @@ const RED_KEY_PREFIX: &str = "red:";
 const CAV_KEY_PREFIX: &str = "cav:";
 const CHANNEL1_REMINDER_OPEN: &str = "\n\n<system-reminder>\n";
 const CHANNEL1_REMINDER_CLOSE: &str = "\n</system-reminder>";
-const IMAGE_TOKEN_DIVISOR: u64 = 750;
-const IMAGE_FALLBACK_TOKENS: i64 = 1_200;
-const IMAGE_TOKEN_CAP: i64 = 4_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HygieneBand {
@@ -186,129 +183,9 @@ fn media_content(media: &MediaBlock) -> String {
         .unwrap_or_else(|| serde_json::to_string(&media.source).unwrap_or_default())
 }
 
-fn decode_base64_preview(payload: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(payload.len() * 3 / 4);
-    let mut quartet = [0u8; 4];
-    let mut filled = 0usize;
-    for byte in payload.bytes().take(512) {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        quartet[filled] = value;
-        filled += 1;
-        if filled == 4 {
-            output.push((quartet[0] << 2) | (quartet[1] >> 4));
-            output.push((quartet[1] << 4) | (quartet[2] >> 2));
-            output.push((quartet[2] << 6) | quartet[3]);
-            filled = 0;
-        }
-    }
-    if filled >= 2 {
-        output.push((quartet[0] << 2) | (quartet[1] >> 4));
-    }
-    if filled >= 3 {
-        output.push((quartet[1] << 4) | (quartet[2] >> 2));
-    }
-    Some(output)
-}
-
-fn image_dimensions(header: &str, bytes: &[u8]) -> Option<(u64, u64)> {
-    if header.contains("image/png")
-        && bytes.len() >= 24
-        && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-    {
-        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as u64;
-        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as u64;
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    if header.contains("image/gif") && bytes.len() >= 10 && bytes.starts_with(b"GIF") {
-        let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u64;
-        let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u64;
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    if (header.contains("image/jpeg") || header.contains("image/jpg"))
-        && bytes.starts_with(&[0xff, 0xd8])
-    {
-        let mut index = 2usize;
-        while index + 8 < bytes.len() {
-            if bytes[index] != 0xff {
-                index += 1;
-                continue;
-            }
-            let marker = bytes[index + 1];
-            let is_sof = matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf);
-            if is_sof {
-                let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u64;
-                let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u64;
-                return (width > 0 && height > 0).then_some((width, height));
-            }
-            if matches!(marker, 0xd8 | 0xd9 | 0x01) {
-                index += 2;
-                continue;
-            }
-            let segment_len = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
-            if segment_len < 2 {
-                return None;
-            }
-            index = index.saturating_add(2 + segment_len);
-        }
-    }
-    if header.contains("image/webp")
-        && bytes.len() >= 30
-        && bytes.starts_with(b"RIFF")
-        && &bytes[8..12] == b"WEBP"
-    {
-        let variant = &bytes[12..16];
-        let (width, height) = if variant == b"VP8 " {
-            (
-                u16::from_le_bytes([bytes[26], bytes[27]]) as u64 & 0x3fff,
-                u16::from_le_bytes([bytes[28], bytes[29]]) as u64 & 0x3fff,
-            )
-        } else if variant == b"VP8L" {
-            let width = 1 + (u16::from_le_bytes([bytes[21], bytes[22]]) as u64 & 0x3fff);
-            let height = 1
-                + (((bytes[22] as u64 >> 6)
-                    | ((bytes[23] as u64) << 2)
-                    | ((bytes[24] as u64) << 10))
-                    & 0x3fff);
-            (width, height)
-        } else if variant == b"VP8X" {
-            (
-                1 + bytes[24] as u64 + ((bytes[25] as u64) << 8) + ((bytes[26] as u64) << 16),
-                1 + bytes[27] as u64 + ((bytes[28] as u64) << 8) + ((bytes[29] as u64) << 16),
-            )
-        } else {
-            return None;
-        };
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    None
-}
-
-fn estimate_image_tokens(data_url: &str) -> i64 {
-    let Some((header, payload)) = data_url.split_once(',') else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let Some(bytes) = decode_base64_preview(payload) else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let Some((width, height)) = image_dimensions(header, &bytes) else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let pixels = width.saturating_mul(height);
-    let tokens = pixels.saturating_add(IMAGE_TOKEN_DIVISOR - 1) / IMAGE_TOKEN_DIVISOR;
-    (tokens as i64).clamp(1, IMAGE_TOKEN_CAP)
-}
-
 fn media_tokens(media: &MediaBlock, content: &str) -> i64 {
     match media.kind {
-        MediaKind::Image => estimate_image_tokens(content),
+        MediaKind::Image => crate::image_tokens::estimate_image_tokens(content),
         MediaKind::Audio | MediaKind::Video | MediaKind::File | MediaKind::Document => {
             estimated_tokens(content)
         }

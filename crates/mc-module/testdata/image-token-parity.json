@@ -1,0 +1,77 @@
+[
+  {
+    "name": "png-1920x1080",
+    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAB4AAAAQ4CAYAAADo08FDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "tokens": 2765
+  },
+  {
+    "name": "png-800x600",
+    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAyAAAAJYCAYAAACadoJwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "tokens": 640
+  },
+  {
+    "name": "png-1x1-floor",
+    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "tokens": 1
+  },
+  {
+    "name": "png-4000x4000-cap",
+    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAD6AAAA+gCAYAAADuf+MCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "tokens": 4500
+  },
+  {
+    "name": "jpeg-1024x768",
+    "url": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/wAARCAMABAADASIAAhEBAxEBAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "tokens": 1049
+  },
+  {
+    "name": "jpg-alias-640x480",
+    "url": "data:image/jpg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/wAARCAHgAoADASIAAhEBAxEBAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "tokens": 410
+  },
+  {
+    "name": "gif-320x240",
+    "url": "data:image/gif;base64,R0lGODlhQAHwAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "tokens": 103
+  },
+  {
+    "name": "webp-vp8-500x400",
+    "url": "data:image/webp;base64,UklGRgAAAABXRUJQVlA4IAAAAAAAAAAAAAD0AZABAAAAAAAAAAAAAA==",
+    "tokens": 267
+  },
+  {
+    "name": "webp-vp8l-300x200",
+    "url": "data:image/webp;base64,UklGRgAAAABXRUJQVlA4TAAAAAAvK8ExAAAAAAAAAAAAAAA=",
+    "tokens": 80
+  },
+  {
+    "name": "webp-vp8x-1200x900",
+    "url": "data:image/webp;base64,UklGRgAAAABXRUJQVlA4WAAAAAAAAAAArwQAgwMAAAAAAAAAAAAAAA==",
+    "tokens": 1440
+  },
+  {
+    "name": "fallback-no-comma",
+    "url": "data:image/png;base64",
+    "tokens": 1200
+  },
+  {
+    "name": "fallback-bad-magic",
+    "url": "data:image/png;base64,bm90IGEgcG5nIGF0IGFsbCwganVzdCBieXRlc25vdCBhIHBuZyBhdCBhbGwsIGp1c3QgYnl0ZXM=",
+    "tokens": 1200
+  },
+  {
+    "name": "fallback-mime-mismatch",
+    "url": "data:image/png;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/wAARCABkAGQDASIAAhEBAxEBAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "tokens": 1200
+  },
+  {
+    "name": "fallback-invalid-base64",
+    "url": "data:image/png;base64,!!!!notbase64$$$$",
+    "tokens": 1200
+  },
+  {
+    "name": "fallback-zero-width",
+    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAAAAAAKCAYAAACaEF90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "tokens": 1200
+  }
+]
