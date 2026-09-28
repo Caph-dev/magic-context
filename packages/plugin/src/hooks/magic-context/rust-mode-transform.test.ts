@@ -3436,7 +3436,11 @@ describe("Rust mode authority adapter", () => {
                 transforms += 1;
                 // Second pass: the module lost the delta base. Third pass: the module
                 // times out and the adapter serves its last good array.
-                if (transforms === 2) return { status: "need_full_sync" };
+                if (transforms === 2)
+                    return {
+                        status: "need_full_sync",
+                        need_full_sync_reason: "native_prefix_unavailable",
+                    };
                 if (transforms === 4) throw new Error("rust module transform timed out");
                 return { decision: "SOFT+", native_messages: native };
             },
@@ -3462,6 +3466,13 @@ describe("Rust mode authority adapter", () => {
             logSpy.mockClear();
 
             await runPass(); // need_full_sync, then the full-array retry
+            expect(
+                logSpy.mock.calls.some(
+                    ([, line]) =>
+                        line ===
+                        "need_full_sync retry=full ordinal_memo=kept reason=native_prefix_unavailable",
+                ),
+            ).toBe(true);
             await runPass(); // module timeout, served from the last good array
             rows.push({
                 id: `m-${String(ROWS + 1).padStart(6, "0")}`,
