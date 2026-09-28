@@ -888,7 +888,7 @@ export interface MuralConfig {
 
 export interface MagicContextConfig {
     enabled: boolean;
-    /** User-level setting that lets a session started exactly in the canonical home directory use a deterministic directory identity. */
+    /** User-level setting that lets a session in the canonical home directory use project memory. */
     allow_home_project: boolean;
     mural: MuralConfig;
     /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
@@ -1074,7 +1074,7 @@ export const MagicContextConfigSchema = z
             .boolean()
             .default(false)
             .describe(
-                "Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
+                "Allow Magic Context sessions launched from the exact canonical home directory. A non-git home uses its deterministic dir: identity; a home repository uses its git: identity. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
             ),
         mural: z
             .object({

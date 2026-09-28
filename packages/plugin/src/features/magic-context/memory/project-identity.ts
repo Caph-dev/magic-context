@@ -3,7 +3,7 @@
  *
  * Strategy:
  *   1. Git repo with commits → root commit hash (same across worktrees, clones, forks)
- *   2. Git repo with no commits → fallback to directory hash via resolveProjectIdentity()
+ *   2. Git repo without a readable commit → reuse durable identity or defer
  *   3. No git repo → fallback to directory hash via resolveProjectIdentity()
  *
  * The root commit hash is immutable and survives remote renames, host
@@ -17,6 +17,11 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { log } from "../../../shared/logger";
+import {
+    projectDirectoryKey,
+    readRememberedGitIdentity,
+    rememberGitIdentity,
+} from "./project-identity-cache";
 
 // execFileSync is intentional here (audit #19): this runs once per unique directory per process
 // lifetime when git is healthy, and successful git identities are cached in identityCache. The
@@ -37,7 +42,7 @@ const lastKnownGitIdentityCache = new Map<string, string>();
 const directoryFallbackCache = new Map<string, string>();
 // Cool down git-backed directories whose git probe failed transiently. During
 // the window we reuse the last successful `git:` identity when this process has
-// one; true cold-start failures still use the deterministic `dir:` fallback.
+// one; cold-start failures consult durable storage or defer memory features.
 // After the cooldown expires, the next call re-probes so the cache refreshes
 // when the user fixes git or the slow disk recovers.
 const transientFailureCooldown = new Map<string, number>();
@@ -55,21 +60,10 @@ let userHomeDirectoryForIdentity = (): string => homedir();
 let nowMs = (): number => Date.now();
 let filesystemProbeObserverForTests: (() => void) | undefined;
 
-/**
- * Type-checked project identity failure classes (Finding #16).
- *
- * Caller policy:
- * - `not_git_repo` is deterministic: the directory is accessible but has no git root commit, so
- *   callers that preserve the production contract may fall back to `dir:<md5-12>`.
- * - `git_missing`, `git_timeout`, `dubious_ownership`, and `unknown` git failures fall back in
- *   resolveProjectIdentity() with a short retry cooldown: staying enabled with a temporary
- *   directory identity is safer than disabling Magic Context, and the identity self-heals when git
- *   recovers.
- * - `permission_denied` is not safe to silently coerce during normal resolution: an unreadable
- *   directory may not be the path the user intended. Plugin-load call sites use
- *   resolveProjectIdentityOrFallback() as a final belt so identity resolution never disables load.
- */
+/** Git failures retain their classification; only genuine non-repositories may use dir: keys. */
 export type ProjectIdentityErrorClass =
+    | "home_project_disabled"
+    | "git_identity_unavailable"
     | "not_git_repo"
     | "git_missing"
     | "git_timeout"
@@ -268,7 +262,8 @@ function classifyGitError(error: unknown, rawDirectory: string): ProjectIdentity
  * The cache is process-local, keyed by `path.resolve(directory)`, and stores only successful git
  * identities. Transient failures are never cached.
  */
-export function resolveProjectIdentityStrict(directory: string): string {
+export function resolveProjectIdentityStrict(directory: string, allowHomeProject = false): string {
+    assertProjectAllowed(directory, allowHomeProject);
     const canonical = path.resolve(directory);
     const cached = identityCache.get(canonical);
     if (cached !== undefined) {
@@ -320,26 +315,18 @@ export function resolveProjectIdentityStrict(directory: string): string {
     const identity = `git:${rootCommit}`;
     identityCache.set(canonical, identity);
     lastKnownGitIdentityCache.set(canonical, identity);
+    rememberGitIdentity(canonical, identity);
+    const root = gitRootDirectory(canonical);
+    if (root && root !== canonical) rememberGitIdentity(root, identity);
     transientFailureCooldown.delete(canonical);
     dubiousOwnershipFallbackDirectories.delete(canonical);
     transientGitIdentityReuseLoggedDirectories.delete(canonical);
     return identity;
 }
 
-/**
- * Resolve the project identity for the given directory.
- *
- * Returns a stable string suitable for use as a database key:
- *   - `"git:<sha>"` for git repositories with at least one commit
- *   - `"dir:<md5-12>"` for accessible non-git directories, empty repos, or cold-start git-backed
- *     directories whose git probe is temporarily unavailable before any `git:` identity is known
- *
- * A cold-start `dir:` fallback can split project-scoped rows until git recovers, but that split is
- * bounded and self-heals through the backfill/reconciliation paths. After a successful git resolve,
- * transient failures reuse the last known `git:` identity so mid-session rows stay under one key.
- */
+/** Directory fallback is reserved for paths without git metadata. */
 function shouldUseDirectoryFallback(error: ProjectIdentityError): boolean {
-    return error.errorClass !== "permission_denied";
+    return error.errorClass !== "home_project_disabled";
 }
 
 function getActiveCooldown(canonical: string): number | undefined {
@@ -351,7 +338,11 @@ function getActiveCooldown(canonical: string): number | undefined {
 }
 
 function lastKnownGitIdentity(canonical: string): string | undefined {
-    return lastKnownGitIdentityCache.get(canonical) ?? identityCache.get(canonical);
+    return (
+        lastKnownGitIdentityCache.get(canonical) ??
+        identityCache.get(canonical) ??
+        readRememberedGitIdentity(canonical)
+    );
 }
 
 function nearestLastKnownGitIdentity(
@@ -364,6 +355,8 @@ function nearestLastKnownGitIdentity(
             visited.add(current);
             const cached = lastKnownGitIdentity(current);
             if (cached !== undefined) return { identity: cached, source: current };
+            // Never borrow an outer repository's identity for a nested repository.
+            if (existsSync(path.join(current, ".git"))) break;
             const parent = path.dirname(current);
             if (parent === current) break;
             current = parent;
@@ -397,7 +390,7 @@ function reuseLastKnownGitIdentity(canonical: string): string | undefined {
 }
 
 function formatDubiousOwnershipWarning(canonical: string): string {
-    return `Magic Context: git refused to read ${canonical} (dubious ownership — the repo is owned by a different user). Using a directory-based project identity for now, which keeps memory separate from this repo's normal identity. Fix: git config --global --add safe.directory ${canonical}`;
+    return `Magic Context: git refused to read ${canonical} (dubious ownership — the repo is owned by a different user). Memory features are paused unless a previous git identity is available. Fix: git config --global --add safe.directory ${canonical}`;
 }
 
 function recordDubiousOwnershipFallback(canonical: string): void {
@@ -433,14 +426,35 @@ function canonicalUserHomeDirectory(): string {
 }
 
 export function isUserHomeDirectory(directory: string): boolean {
+    if (projectDirectoryKey(directory) === projectDirectoryKey(userHomeDirectoryForIdentity()))
+        return true;
     try {
-        return realpathSync.native(path.resolve(directory)) === canonicalUserHomeDirectory();
+        return (
+            projectDirectoryKey(realpathSync.native(path.resolve(directory))) ===
+            projectDirectoryKey(canonicalUserHomeDirectory())
+        );
     } catch {
         return false;
     }
 }
 
-export function resolveProjectIdentity(directory: string): string {
+function assertProjectAllowed(directory: string, allowHomeProject: boolean): void {
+    const canonical = path.resolve(directory);
+    if (
+        !allowHomeProject &&
+        (isUserHomeDirectory(directory) ||
+            isUserHomeDirectory(gitRootDirectory(canonical) ?? canonical))
+    ) {
+        throw new ProjectIdentityError(
+            "home_project_disabled",
+            directory,
+            "Home project memory is disabled; set allow_home_project to opt in",
+        );
+    }
+}
+
+export function resolveProjectIdentity(directory: string, allowHomeProject = false): string {
+    assertProjectAllowed(directory, allowHomeProject);
     const canonical = path.resolve(directory);
     const cachedFallback = directoryFallbackCache.get(canonical);
     if (cachedFallback !== undefined) {
@@ -460,28 +474,34 @@ export function resolveProjectIdentity(directory: string): string {
             if (cachedGitIdentity !== undefined) {
                 return cachedGitIdentity;
             }
+            throw new ProjectIdentityError(
+                "git_identity_unavailable",
+                directory,
+                "Git identity unavailable; memory features paused until the retry cooldown expires",
+            );
         }
         return directoryFallback(canonical);
     }
 
     try {
-        return resolveProjectIdentityStrict(directory);
+        return resolveProjectIdentityStrict(directory, allowHomeProject);
     } catch (error) {
         if (error instanceof ProjectIdentityError && shouldUseDirectoryFallback(error)) {
             const fallback = directoryFallback(canonical);
             const hasGitMetadata = hasGitDir(canonical);
             if (!hasGitMetadata) {
+                if (error.errorClass === "permission_denied") throw error;
                 directoryFallbackCache.set(canonical, fallback);
                 transientFailureCooldown.delete(canonical);
             } else {
                 transientFailureCooldown.set(canonical, nowMs() + TRANSIENT_FAILURE_COOLDOWN_MS);
                 const cachedGitIdentity = reuseLastKnownGitIdentity(canonical);
+                if (error.errorClass === "dubious_ownership")
+                    recordDubiousOwnershipFallback(canonical);
                 if (cachedGitIdentity !== undefined) {
                     return cachedGitIdentity;
                 }
-            }
-            if (error.errorClass === "dubious_ownership") {
-                recordDubiousOwnershipFallback(canonical);
+                throw error;
             }
             return fallback;
         }
@@ -489,11 +509,19 @@ export function resolveProjectIdentity(directory: string): string {
     }
 }
 
-export function resolveProjectIdentityOrFallback(directory: string): string {
+export function resolveProjectIdentityOrFallback(
+    directory: string,
+    allowHomeProject = false,
+): string {
     try {
-        return resolveProjectIdentity(directory);
+        return resolveProjectIdentity(directory, allowHomeProject);
     } catch (error) {
         const canonical = path.resolve(directory);
+        if (
+            hasGitDir(canonical) ||
+            (error instanceof ProjectIdentityError && error.errorClass === "home_project_disabled")
+        )
+            throw error;
         const fallback = directoryFallback(canonical);
         const message = error instanceof Error ? error.message : String(error);
         log(
@@ -577,16 +605,15 @@ export function describeUnresolvedProjectIdentity(directory: string): string {
             return resolvedDirectory;
         }
     })();
-    if (
-        canonicalDirectory === canonicalHome ||
-        gitRootDirectory(canonicalDirectory) === canonicalHome
-    ) {
+    if (isUserHomeDirectory(directory) || gitRootDirectory(canonicalDirectory) === canonicalHome) {
         return (
             `this session runs in your home directory (${canonicalHome}), which Magic Context does not treat as a project. ` +
             "Start OpenCode inside a project folder, or set `allow_home_project: true` in the user-level " +
             "magic-context.jsonc (~/.config/cortexkit/) to give home sessions their own memory."
         );
     }
+    if (hasGitDir(resolvedDirectory))
+        return `git identity resolution for ${resolvedDirectory} is temporarily unavailable. Memory features are paused; retry after git access recovers.`;
     return `the session directory ${resolvedDirectory} could not be read as a project.`;
 }
 
@@ -607,13 +634,16 @@ export function resolveProjectIdentityForSession(
     const resolvedDirectory = path.resolve(directory);
     const cacheKey = `${allowHomeProject ? "1" : "0"}\0${resolvedDirectory}`;
     const cached = sessionIdentityCache.get(cacheKey);
-    if (cached && (cached.revalidateAt === null || nowMs() < cached.revalidateAt)) {
+    if (
+        cached &&
+        (cached.revalidateAt === null || nowMs() < cached.revalidateAt) &&
+        !(cached.identity?.startsWith("dir:") && hasGitDir(resolvedDirectory))
+    ) {
         return cached.identity;
     }
     sessionIdentityCache.delete(cacheKey);
 
     filesystemProbeObserverForTests?.();
-    const canonicalHome = canonicalUserHomeDirectory();
     const canonicalDirectory = (() => {
         try {
             filesystemProbeObserverForTests?.();
@@ -623,12 +653,21 @@ export function resolveProjectIdentityForSession(
         }
     })();
     filesystemProbeObserverForTests?.();
-    const inheritsHomeRepository = gitRootDirectory(canonicalDirectory) === canonicalHome;
+    const homeRoot = gitRootDirectory(canonicalDirectory);
+    const inheritsHomeRepository = homeRoot !== null && isUserHomeDirectory(homeRoot);
     let identity: string | undefined;
-    if (canonicalDirectory === canonicalHome || inheritsHomeRepository) {
-        identity = allowHomeProject ? directoryFallback(canonicalHome) : undefined;
+    if (!allowHomeProject && (isUserHomeDirectory(directory) || inheritsHomeRepository)) {
+        identity = undefined;
     } else {
-        identity = resolveProjectIdentityOrFallback(directory);
+        try {
+            identity = resolveProjectIdentityOrFallback(
+                isUserHomeDirectory(directory) ? canonicalUserHomeDirectory() : directory,
+                allowHomeProject,
+            );
+        } catch (error) {
+            if (!(error instanceof ProjectIdentityError)) throw error;
+            identity = undefined;
+        }
     }
 
     // Successful git identities are immutable. Directory/home fallbacks are
@@ -647,9 +686,8 @@ export function resolveProjectIdentityForSession(
  * Normalize a stored project path or legacy raw filesystem path.
  *
  * Already-resolved `git:` / `dir:` identities are returned byte-for-byte. Raw filesystem paths are
- * resolved through the production wrapper. This helper is intentionally best-effort for existing
- * stored data: if strict resolution cannot classify the path, it falls back to the deterministic
- * `dir:<md5-12>` identity instead of throwing.
+ * resolved through the production wrapper. Unresolved paths remain unchanged so a transient
+ * git failure cannot manufacture a new project identity during an ownership check.
  */
 export function normalizeStoredProjectPath(rawOrStored: string): string {
     if (rawOrStored.startsWith("git:") || rawOrStored.startsWith("dir:")) {
@@ -659,7 +697,8 @@ export function normalizeStoredProjectPath(rawOrStored: string): string {
     try {
         return resolveProjectIdentity(rawOrStored);
     } catch {
-        return directoryFallback(rawOrStored);
+        // Preserve the raw key when resolution is deferred; never invent a second project.
+        return rawOrStored;
     }
 }
 

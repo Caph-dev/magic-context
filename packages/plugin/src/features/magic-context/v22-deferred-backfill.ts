@@ -89,7 +89,12 @@ function classifyBackfillError(error: unknown): {
 } {
     if (error instanceof ProjectIdentityError) {
         return {
-            errorClass: error.errorClass === "dubious_ownership" ? "unknown" : error.errorClass,
+            errorClass:
+                error.errorClass === "dubious_ownership" ||
+                error.errorClass === "home_project_disabled" ||
+                error.errorClass === "git_identity_unavailable"
+                    ? "unknown"
+                    : error.errorClass,
             errorMessage: error.message,
         };
     }

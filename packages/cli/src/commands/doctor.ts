@@ -25,6 +25,7 @@ import {
     runV22BackfillCommands,
     type V22BackfillCommandArgs,
 } from "../lib/v22-backfill-commands";
+import { diagnoseIdentitySplits } from "./doctor-identity-splits";
 import { runDoctor as runOmpDoctor } from "./doctor-omp";
 import { runDoctor as runOpenCodeDoctor } from "./doctor-opencode";
 import { doctor as runPiDoctor } from "./doctor-pi";
@@ -79,6 +80,14 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
             options,
         );
         if (result.handled) return result.exitCode;
+    }
+
+    try {
+        for (const line of diagnoseIdentitySplits()) log.warn(line);
+    } catch (error) {
+        log.warn(
+            `Identity split check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
     }
 
     // Reconcile interrupted cross-harness session migrations. The journal lives

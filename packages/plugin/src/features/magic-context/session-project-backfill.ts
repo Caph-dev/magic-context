@@ -4,7 +4,7 @@ import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
-import { resolveProjectIdentity } from "./memory/project-identity";
+import { isUserHomeDirectory, resolveProjectIdentity } from "./memory/project-identity";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
@@ -338,7 +338,7 @@ export async function runSessionProjectBackfill(
                 result.alreadyMappedSessions += 1;
             } else {
                 result.unmappedSessions += 1;
-                if (!session.directory) {
+                if (!session.directory || isUserHomeDirectory(session.directory)) {
                     result.skippedEmptyDirectories += 1;
                 } else {
                     const stillExists =
