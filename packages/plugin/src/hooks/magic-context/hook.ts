@@ -622,27 +622,24 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
 
     const rustMemorySyncRequestedSessions = new Set<string>();
-    // Build the same subc-backed client for the TS recovery arm. Constructing the
-    // transport is inert; it connects only if a marker actually needs draining.
-    const authorityRecoveryModuleClient =
-        deps.rustModeModuleClient ??
-        createSubcModuleClient({
-            ...(deps.config.subc?.connection_file !== undefined
-                ? { connectionFile: deps.config.subc.connection_file }
-                : {}),
-            projectRoot: deps.directory,
-        });
     const rustModeModuleClient =
-        deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
+        deps.config.transform_mode === "rust"
+            ? (deps.rustModeModuleClient ??
+              createSubcModuleClient({
+                  ...(deps.config.subc?.connection_file !== undefined
+                      ? { connectionFile: deps.config.subc.connection_file }
+                      : {}),
+                  projectRoot: deps.directory,
+              }))
+            : undefined;
     const rustRefusalRecovery = rustModeModuleClient
         ? createRustRefusalRecovery({
               moduleClient: rustModeModuleClient,
               client: deps.client,
           })
         : undefined;
-    // The facades that let the host's own tools write through the module are
-    // built in one place both host lanes call, so a facade cannot be present on
-    // one host and silently missing on the other.
+    // Both host lanes share the module backend for drop state; memories and notes
+    // use the host tools against context.db directly.
     const moduleToolBackends = createModuleToolBackends({
         db,
         moduleClient: rustModeModuleClient,
@@ -650,10 +647,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         memorySyncRequestedSessions: rustMemorySyncRequestedSessions,
     });
     const rustToolBackends: RustToolBackends | undefined = moduleToolBackends?.backends;
-    const ensureModuleNoteEvaluationBridge = (bridgeProjectPath: string): void => {
-        moduleToolBackends?.ensureNoteEvaluationBridge(bridgeProjectPath);
-    };
-    ensureModuleNoteEvaluationBridge(projectPath);
     const notifyRustModeParked = (sessionId: string, message: string): void => {
         const client = deps.client as {
             tui?: {
@@ -796,10 +789,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         promptSurface: deps.config.prompt_surface,
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,
-        tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
+
         rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
-        onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
+
         onRustEngineReconnectRefusal: (args) => rustRefusalRecovery?.arm(args),
     });
     const eventHandler = createEventHandler({

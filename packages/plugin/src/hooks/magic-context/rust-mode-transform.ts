@@ -3,30 +3,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 
 import {
-    type AuthorityDrainResponse,
-    type AuthorityModuleClient,
-    type AuthorityStatus,
-    checksumAuthoritySeedRows,
-    drainAuthority,
-    ensureContextStoreUuid,
-    observeAuthorityRouting,
-    prepareAuthority,
-    pullMemoryMirrorOnce,
-    reconcileAuthorityProject,
-} from "../../features/magic-context/context-authority";
-import { reembedMirrorInvalidatedMemories } from "../../features/magic-context/memory/mirror-reembed";
-import {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
 } from "../../features/magic-context/memory/project-identity";
 import { drainSingleStoreEmbeddingWatermarks } from "../../features/magic-context/memory/single-store-embedding-drain";
-import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import {
     modelKeyAcceptsImages,
     resolveMuralWire,
 } from "../../features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
-import { getMuralIdentity } from "../../features/magic-context/mural/storage-mural";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
@@ -113,12 +98,8 @@ import {
     visitMessageContentFields,
 } from "./lkg-slot";
 import {
-    clearCompartmentMirrorCursor,
-    type ModuleCompartmentMirrorResponse,
-    type ModuleCompartmentReader,
     type ModuleStateSyncClient,
     type ModuleStateSyncState,
-    mirrorModuleCompartments,
     syncModuleState,
 } from "./module-state-sync";
 import {
@@ -139,6 +120,7 @@ import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { singleStoreMigrationRequiredFailure } from "./single-store-refusal";
 import { STORE_AHEAD_OF_BINARY_CODE, storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
@@ -154,17 +136,6 @@ import {
     type ThinkingBindingRecoveryApplication,
 } from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
-
-export class MemoryAuthorityUnavailableError extends Error {
-    readonly code = "MEMORY_AUTHORITY_UNAVAILABLE";
-
-    constructor(detail: string) {
-        super(
-            `rust memory authority unavailable; route ctx_memory through the Rust module: ${detail}`,
-        );
-        this.name = "MemoryAuthorityUnavailableError";
-    }
-}
 
 class RustTransformProtocolError extends Error {
     readonly code = "rust_transform_protocol_error";
@@ -273,41 +244,8 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
             onTimings?: (timings: import("./module-transport").ModuleCallTimings) => void;
         },
     ): Promise<unknown>;
-    authorityStatus?(args: {
-        context_store_uuid: string;
-        project: string;
-        /** Bound route root for this authority query. */
-        projectRoot?: string;
-        /** Existing OpenCode session route used by host tools. */
-        sessionId?: string;
-        domain: "memories" | "notes";
-    }): Promise<{ authority: AuthorityStatus | null }>;
-    authorityPrepare?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
-    authoritySeed?(
-        args: Record<string, unknown>,
-    ): Promise<{ seeded: number; module_row_ids?: number[] }>;
-    authorityDrain?(args: Record<string, unknown>): Promise<AuthorityDrainResponse>;
-    mirrorPull?(args: {
-        domain: "memories" | "notes";
-        cursor: number;
-        limit: number;
-        live_only?: boolean;
-        projectRoot?: string;
-    }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
-    mirrorMemory?(args: { module_row_id: number; projectRoot?: string }): Promise<{
-        row: import("../../features/magic-context/context-authority").ChangefeedRow | null;
-    }>;
-    memoryIdentityAck?(args: {
-        project: string;
-        rows: Array<{ module_row_id: number; context_row_id: number }>;
-        projectRoot?: string;
-    }): Promise<{ acknowledged: number }>;
     deleteSession?(sessionId: string, projectRoot: string): Promise<void>;
     closeSession?(sessionId: string): void;
-    getCompartmentsAfter?(
-        sessionId: string,
-        afterSequence: number,
-    ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
 interface RustLkgCapturePlan {
@@ -424,21 +362,13 @@ interface RustSessionState extends ModuleStateSyncState {
     syntheticTurnCount: number;
     lastObservedUserMessageId: string | null;
     syntheticLoopBreakerLogged: boolean;
-    memoryAuthorityProject: string | null;
-    memoryAuthorityRoot: string | null;
-    memoryAuthorityReady: boolean;
     recordedSessionProjectIdentity: string | null;
     recordedSessionDirectory: string | null;
     resolvedMemoryProjectDirectory: string | null;
     resolvedMemoryProjectPath: string | null;
     stateSyncInputSignature: string | null;
-    memoryMirrorProjectionKey: string | null;
-    compartmentMirrorProjectionKey: string | null;
-    mirrorProjectionInFlight: boolean;
-    muralCuePoolVersion: number;
-    muralGeneration: number;
     muralCache: { key: string; value: MuralWireOptions } | null;
-    authorityMemorySyncSkipLogged?: boolean;
+
     lkgCaptureSequence: number;
     /**
      * Capture sequence of the snapshot prepared from the array the previous pass
@@ -473,21 +403,13 @@ export interface RustModeTransformOptions {
     /** Test-only page-size override for exercising multi-page control flow with small fixtures. */
     modulePageMaxBytes?: number;
     memorySyncRequestedSessions?: Set<string>;
-    /**
-     * Invoked with each project that reaches rust-mode authority preparation, so the
-     * host can lazily register per-project services (the smart-note evaluator bridge)
-     * for projects other than the plugin's launch directory.
-     */
-    onProjectPrepared?: (projectPath: string) => void;
-    /** Test-only escape hatch for transform-wire tests without an authority transport. */
-    allowAuthorityProtocolBypassForTests?: boolean;
     /** Override only for deterministic capture scheduling in tests. */
     scheduleLkgCapture?: (capture: () => void) => void;
     /** Override only to exercise a failure at the native-output installation boundary. */
     installNativeMessagesForTests?: (output: { messages: unknown[] }, messages: unknown[]) => void;
     /** Override only to exercise raw-fallback estimator failures in tests. */
     rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
-    /** Override only to observe mural generation caching in tests. */
+    /** Override only to observe mural candidate resolution in tests. */
     muralResolverForTests?: typeof resolveMuralWire;
     /** Override only to observe session-identity caching in tests. */
     sessionProjectIdentityResolverForTests?: typeof resolveProjectIdentityForSession;
@@ -962,32 +884,6 @@ function responseValue(response: unknown): Record<string, unknown> {
     throw new Error("module transform returned a non-object response");
 }
 
-function mirrorProjectionKey(response: Record<string, unknown>): string | null {
-    const memoryMirrorHead = response.memory_mirror_head;
-    if (
-        typeof memoryMirrorHead === "number" &&
-        Number.isSafeInteger(memoryMirrorHead) &&
-        memoryMirrorHead >= 0
-    ) {
-        return JSON.stringify(["memory-feed", memoryMirrorHead]);
-    }
-    const rowVersion = response.row_version;
-    if (typeof rowVersion !== "number" || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
-        return null;
-    }
-    const renderedMemoryIds = Array.isArray(response.rendered_memory_ids)
-        ? response.rendered_memory_ids
-        : [];
-    // Older modules do not publish the feed frontier. Keep their legacy projection trigger
-    // rather than polling on every pass; current modules use the exact feed sequence above.
-    return JSON.stringify([
-        rowVersion,
-        response.boundary_id ?? null,
-        response.coverage_ordinal ?? null,
-        renderedMemoryIds,
-    ]);
-}
-
 function stateSyncInputSignature(args: {
     projectPath: string | undefined;
     sessionMeta: ReturnType<typeof getOrCreateSessionMeta>;
@@ -1104,21 +1000,13 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             syntheticTurnCount: 0,
             lastObservedUserMessageId: null,
             syntheticLoopBreakerLogged: false,
-            memoryAuthorityProject: null,
-            memoryAuthorityRoot: null,
-            memoryAuthorityReady: false,
             recordedSessionProjectIdentity: null,
             recordedSessionDirectory: null,
             resolvedMemoryProjectDirectory: null,
             resolvedMemoryProjectPath: null,
             stateSyncInputSignature: null,
-            memoryMirrorProjectionKey: null,
-            compartmentMirrorProjectionKey: null,
-            mirrorProjectionInFlight: false,
-            muralCuePoolVersion: 0,
-            muralGeneration: 0,
             muralCache: null,
-            authorityMemorySyncSkipLogged: false,
+
             lkgCaptureSequence: 0,
             lkgLastServedCaptureSequence: null,
             lkgLastCapturedRowVersion: 0,
@@ -1257,247 +1145,6 @@ function directiveTextOf(response: Record<string, unknown>): string | undefined 
 
 function isNeedFullSync(response: Record<string, unknown>): boolean {
     return response.status === "need_full_sync" || response.action === "NEED_FULL_SYNC";
-}
-
-function canonicalizeForChecksum(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(canonicalizeForChecksum);
-    if (!isRecord(value)) return value;
-    return Object.fromEntries(
-        Object.keys(value)
-            .sort()
-            .map((key) => [key, canonicalizeForChecksum(value[key])]),
-    );
-}
-
-function checksumSeedRows(rows: readonly Record<string, unknown>[]): string {
-    return createHash("sha256")
-        .update(JSON.stringify(rows.map(canonicalizeForChecksum)))
-        .digest("hex");
-}
-
-function authoritySeedRows(
-    db: TransformDeps["db"],
-    projectPath: string,
-    domain: "memories" | "notes",
-): Record<string, unknown>[] {
-    const snapshots =
-        domain === "memories"
-            ? db
-                  .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC")
-                  .all(projectPath)
-            : db
-                  .prepare(
-                      `SELECT n.*
-                         FROM notes n
-                        WHERE n.project_path = ?
-                           OR (n.project_path IS NULL AND EXISTS (
-                               SELECT 1 FROM session_projects sp
-                                WHERE sp.session_id = n.session_id AND sp.project_path = ?
-                           ))
-                        ORDER BY n.id ASC`,
-                  )
-                  .all(projectPath, projectPath);
-    const memoryRows = snapshots.filter(isRecord);
-    // A `superseded_by_memory_id` pointing outside this seed set can never resolve
-    // module-side: the store records it as a pending memory reference, and the
-    // resolution sweep only clears pendings whose target later appears in
-    // mc_memories. A target that is absent here is absent for good (its row was
-    // hard-deleted after an archive), so the pending would survive to
-    // authority_finish_prepare and permanently reject the memories-domain handoff.
-    // Dropping the dead link here keeps the gate meaningful for the case it exists
-    // to catch: a target the host DID send that the module failed to ingest.
-    const seededIds = new Set(memoryRows.map((row) => Number(row.id)));
-    const mappings =
-        domain === "memories"
-            ? getMemoryVerifications(
-                  db,
-                  memoryRows.map((row) => Number(row.id)),
-              )
-            : new Map<number, { files: string[]; hasSentinel: boolean; mappingOrigin: "mapper" }>();
-    return memoryRows.map((snapshot) => {
-        const id = Number(snapshot.id);
-        const mapping = mappings.get(id);
-        const resolvedSnapshot =
-            domain === "memories" &&
-            snapshot.superseded_by_memory_id != null &&
-            !seededIds.has(Number(snapshot.superseded_by_memory_id))
-                ? { ...snapshot, superseded_by_memory_id: null }
-                : snapshot;
-        const seededSnapshot =
-            domain === "memories" && mapping
-                ? {
-                      ...resolvedSnapshot,
-                      mapping: mapping.hasSentinel ? null : mapping.files,
-                      mapping_origin: mapping.mappingOrigin,
-                  }
-                : domain === "notes" && snapshot.project_path == null
-                  ? { ...resolvedSnapshot, project_path: projectPath }
-                  : resolvedSnapshot;
-        return { source_row_id: snapshot.id, snapshot: seededSnapshot };
-    });
-}
-
-async function prepareRustMemoryAuthority(args: {
-    db: TransformDeps["db"];
-    module: RustModeModuleClient;
-    projectPath: string;
-    projectRoot: string;
-    state: RustSessionState;
-    allowProtocolBypassForTests?: boolean;
-    /** Fires after authority is ready so hosts can register per-project services. */
-    onProjectPrepared?: (projectPath: string) => void;
-}): Promise<void> {
-    const { db, module, projectPath, projectRoot, state } = args;
-    if (
-        state.memoryAuthorityProject === projectPath &&
-        state.memoryAuthorityRoot === projectRoot &&
-        state.memoryAuthorityReady
-    ) {
-        return;
-    }
-    state.memoryAuthorityProject = projectPath;
-    state.memoryAuthorityRoot = projectRoot;
-    state.memoryAuthorityReady = false;
-    if (!module.authorityStatus || !module.authorityPrepare || !module.authoritySeed) {
-        if (args.allowProtocolBypassForTests === true) {
-            state.memoryAuthorityReady = true;
-            return;
-        }
-        throw new MemoryAuthorityUnavailableError(
-            "the module does not expose authority.status, authority.prepare, and authority.seed",
-        );
-    }
-
-    // Call through the module object on every invocation: these may be real class
-    // methods whose implementations depend on their instance, so detaching them into
-    // locals would sever `this` and only fail at runtime (test fakes are object
-    // literals and cannot catch the difference).
-    const authorityModule: AuthorityModuleClient = {
-        authorityStatus: (request) => {
-            const method = module.authorityStatus;
-            if (!method) throw new MemoryAuthorityUnavailableError("authority.status unavailable");
-            return method.call(module, { ...request, projectRoot });
-        },
-        authorityPrepare: (request) => {
-            const method = module.authorityPrepare;
-            if (!method) throw new MemoryAuthorityUnavailableError("authority.prepare unavailable");
-            return method.call(module, { ...request, projectRoot });
-        },
-        authoritySeed: (request) => {
-            const method = module.authoritySeed;
-            if (!method) throw new MemoryAuthorityUnavailableError("authority.seed unavailable");
-            return method.call(module, { ...request, projectRoot });
-        },
-        authorityDrain: module.authorityDrain
-            ? (request) => {
-                  const method = module.authorityDrain;
-                  if (!method)
-                      throw new MemoryAuthorityUnavailableError("authority.drain unavailable");
-                  return method.call(module, { ...request, projectRoot });
-              }
-            : undefined,
-        mirrorPull: module.mirrorPull
-            ? (request) => {
-                  const method = module.mirrorPull;
-                  if (!method) throw new MemoryAuthorityUnavailableError("mirror.pull unavailable");
-                  return method.call(module, { ...request, projectRoot });
-              }
-            : undefined,
-    };
-    const contextStoreUuid = ensureContextStoreUuid(db);
-    const domains = ["memories", "notes"] as const;
-    const statuses = new Map<
-        (typeof domains)[number],
-        Awaited<ReturnType<NonNullable<RustModeModuleClient["authorityStatus"]>>>["authority"]
-    >();
-    for (const domain of domains) {
-        const current = await authorityModule.authorityStatus({
-            context_store_uuid: contextStoreUuid,
-            project: projectPath,
-            domain,
-        });
-        statuses.set(domain, current.authority);
-    }
-
-    let resumedDrain = false;
-    for (const domain of domains) {
-        const current = statuses.get(domain);
-        if (current?.state !== "DRAINING") continue;
-        resumedDrain = true;
-        let drained: Awaited<ReturnType<typeof drainAuthority>> | undefined;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-            drained = await drainAuthority({
-                db,
-                projectPath,
-                domain,
-                module: authorityModule,
-                checksum: () =>
-                    checksumSeedRows(
-                        db
-                            .prepare(
-                                `SELECT * FROM ${domain === "memories" ? "memories" : "notes"} WHERE project_path = ? ORDER BY id ASC`,
-                            )
-                            .all(projectPath)
-                            .filter(isRecord),
-                    ),
-            });
-            if (!("code" in drained)) break;
-        }
-        if (!drained) {
-            throw new MemoryAuthorityUnavailableError("authority drain did not return a result");
-        }
-        if ("code" in drained) {
-            throw new MemoryAuthorityUnavailableError(
-                `${drained.code}; the next scheduled transform will resume the drain`,
-            );
-        }
-        statuses.set(domain, null);
-    }
-
-    // Do not return before finishing authority restore: if some domains are still
-    // DRAINING and others MODULE, reinstall the on-disk authority_managed marker and
-    // re-apply write fences on remaining MODULE domains before any tools run.
-    if (!resumedDrain) {
-        for (const domain of domains) {
-            const current = statuses.get(domain);
-            if (current?.state !== "PREPARING") continue;
-            await authorityModule.authorityPrepare({
-                method: "authority.prepare",
-                phase: "abort",
-                context_store_uuid: contextStoreUuid,
-                project: projectPath,
-                domain,
-                generation: current.generation,
-            });
-            statuses.set(domain, null);
-        }
-        const preparing = domains.filter((domain) => statuses.get(domain)?.state !== "MODULE");
-        for (const domain of preparing) {
-            const stateName = statuses.get(domain)?.state;
-            if (stateName && stateName !== "TS") {
-                throw new Error(`${domain} authority cannot prepare from ${stateName}`);
-            }
-        }
-        if (preparing.length > 0) {
-            const prepared = await prepareAuthority({
-                db,
-                projectPath,
-                domains: preparing,
-                module: authorityModule,
-                seedPages: async (domain) => authoritySeedRows(db, projectPath, domain),
-                checksum: (_domain, rows) => checksumAuthoritySeedRows(rows),
-            });
-            for (const authority of prepared) statuses.set(authority.domain, authority);
-        }
-    }
-
-    await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
-    observeAuthorityRouting(
-        projectPath,
-        domains.every((domain) => statuses.get(domain)?.state === "MODULE") ? "MODULE" : "TS",
-    );
-    state.memoryAuthorityReady = true;
-    args.onProjectPrepared?.(projectPath);
 }
 
 const TODO_HEAD_ANCHOR_ID = "__magic_context_todo_head__";
@@ -1647,6 +1294,25 @@ function resolvedHistorianModelLimits(
                 },
             ];
         }),
+    );
+}
+
+/** Over-approximate host-visible HARD opportunities: the module freezes mural bytes on all non-materializing passes. */
+function shouldRefreshMuralCandidate(args: {
+    initialized: boolean;
+    pressure: number;
+    threshold: number;
+    lastAppliedAtMs: number | undefined;
+    nowMs: number;
+    cacheTtl: string;
+    explicitMaterialization: boolean;
+}): boolean {
+    const ttlMs = args.cacheTtl === "1h" ? 3_600_000 : 300_000;
+    return (
+        !args.initialized ||
+        args.pressure >= args.threshold ||
+        args.explicitMaterialization ||
+        (args.lastAppliedAtMs !== undefined && args.nowMs - args.lastAppliedAtMs >= ttlMs)
     );
 }
 
@@ -1906,32 +1572,15 @@ export function createRustModeTransform(
         projectIdentity: string | undefined,
         modelKey: string | undefined,
         budgetTokens: number | undefined,
+        refresh: boolean,
     ): MuralWireOptions => {
-        // SDK refreshes can correct image support without changing the model key.
-        // Cache the candidate mural for the next permitted HARD (prefix rebuild);
-        // the Rust module keeps already-served m0 prefix bytes frozen on passes
-        // without cache-bust permission.
-        // Reading only the mural's persisted identity avoids loading PNG bytes or rendering on
-        // the hot path, while detecting murals written outside this transform process so the
-        // cached candidate is invalidated.
-        const artifactIdentity = projectIdentity
-            ? getMuralIdentity(deps.db, projectIdentity)
-            : null;
-        const cacheKey = (artifact: typeof artifactIdentity): string =>
-            JSON.stringify([
-                state.muralGeneration,
-                state.muralCuePoolVersion,
-                projectIdentity ?? null,
-                modelKey ?? null,
-                budgetTokens ?? null,
-                modelKeyAcceptsImages(modelKey),
-                artifact?.contentHash ?? null,
-                artifact?.renderedAt ?? null,
-            ]);
-        const key = cacheKey(artifactIdentity);
-        if (options.disableHotPathIoCachesForTests !== true && state.muralCache?.key === key) {
-            return state.muralCache.value;
-        }
+        const key = JSON.stringify([
+            projectIdentity,
+            modelKey,
+            budgetTokens,
+            modelKeyAcceptsImages(modelKey),
+        ]);
+        if (!refresh && state.muralCache?.key === key) return state.muralCache.value;
         const value = (options.muralResolverForTests ?? resolveMuralWire)(
             deps.db,
             projectIdentity,
@@ -1939,10 +1588,7 @@ export function createRustModeTransform(
             true,
             budgetTokens,
         );
-        const resolvedArtifactIdentity = projectIdentity
-            ? getMuralIdentity(deps.db, projectIdentity)
-            : null;
-        state.muralCache = { key: cacheKey(resolvedArtifactIdentity), value };
+        state.muralCache = { key, value };
         return value;
     };
 
@@ -2814,6 +2460,13 @@ export function createRustModeTransform(
                 promptSurfaceGuidance ??
                 resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
             logStage(sessionId, "promptSurface", promptSurfaceStartedAt, timings);
+            const protectionFloorCacheBustingPass =
+                schedulerDecision === "execute" ||
+                deps.historyRefreshSessions.has(sessionId) ||
+                deps.pendingMaterializationSessions.has(sessionId) ||
+                deps.deferredHistoryRefreshSessions?.has(sessionId) === true ||
+                deps.deferredMaterializationSessions?.has(sessionId) === true;
+            // A module-driven HARD on a host-defer pass may use the previous candidate; cue-only changes wait for the next host bust opportunity.
             const muralResolveStartedAt = performance.now();
             const resolvedMural =
                 !sessionMeta.isSubagent && deps.muralEnabled === true
@@ -2822,16 +2475,19 @@ export function createRustModeTransform(
                           deps.projectPath,
                           modelKey ?? undefined,
                           deps.memoryConfig?.injectionBudgetTokens,
+                          shouldRefreshMuralCandidate({
+                              initialized: state.initialized,
+                              pressure: usage.percentage,
+                              threshold,
+                              lastAppliedAtMs: state.lastAppliedAtMs,
+                              nowMs: passObservedAtMs,
+                              cacheTtl: sessionMeta.cacheTtl,
+                              explicitMaterialization: protectionFloorCacheBustingPass,
+                          }),
                       )
                     : undefined;
             const mural = muralInputForWire(resolvedMural);
             logStage(sessionId, "muralResolve", muralResolveStartedAt, timings);
-            const protectionFloorCacheBustingPass =
-                schedulerDecision === "execute" ||
-                deps.historyRefreshSessions.has(sessionId) ||
-                deps.pendingMaterializationSessions.has(sessionId) ||
-                deps.deferredHistoryRefreshSessions?.has(sessionId) === true ||
-                deps.deferredMaterializationSessions?.has(sessionId) === true;
             const protectionFloorResolution = resolveEpochFloorForPass(deps.db, sessionId, {
                 configuredOverride: deps.protectedTokens,
                 tierOverrides: deps.protectedTokenTierOverrides,
@@ -3099,8 +2755,6 @@ export function createRustModeTransform(
                 getProjectState(deps.db, GLOBAL_USER_PROFILE_PROJECT_PATH),
                 passInputs.upgrade_state,
                 promptSurfaceConfigIdentity(deps.promptSurface),
-                state.muralCuePoolVersion,
-                state.muralGeneration,
                 mural,
                 effectiveFloor,
                 deps.clearReasoningAge,
@@ -3151,28 +2805,6 @@ export function createRustModeTransform(
             let stateSyncRetryBusy = false;
             const stateSyncStartedAt = performance.now();
             try {
-                await prepareRustMemoryAuthority({
-                    db: deps.db,
-                    module: options.moduleClient,
-                    projectPath: memoryProjectPath ?? projectRoot,
-                    projectRoot,
-                    state,
-                    allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
-                    onProjectPrepared: options.onProjectPrepared,
-                });
-                if (memorySyncRequested) {
-                    // A memory tool call can complete after the prior authority pass has
-                    // acknowledged its watermarks. Rewind only memory watermarks so the
-                    // next pass ships the mutation delta without reseeding compartments.
-                    const watermarks = state.lastAckedWatermarks;
-                    if (watermarks) {
-                        state.lastAckedWatermarks = {
-                            ...watermarks,
-                            memory_id: 0,
-                            memory_mutation_id: 0,
-                        };
-                    }
-                }
                 const getCachedStateSyncCapabilities =
                     options.moduleClient.getCachedStateSyncCapabilities;
                 const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
@@ -3193,7 +2825,6 @@ export function createRustModeTransform(
                     force: !state.initialized,
                     options: {
                         authority: true,
-                        authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
                         authoritySeqAdoption,
                         knownWatermarksUnchanged,
                     },
@@ -4062,103 +3693,20 @@ export function createRustModeTransform(
             heapHolder.wireCaches.set(sessionId, pendingWireCache);
             timings.bookkeeping += performance.now() - bookkeepingStartedAt - timings.delivery;
             appliedAt = performance.now();
-            // Stable transform projections cannot have new module-owned mirror rows. A changed
-            // row/boundary/manifest marker schedules one ordered background pull; old modules that
-            // omit row_version keep the compatibility behavior of polling after every pass.
-            const projectionKey =
-                options.disableHotPathIoCachesForTests === true
-                    ? null
-                    : mirrorProjectionKey(response);
-            const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
-            const memoryMirrorDue =
-                options.moduleClient.mirrorPull !== undefined &&
-                (memorySyncRequested ||
-                    projectionKey === null ||
-                    state.memoryMirrorProjectionKey !== projectionKey);
-            const compartmentMirrorDue =
-                getCompartmentsAfter !== undefined &&
-                (projectionKey === null || state.compartmentMirrorProjectionKey !== projectionKey);
-            if ((memoryMirrorDue || compartmentMirrorDue) && !state.mirrorProjectionInFlight) {
-                state.mirrorProjectionInFlight = true;
-                void (async () => {
-                    if (memoryMirrorDue) {
-                        const mirrorPullStartedAt = performance.now();
-                        try {
-                            const mirrorDrain = await pullMemoryMirrorOnce({
-                                db: deps.db,
-                                module: options.moduleClient,
-                            });
-                            if (mirrorDrain.cuePoolVersion !== state.muralCuePoolVersion) {
-                                state.muralCuePoolVersion = mirrorDrain.cuePoolVersion;
-                                state.muralCache = null;
-                            }
-                            // A module-side edit arrives here as changed content, and
-                            // the mirror drops the row's now-stale embedding. Put a
-                            // fresh one back while the module still holds authority,
-                            // so an edited memory does not quietly fall out of scored
-                            // recall for the rest of the session.
-                            if (mirrorDrain.rowsApplied > 0) {
-                                await reembedMirrorInvalidatedMemories(deps.db);
-                            }
-                            // Memories the module wrote straight into context.db never
-                            // pass through the mirror, so the invalidation set above
-                            // cannot know about them. Their high-water mark can.
-                            await drainSingleStoreEmbeddingWatermarks(deps.db);
-                            if (mirrorDrain.complete) {
-                                state.memoryMirrorProjectionKey = projectionKey;
-                            } else if (mirrorDrain.budgetExhausted) {
-                                sessionLog(
-                                    sessionId,
-                                    `rust memory mirror backlog deferred: rows_applied=${mirrorDrain.rowsApplied} backlog_remaining=true pages=${mirrorDrain.pagesPulled}`,
-                                );
-                            }
-                        } catch (error) {
-                            sessionLog(
-                                sessionId,
-                                "rust memory mirror-back failed (ignored):",
-                                error,
-                            );
-                        } finally {
-                            logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
-                        }
-                    }
-                    if (compartmentMirrorDue && getCompartmentsAfter) {
-                        const compartmentMirrorStartedAt = performance.now();
-                        try {
-                            await mirrorModuleCompartments({
-                                db: deps.db,
-                                sessionId,
-                                reader: {
-                                    getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                        getCompartmentsAfter.call(
-                                            options.moduleClient,
-                                            mirroredSessionId,
-                                            afterSequence,
-                                        ),
-                                } satisfies ModuleCompartmentReader,
-                            });
-                            state.compartmentMirrorProjectionKey = projectionKey;
-                        } catch (error) {
-                            sessionLog(
-                                sessionId,
-                                "rust compartment mirror-back failed (ignored):",
-                                error,
-                            );
-                        } finally {
-                            logStage(
-                                sessionId,
-                                "compartmentMirror",
-                                compartmentMirrorStartedAt,
-                                timings,
-                            );
-                        }
-                    }
-                })().finally(() => {
-                    state.mirrorProjectionInFlight = false;
-                });
-            }
+            // Shared-store writes carry embedding watermarks independently of cache projections.
+            void drainSingleStoreEmbeddingWatermarks(deps.db).catch((error) => {
+                sessionLog(sessionId, "single-store embedding drain failed (ignored):", error);
+            });
             finishPass(true);
         } catch (error) {
+            const migration = singleStoreMigrationRequiredFailure(error);
+            if (migration) {
+                decision = "error";
+                materializeReason = migration.code;
+                sessionLog(sessionId, `mc_rust_single_store_refusal reason=${migration.code}`);
+                finishPass(false, false);
+                throw new EmergencyFailClosedError(migration.message, { cause: migration });
+            }
             const storeAhead = storeAheadOfBinaryFailure(error);
             if (storeAhead) {
                 // The module refuses every request until ck-mc is updated or both databases
@@ -4271,13 +3819,12 @@ export function createRustModeTransform(
         },
         async clearSession(sessionId: string): Promise<void> {
             const projectRoot =
-                states.get(sessionId)?.memoryAuthorityRoot ?? options.projectRoot ?? null;
+                states.get(sessionId)?.recordedSessionDirectory ?? options.projectRoot ?? null;
             const clearLocalState = () => {
                 dropSlot(sessionId, "session-deleted");
                 states.delete(sessionId);
                 heapHolder.wireCaches.delete(sessionId);
                 promptSurfaceGuidanceEpochs?.clear(sessionId);
-                clearCompartmentMirrorCursor(sessionId);
             };
             clearLocalState();
             try {
@@ -4338,7 +3885,6 @@ export async function runRustModeTransform(
 
 export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
-    authoritySeedRows,
     contentSnapshotsFor,
     rustCaptureDigests,
     snapshotTags: {
@@ -4365,5 +3911,4 @@ export const __rustModeTransformTest = {
     shouldDisarmRustEmergencyRecovery,
     createRustModeTransform,
     directiveTextOf,
-    prepareRustMemoryAuthority,
 };

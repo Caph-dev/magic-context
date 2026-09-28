@@ -1,15 +1,6 @@
 import type { ProtectedTokensTierOverrides } from "../../config/project-security";
+
 import {
-    type AuthorityModuleClient,
-    checksumAuthoritySeedRows,
-    drainAuthority,
-    ensureContextStoreUuid,
-    getAuthorityManagedMarker,
-    observeAuthorityRouting,
-    reconcileAuthorityMarker,
-} from "../../features/magic-context/context-authority";
-import {
-    isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
@@ -54,7 +45,6 @@ import {
     resetProtectedTailNoEligibleHead,
     resolveEpochFloorForPass,
 } from "../../features/magic-context/storage-meta-persisted";
-import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
 import type { CoordinateGeneration } from "../../features/magic-context/store-generation-rebase";
 import {
     readCoordinateGeneration,
@@ -71,7 +61,7 @@ import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
-import { log, sessionLog } from "../../shared/logger";
+import { sessionLog } from "../../shared/logger";
 import type { ModelInput } from "../../shared/model-resolution";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
@@ -384,187 +374,6 @@ function findNewestUserModel(
     return null;
 }
 
-type TsAuthorityRecoveryOutcome = "completed" | "retryable";
-
-const tsAuthorityRecoveryStateByProject = new Map<string, "running" | "complete">();
-const tsAuthorityMismatchLoggedProjects = new Set<string>();
-const tsAuthorityUnreachableLoggedProjects = new Set<string>();
-
-function authorityModuleForProject(
-    module: RustModeModuleClient,
-    projectRoot: string,
-): AuthorityModuleClient {
-    const authorityStatus = module.authorityStatus;
-    const authorityDrain = module.authorityDrain;
-    const mirrorPull = module.mirrorPull;
-    if (!authorityStatus || !authorityDrain || !mirrorPull) {
-        throw new Error(
-            "the module does not expose authority.status, authority.drain, and mirror.pull",
-        );
-    }
-    return {
-        authorityStatus: (request) => authorityStatus.call(module, { ...request, projectRoot }),
-        authorityPrepare: (request) => {
-            if (!module.authorityPrepare) {
-                throw new Error("the module does not expose authority.prepare");
-            }
-            return module.authorityPrepare({ ...request, projectRoot });
-        },
-        authorityDrain: (request) => authorityDrain.call(module, { ...request, projectRoot }),
-        mirrorPull: (request) => mirrorPull.call(module, { ...request, projectRoot }),
-    };
-}
-
-/**
- * Restore a project to TypeScript ownership after its transform_mode setting no
- * longer selects Rust. The durable marker keeps writes fenced until the module
- * confirms every module-owned domain has drained back through its normal protocol.
- */
-export async function recoverTsAuthorityProject(args: {
-    db: ContextDatabase;
-    projectPath: string;
-    projectRoot: string;
-    module: RustModeModuleClient;
-}): Promise<TsAuthorityRecoveryOutcome> {
-    if (!getAuthorityManagedMarker(args.db, args.projectPath)) return "completed";
-    let releasedMarker = false;
-    const onMarkerReleased = () => {
-        bumpProjectMemoryEpoch(args.db, args.projectPath);
-        releasedMarker = true;
-    };
-    const module = authorityModuleForProject(args.module, args.projectRoot);
-    const domains = ["memories", "notes"] as const;
-    const statuses = await Promise.all(
-        domains.map(async (domain) => ({
-            domain,
-            authority: (
-                await module.authorityStatus({
-                    context_store_uuid: ensureContextStoreUuid(args.db),
-                    project: args.projectPath,
-                    domain,
-                })
-            ).authority,
-        })),
-    );
-
-    // A restarted TypeScript host may find a project that is still module-owned.
-    // Record MODULE routing before the authority drain clears its marker so the
-    // later return to TypeScript is legible as a routing transition.
-    if (
-        statuses.some(
-            ({ authority }) =>
-                authority !== null && authority !== undefined && authority.state !== "TS",
-        )
-    ) {
-        observeAuthorityRouting(args.projectPath, "MODULE");
-    }
-
-    let drainedDomain = false;
-    for (const { domain, authority } of statuses) {
-        if (!authority || authority.state === "TS") continue;
-        // The module's begin route owns MODULE → DRAINING. Calling drainAuthority
-        // preserves the lease, mirror replay, checksum, and recovery choreography.
-        if (authority.state !== "MODULE" && authority.state !== "DRAINING") {
-            return "retryable";
-        }
-        let drained: Awaited<ReturnType<typeof drainAuthority>> | undefined;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-            drained = await drainAuthority({
-                db: args.db,
-                projectPath: args.projectPath,
-                domain,
-                module,
-                onMarkerReleased,
-                checksum: () => {
-                    const table = domain === "memories" ? "memories" : "notes";
-                    const rows = args.db
-                        .prepare(`SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`)
-                        .all(args.projectPath)
-                        .filter(
-                            (row): row is Record<string, unknown> =>
-                                row !== null && typeof row === "object",
-                        );
-                    return checksumAuthoritySeedRows(rows);
-                },
-            });
-            if (!("code" in drained)) break;
-        }
-        if (!drained || "code" in drained) return "retryable";
-        drainedDomain = true;
-    }
-
-    // A previous process may have finished the drain before removing its marker.
-    // Use the same identity-checked heal as startup reconciliation, not another drain.
-    if (!drainedDomain && getAuthorityManagedMarker(args.db, args.projectPath)) {
-        await reconcileAuthorityMarker({
-            db: args.db,
-            projectPath: args.projectPath,
-            module,
-            onMarkerReleased,
-        });
-    }
-    if (!getAuthorityManagedMarker(args.db, args.projectPath)) {
-        // Only the caller that atomically released the marker owns this transition.
-        if (releasedMarker) observeAuthorityRouting(args.projectPath, "TS");
-        return "completed";
-    }
-    return "retryable";
-}
-
-export function scheduleTsAuthorityRecovery(args: {
-    db: ContextDatabase;
-    projectPath: string;
-    projectRoot: string;
-    module?: RustModeModuleClient;
-    isLinkedWorktree?: (directory: string) => boolean;
-}): void {
-    if (!getAuthorityManagedMarker(args.db, args.projectPath)) return;
-    if ((args.isLinkedWorktree ?? isLinkedGitWorktree)(args.projectRoot)) return;
-    if (tsAuthorityRecoveryStateByProject.has(args.projectPath)) return;
-    const module = args.module;
-
-    if (!tsAuthorityMismatchLoggedProjects.has(args.projectPath)) {
-        tsAuthorityMismatchLoggedProjects.add(args.projectPath);
-        log(
-            `[magic-context] project ${args.projectPath} is module-authority-managed but transform_mode is TS; draining authority back to TypeScript`,
-        );
-    }
-    if (!module) {
-        tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
-        if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
-            tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
-            log(
-                `[magic-context] authority recovery for ${args.projectPath} cannot reach subc; writes remain fenced. Run magic-context doctor drain-authority ${args.projectRoot} with rust mode or restore subc connectivity.`,
-            );
-        }
-        return;
-    }
-
-    tsAuthorityRecoveryStateByProject.set(args.projectPath, "running");
-    void Promise.resolve()
-        .then(() => recoverTsAuthorityProject({ ...args, module }))
-        .then((outcome) => {
-            if (outcome === "completed") {
-                tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
-                log(`[magic-context] authority drain complete for project ${args.projectPath}`);
-            } else {
-                // A bounded contention result is durable and resumable. Do not cache it
-                // so the next project setup can resume the module's DRAINING state.
-                tsAuthorityRecoveryStateByProject.delete(args.projectPath);
-            }
-        })
-        .catch((error) => {
-            tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
-            if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
-                tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
-                log(
-                    `[magic-context] authority recovery for ${args.projectPath} cannot reach subc; writes remain fenced. Run magic-context doctor drain-authority ${args.projectRoot} with rust mode or restore subc connectivity.`,
-                    error,
-                );
-            }
-        });
-}
-
 export const EMERGENCY_REFUSAL_NOTICE = "Context full — /ctx-flush or /clear to continue.";
 
 export type HostRefusalNotice = (
@@ -808,16 +617,8 @@ export interface TransformDeps {
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     /** Module transport injected by the hook; tests use a deterministic mock. */
     rustModeModuleClient?: RustModeModuleClient;
-    /** Test-only opt-out for transform-wire fixtures without the authority protocol. */
-    rustModeAllowAuthorityProtocolBypassForTests?: boolean;
     rustModeProjectRoot?: string;
-    /**
-     * Module route used only to recover a project whose config changed from Rust
-     * transforms back to TypeScript while the durable authority marker remains.
-     */
-    tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
-    onRustModeProjectPrepared?: (projectPath: string) => void;
     onRustEngineReconnectRefusal?: (args: {
         sessionId: string;
         projectRoot: string;
@@ -867,11 +668,8 @@ export function createTransform(deps: TransformDeps) {
                   hostClient: deps.client,
                   projectRoot: deps.rustModeProjectRoot,
                   notifyParked: deps.onRustModeParked,
-                  onProjectPrepared: deps.onRustModeProjectPrepared,
                   onEngineReconnectRefusal: deps.onRustEngineReconnectRefusal,
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
-                  allowAuthorityProtocolBypassForTests:
-                      deps.rustModeAllowAuthorityProtocolBypassForTests,
               })
             : undefined;
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
@@ -1914,12 +1712,6 @@ export function createTransform(deps: TransformDeps) {
             deps.projectPath ??
             sessionProjectIdentity;
         if (authorityProjectPath) {
-            scheduleTsAuthorityRecovery({
-                db,
-                projectPath: authorityProjectPath,
-                projectRoot: sessionDirectory || memoryProjectDirectory,
-                module: deps.tsAuthorityRecoveryModuleClient,
-            });
         }
         // Persist only host-resolved session bindings. The launch-directory
         // fallback keeps transforms non-fatal, but storing it as ownership would

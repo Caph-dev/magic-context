@@ -10,10 +10,7 @@ import { join } from "node:path";
 import { COMPACTION_ENABLED_PATH, isCompactionEnabled } from "../config/agent-disable";
 import { currentPluginConfigReader, historianRunConfig } from "../config/live-run-config";
 import type { MagicContextConfig } from "../config/schema/magic-context";
-import {
-    getAuthorityManagedMarker,
-    getMemoryMirrorStatus,
-} from "../features/magic-context/context-authority";
+
 import {
     getFailingDreamTasks,
     getMostRecentTaskRunAt,
@@ -79,7 +76,7 @@ import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers"
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { getLkgSlotHeapStats } from "../hooks/magic-context/lkg-slot";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
-import { getCompartmentMirrorHeapStats } from "../hooks/magic-context/module-state-sync";
+
 import {
     findLastAssistantModelFromOpenCodeDb,
     openCodeDbExists,
@@ -770,10 +767,10 @@ export function buildStatusDetail(
         compactionEnabled,
     );
     const rustMode = config?.transform_mode === "rust";
-    const projectIdentity = rustMode ? resolveProjectIdentity(directory) : null;
+    const _projectIdentity = rustMode ? resolveProjectIdentity(directory) : null;
     const moduleMemoryAuthority = moduleStatus?.authority?.memories;
-    const moduleMemoryState = moduleMemoryAuthority?.state;
-    const moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
+    const _moduleMemoryState = moduleMemoryAuthority?.state;
+    const _moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
     const moduleHistorian = moduleStatus?.historian;
     const historianRefusalDetail =
         moduleHistorian?.last_failure ?? moduleHistorian?.last_no_fire ?? null;
@@ -801,14 +798,7 @@ export function buildStatusDetail(
         dreamerTickFailure: safeTickFailure(db),
         hiddenVariantWarnings: listHiddenVariantWarnings(),
         hostBackendsModuleSide: rustMode,
-        memoryMirror: rustMode ? getMemoryMirrorStatus(db, moduleFeedHead) : undefined,
         compactionMarker: getCompactionMarkerHealth(db, sessionId),
-        memoryAuthorityMismatch:
-            rustMode &&
-            moduleStatus?.authority !== undefined &&
-            projectIdentity !== null &&
-            getAuthorityManagedMarker(db, projectIdentity) !== null &&
-            (moduleMemoryState === "TS" || moduleMemoryAuthority === null),
         activeProfile: typeof config?.profile === "string" ? config.profile : null,
         tagCounter: 0,
         activeTags: 0,
@@ -1197,7 +1187,7 @@ export function buildDebugMemoryUsage(
     const lkg = getLkgSlotHeapStats();
     const tagger = runtimeHolders.taggerCache ?? EMPTY_TAGGER_HEAP_STATS;
     const wire = runtimeHolders.wireCache ?? EMPTY_WIRE_HEAP_STATS;
-    const mirrors = getCompartmentMirrorHeapStats();
+
     const messageIndexQueue = getMessageIndexQueueHeapStats();
     const sessions = new Map<string, DebugMemoryHolders["sessions"][number]>();
     const session = (sessionId: string) => {
@@ -1263,7 +1253,7 @@ export function buildDebugMemoryUsage(
                 rawContentSnapshots: wire.rawContentSnapshots,
                 estimatedBytes: wire.estimatedBytes,
             },
-            compartmentMirrors: { entries: mirrors.entries },
+            compartmentMirrors: { entries: 0 },
             messageIndexQueue,
             sessions: [...sessions.values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
         },

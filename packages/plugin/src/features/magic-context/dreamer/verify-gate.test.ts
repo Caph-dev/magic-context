@@ -7,12 +7,9 @@ import { join } from "node:path";
 
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { applyMirrorPage, type ChangefeedPage } from "../context-authority";
 import {
     __resetVerificationPathsForTests,
     __setVerificationPathsTestHooks,
-    getMemoryVerifications,
-    getUnmappedMemoryIds,
     insertMemory,
     readGitFileChangeTimesSince,
     recordMemoryMapping,
@@ -124,135 +121,6 @@ describe("partitionVerifyScope (per-memory verified_at gate)", () => {
                 now: 1000,
             });
             expect(gate.inScopeIds).toEqual([mapped]);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("module feed drives mapped, verified, updated, and remapped gate state", async () => {
-        const db = freshDb();
-        const dir = makeGitMetadataDirectory("mc-verify-gate-module-feed-");
-        installGitScript(
-            new Map([
-                [gitCommand(["rev-parse", "--show-toplevel"]), `${dir}\n`],
-                [gitCommand(["log", "--since=@5", "--name-only", "--format=%ct"]), ""],
-                [gitCommand(["log", "--since=@10", "--name-only", "--format=%ct"]), ""],
-                [gitCommand(["rev-parse", "HEAD"]), `${HEAD_SHA}\n`],
-                [gitCommand(["diff", "--name-only", "-z", HEAD_SHA]), ""],
-            ]),
-        );
-        const snapshot = (
-            content: string,
-            hash: string,
-            verifiedAt: number | null,
-            mapping: string[] | null,
-        ) => ({
-            id: 77,
-            project_path: PROJECT,
-            category: "ARCHITECTURE",
-            content,
-            normalized_hash: hash,
-            importance: 50,
-            scope: "project",
-            shareable: 0,
-            source_session_id: "ses",
-            source_type: "dreamer",
-            seen_count: 1,
-            retrieval_count: 0,
-            first_seen_at: 1,
-            created_at: 1,
-            updated_at: verifiedAt ?? 1,
-            last_seen_at: 1,
-            last_retrieved_at: null,
-            status: "active",
-            expires_at: null,
-            verification_status: verifiedAt === null ? "unverified" : "verified",
-            verified_at: verifiedAt,
-            classified_at: null,
-            superseded_by_memory_id: null,
-            merged_from: null,
-            metadata_json: null,
-            mapping,
-        });
-        const apply = (
-            cursor: number,
-            content: string,
-            hash: string,
-            verifiedAt: number | null,
-            mapping: string[] | null,
-            op: ChangefeedPage["rows"][number]["op"] = "update",
-        ) =>
-            applyMirrorPage({
-                db,
-                page: {
-                    domain: "memories",
-                    cursor,
-                    next_cursor: cursor + 1,
-                    has_more: false,
-                    rows: [
-                        {
-                            feed_seq: cursor + 1,
-                            domain: "memories",
-                            op,
-                            module_row_id: 77,
-                            full_row_snapshot: snapshot(content, hash, verifiedAt, mapping),
-                            content_hash: hash,
-                        },
-                    ],
-                },
-            });
-
-        try {
-            apply(0, "A in a.ts", "hash-a", null, ["a.ts"], "insert");
-            const contextId = Number(
-                (
-                    db.prepare("SELECT id FROM memories WHERE project_path = ?").get(PROJECT) as {
-                        id: number;
-                    }
-                ).id,
-            );
-            const mappedGate = await partitionVerifyScope({
-                db,
-                projectIdentity: PROJECT,
-                projectDirectory: dir,
-                now: 5_000,
-            });
-            expect(mappedGate.inScopeIds).toEqual([contextId]);
-
-            apply(1, "A in a.ts", "hash-a", 10_000, ["a.ts"]);
-            const verifiedGate = await partitionVerifyScope({
-                db,
-                projectIdentity: PROJECT,
-                projectDirectory: dir,
-                now: 20_000,
-            });
-            expect(verifiedGate.inScopeIds).toEqual([]);
-            expect(verifiedGate.skippedIds).toEqual([contextId]);
-            expect(getMemoryVerifications(db, [contextId]).get(contextId)?.verifiedAt).toBe(10_000);
-
-            apply(2, "B in b.ts", "hash-b", 30_000, null);
-            expect(getUnmappedMemoryIds(db, [contextId])).toEqual([contextId]);
-            const updatedGate = await partitionVerifyScope({
-                db,
-                projectIdentity: PROJECT,
-                projectDirectory: dir,
-                now: 40_000,
-            });
-            expect(updatedGate.inScopeIds).toEqual([]);
-            expect(updatedGate.reason).toBe("no file-mapped memories in scope");
-
-            apply(3, "B in b.ts", "hash-b", 30_000, ["b.ts"]);
-            const remapped = getMemoryVerifications(db, [contextId]).get(contextId);
-            expect(remapped?.files).toEqual(["b.ts"]);
-            expect(remapped?.verifiedAt).toBe(30_000);
-            const broadGate = await partitionVerifyScope({
-                db,
-                projectIdentity: PROJECT,
-                projectDirectory: dir,
-                now: 50_000,
-                forceBroad: true,
-            });
-            expect(broadGate.inScope[0]?.mappedFiles).toEqual(["b.ts"]);
         } finally {
             closeQuietly(db);
         }

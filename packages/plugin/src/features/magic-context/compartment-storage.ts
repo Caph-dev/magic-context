@@ -4,6 +4,7 @@ import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { isCompartmentLeaseHeld } from "./compartment-lease";
 import { getIncrementDepthStatement } from "./compression-depth-storage";
 import { isNoContentCompartment } from "./no-content-compartment";
+import { queueM0Mutation } from "./storage-m0-mutation-log";
 import { clearCachedM0M1 } from "./storage-meta-shared";
 
 const insertCompartmentStatements = new WeakMap<Database, PreparedStatement>();
@@ -330,7 +331,14 @@ export function replaceAllCompartments(
 ): void {
     const now = Date.now();
     db.transaction(() => {
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        const deleted = db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        if (deleted.changes > 0) {
+            queueM0Mutation(db, {
+                sessionId,
+                mutationType: "recomp_boundary_change",
+                queuedAt: now,
+            });
+        }
         insertCompartmentRows(db, sessionId, compartments, now);
     }).immediate();
 }
@@ -386,7 +394,14 @@ export function replaceAllCompartmentState(
 ): void {
     const now = Date.now();
     db.transaction(() => {
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        const deleted = db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        if (deleted.changes > 0) {
+            queueM0Mutation(db, {
+                sessionId,
+                mutationType: "recomp_boundary_change",
+                queuedAt: now,
+            });
+        }
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, compartments, now);
@@ -416,7 +431,14 @@ export function replaceAllCompartmentStateAndBumpDepth(
             return false;
         }
 
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        const deleted = db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        if (deleted.changes > 0) {
+            queueM0Mutation(db, {
+                sessionId,
+                mutationType: "recomp_boundary_change",
+                queuedAt: now,
+            });
+        }
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, compartments, now);
@@ -607,7 +629,16 @@ export function promoteRecompStaging(
                 const staging = getRecompStaging(db, sessionId);
                 if (!staging || staging.compartments.length === 0) return null;
 
-                db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+                const deleted = db
+                    .prepare("DELETE FROM compartments WHERE session_id = ?")
+                    .run(sessionId);
+                if (deleted.changes > 0) {
+                    queueM0Mutation(db, {
+                        sessionId,
+                        mutationType: "recomp_boundary_change",
+                        queuedAt: now,
+                    });
+                }
                 db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
                 insertCompartmentRows(db, sessionId, staging.compartments, now);
                 insertFactRows(db, sessionId, staging.facts, now);
@@ -636,7 +667,14 @@ export function promoteRecompStaging(
             return null;
         }
         // Replace real tables
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        const deleted = db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        if (deleted.changes > 0) {
+            queueM0Mutation(db, {
+                sessionId,
+                mutationType: "recomp_boundary_change",
+                queuedAt: now,
+            });
+        }
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, staging.compartments, now);

@@ -618,7 +618,7 @@ async function applyParsedVerifyManifest(
             if (!identity)
                 throw new DreamerModuleFailureError(
                     "memory.set_verification",
-                    new Error(`missing mirror identity for ${write.id}`),
+                    new Error(`shared memory no longer belongs to the project: ${write.id}`),
                 );
             return {
                 memory_id: identity.moduleId,
@@ -638,8 +638,6 @@ async function applyParsedVerifyManifest(
                     name: "memory.set_verification",
                     arguments: {
                         memory_project: args.projectIdentity,
-                        context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
-                        authority_generation: args.moduleRoute.moduleAuthorityGeneration,
                         command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256")
                             .update(rows.map((row) => row.memory_id).join(","))
                             .digest("hex")

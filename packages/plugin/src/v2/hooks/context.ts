@@ -1239,11 +1239,6 @@ export async function registerContext(context: V2Context) {
                         { message: `Rust Magic Context paused: ${message}`, variant: "warning" },
                         sessionId,
                     ),
-                // A session can resolve a project other than the launch directory,
-                // so the note-evaluation bridge is ensured per prepared project
-                // rather than once at setup.
-                onRustModeProjectPrepared: (projectPath) =>
-                    moduleToolBackends?.ensureNoteEvaluationBridge(projectPath),
                 promptSurface: config.prompt_surface,
                 promptSurfaceRuntime,
                 onRustEngineReconnectRefusal: (refusal) => rustRefusalRecovery?.arm(refusal),

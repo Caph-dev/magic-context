@@ -1,3 +1,4 @@
+import { SingleStoreMigrationRequiredError } from "./single-store-refusal";
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
@@ -365,6 +366,60 @@ describe("SubcModuleTransport", () => {
             binaryMax: 62,
         });
         expect(requestCount).toBe(1);
+    });
+
+    it("maps required and split store frames to MC-C14 without retrying", async () => {
+        for (const code of ["single_store_migration_required", "single_store_state_split"]) {
+            const transport = new SubcModuleTransport(
+                "unused-connection-file",
+                "magic-context",
+                100,
+            );
+            const route = { channel: 7, epoch: 77 } as RouteHandle;
+            let requestCount = 0;
+            const client = {
+                routeOpen: async () => route,
+                request: async () => {
+                    requestCount += 1;
+                    throw new SubcCallError(
+                        "terminal",
+                        "storage open refused",
+                        code,
+                        new SubcError("storage open refused", code, {
+                            reason_code: code,
+                            db_version: 63,
+                            binary_max: 62,
+                        }),
+                    );
+                },
+                close: () => undefined,
+            } as unknown as SubcClient;
+            const internals = transport as unknown as {
+                client: SubcClient | null;
+                ensureConnected(): Promise<SubcClient>;
+            };
+            internals.ensureConnected = async () => {
+                internals.client = client;
+                return client;
+            };
+
+            const failure = await transport
+                .call({
+                    sessionId: "session-store-ahead",
+                    projectRoot: "/workspace/project",
+                    method: "transform",
+                    body: { method: "transform", v: 1 },
+                })
+                .then(
+                    () => null,
+                    (error: unknown) => error,
+                );
+            expect(failure).toBeInstanceOf(SingleStoreMigrationRequiredError);
+            expect((failure as Error).message).toBe(
+                "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+            );
+            expect(requestCount).toBe(1);
+        }
     });
 
     it("returns a typed generation change instead of retrying a sensitive body", async () => {

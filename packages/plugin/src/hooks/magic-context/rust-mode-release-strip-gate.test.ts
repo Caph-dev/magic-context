@@ -208,13 +208,11 @@ function scriptedSession(label: string) {
         sessionDirectoryBySession: new Map(),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
         historianRunner: "broca",
         getModelKey: () => MODEL_KEY,
     };
     const transform = createRustModeTransformImpl(deps, {
         moduleClient,
-        allowAuthorityProtocolBypassForTests: true,
         modulePageMaxBytes: 512 * 1024,
         // Captures commit inline, as setImmediate would before the next request.
         scheduleLkgCapture: (capture) => capture(),

@@ -63,6 +63,38 @@ describe("createCtxNoteTools", () => {
         });
     });
 
+    it("refuses unmigrated note writes with MC-C14 and otherwise writes the shared store", async () => {
+        let moduleCalls = 0;
+        const localTools = createCtxNoteTools({
+            db,
+            resolveProjectPath: () => "git:project-a",
+            rustToolBackends: {
+                note: async () => {
+                    moduleCalls++;
+                    throw new Error("module note route must not be called");
+                },
+            },
+        });
+        db.prepare("INSERT INTO authority_managed VALUES (?, 'old-store', 1)").run("git:project-a");
+        const reply = await localTools.ctx_note.execute(
+            { action: "write", content: "blocked" },
+            toolContext(),
+        );
+        expect(reply).toBe(
+            "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+        );
+        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
+        db.exec("DELETE FROM authority_managed");
+        expect(
+            await localTools.ctx_note.execute(
+                { action: "write", content: "shared" },
+                toolContext(),
+            ),
+        ).toContain("Saved session note");
+        expect(db.prepare("SELECT content FROM notes").get()).toEqual({ content: "shared" });
+        expect(moduleCalls).toBe(0);
+    });
+
     it("writes and reads session notes", async () => {
         const writeResult = await tools.ctx_note.execute(
             { action: "write", content: "Remember the user prefers build on integrate." },
@@ -94,151 +126,6 @@ describe("createCtxNoteTools", () => {
         expect(
             db.prepare("SELECT status, surface_condition FROM notes WHERE id = 1").get(),
         ).toEqual({ status: "active", surface_condition: null });
-    });
-
-    it("routes notes only when the notes domain reports module authority", async () => {
-        const routed: Array<{ action: string; memoryProject: string }> = [];
-        tools = createCtxNoteTools({
-            db,
-            resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                authorityState: async ({ domain }) => (domain === "notes" ? "MODULE" : "TS"),
-                note: async (request) => {
-                    routed.push({
-                        action: request.action,
-                        memoryProject: request.memoryProject,
-                    });
-                    return { content: [{ type: "text", text: "module note result" }] };
-                },
-                noteEvaluationAvailable: () => true,
-            },
-        });
-        const result = await tools.ctx_note.execute(
-            { action: "write", content: "module owned note" },
-            toolContext(),
-        );
-        expect(result).toBe("module note result");
-        expect(routed).toEqual([{ action: "write", memoryProject: "git:project-a" }]);
-        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
-    });
-
-    it("maps a raced module drain rejection to the transition retry message", async () => {
-        tools = createCtxNoteTools({
-            db,
-            resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                authorityState: async () => "MODULE",
-                note: async () => ({
-                    error: {
-                        code: "authority_draining",
-                        message: "authority is draining",
-                    },
-                }),
-            },
-        });
-        const result = await tools.ctx_note.execute(
-            { action: "write", content: "retry me" },
-            toolContext(),
-        );
-        expect(result).toBe(
-            "Note changes are paused while the engine syncs. Retry in a moment. (MC-C03)",
-        );
-        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
-    });
-
-    it("names both store versions and the fix when the module refuses a store ahead of it", async () => {
-        const storeAhead = () =>
-            Object.assign(new Error("store_ahead_of_binary"), {
-                code: "store_ahead_of_binary",
-                detail: { reason_code: "store_ahead_of_binary", db_version: 63, binary_max: 62 },
-            });
-        // Both places the module is asked: the authority probe, and the tool call itself.
-        for (const rustToolBackends of [
-            {
-                authorityState: async () => {
-                    throw storeAhead();
-                },
-            },
-            {
-                authorityState: async () => "MODULE" as const,
-                note: async () => {
-                    throw storeAhead();
-                },
-            },
-        ]) {
-            tools = createCtxNoteTools({
-                db,
-                resolveProjectPath: () => "git:project-a",
-                rustToolBackends,
-            });
-            const result = await tools.ctx_note.execute(
-                { action: "write", content: "must not be written" },
-                toolContext(),
-            );
-            expect(result).toBe(
-                "Magic Context refused to start: its store (store.db) is at schema v63 but this ck-mc build only knows up to v62. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)",
-            );
-        }
-        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
-    });
-
-    it("does not echo content attached to a read-only module refusal", async () => {
-        tools = createCtxNoteTools({
-            db,
-            resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                authorityState: async () => "MODULE",
-                note: async () => ({
-                    error: { code: "authority_draining", message: "authority is draining" },
-                }),
-            },
-        });
-        const result = await tools.ctx_note.execute(
-            { action: "read", content: "read-only content must not echo" },
-            toolContext(),
-        );
-        expect(result).toBe("Notes are temporarily unavailable. Retry in a moment. (MC-C04)");
-        expect(result).not.toContain("read-only content must not echo");
-    });
-
-    it("offers a regular note when conditional notes are unavailable", async () => {
-        tools = createCtxNoteTools({
-            db,
-            resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                authorityState: async () => "MODULE",
-                note: async () => "unexpected",
-                noteEvaluationAvailable: () => false,
-            },
-        });
-        const result = await tools.ctx_note.execute(
-            { action: "write", content: "Remember this", surface_condition: "tomorrow" },
-            toolContext(),
-        );
-        expect(result).toBe(
-            "Conditional notes are not available in the current mode. Save a regular note without a condition. (MC-C08)",
-        );
-    });
-
-    it("keeps TS note handling when the notes domain reports TS authority", async () => {
-        let routed = false;
-        tools = createCtxNoteTools({
-            db,
-            resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                authorityState: async () => "TS",
-                note: async () => {
-                    routed = true;
-                    return "unexpected";
-                },
-            },
-        });
-        const result = await tools.ctx_note.execute(
-            { action: "write", content: "TS owned note" },
-            toolContext(),
-        );
-        expect(result).toContain("Saved session note");
-        expect(routed).toBe(false);
     });
 
     it("stores compiled, plain, and refused smart notes with the required reply shapes", async () => {
@@ -342,126 +229,6 @@ describe("createCtxNoteTools", () => {
                 ).toEqual({ type: "smart" });
             }
         }
-    });
-
-    it("downgrades module-authority smart authoring to a regular note when wake plane is present", async () => {
-        __wakePlaneTest.setCatalogProbe(async () => [
-            { module_id: "scheduled-wakes", roles: [], control_ops: [WAKE_PLANE_CAPABILITY] },
-        ]);
-        let receivedSurfaceCondition: string | undefined;
-        tools = createCtxNoteTools({
-            db,
-            dreamerEnabled: true,
-            resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                authorityState: async () => "MODULE",
-                note: async (request) => {
-                    receivedSurfaceCondition = request.surfaceCondition;
-                    db.prepare(
-                        `INSERT INTO notes (type, status, content, session_id, created_at, updated_at)
-                         VALUES ('session', 'active', ?, ?, 1, 1)`,
-                    ).run(request.content, request.sessionId);
-                    return "Saved session note #1.";
-                },
-            },
-        });
-
-        const result = await tools.ctx_note.execute(
-            {
-                action: "write",
-                content: "Wake-plane module note",
-                surface_condition: "When the scheduled operation completes",
-            },
-            toolContext(),
-        );
-
-        expect(receivedSurfaceCondition).toBeUndefined();
-        expect(result).toContain(
-            "wake plane active — create a scheduled wake instead; stored as a plain note.",
-        );
-        expect(db.prepare("SELECT type FROM notes WHERE id = 1").get()).toEqual({
-            type: "session",
-        });
-    });
-
-    it("compiles a fenced MODULE-authority smart note before the facade write", async () => {
-        tools = createCtxNoteTools({
-            db,
-            dreamerEnabled: true,
-            resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                authorityState: async () => "MODULE",
-                noteEvaluationAvailable: () => true,
-                note: async (request) => {
-                    db.prepare(
-                        `INSERT INTO notes (
-                            type, status, content, session_id, project_path, surface_condition,
-                            compiled_provider, compiled_config, compiled_at, compile_status,
-                            created_at, updated_at
-                        ) VALUES ('smart', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)`,
-                    ).run(
-                        request.content,
-                        request.sessionId,
-                        request.memoryProject,
-                        request.surfaceCondition,
-                        request.compiledProvider,
-                        request.compiledConfig,
-                        request.compiledAt,
-                        request.compileStatus,
-                    );
-                    return {
-                        content: [{ type: "text", text: "Created smart note #1." }],
-                    };
-                },
-            },
-        });
-
-        const result = await tools.ctx_note.execute(
-            {
-                action: "write",
-                content: "Never inspect key material.",
-                surface_condition: "when path /tmp/project-binding-key exists",
-            },
-            toolContext(),
-        );
-
-        expect(result).toContain("Created smart note #1");
-        expect(result).toContain("Retina compile refused: fenced path");
-        expect(
-            db
-                .prepare(
-                    "SELECT compile_status, compiled_provider, compiled_config FROM notes WHERE id = 1",
-                )
-                .get(),
-        ).toEqual({
-            compile_status: "refused",
-            compiled_provider: null,
-            compiled_config: null,
-        });
-    });
-
-    it("rejects module smart-note writes when evaluation is unavailable", async () => {
-        tools = createCtxNoteTools({
-            db,
-            dreamerEnabled: true,
-            resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                authorityState: async () => "MODULE",
-                note: async () => "must not be called",
-                noteEvaluationAvailable: () => false,
-            },
-        });
-        const result = await tools.ctx_note.execute(
-            {
-                action: "write",
-                content: "wait for release",
-                surface_condition: "when release exists",
-            },
-            toolContext(),
-        );
-        expect(result).toContain("(MC-C08)");
-        expect(result).toContain("Save a regular note without a condition.");
-        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
     });
 
     it("defaults to read (not write) when content is an empty string and no action is given", async () => {

@@ -86,7 +86,6 @@ function createFixture(
         sessionDirectoryBySession: new Map([[sessionId, project]]),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
         ...(runner ? { historianRunner: runner } : {}),
         ...(hostRunnerEnabled !== undefined
             ? { historianHostRunnerEnabled: hostRunnerEnabled }
@@ -94,7 +93,6 @@ function createFixture(
     };
     const transform = createRustModeTransform(deps, {
         moduleClient,
-        allowAuthorityProtocolBypassForTests: true,
         scheduleLkgCapture: (capture) => capture(),
     });
     return {

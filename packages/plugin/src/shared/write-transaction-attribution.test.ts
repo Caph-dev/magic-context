@@ -32,10 +32,7 @@ const fencedSources: Array<{ path: string; sites: string[] }> = [
             "storage_meta_wrapup_release",
         ],
     },
-    {
-        path: "packages/plugin/src/features/magic-context/context-authority.ts",
-        sites: ["authority_marker_capture", "authority_capture_check"],
-    },
+
     {
         path: "packages/plugin/src/features/magic-context/compartment-storage.ts",
         sites: ["compartment_state_replace", "recomp_staging_promote"],

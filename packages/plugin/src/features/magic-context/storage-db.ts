@@ -33,7 +33,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 
-import { ensureContextStoreUuid } from "./context-authority";
+import { ensureContextStoreUuid } from "./context-store-uuid";
 import {
     attachFailClosedBlockingProcessEvidence,
     type FailClosedBlockingProcess,
