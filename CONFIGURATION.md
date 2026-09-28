@@ -383,12 +383,12 @@ Controls whether and where Magic Context augments the system prompt (its guidanc
 
 ### `todowrite` (Pi only)
 
-Pi does not ship a built-in `todowrite` tool, so Magic Context registers an OpenCode-parity task-list tool by default. Disable it if another Pi extension already provides todo UX:
+Pi does not ship a built-in `todowrite` tool. Magic Context's task-list tool is off by default; enable it to use the tool, `/todos` command, and optional overlay:
 
 ```jsonc
 {
   "todowrite": {
-    "enabled": true,  // default: true
+    "enabled": true,  // default: false (opt in to Pi todowrite)
     "overlay": true   // default: true
   }
 }
@@ -396,7 +396,7 @@ Pi does not ship a built-in `todowrite` tool, so Magic Context registers an Open
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Register Magic Context's Pi `todowrite` tool and `/todos` command. Set `false` when using another todo extension. |
+| `enabled` | `boolean` | `false` | Set `true` to register Magic Context's Pi `todowrite` tool and `/todos` command. |
 | `overlay` | `boolean` | `true` | Show the persistent todo overlay above the editor while tasks are active. |
 
 Pi registers tools, slash commands, and widgets once at extension boot. If you `/cd` into a project with a different `todowrite.enabled` value, run `/reload` or restart Pi for the tool surface to change.

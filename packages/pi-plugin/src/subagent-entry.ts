@@ -112,13 +112,13 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 				// child session, so session-scoped ctx_note/ctx_expand would write
 				// orphaned notes / expand an empty transcript. Drop them; keep ctx_search.
 				sessionScopedToolsDisabled: true,
-				todowriteEnabled: cfg.todowrite.enabled !== false,
+				todowriteEnabled: cfg.todowrite.enabled,
 				todowriteCommandEnabled: false,
 				promptSurface: registrationPromptSurface,
 			});
 
 			log(
-				`[pi-subagent] registered tools: ctx_search${dreamerActionsEnabled ? ", ctx_memory" : ""}${cfg.todowrite.enabled !== false ? ", todowrite" : ""}` +
+				`[pi-subagent] registered tools: ctx_search${dreamerActionsEnabled ? ", ctx_memory" : ""}${cfg.todowrite.enabled ? ", todowrite" : ""}` +
 					` (ctx_note/ctx_expand omitted: --no-session child;` +
 					` memory=${cfg.memory.enabled}, embedding=${cfg.embedding.provider !== "off"},` +
 					` git_commits=${cfg.memory.git_commit_indexing.enabled}, dreamer_actions=${dreamerActionsEnabled})`,

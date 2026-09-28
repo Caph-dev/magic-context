@@ -55,6 +55,7 @@ describe("registerMagicContextTools", () => {
 
 			registerMagicContextTools(pi, {
 				db,
+				todowriteEnabled: true,
 				memoryToolEnabled: false,
 				sessionScopedToolsDisabled: true,
 				todowriteCommandEnabled: false,
@@ -79,7 +80,11 @@ describe("registerMagicContextTools", () => {
 				registerTool: (tool: { name: string }) => registered.push(tool.name),
 				registerCommand: () => undefined,
 			} as never;
-			registerMagicContextTools(pi, { db, compactionOff: true });
+			registerMagicContextTools(pi, {
+				db,
+				compactionOff: true,
+				todowriteEnabled: true,
+			});
 
 			expect(registered).not.toContain("ctx_reduce");
 			expect(registered).toEqual(
@@ -227,7 +232,7 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
-	it("registers todowrite and /todos by default", () => {
+	it("registers todowrite and /todos when explicitly enabled", () => {
 		const db = createTestDb();
 		try {
 			const registered: string[] = [];
@@ -237,7 +242,7 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db });
+			registerMagicContextTools(pi, { db, todowriteEnabled: true });
 
 			expect(registered).toContain("todowrite");
 			expect(commands).toContain("todos");
@@ -246,7 +251,10 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
-	it("omits todowrite and /todos when todowrite is disabled", () => {
+	it.each([
+		undefined,
+		false,
+	])("omits todowrite and /todos when enabled is %s", (todowriteEnabled) => {
 		const db = createTestDb();
 		try {
 			const registered: string[] = [];
@@ -256,7 +264,7 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db, todowriteEnabled: false });
+			registerMagicContextTools(pi, { db, todowriteEnabled });
 
 			expect(registered).toContain("ctx_search");
 			expect(registered).not.toContain("todowrite");
@@ -276,7 +284,11 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db, todowriteCommandEnabled: false });
+			registerMagicContextTools(pi, {
+				db,
+				todowriteEnabled: true,
+				todowriteCommandEnabled: false,
+			});
 
 			expect(registered).toContain("todowrite");
 			expect(commands).not.toContain("todos");

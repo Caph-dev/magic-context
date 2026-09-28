@@ -182,7 +182,7 @@ export function registerMagicContextTools(
 		pi.registerTool(surfaceTool(createCtxExpandTool({ db: opts.db })));
 	}
 
-	if (opts.todowriteEnabled !== false) {
+	if (opts.todowriteEnabled === true) {
 		// `todowrite` parity with OpenCode. Pi-coding-agent has no built-in
 		// task list tool, so without this the synthetic-todowrite injector
 		// would never have anything to surface. The tool just captures the
