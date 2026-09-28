@@ -16085,6 +16085,295 @@ pub(crate) mod tests {
         }
     }
 
+    /// Stage profile of a large real session, rebuilt with scrubbed content.
+    ///
+    /// Inputs (all read-only copies; the live store is never opened):
+    /// - `MC_PROFILE_STORE`: a `store.db` copy (`sqlite3 -readonly <live> "VACUUM INTO ..."`).
+    ///   It is copied again into a temporary directory before anything opens it.
+    /// - `MC_PROFILE_SESSION`: the session id.
+    /// - `MC_PROFILE_IDENTITIES`: `mid|identities-json` lines exported from that copy's
+    ///   `mc_block_identities`, giving every message's block kinds in order.
+    /// - `MC_PROFILE_SHAPE`: tab-separated `mid role created_ms completed_ms` lines exported
+    ///   from the host database in host order (roles and times only, no content). A line's
+    ///   position is the message ordinal, plus the optional `MC_PROFILE_ORDINAL_OFFSET`.
+    ///
+    /// Every block keeps its real id, kind and, when tagged, its stored source length; all text
+    /// is replaced by filler. The session's real tag rows stay in the store, so tag caching,
+    /// hygiene attribution and temporal marks run at production scale. Cache state and the
+    /// session's coverage rows are cleared so the first pass bootstraps deterministically and
+    /// the whole rebuilt array is live tail. Prints stage timings per pass and a
+    /// digest of each served array, so two builds can be compared for time and bytes.
+    #[test]
+    #[ignore = "requires scrubbed real-session inputs; see the doc comment"]
+    fn real_session_stage_profile() {
+        use mc_store::{
+            CkKind, CkOutputKind, CkToolOutput, HarnessMeta, MediaBlock, MediaKind, OpaqueBlock,
+            ProviderExtras,
+        };
+        use sha2::{Digest, Sha256};
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} is required"));
+        let session = env("MC_PROFILE_SESSION");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(env("MC_PROFILE_STORE"), dir.path().join("store.db")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+            conn.execute("DELETE FROM mc_cache_state", []).unwrap();
+            // The rebuilt array cannot reproduce the host's exact ordinals, so stored coverage
+            // (compartments, roots, fingerprints, frontiers, queued drops) would claim positions
+            // the array cannot match. Clearing the session's rows except tags and the overlays
+            // keyed by block id makes the whole rebuilt array live tail, which keeps every
+            // tagged block in the projection.
+            const KEEP: [&str; 6] = [
+                "mc_tags",
+                "mc_tag_cache_generations",
+                "mc_temporal_marks",
+                "mc_user_hints",
+                "mc_channel1_appends",
+                "mc_notes",
+            ];
+            let tables = conn
+                .prepare(
+                    "SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS \
+                     (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'session_id')",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for table in tables
+                .iter()
+                .filter(|table| !KEEP.contains(&table.as_str()))
+            {
+                conn.execute(
+                    &format!("DELETE FROM \"{table}\" WHERE session_id = ?1"),
+                    rusqlite::params![session],
+                )
+                .unwrap();
+            }
+            conn.execute("UPDATE cortexkit_fence SET epoch=1", [])
+                .unwrap();
+        }
+        let s = store(dir.path());
+        let tag_lengths = s
+            .load_tags_for_session(&session)
+            .unwrap()
+            .into_iter()
+            .map(|tag| (tag.block_id, tag.source_bytes.len()))
+            .collect::<HashMap<_, _>>();
+        let shape = std::fs::read_to_string(env("MC_PROFILE_SHAPE")).unwrap();
+        // Host ordinals can differ from the export's row position by a constant when the host
+        // skips rows; `MC_PROFILE_ORDINAL_OFFSET` corrects that so stored anchors line up.
+        let ordinal_offset = std::env::var("MC_PROFILE_ORDINAL_OFFSET")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let shape = shape
+            .lines()
+            .enumerate()
+            .filter_map(|(position, line)| {
+                let mut fields = line.split('\t');
+                let mid = fields.next()?;
+                let role = fields.next()?;
+                let created = fields.next().and_then(|v| v.parse::<i64>().ok());
+                let completed = fields.next().and_then(|v| v.parse::<i64>().ok());
+                Some((
+                    mid.to_string(),
+                    (
+                        role.to_string(),
+                        created,
+                        completed,
+                        (position as i64 + 1 + ordinal_offset).max(1) as u64,
+                    ),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let filler = |len: usize| {
+            let mut text = "scrubbed ".repeat(len / 9 + 1);
+            text.truncate(len.max(1));
+            text
+        };
+        let identities = std::fs::read_to_string(env("MC_PROFILE_IDENTITIES")).unwrap();
+        let mut messages = Vec::new();
+        let mut last_created = 0;
+        for line in identities.lines() {
+            let Some((mid, json_text)) = line.split_once('|') else {
+                continue;
+            };
+            let kinds: Vec<Value> = serde_json::from_str(json_text).unwrap();
+            // Real ordinals (host order) keep stored compartments and anchors consistent.
+            let (role, created, completed, ordinal) =
+                shape.get(mid).cloned().unwrap_or_else(|| {
+                    let after = messages.last().map_or(0, |m: &CkIngressMessage| m.ordinal);
+                    ("assistant".to_string(), None, None, after + 1)
+                });
+            let mut call_id = String::new();
+            let blocks = kinds
+                .iter()
+                .enumerate()
+                .map(|(index, identity)| {
+                    let len = tag_lengths
+                        .get(&format!("{mid}#{index}"))
+                        .copied()
+                        .unwrap_or(16);
+                    let kind = match identity["kind_tag"].as_str().unwrap_or("opaque") {
+                        "text" => CkKind::Text { text: filler(len) },
+                        "reasoning" => CkKind::Reasoning {
+                            text: filler(64),
+                            signature: Some(format!("sig-{mid}-{index}")),
+                        },
+                        "redacted_reasoning" => CkKind::RedactedReasoning { data: filler(32) },
+                        "tool_call" => {
+                            call_id = format!("call_{mid}_{index}");
+                            CkKind::ToolCall {
+                                id: call_id.clone(),
+                                name: "read".to_string(),
+                                input: json!({ "path": format!("file-{index}") }),
+                                provider_executed: false,
+                            }
+                        }
+                        "tool_result" => CkKind::ToolResult {
+                            id: call_id.clone(),
+                            tool_name: "read".to_string(),
+                            output: CkToolOutput::bare(CkOutputKind::Text { text: filler(len) }),
+                            provider_executed: false,
+                        },
+                        "media" => CkKind::Media(MediaBlock {
+                            kind: MediaKind::Image,
+                            media_type: "image/png".to_string(),
+                            filename: None,
+                            source: json!({ "type": "data_base64", "data": "aGVsbG8=" }),
+                        }),
+                        _ => CkKind::Opaque(OpaqueBlock {
+                            source: json!({ "type": "harness", "harness": "opencode" }),
+                            kind: "step-start".to_string(),
+                            raw: json!({ "type": "step-start" }),
+                            arc: None,
+                        }),
+                    };
+                    CkWireBlock::bare(kind)
+                })
+                .collect::<Vec<_>>();
+            // Keep block positions (and so block ids) stable while making every arc complete:
+            // an unanswered call becomes an opaque step, an unmatched result becomes text.
+            let answered = blocks
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::ToolResult { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let called = blocks
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let blocks = blocks
+                .into_iter()
+                .map(|block| match block.kind {
+                    CkKind::ToolCall { ref id, .. } if !answered.contains(id) => {
+                        CkWireBlock::bare(CkKind::Opaque(OpaqueBlock {
+                            source: json!({ "type": "harness", "harness": "opencode" }),
+                            kind: "step-start".to_string(),
+                            raw: json!({ "type": "step-start" }),
+                            arc: None,
+                        }))
+                    }
+                    CkKind::ToolResult {
+                        ref id, ref output, ..
+                    } if !called.contains(id) => {
+                        let text = match &output.kind {
+                            CkOutputKind::Text { text } => text.clone(),
+                            _ => String::new(),
+                        };
+                        CkWireBlock::bare(CkKind::Text { text })
+                    }
+                    _ => block,
+                })
+                .collect::<Vec<_>>();
+            let mut ck = CkWireMessage::from_parts(
+                &role,
+                blocks,
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            );
+            ck.meta.created_at_ms = created;
+            ck.meta.completed_at_ms = completed;
+            last_created = last_created.max(created.unwrap_or(0));
+            messages.push(CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck,
+            });
+        }
+        messages.sort_by_key(|message| message.ordinal);
+        let mut request = req(&session, "profile", messages);
+        request.serializer_profile = "opencode-aisdk".into();
+        // A host with the reduce tool, so tag minting and the tag overlay are active.
+        request.tool_present = true;
+        let dir_text = dir.path().to_str().unwrap().to_string();
+        let context = pctx("git:profile", &dir_text, last_created + 60_000);
+        let mut appended = request.clone();
+        let mut next = item(
+            "msg_zzzz_profile_append",
+            appended.messages.last().map_or(1, |m| m.ordinal + 1),
+            "one more question",
+        );
+        next.ck.meta.created_at_ms = Some(last_created + 30_000);
+        appended.messages.push(next);
+        eprintln!(
+            "real-profile session={session} messages={} tags={} tag_source_bytes={}",
+            request.messages.len(),
+            tag_lengths.len(),
+            tag_lengths.values().sum::<usize>()
+        );
+        for (name, pass_request) in [
+            ("A-bootstrap", &request),
+            ("B1-replay", &request),
+            ("B2-replay", &request),
+            ("B3-replay", &request),
+            ("C-append", &appended),
+            ("D-replay", &appended),
+        ] {
+            let started = Instant::now();
+            let output = apply_once_with_estimator_and_projection(
+                &s,
+                pass_request,
+                &context,
+                mc_tokenizer::estimate_tokens,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+            let execute_ms = elapsed_ms(started);
+            let mut digest = Sha256::new();
+            for message in output.response.messages() {
+                digest.update(serde_json::to_vec(&**message).unwrap());
+            }
+            let tags = s.load_tags_for_session(&session).unwrap();
+            let timings = output.response.timings.as_ref().unwrap();
+            eprintln!(
+                "real-profile pass={name} decision={} transform_execute={execute_ms:.1} planning={:.1} state_evolution={:.1} tag_overlay={:.1} temporal={:.1} caveman={:.1} build_output={:.1} total={:.1} served_messages={} tags={} max_tag={} served_sha256={:x}",
+                output.response.decision,
+                timings.planning,
+                timings.state_evolution,
+                timings.tag_overlay,
+                timings.temporal,
+                timings.caveman,
+                timings.build_output,
+                timings.total,
+                output.response.messages().len(),
+                tags.len(),
+                tags.last().map_or(0, |tag| tag.tag_number),
+                digest.finalize()
+            );
+        }
+    }
+
     #[test]
     fn apply_once_records_per_stage_timings() {
         let dir = tempfile::tempdir().unwrap();
