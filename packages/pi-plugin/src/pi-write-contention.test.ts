@@ -186,6 +186,7 @@ process.stdin.destroy();
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
+			windowsHide: true,
 		});
 		const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
 		const decoder = new TextDecoder();

@@ -54,11 +54,11 @@ export interface HostUseProbeTargets {
 type SpawnLike = (
     command: string,
     args: string[],
-    options: { encoding: "utf-8"; timeout: number },
+    options: { encoding: "utf-8"; timeout: number; windowsHide: true },
 ) => { status: number | null; stdout?: string | null; error?: Error };
 
 function runLsof(args: string[], spawn: SpawnLike): { pids: number[] } | { error: string } {
-    const result = spawn("lsof", args, { encoding: "utf-8", timeout: 15_000 });
+    const result = spawn("lsof", args, { encoding: "utf-8", timeout: 15_000, windowsHide: true });
     if (result.error) return { error: result.error.message };
     // lsof exits 1 when no process matches; any other non-zero status is a failure.
     if (result.status !== 0 && result.status !== 1) {

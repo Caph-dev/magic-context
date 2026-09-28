@@ -198,6 +198,7 @@ for (const latchControl of [false, true]) {
 			const child = Bun.spawnSync(
 				[process.execPath, "test", import.meta.path, "-t", name],
 				{
+					windowsHide: true,
 					cwd: process.cwd(),
 					env: { ...process.env, MC_NATIVE_EPISODE_RESTART_DB: dbPath },
 					stdout: "pipe",

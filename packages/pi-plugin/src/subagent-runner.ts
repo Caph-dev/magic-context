@@ -1283,6 +1283,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					this.invocation.command,
 					[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
 					{
+						windowsHide: true,
 						cwd: options.cwd,
 						// Merge over the parent env so PATH/HOME/auth variables flow
 						// through for provider extensions. The guard only disables Magic

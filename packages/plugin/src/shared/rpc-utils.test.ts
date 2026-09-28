@@ -183,6 +183,32 @@ describe("discoverLivePiProcessIds", () => {
 });
 
 describe("#411 Windows OMP/Pi live-process scan", () => {
+    test("reuses a Windows snapshot briefly, then refreshes process discovery", () => {
+        let now = PLUGIN_BUILD_MS;
+        const calls: string[] = [];
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            nowMs: () => now,
+            processListExecFileSync: windowsProcessListExec((file) => {
+                calls.push(file);
+                return cimOutput([
+                    {
+                        ProcessId: WINDOWS_FOREIGN_PID,
+                        ParentProcessId: 4,
+                        CommandLine: OMP_PI_ARC_COMMAND,
+                        CreationDate: wmiCreationDate(OLDER_THAN_PLUGIN_MS),
+                    },
+                ]);
+            }),
+        });
+        expect(inspectLivePiProcesses().processIds).toEqual([WINDOWS_FOREIGN_PID]);
+        now += 1_999;
+        expect(inspectLivePiProcesses().processIds).toEqual([WINDOWS_FOREIGN_PID]);
+        expect(calls).toEqual(["powershell"]);
+        now += 1;
+        inspectLivePiProcesses();
+        expect(calls).toEqual(["powershell", "powershell"]);
+    });
     test("(a) tasklist-only fallback skips a parent omp.exe as an ancestor", () => {
         const calls: string[] = [];
         __setRpcIdentityTestHooks({

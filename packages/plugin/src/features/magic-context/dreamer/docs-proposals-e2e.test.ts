@@ -23,7 +23,7 @@ afterEach(() => {
 test("maintain-docs stub model cannot edit docs, emits a proposal and skips the next run", async () => {
     dir = mkdtempSync(join(tmpdir(), "mc-docs-e2e-"));
     const git = (...args: string[]) =>
-        execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+        execFileSync("git", args, { windowsHide: true, cwd: dir, encoding: "utf8" }).trim();
     const file = join(dir, "ARCHITECTURE.md");
     writeFileSync(file, "# Architecture\n\n## Core\nOld sentence.\n");
     writeFileSync(join(dir, "STRUCTURE.md"), "# Structure\n\n## Layout\nLayout.\n");

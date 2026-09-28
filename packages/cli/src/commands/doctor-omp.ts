@@ -406,6 +406,7 @@ function timestamp(date: Date): string {
 function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult {
     if (args[0] === "issue") {
         const result = deps.spawnSync("gh", args, {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "pipe"],
         });
@@ -418,6 +419,7 @@ function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult
 
     try {
         const output = deps.execFileSync("gh", args, {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "pipe"],
         });

@@ -148,6 +148,7 @@ export async function readGitCommitsResult(
     let stdout: string;
     try {
         const result = await execFileAsync("git", args, {
+            windowsHide: true,
             cwd: directory,
             timeout: GIT_TIMEOUT_MS,
             // Default buffer is 1MB; bump to 32MB for large repos. Commits are

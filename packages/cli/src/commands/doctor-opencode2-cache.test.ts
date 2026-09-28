@@ -288,7 +288,7 @@ describe("host process probe", () => {
                     "-e",
                     "require('node:fs').openSync(process.env.HOLD_FILE, 'r'); console.log('ready'); setInterval(() => {}, 1000);",
                 ],
-                { env: { ...process.env, HOLD_FILE: database }, stdout: "pipe" },
+                { windowsHide: true, env: { ...process.env, HOLD_FILE: database }, stdout: "pipe" },
             );
             try {
                 const reader = holder.stdout.getReader();

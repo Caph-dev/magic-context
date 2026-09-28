@@ -64,6 +64,7 @@ async function runCli(args: string[]): Promise<{ code: number; stdout: string; s
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
+        windowsHide: true,
     });
     const [stdout, stderr, code] = await Promise.all([
         new Response(child.stdout).text(),

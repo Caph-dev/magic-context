@@ -42,7 +42,11 @@ export function getOpenCodeCommandInvocation(
  */
 function runOpenCode(args: string[], binary?: string | null, timeoutMs?: number): string | null {
     try {
-        const options = { stdio: "pipe" as const, ...(timeoutMs ? { timeout: timeoutMs } : {}) };
+        const options = {
+            stdio: "pipe" as const,
+            windowsHide: true,
+            ...(timeoutMs ? { timeout: timeoutMs } : {}),
+        };
         if (binary) {
             const invocation = getOpenCodeCommandInvocation(binary, args);
             return execFileSync(invocation.command, invocation.args, {

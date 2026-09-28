@@ -189,6 +189,7 @@ async function runLoggerScenario<T>(
     const root = mkdtempSync(path.join(os.tmpdir(), "magic-context-logger-test-"));
     scenarioRoots.push(root);
     const child = Bun.spawn({
+        windowsHide: true,
         cmd: ["bun", "--eval", loggerScenario],
         cwd: import.meta.dir,
         env: {

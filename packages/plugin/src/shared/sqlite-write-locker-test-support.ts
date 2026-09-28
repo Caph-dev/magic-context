@@ -26,6 +26,7 @@ export async function startSqliteWriteLocker(
     const child = Bun.spawn(["bun", import.meta.path, dbPath, String(holdMs)], {
         stdout: "pipe",
         stderr: "pipe",
+        windowsHide: true,
     });
     const reader = child.stdout.getReader();
     const decoder = new TextDecoder();
