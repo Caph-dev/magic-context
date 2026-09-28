@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	MEMORY_MURAL_BLOCK,
+	MEMORY_MURAL_GUIDANCE,
+} from "@magic-context/core/agents/magic-context-prompt";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -82,6 +86,58 @@ function findM0Image(messages: Array<{ content?: unknown }>): {
 }
 
 describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
+	it("replays a pre-legend baseline unchanged until the next HARD fold", () => {
+		const db = createTestDb();
+		try {
+			getOrCreateSessionMeta(db, SESSION_ID);
+			const firstMessages = [userMessage("first")];
+			injectM0M1Pi(
+				baseState({ mural: muralOption() }),
+				db,
+				firstMessages as never,
+				undefined,
+				true,
+			);
+			const meta = getOrCreateSessionMeta(db, SESSION_ID);
+			const legacy = Buffer.from(
+				meta
+					.cachedM0Bytes!.toString("utf8")
+					.replace(`${MEMORY_MURAL_GUIDANCE}\n`, ""),
+			);
+			db.prepare(
+				"UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?",
+			).run(legacy, SESSION_ID);
+			__test.clearPiMuralProcessCache(SESSION_ID);
+			const deferredMessages = [userMessage("defer")];
+			const deferred = injectM0M1Pi(
+				baseState(),
+				db,
+				deferredMessages as never,
+				undefined,
+				false,
+			);
+			expect(deferred.m0Materialized).toBe(false);
+			expect(textOf(deferredMessages[0])).toBe(
+				textOf(firstMessages[0]).replace(`${MEMORY_MURAL_GUIDANCE}\n`, ""),
+			);
+			const foldedMessages = [userMessage("hard")];
+			injectM0M1Pi(
+				baseState({
+					mural: muralOption(),
+					hardSignals: { ...baseState().hardSignals!, systemHash: "next" },
+				}),
+				db,
+				foldedMessages as never,
+				undefined,
+				true,
+			);
+			expect(textOf(foldedMessages[0])).toContain(MEMORY_MURAL_BLOCK);
+		} finally {
+			__test.clearPiMuralProcessCache(SESSION_ID);
+			closeQuietly(db);
+		}
+	});
+
 	it("folds the <memory-mural> block and Pi image part on HARD, replays byte-identical on defer", () => {
 		const db = createTestDb();
 		try {
@@ -98,7 +154,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			);
 			expect(first.injected).toBe(true);
 			expect(first.m0Materialized).toBe(true);
-			expect(textOf(hardMessages[0])).toContain("<memory-mural>");
+			expect(textOf(hardMessages[0])).toContain(MEMORY_MURAL_BLOCK);
 			const hardImage = findM0Image(hardMessages);
 			expect(hardImage).toBeDefined();
 			expect(hardImage?.mimeType).toBe("image/png");
@@ -187,6 +243,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			expect(disabled.m0Materialized).toBe(true);
 			expect(findM0Image(disabledMessages)).toBeNull();
 			expect(textOf(disabledMessages[0])).not.toContain("<memory-mural>");
+			expect(textOf(disabledMessages[0])).not.toContain(MEMORY_MURAL_GUIDANCE);
 
 			const deferMessages = [userMessage("defer")];
 			const defer = injectM0M1Pi(

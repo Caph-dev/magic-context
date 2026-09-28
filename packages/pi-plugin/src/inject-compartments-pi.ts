@@ -25,6 +25,7 @@
  *     historyRefreshSessions signal.
  */
 
+import { MEMORY_MURAL_BLOCK } from "@magic-context/core/agents/magic-context-prompt";
 import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
@@ -1363,9 +1364,7 @@ export function renderM0Pi(
 	if (memoryBlock) sections.push(memoryBlock);
 	// Sibling layout parity with OpenCode renderM0: mural marker after memories.
 	if (mural?.enabled && mural.supportsVision && mural.dataUrl) {
-		sections.push(
-			"<memory-mural>\nThe project memory mural image follows.\n</memory-mural>",
-		);
+		sections.push(MEMORY_MURAL_BLOCK);
 	}
 	return sections.join("\n\n").trim();
 }

@@ -20,7 +20,7 @@ use crate::memory_render::{render_m0, render_memory_line, workspace_source_names
 use crate::project_docs::read_project_docs_canonical;
 
 pub(crate) const MEMORY_MURAL_BLOCK: &str =
-    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
+    "<memory-mural>\nThe project memory mural image follows.\nThe memory mural image lists project memories that did not fit `<project-memory>`, as compressed cues under category banners. A red cue is a prohibition (`⊘thing (reason)`), `→` means leads to. Run `ctx_search` with a cue's identifiers to recall the full memory.\n</memory-mural>";
 
 /// Why composing the HARD m0 from the store failed.
 #[derive(Debug)]
@@ -937,6 +937,31 @@ mod tests {
         assert!(composed.rendered_memory_ids.is_empty());
         assert_eq!(composed.max_memory_id, 0);
         assert_eq!(composed.memory_mutation_cursor, 0);
+
+        for (enabled, supports_vision, data_url, expected) in [
+            (true, true, Some("data:image/png;base64,YQ=="), true),
+            (false, true, Some("data:image/png;base64,YQ=="), false),
+            (true, false, Some("data:image/png;base64,YQ=="), false),
+            (true, true, None, false),
+        ] {
+            let image = M0MuralInput {
+                enabled,
+                supports_vision,
+                data_url: data_url.map(str::to_string),
+                content_hash: Some("legend-test".to_string()),
+            };
+            let active_inputs = M0ComposeInputs {
+                memory_enabled: true,
+                mural: Some(&image),
+                ..inputs
+            };
+            let active = compose_m0_from_store(store, &active_inputs, no_estimate).unwrap();
+            assert_eq!(active.m0_bytes.contains(MEMORY_MURAL_BLOCK), expected);
+            assert_eq!(
+                active.m0_bytes.contains("The memory mural image lists"),
+                expected
+            );
+        }
     }
 
     #[test]
