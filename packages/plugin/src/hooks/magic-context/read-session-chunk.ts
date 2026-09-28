@@ -40,6 +40,7 @@ import {
     readRawSessionMessageOrdinalPageFromDb,
     readRawSessionMessagePageFromDb,
     readRawSessionMessagePartsByIdFromDb,
+    readRawSessionMessageSummaryPageFromDb,
     readRawSessionMessagesFromDb,
     readRawSessionTailFromDb,
 } from "./read-session-raw";
@@ -400,6 +401,63 @@ function readRawSessionMessageRangeFromSource(
         afterOrdinal = nextOrdinal;
     }
     return messages;
+}
+
+/** Messages per page for the streaming visitors below. */
+export const RAW_MESSAGE_VISIT_PAGE_SIZE = 50;
+
+/**
+ * Visit the messages in [fromOrdinal, toOrdinal] in order, one bounded page at a
+ * time, until `visit` returns false. Memory stays at one page whatever the
+ * session or range size, unlike reading the range into one array.
+ *
+ * `summary: true` reads OpenCode's store through the summary projection: text
+ * parts (cut to a bounded length) and tool parts reduced to what a `TC:` line
+ * shows, with outputs, metadata, reasoning, and file payloads left in SQLite.
+ * A registered provider (Pi) serves its own parts unchanged.
+ */
+export function visitRawSessionMessages(
+    sessionId: string,
+    fromOrdinal: number,
+    toOrdinal: number,
+    visit: (message: RawMessage) => boolean,
+    options: { summary?: boolean; pageSize?: number } = {},
+): void {
+    const from = Math.max(1, Math.floor(fromOrdinal));
+    const to = Math.floor(toOrdinal);
+    if (to < from) return;
+    const provider = sessionProviders.get(sessionId);
+    if (provider && !provider.readMessagePage) {
+        for (const message of provider.readMessages()) {
+            if (message.ordinal < from || message.ordinal > to) continue;
+            if (!visit(message)) return;
+        }
+        return;
+    }
+    if (!provider && !openCodeDbExists()) return;
+
+    const pageSize = Math.max(1, Math.floor(options.pageSize ?? RAW_MESSAGE_VISIT_PAGE_SIZE));
+    let afterOrdinal = from - 1;
+    while (afterOrdinal < to) {
+        const limit = Math.min(pageSize, to - afterOrdinal);
+        const cursor = afterOrdinal;
+        const page = provider?.readMessagePage
+            ? provider.readMessagePage(cursor, limit, to)
+            : withReadOnlySessionDb((db) =>
+                  options.summary
+                      ? readRawSessionMessageSummaryPageFromDb(db, sessionId, cursor, limit, to)
+                      : readRawSessionMessagePageFromDb(db, sessionId, cursor, limit, to),
+              );
+        if (page.length === 0) return;
+        let nextOrdinal = afterOrdinal;
+        for (const message of page) {
+            if (message.ordinal < from || message.ordinal > to) continue;
+            if (!visit(message)) return;
+            nextOrdinal = Math.max(nextOrdinal, message.ordinal);
+        }
+        if (nextOrdinal <= afterOrdinal) return;
+        afterOrdinal = nextOrdinal;
+    }
 }
 
 /** Read the requested absolute-ordinal interval from cache and source as needed. */

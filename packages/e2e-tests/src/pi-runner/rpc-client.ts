@@ -229,6 +229,10 @@ export class PiRpcClient {
     return this.extensionErrors;
   }
 
+  get pid(): number | undefined {
+    return this.process?.pid;
+  }
+
   async start(): Promise<void> {
     if (this.process) throw new Error("Pi RPC client already started");
     writeConfigs(this.env, this.options);

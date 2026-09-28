@@ -50,7 +50,10 @@ import {
 	type FailClosedReason,
 	formatFailClosedBlockingMessage,
 } from "@magic-context/core/features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	isUsableProjectIdentity,
+	resolveProjectIdentityForSession,
+} from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
@@ -480,6 +483,24 @@ function info(message: string, data?: unknown): void {
 
 function warn(message: string, data?: unknown): void {
 	log(`${PREFIX} WARN ${message}`, data);
+}
+
+const loggedNoProjectIdentityDirs = new Set<string>();
+
+/**
+ * Say once per directory that it has no project identity. The resolver refuses
+ * the home directory (and folders inside a dotfiles repository rooted at home)
+ * unless `allow_home_project` is set; such a directory gets no memory, search,
+ * embeddings, or dreamer, and nothing is keyed by an empty project name.
+ */
+function logNoProjectIdentityOnce(directory: string): void {
+	if (loggedNoProjectIdentityDirs.has(directory)) return;
+	loggedNoProjectIdentityDirs.add(directory);
+	info(
+		`no project identity for ${directory}: it is not treated as a project, so memory, search, ` +
+			"embeddings and the dreamer stay off here. Start Pi inside a project folder, or set " +
+			"`allow_home_project: true` in the user-level magic-context.jsonc to give home sessions their own project.",
+	);
 }
 
 // Migrate config from the legacy per-harness locations to the shared CortexKit
@@ -1239,7 +1260,7 @@ async function startPiMagicContextRuntime(
 	if (projectIdentity) seenDreamerProjectIdentities.add(projectIdentity);
 	info(
 		`loaded v${PLUGIN_VERSION} | harness=${PI_HARNESS_KIND} (via ${PI_HARNESS_DETECTION.via}) | db=${dbPath} | ` +
-			`project=${projectIdentity} | dir=${projectDir}`,
+			`project=${projectIdentity || "(none)"} | dir=${projectDir}`,
 	);
 	// Pi tools are registered once per process, so this mode is intentionally
 	// boot-resolved rather than following later /cd project config changes.
@@ -1297,9 +1318,11 @@ async function startPiMagicContextRuntime(
 	}
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
-	info(
-		`registered embedding config for project ${projectIdentity ?? "(no project identity; cwd is $HOME)"}`,
-	);
+	if (isUsableProjectIdentity(projectIdentity)) {
+		info(`registered embedding config for project ${projectIdentity}`);
+	} else {
+		logNoProjectIdentityOnce(projectDir);
+	}
 
 	type ResolvedPiProjectDeps = {
 		projectDir: string;
@@ -1516,6 +1539,12 @@ async function startPiMagicContextRuntime(
 		modelRegistry?: { find(provider: string, modelId: string): unknown },
 	): void {
 		if (sessionShuttingDown) return;
+		// No identity means this directory is not a project (for example the home
+		// directory). Nothing is registered for it, so there is nothing to track.
+		if (!isUsableProjectIdentity(current.projectIdentity)) {
+			logNoProjectIdentityOnce(current.projectDir);
+			return;
+		}
 		seenDreamerProjectIdentities.add(current.projectIdentity);
 		if (!current.dreamerConfig) {
 			unregisterPiDreamerProject({

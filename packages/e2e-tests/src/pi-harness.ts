@@ -37,6 +37,8 @@ export interface PiTestHarnessOptions {
   sharedDataDir?: string;
   /** Optional working directory override before the persistent Pi process starts. */
   workdir?: string;
+  /** Start Pi in its (throwaway) HOME directory instead of a project folder. */
+  workdirIsHome?: boolean;
 }
 
 const DEFAULT_MOCK_RESPONSE: MockResponse = {
@@ -219,6 +221,7 @@ export class PiTestHarness implements PiHostHarness {
     const host = options.host ?? "pi";
     const env = createPiIsolatedEnv(options.sharedDataDir, host);
     if (options.workdir) env.workdir = options.workdir;
+    if (options.workdirIsHome) env.workdir = env.baseDir;
     // A released plugin build under MC_E2E_PI_PLUGIN_ROOT owns an older schema
     // and refuses a database this checkout migrated ahead of it.
     if (options.magicContextConfig?.enabled !== false && !process.env.MC_E2E_PI_PLUGIN_ROOT) {
@@ -254,6 +257,11 @@ export class PiTestHarness implements PiHostHarness {
 
   get workdir(): string {
     return this.env.workdir;
+  }
+
+  /** Process id of the running Pi host, for inspecting what it has open. */
+  get hostPid(): number | undefined {
+    return this.rpc.pid;
   }
 
   get dataDir(): string {

@@ -589,6 +589,16 @@ export function describeUnresolvedProjectIdentity(directory: string): string {
     return `the session directory ${resolvedDirectory} could not be read as a project.`;
 }
 
+/**
+ * Whether a resolved project identity can key project-scoped state (memories,
+ * embeddings, dreamer schedules, session attribution). An unresolved directory
+ * has no identity; callers that coerce that to "" must refuse the empty string
+ * instead of using it as one more project.
+ */
+export function isUsableProjectIdentity(identity: string | null | undefined): identity is string {
+    return typeof identity === "string" && identity.trim().length > 0;
+}
+
 export function resolveProjectIdentityForSession(
     directory: string,
     allowHomeProject = false,

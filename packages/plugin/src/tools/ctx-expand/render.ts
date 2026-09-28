@@ -21,7 +21,7 @@
  * its `RawMessageProvider` for the call exactly like the range view does.
  */
 
-import { readRawSessionMessages } from "../../hooks/magic-context/read-session-chunk";
+import { visitRawSessionMessages } from "../../hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 
@@ -220,7 +220,13 @@ function renderPartFull(part: unknown): string | null {
  * at that ordinal (pruned/reverted or wrong ordinal).
  */
 export function renderMessageByOrdinal(sessionId: string, ordinal: number): string {
-    const msg = readRawSessionMessages(sessionId).find((m: RawMessage) => m.ordinal === ordinal);
+    // Read only the one message, never the whole session.
+    const found: RawMessage[] = [];
+    visitRawSessionMessages(sessionId, ordinal, ordinal, (m) => {
+        if (m.ordinal === ordinal) found.push(m);
+        return false;
+    });
+    const msg = found[0];
     if (!msg) {
         return (
             `No message at ordinal ${ordinal} in this session's stored history — it was deleted ` +
@@ -258,16 +264,14 @@ export function renderVerboseRange(
     end: number,
     tokenBudget: number,
 ): VerboseRangeResult {
-    const messages = readRawSessionMessages(sessionId).filter(
-        (m: RawMessage) => m.ordinal >= start && m.ordinal <= end,
-    );
-
     const out: string[] = [];
     let usedTokens = 0;
     let lastOrdinal = start - 1;
     let truncated = false;
 
-    for (const msg of messages) {
+    // Stream the range a page at a time and stop at the budget, so a wide range
+    // over a long session never loads every message and tool output at once.
+    visitRawSessionMessages(sessionId, start, end, (msg: RawMessage) => {
         const header = `[${msg.ordinal}] ${verboseRoleLabel(msg)}`;
         const partLines = msg.parts.map(renderPartPreview).filter((l): l is string => l !== null);
         const block = partLines.length > 0 ? `${header}\n${partLines.join("\n")}` : header;
@@ -275,12 +279,13 @@ export function renderVerboseRange(
         const blockTokens = estimateTokens(block);
         if (usedTokens + blockTokens > tokenBudget && out.length > 0) {
             truncated = true;
-            break;
+            return false;
         }
         out.push(block);
         usedTokens += blockTokens;
         lastOrdinal = msg.ordinal;
-    }
+        return true;
+    });
 
     return { text: out.join("\n\n"), lastOrdinal, truncated };
 }
