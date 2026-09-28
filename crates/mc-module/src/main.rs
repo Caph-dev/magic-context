@@ -21,6 +21,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{}", mc_module::version_line());
         return Ok(());
     }
+    if std::env::args().skip(1).any(|arg| arg == "--print-fences") {
+        println!("{}", mc_module::supported_fences_line());
+        return Ok(());
+    }
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())

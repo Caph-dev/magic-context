@@ -19471,8 +19471,18 @@ fn ctx_note_schema() -> Value {
     })
 }
 
-/// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
-/// bound sessions obtain preset-selected description text through `manifest.get`.
+/// Supported schema ceilings baked into this build, without opening either database.
+/// The context ceiling is extracted from the same plugin source that enforces it at open.
+pub fn supported_fences_line() -> String {
+    let source = include_str!("../../../packages/plugin/src/features/magic-context/storage-db.ts");
+    let context = source
+        .split_once("export const LATEST_SUPPORTED_VERSION = ")
+        .and_then(|(_, tail)| tail.split_once(';'))
+        .and_then(|(value, _)| value.trim().parse::<u32>().ok())
+        .expect("plugin context.db fence must be a numeric literal");
+    format!("context.db={context} store.db={LATEST_MIGRATION_VERSION}")
+}
+
 /// The single-line `--version` self-report: `ck-mc <crate version> (<build sha>)`.
 /// The build sha is the same compile-time `MC_BUILD_SHA` that stamps manifest
 /// provenance, so a release train tag whose id is a prefix of that sha
@@ -19489,6 +19499,8 @@ pub fn version_line() -> String {
     }
 }
 
+/// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
+/// bound sessions obtain preset-selected description text through `manifest.get`.
 pub fn manifest(module_id: &str) -> ModuleManifest {
     manifest_with_route_targets(module_id, &RouteTargetConfig::default())
 }
@@ -20999,6 +21011,12 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "a lease wait must refuse at once, not hold the request for the lease window"
         );
+    }
+
+    #[test]
+    fn supported_fences_report_plugin_and_store_ceilings() {
+        let line = supported_fences_line();
+        assert_eq!(line, format!("context.db=91 store.db={LATEST_MIGRATION_VERSION}"));
     }
 
     #[test]
