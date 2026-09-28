@@ -22,6 +22,7 @@ import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflo
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
+import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
@@ -593,6 +594,7 @@ export async function sendEmergencyRefusalNotice(
 }
 
 export interface TransformDeps {
+    cacheTtlConfig?: import("../../shared/model-cache-ttl").CacheTtlConfig;
     hiddenCompletionExecutor?: import("./compartment-runner-types").HiddenCompletionExecutor;
     /** Host marker lifecycle; omission preserves OpenCode 1 marker writes and replay. */
     compactionMarkerStrategy?: CompactionMarkerStrategy & {
@@ -975,6 +977,16 @@ export function createTransform(deps: TransformDeps) {
         try {
             // Intentional fail-open: magic-context should not block live chat if session state read fails.
             sessionMeta = getOrCreateSessionMeta(db, sessionId);
+            const ttlModel =
+                findNewestUserModel(messages) ??
+                deps.liveModelBySession?.get(sessionId) ??
+                findLastAssistantModel(messages);
+            sessionMeta.cacheTtl = resolveSessionCacheTtl(
+                db,
+                sessionId,
+                deps.cacheTtlConfig,
+                ttlModel ? `${ttlModel.providerID}/${ttlModel.modelID}` : undefined,
+            ).value;
         } catch (error) {
             passOutcome.record("session-meta-early-return", "fatal");
             sessionLog(sessionId, "transform failed reading session meta:", error);

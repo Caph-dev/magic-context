@@ -6,12 +6,12 @@ import {
 import { escalationBands, MAX_EXECUTE_THRESHOLD } from "../../shared/escalation-bands";
 import { modelRefLookupOrder, piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
+import { resolveModelCacheTtl } from "../../shared/model-cache-ttl";
 import {
     getSdkContextLimit,
     getSdkWindowGeometry,
     isSaneLimit,
 } from "../../shared/models-dev-cache";
-import { resolveModelConfigOrDefault } from "../../shared/prompt-surface";
 import { applyProvenInputFloor, hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 
 export { escalationBands, MAX_EXECUTE_THRESHOLD };
@@ -235,11 +235,7 @@ export function resolveTrustedContextLimit(
 }
 
 export function resolveCacheTtl(cacheTtl: CacheTtlConfig, modelKey: string | undefined): string {
-    if (typeof cacheTtl === "string") {
-        return cacheTtl;
-    }
-
-    return resolveModelConfigOrDefault(cacheTtl, modelKey, cacheTtl.default ?? "5m");
+    return resolveModelCacheTtl(cacheTtl, modelKey).value;
 }
 
 type ExecuteThresholdConfig = number | { default: number; [modelKey: string]: number };

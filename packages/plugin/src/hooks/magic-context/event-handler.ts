@@ -5,6 +5,7 @@ import {
     detectThinkingBindingMismatch,
     isPrefixBoundThinkingModel,
 } from "../../features/magic-context/overflow-detection";
+import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import {
     armThinkingBindingRecovery,
     clearDetectedContextLimit,
@@ -59,7 +60,6 @@ import {
     getSessionProperties,
 } from "./event-payloads";
 import {
-    resolveCacheTtl,
     resolveContextLimit,
     resolveContextWindowGeometry,
     resolveModelKey,
@@ -312,7 +312,12 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
                 updateSessionMeta(deps.db, info.id, {
                     isSubagent: info.parentID.length > 0,
-                    cacheTtl: resolveCacheTtl(deps.config.cache_ttl, modelKey),
+                    cacheTtl: resolveSessionCacheTtl(
+                        deps.db,
+                        info.id,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value,
                 });
             } catch (error) {
                 sessionLog(info.id, "event session.created persistence failed:", error);
@@ -660,9 +665,19 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
 
                 if (typeof deps.config.cache_ttl === "string") {
-                    updates.cacheTtl = resolveCacheTtl(deps.config.cache_ttl, modelKey);
+                    updates.cacheTtl = resolveSessionCacheTtl(
+                        deps.db,
+                        info.sessionID,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value;
                 } else if (modelKey) {
-                    updates.cacheTtl = resolveCacheTtl(deps.config.cache_ttl, modelKey);
+                    updates.cacheTtl = resolveSessionCacheTtl(
+                        deps.db,
+                        info.sessionID,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value;
                 }
 
                 const totalInputTokens =

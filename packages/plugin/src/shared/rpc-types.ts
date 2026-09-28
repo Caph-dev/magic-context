@@ -280,7 +280,7 @@ export interface StatusDetail extends SidebarSnapshot {
     cacheExpired: boolean;
     /** Reports whether the displayed TTL came from config, persisted session metadata,
      *  or the default; cache scheduling still uses the TTL stored in session metadata. */
-    cacheTtlSource?: "config" | "session" | "default";
+    cacheTtlSource?: import("./cache-ttl-display").CacheTtlDisplaySource;
     cacheTtlModelKey?: string;
     configParseFailures?: ConfigParseFailure[];
     /** True when cacheTtl is "never" — the idle-TTL heuristic is disabled on
