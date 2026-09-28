@@ -538,3 +538,165 @@ impl McStore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use rusqlite::{Connection, Transaction};
+
+    use super::*;
+    use crate::{ContextDomain, SqliteContextDomain};
+
+    /// A `context.db` whose next write fails, standing in for a process that stops (or a
+    /// `context.db` that stays busy) after the `store.db` half committed.
+    struct FailNextWrite {
+        inner: SqliteContextDomain,
+        fail: AtomicBool,
+    }
+
+    impl ContextDomain for FailNextWrite {
+        fn read(
+            &self,
+            read: &mut dyn FnMut(&Connection) -> rusqlite::Result<()>,
+        ) -> Result<(), McStoreError> {
+            self.inner.read(read)
+        }
+
+        fn write(
+            &self,
+            tables: &[&str],
+            write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+        ) -> Result<(), McStoreError> {
+            if self.fail.swap(false, Ordering::SeqCst) {
+                return Err(crate::single_store_domain::context_error(
+                    "context_busy",
+                    "injected failure",
+                ));
+            }
+            self.inner.write(tables, write)
+        }
+    }
+
+    fn fold() -> PendingContextWrite {
+        PendingContextWrite::Fold(FoldWrite {
+            project_path: "git:proj".to_string(),
+            harness: None,
+            compartments: vec![StoredCompartment {
+                sequence: 1,
+                start_message: 1,
+                end_message: 4,
+                end_message_id: "m4#0".to_string(),
+                title: "fold".to_string(),
+                content: "folded".to_string(),
+                p1: Some("folded".to_string()),
+                importance: 50,
+                created_at: 10,
+                ..Default::default()
+            }],
+            facts: vec![FactCandidate {
+                category: "CONSTRAINTS".to_string(),
+                content: "a promoted fact".to_string(),
+                ..Default::default()
+            }],
+            promote_facts: true,
+            published_at_ms: 10,
+            events: vec![HistorianEventCandidate {
+                kind: "decision".to_string(),
+                at_compartment: Some(1),
+                compartment_id: Some(1),
+                fields_json: "{}".to_string(),
+                created_at: 10,
+                harness: "opencode".to_string(),
+            }],
+            primer_candidates: vec![HistorianPrimerCandidate {
+                project_path: "git:proj".to_string(),
+                session_id: "ses".to_string(),
+                question: "why this design?".to_string(),
+                source_compartment_start: Some(1),
+                source_compartment_end: Some(4),
+                source_start_message_id: "m1".to_string(),
+                source_end_message_id: "m4".to_string(),
+                source_message_time: 10,
+                created_at: 10,
+            }],
+            user_memory_candidates: vec![HistorianUserMemoryCandidate {
+                content: "prefers terse answers".to_string(),
+                session_id: "ses".to_string(),
+                source_compartment_start: Some(1),
+                source_compartment_end: Some(4),
+                created_at: 10,
+            }],
+        })
+    }
+
+    /// Row counts of every table a fold writes, in the order: compartments, memories,
+    /// events, primers, user observations.
+    fn counts(store: &McStore) -> [i64; 5] {
+        store
+            .with_context_conn_for_test(|tx| {
+                let count = |table: &str| -> rusqlite::Result<i64> {
+                    tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                };
+                Ok([
+                    count("compartments")?,
+                    count("memories")?,
+                    count("compartment_events")?,
+                    count("primer_candidates")?,
+                    count("user_memory_candidates")?,
+                ])
+            })
+            .unwrap()
+    }
+
+    fn record(store: &McStore, write: &PendingContextWrite) {
+        store
+            .inner
+            .with_conn_fenced(|tx| record_pending_context_write_tx(tx, "ses", write))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_fold_resumed_after_either_crash_window_lands_its_side_channels_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = cortexkit_store_types::StorageDescriptor {
+            module_id: "magic-context-test".to_string(),
+            storage_namespace: crate::single_store_schema::STORE_NAMESPACE.to_string(),
+            isolation: cortexkit_store_types::Isolation::Module,
+            backend: cortexkit_store_types::StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        };
+        let store = McStore::open_for_test(&descriptor).unwrap();
+        let context_path = dir.path().join("context.db");
+        let failing = Arc::new(FailNextWrite {
+            inner: SqliteContextDomain::open(&context_path).unwrap(),
+            fail: AtomicBool::new(true),
+        });
+        store.install_context_domain(failing);
+        let write = fold();
+
+        // Window 1: store.db committed the pending row, then the context.db half never
+        // landed. Nothing of the fold is in context.db and the row is still pending.
+        record(&store, &write);
+        assert!(store.complete_pending_context_write("ses", &write).is_err());
+        assert_eq!(counts(&store), [0, 0, 0, 0, 0]);
+        assert!(store.has_pending_context_write("ses").unwrap());
+
+        // The resume applies the whole fold, side channels included, once.
+        assert!(store.resume_pending_context_write("ses").unwrap());
+        assert_eq!(counts(&store), [1, 1, 1, 1, 1]);
+        assert!(!store.has_pending_context_write("ses").unwrap());
+
+        // Window 2: the context.db half committed but the process stopped before the
+        // pending row was deleted. The resume finds the compartments already in place
+        // and must not write any side channel, or the promoted fact, a second time.
+        record(&store, &write);
+        assert!(store.resume_pending_context_write("ses").unwrap());
+        assert_eq!(counts(&store), [1, 1, 1, 1, 1]);
+        assert!(!store.has_pending_context_write("ses").unwrap());
+    }
+}
