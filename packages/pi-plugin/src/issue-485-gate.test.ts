@@ -198,6 +198,7 @@ it("A C D reporter fold, process restart, LKG and second cut", async () => {
 		const child = Bun.spawnSync(
 			[process.execPath, "test", import.meta.path, "-t", "A restart child"],
 			{
+				windowsHide: true,
 				env: {
 					...process.env,
 					MC_GATE_RESTART: "1",

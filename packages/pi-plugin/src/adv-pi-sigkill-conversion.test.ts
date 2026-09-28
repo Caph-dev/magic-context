@@ -163,6 +163,7 @@ describe("ADV Pi: SIGKILL between the HARD fold commit and legacy conversion", (
 				process.execPath,
 				["test", import.meta.path, "--timeout", "60000"],
 				{
+					windowsHide: true,
 					env: {
 						...process.env,
 						ADV_PI_CHILD: variant,

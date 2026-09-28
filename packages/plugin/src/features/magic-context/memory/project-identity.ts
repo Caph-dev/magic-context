@@ -293,6 +293,7 @@ export function resolveProjectIdentityStrict(directory: string): string {
             env: { ...process.env, LC_ALL: "C", LANG: "C" },
             stdio: ["ignore", "pipe", "pipe"],
             timeout: GIT_TIMEOUT_MS,
+            windowsHide: true,
         }) as string;
     } catch (error) {
         throw classifyGitError(error, directory);

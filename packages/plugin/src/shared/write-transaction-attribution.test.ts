@@ -190,6 +190,7 @@ describe("write transaction attribution fences", () => {
             logger.flushLogger();
         `;
         const child = Bun.spawn({
+            windowsHide: true,
             cmd: ["bun", "--eval", scenario],
             cwd: import.meta.dir,
             env: {

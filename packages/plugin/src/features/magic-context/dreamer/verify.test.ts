@@ -58,8 +58,8 @@ function tempProject(): string {
 
 function gitProject(): string {
     const dir = tempProject();
-    execFileSync("git", ["init", "--quiet"], { cwd: dir, timeout: 10_000 });
-    execFileSync("git", ["add", "."], { cwd: dir, timeout: 10_000 });
+    execFileSync("git", ["init", "--quiet"], { windowsHide: true, cwd: dir, timeout: 10_000 });
+    execFileSync("git", ["add", "."], { windowsHide: true, cwd: dir, timeout: 10_000 });
     execFileSync(
         "git",
         [
@@ -73,6 +73,7 @@ function gitProject(): string {
             "Initial source",
         ],
         {
+            windowsHide: true,
             cwd: dir,
             timeout: 10_000,
             env: {

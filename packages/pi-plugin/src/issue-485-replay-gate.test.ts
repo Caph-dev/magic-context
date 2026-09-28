@@ -112,6 +112,7 @@ it("F no-system served arrays equal pre-fix master on every replay", () => {
 		const child = Bun.spawnSync(
 			[process.execPath, "test", import.meta.path, "-t", "F pure replay child"],
 			{
+				windowsHide: true,
 				cwd: import.meta.dir,
 				env: { ...process.env, MC_GATE_PURE: "1", MC_GATE_EMPTY: empty },
 				stdout: "pipe",
