@@ -695,6 +695,13 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
             assertV91EmbeddingWatermarkArm(db);
             populateModuleOwnedRows(db, version, state);
             return;
+        case 92:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(db.prepare("SELECT id, state FROM single_store_state").all()).toEqual([
+                { id: 1, state: "required" },
+            ]);
+            populateModuleOwnedRows(db, version, state);
+            return;
         default:
             throw new Error(`populateForVersion has no arm for migration v${version}`);
     }

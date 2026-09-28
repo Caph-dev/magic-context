@@ -537,7 +537,7 @@ describe("migrateOpenCodeSessionToPi", () => {
                 },
             }),
         ).toThrow(
-            `context.db may contain only host mirrors, not the Rust engine truth. Drain authority to TypeScript with \`magic-context doctor drain-authority ${cwd}\``,
+            "(MC-C14)",
         );
         expect(writes).toEqual([]);
         expect(readJournalRows(cortexkitDb)).toEqual([]);

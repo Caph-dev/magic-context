@@ -70,7 +70,7 @@ function printUsage(): void {
     console.log("    doctor --retry-v22-backfill       Retry failed v22 memory backfill rows");
     console.log("    doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows");
     console.log(
-        "    doctor drain-authority <project>  Drain module memory/note authority back to TypeScript",
+        "    doctor single-store migrate      Move Rust domain rows into context.db offline",
     );
     console.log("    doctor migrate   Migrate OpenCode session to Pi or OMP JSONL");
     console.log("    doctor migrate-session   Re-home an OpenCode session to another directory");
@@ -130,22 +130,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         if (command === "doctor") {
             if (!(await runSqlitePreflight())) return 1;
 
-            if (rest[0] === "drain-authority") {
-                const projectRoot = rest[1];
-                if (!projectRoot || projectRoot.startsWith("-")) {
-                    console.error("Usage: magic-context doctor drain-authority <project>");
-                    return 1;
-                }
-                const [{ runDoctorDrainAuthority }, { getMagicContextStorageDir }, { join }] =
-                    await Promise.all([
-                        import("./commands/doctor-authority"),
-                        import("@magic-context/core/shared/data-path"),
-                        import("node:path"),
-                    ]);
-                return runDoctorDrainAuthority(
-                    projectRoot,
-                    join(getMagicContextStorageDir(), "context.db"),
-                );
+            if (rest[0] === "single-store") {
+                const { runDoctorSingleStoreCli } = await import("./commands/doctor-single-store");
+                return runDoctorSingleStoreCli(rest.slice(1));
             }
             if (rest[0] === "merge-identity") {
                 const { runMergeIdentityCli } = await import("./commands/doctor-merge-identity");

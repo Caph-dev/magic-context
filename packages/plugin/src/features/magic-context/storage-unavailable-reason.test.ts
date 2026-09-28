@@ -65,6 +65,7 @@ function seedPendingMigration(dataHome: string): string {
     const dbPath = join(dataHome, "cortexkit", "magic-context", "context.db");
     const db = new Database(dbPath);
     db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(LATEST_SUPPORTED_VERSION);
+    db.exec("DROP TABLE single_store_state");
     closeQuietly(db);
     return dbPath;
 }

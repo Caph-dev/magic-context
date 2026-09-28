@@ -143,6 +143,7 @@ describe("createV2StorageGate against a migration blocked by another live host",
         seeded
             .prepare("DELETE FROM schema_migrations WHERE version = ?")
             .run(LATEST_SUPPORTED_VERSION);
+        seeded.exec("DROP TABLE single_store_state");
         closeQuietly(seeded);
         const dir = join(dirname(dbPath), "rpc", "older-host");
         mkdirSync(dir, { recursive: true });

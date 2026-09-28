@@ -38,7 +38,7 @@ function openAtV90(): Database {
     initializeDatabase(db);
     runMigrations(db);
     db.exec("DROP TABLE IF EXISTS memory_embedding_watermarks");
-    db.prepare("DELETE FROM schema_migrations WHERE version = 91").run();
+    db.prepare("DELETE FROM schema_migrations WHERE version >= 91").run();
     return db;
 }
 
@@ -49,7 +49,7 @@ describe("migration v91: module-written memory embedding watermark", () => {
             initializeDatabase(db);
             runMigrations(db);
 
-            expect(LATEST_SUPPORTED_VERSION).toBe(91);
+            expect(LATEST_SUPPORTED_VERSION).toBe(92);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(
                 db
@@ -114,7 +114,7 @@ describe("migration v91: module-written memory embedding watermark", () => {
                  VALUES ('git:p', 41, 12, 900)`,
             ).run();
 
-            db.prepare("DELETE FROM schema_migrations WHERE version = 91").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version >= 91").run();
             runMigrations(db);
 
             expect(

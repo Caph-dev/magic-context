@@ -13,6 +13,7 @@ import {
 } from "../lib/database-access";
 import { getOpenCodeDatabasePath, projectPathToPiSessionSlug } from "../lib/migration-paths";
 import { getOmpSessionsRoot, getPiSessionsRoot } from "../lib/paths";
+import { assertNoUnmigratedAuthority } from "../lib/single-store-safety";
 
 export interface MigrateOpenCodeSessionToPiOptions {
     /**
@@ -295,28 +296,6 @@ function shortId(): string {
  */
 export function migrationKeyFor(sourceSessionId: string, targetHarness: string): string {
     return createHash("sha256").update(`${sourceSessionId}\n${targetHarness}`).digest("hex");
-}
-
-function moduleManagedProjectForSession(db: DatabaseLike, sessionId: string): string | null {
-    const tables = db
-        .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('authority_managed', 'session_projects')",
-        )
-        .all() as Array<{ name?: unknown }>;
-    const names = new Set(
-        tables.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])),
-    );
-    if (!names.has("authority_managed") || !names.has("session_projects")) return null;
-    const row = db
-        .prepare(
-            `SELECT am.project_path
-               FROM authority_managed am
-               JOIN session_projects sp ON sp.project_path = am.project_path
-              WHERE sp.session_id = ? AND sp.harness = 'opencode'
-              LIMIT 1`,
-        )
-        .get(sessionId) as { project_path?: unknown } | undefined;
-    return typeof row?.project_path === "string" ? row.project_path : null;
 }
 
 function hasMigrationJournal(db: DatabaseLike): boolean {
@@ -1411,13 +1390,7 @@ export function migrateOpenCodeSessionToPi(
         const cwd = session.directory ?? session.path ?? process.cwd();
         const outputDir = join(piSessionsRoot, projectPathToPiDirSlug(cwd));
         const targetHarness = opts.targetHarness ?? "pi";
-        const moduleManagedProject =
-            cortexkitDb === null ? null : moduleManagedProjectForSession(cortexkitDb, session.id);
-        if (moduleManagedProject) {
-            throw new Error(
-                `Migration refused: source session ${session.id} belongs to module-managed project ${moduleManagedProject}; context.db may contain only host mirrors, not the Rust engine truth. Drain authority to TypeScript with \`magic-context doctor drain-authority ${cwd}\`, then retry.`,
-            );
-        }
+        if (cortexkitDb !== null) assertNoUnmigratedAuthority(cortexkitDb);
 
         // Journal-backed runs (real cortexkit DB, not a dry run) reconcile any
         // interrupted attempts FIRST, then claim this migration's identity.

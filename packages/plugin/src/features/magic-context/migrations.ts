@@ -3156,6 +3156,23 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 92,
+        description: "store-level offline single-store migration state",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS single_store_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    state TEXT NOT NULL CHECK (state IN ('required', 'migrated')),
+                    migrated_at INTEGER,
+                    migrated_by TEXT,
+                    backup_dir TEXT,
+                    report_json TEXT
+                );
+                INSERT OR IGNORE INTO single_store_state(id, state) VALUES (1, 'required');
+            `);
+        },
+    },
 ];
 
 /**
