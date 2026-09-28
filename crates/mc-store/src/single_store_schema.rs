@@ -599,55 +599,51 @@ mod tests {
         assert!(table_exists(&conn, "main", "mc_single_store_pending_publish").unwrap());
     }
 
-    /// A store the engine migrated to 61, marker set, as the engine leaves it.
-    fn migrated_store(dir: &std::path::Path) {
-        let path = dir.join("store.db");
-        crate::migrate_store_to_pre_single_store(&path).unwrap();
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(MIGRATION_61_SQL).unwrap();
-        conn.execute(
-            SINGLE_STORE_MARKER_SQL,
-            rusqlite::params![1_i64, "test-build"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cortexkit_schema_version(namespace, version, applied_at_unix) VALUES (?1, ?2, 0)",
-            rusqlite::params![STORE_NAMESPACE, SINGLE_STORE_MIGRATION_VERSION],
-        )
-        .unwrap();
-    }
-
-    /// What stops this binary, and every ck-mc before it, on a migrated store: its store
-    /// chain ends at 60, so a store at 61 reads as ahead of it and is refused by name before
-    /// any row is read. The runtime that serves a migrated store arrives with its own change.
+    /// What stops a ck-mc built before this migration: its store chain ends at 60, so a
+    /// migrated store reads as ahead of it, and the marker it also checks is set. The old
+    /// chain here is the real migration list cut at 60, not a hand-set version number.
     #[test]
     fn a_binary_whose_chain_ends_at_60_is_refused_by_a_migrated_store() {
-        assert_eq!(crate::LATEST_MIGRATION_VERSION, PRE_SINGLE_STORE_VERSION);
         let dir = tempfile::tempdir().unwrap();
-        migrated_store(dir.path());
-        let error = crate::McStore::open(&descriptor(dir.path()))
-            .err()
-            .expect("a migrated store must be refused");
-        assert!(
-            matches!(
-                error,
-                crate::McStoreError::StoreAheadOfBinary {
-                    db_version: SINGLE_STORE_MIGRATION_VERSION,
-                    binary_max: PRE_SINGLE_STORE_VERSION,
-                }
-            ),
-            "{error}"
-        );
-        let conn = Connection::open(dir.path().join("store.db")).unwrap();
-        assert_eq!(recorded_store_version(&conn).unwrap(), 61);
+        drop(crate::McStore::open(&descriptor(dir.path())).unwrap());
+        let old_chain: Vec<cortexkit_store::Migration> = crate::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= PRE_SINGLE_STORE_VERSION)
+            .map(|migration| cortexkit_store::Migration {
+                version: migration.version,
+                statements: migration.statements,
+            })
+            .collect();
+        assert_eq!(old_chain.last().unwrap().version, PRE_SINGLE_STORE_VERSION);
+        let old = cortexkit_store::open_sqlite(&descriptor(dir.path())).unwrap();
+        let outcome = old.migrate(STORE_NAMESPACE, &old_chain).unwrap();
+        assert!(outcome.store_ahead());
+        assert_eq!(outcome.recorded, SINGLE_STORE_MIGRATION_VERSION);
+        let marker = old.with_conn(crate::read_single_store_marker).unwrap();
+        assert!(marker.is_some(), "the marker is set as well");
     }
 
-    /// Today's populated stores keep opening: the refusal of an unmigrated store waits for
-    /// the runtime that reads context.db, so nothing here may apply 61 or refuse them.
+    /// An empty store takes migration 61 on open and stamps the marker as a fresh install;
+    /// a store holding a domain row is refused and keeps its rows and its version.
     #[test]
-    fn a_populated_store_at_60_still_opens_and_keeps_its_rows() {
+    fn open_migrates_an_empty_store_and_refuses_a_populated_one() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("store.db");
+        drop(crate::McStore::open(&descriptor(dir.path())).unwrap());
+        let conn = Connection::open(dir.path().join("store.db")).unwrap();
+        assert_eq!(recorded_store_version(&conn).unwrap(), 61);
+        let (set, stamp, by): (i64, Option<i64>, String) = conn
+            .query_row(
+                "SELECT single_store, single_store_set_at_ms, single_store_set_by FROM mc_privilege_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(set, 1);
+        assert!(stamp.is_some());
+        assert!(by.ends_with(FRESH_INSTALL_MARKER_SUFFIX), "{by}");
+
+        let populated = tempfile::tempdir().unwrap();
+        let path = populated.path().join("store.db");
         crate::migrate_store_to_pre_single_store(&path).unwrap();
         Connection::open(&path)
             .unwrap()
@@ -657,12 +653,18 @@ mod tests {
                 [],
             )
             .unwrap();
-        drop(crate::McStore::open(&descriptor(dir.path())).unwrap());
+        let error = crate::McStore::open(&descriptor(populated.path()))
+            .err()
+            .expect("a populated unmigrated store must be refused");
+        assert!(matches!(
+            error,
+            crate::McStoreError::SingleStoreMigrationRequired { db_version: 60, .. }
+        ));
         let conn = Connection::open(&path).unwrap();
         assert_eq!(recorded_store_version(&conn).unwrap(), 60);
-        assert_eq!(
-            first_populated_moved_table(&conn, "main").unwrap(),
-            Some("mc_compartments")
-        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mc_compartments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the refusal must leave the rows in place");
     }
 }
