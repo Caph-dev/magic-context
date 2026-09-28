@@ -2868,6 +2868,9 @@ export function createRustModeTransform(
             });
             const passInputs: Record<string, unknown> = {
                 historian_model_limits: resolvedHistorianModelLimits(historianChain),
+                historian_max_output_tokens: historianRun
+                    ? historianRun.maxOutputTokens
+                    : deps.historianMaxOutputTokens,
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
                 provider_id: model?.providerID ?? null,

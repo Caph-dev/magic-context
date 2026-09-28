@@ -1,5 +1,6 @@
 import { loadPluginConfigDetailed } from "../../config";
 import { isCompactionEnabled } from "../../config/agent-disable";
+import { withLiveDreamerOutputCap } from "../../config/live-child-output-cap";
 import {
     dreamerRunConfig,
     historianRunConfig,
@@ -641,7 +642,11 @@ export async function registerContext(context: V2Context) {
                       const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
                       return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
                   },
-                  executor,
+                  executor: withLiveDreamerOutputCap(
+                      executor,
+                      config,
+                      () => liveConfigReader.poll().effective,
+                  ),
                   projectIdentity: () => resolveProjectIdentity(directory) ?? directory,
                   language: config.language,
                   mural: config.mural,

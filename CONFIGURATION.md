@@ -22,6 +22,7 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 <!-- LIVE-CONFIG-KEYS-START -->
 - `commit_cluster_trigger.enabled`
 - `commit_cluster_trigger.min_clusters`
+- `dreamer.maxTokens`
 - `dreamer.omp.fallback_models`
 - `dreamer.omp.model`
 - `dreamer.omp.tasks`
@@ -38,8 +39,8 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 - `dreamer.tasks.compress-cues.schedule`
 - `dreamer.tasks.curate.schedule`
 - `dreamer.tasks.evaluate-smart-notes.schedule`
-- `dreamer.tasks.maintain-docs.schedule`
 - `dreamer.tasks.maintain-docs.max_tokens` (default 12000; combined proposed docs budget)
+- `dreamer.tasks.maintain-docs.schedule`
 - `dreamer.tasks.map-memories.schedule`
 - `dreamer.tasks.promote-primers.promotion_threshold`
 - `dreamer.tasks.promote-primers.schedule`
@@ -50,6 +51,7 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 - `dreamer.tasks.review-user-memories.schedule`
 - `dreamer.tasks.verify-broad.schedule`
 - `dreamer.tasks.verify.schedule`
+- `historian.maxTokens`
 - `historian.omp.fallback_models`
 - `historian.omp.model`
 - `historian.omp.thinking_level`

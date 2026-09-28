@@ -709,6 +709,7 @@
         },
         "maxTokens": {
           "description": "Maximum output tokens",
+          "x-mc-live-reload": true,
           "type": "number"
         },
         "opencode": {
@@ -1135,6 +1136,7 @@
         },
         "maxTokens": {
           "description": "Maximum output tokens",
+          "x-mc-live-reload": true,
           "type": "number"
         },
         "runner": {

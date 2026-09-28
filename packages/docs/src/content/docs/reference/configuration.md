@@ -107,7 +107,7 @@ The background agent that condenses old conversation into compact history.
 | `historian.permission.webfetch` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
 | `historian.permission.doom_loop` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
 | `historian.permission.external_directory` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
-| `historian.maxTokens` | number | — | Maximum output tokens |
+| `historian.maxTokens` **Live** | number | — | Maximum output tokens |
 | `historian.opencode` | object | — | Strict OpenCode model-resolution block. It accepts no Pi vocabulary. |
 | `historian.opencode.model` **Live** | string \| object | — | Primary OpenCode model entry. |
 | `historian.opencode.fallback_models` **Live** | string \| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
@@ -186,7 +186,7 @@ Off-hours maintenance through Dreamer.
 | `dreamer.permission.webfetch` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
 | `dreamer.permission.doom_loop` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
 | `dreamer.permission.external_directory` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
-| `dreamer.maxTokens` | number | — | Maximum output tokens |
+| `dreamer.maxTokens` **Live** | number | — | Maximum output tokens |
 | `dreamer.runner` | `"broca"` \| `"host"` | — | Which side runs the dreamer completions the Rust module routes (classify-memories) in Rust transform mode: "host" runs them on this process's carrier, "broca" routes them to the Broca module. When unset, historian.runner applies, and when that is unset too the harness decides the same way it does for the historian. User-level config only. |
 | `dreamer.opencode` | object | — | Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary. |
 | `dreamer.opencode.model` **Live** | string \| object | — | Primary OpenCode model entry. |

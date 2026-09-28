@@ -2,6 +2,10 @@ import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HISTORIAN_AGENT, HISTORIAN_EDITOR_AGENT } from "../../agents/historian";
 import { withContentLanguageDirective } from "../../agents/language-directive";
+import {
+    forgetHistorianOutputCap,
+    rememberHistorianOutputCap,
+} from "../../config/live-child-output-cap";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import { openDatabase } from "../../features/magic-context/storage";
 import type {
@@ -185,6 +189,8 @@ export function createV1HiddenCompletionExecutor(
             });
             const id = typeof created?.id === "string" ? created.id : "";
             if (id && run.kind === "dreamer-task") asyncChildren.add(id);
+            if (id && run.kind !== "dreamer-task")
+                rememberHistorianOutputCap(id, run.maxOutputTokens);
             return { id, childSessionId: id || undefined };
         },
         async attempt(handle, request) {
@@ -223,7 +229,10 @@ export function createV1HiddenCompletionExecutor(
             };
         },
         async close(handle, settlement) {
-            if (handle?.id) asyncChildren.delete(handle.id);
+            if (handle?.id) {
+                asyncChildren.delete(handle.id);
+                forgetHistorianOutputCap(handle.id);
+            }
             if (!client) return;
             await teardownChildSession({
                 client,
