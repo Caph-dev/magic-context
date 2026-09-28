@@ -63,6 +63,8 @@ test("GitHub live key list and generated site badges match schema marks", async 
     };
     walk(schema);
     const github = fs.readFileSync(path.resolve(import.meta.dir, "../../..", "CONFIGURATION.md"), "utf8");
+    const { buildGitHubLiveKeys } = await import("./build-config-docs");
+    expect(github).toBe(buildGitHubLiveKeys(github));
     const block = github.match(/<!-- LIVE-CONFIG-KEYS-START -->([\s\S]*?)<!-- LIVE-CONFIG-KEYS-END -->/);
     expect(block).not.toBeNull();
     const listed = [...(block?.[1] ?? "").matchAll(/^- `([^`]+)`$/gm)].map((match) => match[1]);

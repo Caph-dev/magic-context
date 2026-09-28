@@ -7,12 +7,13 @@ import {
     buildDreamTaskRuntimeConfigs,
     userMemoryCollectionEnabled,
 } from "../features/magic-context/dreamer/task-config";
+import { producerInputTokenLimit } from "../hooks/magic-context/producer-window-guard";
 import { resolveHistorianModel } from "../shared/model-resolution";
 import { loadPluginConfigDetailed } from "./index";
 import { dreamerRunConfig, historianRunConfig } from "./live-run-config";
 import { LiveConfigReader } from "./live-snapshot";
 
-for (const host of ["OC1", "OC2", "Pi"] as const) {
+for (const host of ["OC1", "OC2", "Pi", "OMP"] as const) {
     test(`${host} historian samples the next generation while an existing run keeps its model and fallback`, () => {
         const root = mkdtempSync(join(tmpdir(), "mc-live-historian-"));
         const previous = { home: process.env.HOME, config: process.env.XDG_CONFIG_HOME };
@@ -23,22 +24,23 @@ for (const host of ["OC1", "OC2", "Pi"] as const) {
         mkdirSync(join(root, "config", "cortexkit"), { recursive: true });
         mkdirSync(join(directory, ".cortexkit"), { recursive: true });
         try {
-            const block = host === "Pi" ? "pi" : "opencode";
+            const block = host === "Pi" ? "pi" : host === "OMP" ? "omp" : "opencode";
             const write = (
                 model: string,
                 fallback: string,
                 autoPromote: boolean,
                 minClusters: number,
+                maxTokens: number,
             ) =>
                 writeFileSync(
                     file,
                     JSON.stringify({
-                        historian: { [block]: { model, fallback_models: [fallback] } },
+                        historian: { maxTokens, [block]: { model, fallback_models: [fallback] } },
                         memory: { auto_promote: autoPromote },
                         commit_cluster_trigger: { enabled: true, min_clusters: minClusters },
                     }),
                 );
-            write("anthropic/old-model", "anthropic/old-fallback", true, 3);
+            write("anthropic/old-model", "anthropic/old-fallback", true, 3, 4096);
             const load = () => loadPluginConfigDetailed(directory, false).config;
             const boot = load();
             const reader = new LiveConfigReader(directory, boot, load, () => {});
@@ -49,9 +51,10 @@ for (const host of ["OC1", "OC2", "Pi"] as const) {
                 "anthropic/new-fallback-with-longer-name",
                 false,
                 5,
+                8192,
             );
             const runTwo = historianRunConfig(boot, reader.poll().effective);
-            const harness = host === "Pi" ? "pi" : "opencode";
+            const harness = host === "Pi" ? "pi" : host === "OMP" ? "omp" : "opencode";
             expect(resolveHistorianModel(runOne, harness).primary?.model).toBe(
                 "anthropic/old-model",
             );
@@ -68,6 +71,9 @@ for (const host of ["OC1", "OC2", "Pi"] as const) {
             expect(runTwo.memory.auto_promote).toBe(false);
             expect(runOne.commit_cluster_trigger.min_clusters).toBe(3);
             expect(runTwo.commit_cluster_trigger.min_clusters).toBe(5);
+            expect(runOne.historian?.maxTokens).toBe(4096);
+            expect(runTwo.historian?.maxTokens).toBe(8192);
+            expect(producerInputTokenLimit(32_000, runTwo.historian?.maxTokens ?? 0)).toBe(23_093);
             expect(reader.current().generation).toBe(2);
         } finally {
             if (previous.home === undefined) delete process.env.HOME;
@@ -79,7 +85,7 @@ for (const host of ["OC1", "OC2", "Pi"] as const) {
     });
 }
 
-for (const host of ["OC1", "OC2", "Pi"] as const) {
+for (const host of ["OC1", "OC2", "Pi", "OMP"] as const) {
     test(`${host} dreamer samples the new schedule and model chain without changing a running task`, () => {
         const root = mkdtempSync(join(tmpdir(), "mc-live-dreamer-"));
         const previous = { home: process.env.HOME, config: process.env.XDG_CONFIG_HOME };
@@ -91,11 +97,14 @@ for (const host of ["OC1", "OC2", "Pi"] as const) {
         mkdirSync(join(root, "config", "cortexkit"), { recursive: true });
         mkdirSync(join(directory, ".cortexkit"), { recursive: true });
         try {
-            const block = host === "Pi" ? "pi" : "opencode";
+            const block = host === "Pi" ? "pi" : host === "OMP" ? "omp" : "opencode";
             writeFileSync(
                 userFile,
                 JSON.stringify({
-                    dreamer: { [block]: { model: "old/model", fallback_models: ["old/fallback"] } },
+                    dreamer: {
+                        maxTokens: 4096,
+                        [block]: { model: "old/model", fallback_models: ["old/fallback"] },
+                    },
                 }),
             );
             const writeSchedule = (schedule: string) =>
@@ -122,6 +131,7 @@ for (const host of ["OC1", "OC2", "Pi"] as const) {
                 userFile,
                 JSON.stringify({
                     dreamer: {
+                        maxTokens: 8192,
                         [block]: {
                             model: "new/model-long",
                             fallback_models: ["new/fallback-long"],
@@ -132,14 +142,17 @@ for (const host of ["OC1", "OC2", "Pi"] as const) {
             writeSchedule("15 4 * * *");
             const runTwo = dreamerRunConfig(boot, reader.poll().effective);
             const task = (cfg: typeof runOne) =>
-                buildDreamTaskRuntimeConfigs(cfg.dreamer, host === "Pi" ? "pi" : "opencode").find(
-                    (entry) => entry.task === "verify",
-                )!;
+                buildDreamTaskRuntimeConfigs(
+                    cfg.dreamer,
+                    host === "Pi" ? "pi" : host === "OMP" ? "omp" : "opencode",
+                ).find((entry) => entry.task === "verify")!;
             expect(task(runOne).schedule).toBe("0 3 * * *");
             expect(userMemoryCollectionEnabled(runOne.dreamer)).toBe(false);
             expect(task(runOne).model?.model).toBe("old/model");
             expect(task(runOne).fallbackModels[0]?.model).toBe("old/fallback");
             expect(task(runTwo).schedule).toBe("15 4 * * *");
+            expect(runOne.dreamer?.maxTokens).toBe(4096);
+            expect(runTwo.dreamer?.maxTokens).toBe(8192);
             expect(
                 userMemoryCollectionEnabled(
                     historianRunConfig(boot, reader.current().effective).dreamer,

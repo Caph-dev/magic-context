@@ -3353,6 +3353,7 @@ mod tests {
             historian_model_chain: None,
             historian_model_limits: Default::default(),
             historian_timeout_ms: None,
+            historian_max_output_tokens: None,
             declared_trim: None,
             lineage_switched: false,
             descent_edge_id: 0,

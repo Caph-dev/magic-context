@@ -859,6 +859,8 @@ pub struct TransformRequest {
     /// Host-resolved per-attempt historian deadline; absent on older adapters.
     #[serde(default)]
     pub historian_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub historian_max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
     /// Composed fake-compaction edge delivered by the lineage owner. Missing fields retain
@@ -1079,6 +1081,8 @@ struct TransformRequestWire {
     #[serde(default)]
     historian_timeout_ms: Option<u64>,
     #[serde(default)]
+    historian_max_output_tokens: Option<u32>,
+    #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
     #[serde(default)]
     lineage_switched: bool,
@@ -1172,6 +1176,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             historian_model_chain: wire.historian_model_chain,
             historian_model_limits: wire.historian_model_limits,
             historian_timeout_ms: wire.historian_timeout_ms,
+            historian_max_output_tokens: wire.historian_max_output_tokens,
             declared_trim: wire.declared_trim,
             lineage_switched: wire.lineage_switched,
             descent_edge_id: wire.descent_edge_id,
@@ -15273,6 +15278,23 @@ pub(crate) mod tests {
         NoteCasOutcome, NoteEvaluationInput, NoteWriteInput, StoredCompartment,
     };
 
+    #[test]
+    fn historian_output_cap_is_scoped_to_each_transform_request() {
+        let request = |cap| {
+            serde_json::from_value::<TransformRequest>(serde_json::json!({
+                "session_id": "historian-cap",
+                "render_config": "{}",
+                "historian_model_chain": ["test/model"],
+                "historian_max_output_tokens": cap,
+            }))
+            .expect("valid historian request")
+        };
+        let first = request(4096);
+        let second = request(8192);
+        assert_eq!(first.historian_max_output_tokens, Some(4096));
+        assert_eq!(second.historian_max_output_tokens, Some(8192));
+    }
+
     fn resolve_test_cache_ttl(
         ctx: &mut ProducerContext<'_>,
         config: &crate::config::McModuleConfig,
@@ -16773,6 +16795,7 @@ pub(crate) mod tests {
             history_budget_tokens: None,
             historian_model_chain: None,
             historian_model_limits: Default::default(),
+            historian_max_output_tokens: None,
             historian_timeout_ms: None,
             declared_trim: None,
             lineage_switched: false,

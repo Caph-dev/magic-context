@@ -267,6 +267,10 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 					opts.projectDir
 			);
 		},
+		() =>
+			opts.sampleDreamRun
+				? opts.sampleDreamRun().dreamerConfig?.maxTokens
+				: opts.config.maxTokens,
 	);
 
 	let cleanup: (() => void) | undefined;
@@ -340,6 +344,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 			() =>
 				owners.get(manualOpts.registrationOwner)?.projectDir ===
 				manualOpts.projectDir,
+			() => dreamerConfig.maxTokens,
 		);
 		const manualRun = runManualDream({
 			db: manualOpts.db,
@@ -487,6 +492,7 @@ function createPiDreamerClient(
 	opts: PiDreamerOptions,
 	onAdjunctsRefreshNeeded = opts.onAdjunctsRefreshNeeded,
 	isRegistrationOwnerActive: () => boolean = () => true,
+	getMaxOutputTokens: () => number | undefined = () => opts.config.maxTokens,
 ): DreamTimerClient {
 	const runner = piSubagentRunnerFactory();
 	const assertRegistrationOwnerActive = (): void => {
@@ -549,6 +555,7 @@ function createPiDreamerClient(
 				// `variant`; the Pi facade translates that same wire field into
 				// `--thinking` without letting a primary level leak to fallbacks.
 				thinkingLevel: extractBodyVariant(args),
+				maxOutputTokens: getMaxOutputTokens(),
 				accountingSessionId: opts.projectIdentity,
 				accountingSubagent: "dreamer",
 				accountingTask: accountingTaskFromTitle(dreamSession.title),

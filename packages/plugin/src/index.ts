@@ -8,6 +8,7 @@ import { withContentLanguageDirective } from "./agents/language-directive";
 import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
+import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
@@ -135,6 +136,10 @@ const server: Plugin = async (ctx) => {
     const loadedPluginConfig = loadPluginConfigDetailed(ctx.directory);
     const pluginConfig = loadedPluginConfig.config;
     const liveConfigReader = pluginConfigReader(ctx.directory, pluginConfig);
+    const dreamerCap = createDreamerOutputCapSampler(
+        pluginConfig,
+        () => liveConfigReader.poll().effective,
+    );
     reloadWindowOverlay(pluginConfig.models?.window_overlay_path);
     const promptSurfaceRuntime = createPromptSurfaceRuntime({
         harness: "opencode",
@@ -809,6 +814,10 @@ const server: Plugin = async (ctx) => {
         event: createEventHandler({
             magicContext: {
                 event: async (input) => {
+                    if (input.event.type === "session.deleted") {
+                        const properties = input.event.properties as { info?: { id?: string } };
+                        if (properties.info?.id) dreamerCap.delete(properties.info.id);
+                    }
                     await magicContextRuntime.magicContext?.event?.(input);
                 },
             },
@@ -855,6 +864,9 @@ const server: Plugin = async (ctx) => {
                 );
             },
         }),
+        "chat.params": async (input, output) => {
+            dreamerCap.apply(input, output);
+        },
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: magicContextRuntime.magicContext,
             getMagicContext: () => magicContextRuntime.magicContext,

@@ -2378,8 +2378,9 @@ export function createTransform(deps: TransformDeps) {
             historianTimeoutMs: historianRun?.timeoutMs ?? deps.historianTimeoutMs,
             historianModel: historianRun?.model ?? deps.historianModel,
             historianContextLimit: historianRun?.contextLimit ?? deps.historianContextLimit,
-            historianMaxOutputTokens:
-                historianRun?.maxOutputTokens ?? deps.historianMaxOutputTokens,
+            historianMaxOutputTokens: historianRun
+                ? historianRun.maxOutputTokens
+                : deps.historianMaxOutputTokens,
             fallbackModels: historianRun?.fallbackModels ?? deps.fallbackModels,
             compartmentDirectory,
             messages,

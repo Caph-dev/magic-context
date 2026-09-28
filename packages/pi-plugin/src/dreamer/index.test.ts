@@ -156,6 +156,49 @@ afterEach(() => {
 });
 
 describe("Pi dreamer wiring", () => {
+	test("manual dreamer uses the cap sampled for each child run", async () => {
+		db = createDb();
+		const identity = "git:pi-live-dreamer-cap";
+		const owner = {};
+		const caps: Array<number | undefined> = [];
+		let liveCap = 4096;
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async (args: { maxOutputTokens?: number }) => {
+						caps.push(args.maxOutputTokens);
+						return { ok: true, assistantText: "curation complete" };
+					}),
+				}) as never,
+		);
+		const config = DreamerConfigSchema.parse({
+			maxTokens: 2048,
+			pi: { model: "test/model" },
+			tasks: { curate: { schedule: "0 4 * * *" } },
+		});
+		insertMemory(db, {
+			projectPath: identity,
+			category: "PROJECT_RULES",
+			content: "Keep run-local caps.",
+		});
+		registerPiDreamerProject({
+			...dreamerOptions({
+				database: db,
+				projectIdentity: identity,
+				projectDir: process.cwd(),
+				registrationOwner: owner,
+				config,
+			}),
+			sampleDreamRun: () => ({
+				dreamerConfig: { ...config, maxTokens: liveCap },
+			}),
+		});
+		await runPiDreamForProject(identity, "curate", owner);
+		liveCap = 8192;
+		await runPiDreamForProject(identity, "curate", owner);
+		expect(caps).toEqual([4096, 8192]);
+	});
 	test("drops an unknown fallback with a warning while the valid primary runs", async () => {
 		db = createDb();
 		const identity = "git:pi-model-validation";

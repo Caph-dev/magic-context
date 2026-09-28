@@ -9,7 +9,8 @@
  * dotted path, type, default, and the `.describe()` text.
  *
  * Run: bun packages/plugin/scripts/build-config-docs.ts
- * Output: packages/docs/src/content/docs/reference/configuration.md
+ * Output: packages/docs/src/content/docs/reference/configuration.md and the
+ * live-key block in CONFIGURATION.md
  */
 
 import * as path from "node:path";
@@ -290,6 +291,30 @@ ${sections.join("\n\n")}
 `;
 }
 
+export function buildGitHubLiveKeys(current: string): string {
+    const schema = buildSchema() as JsonSchema;
+    const rows: LeafRow[] = [];
+    collectLeaves(schema, "", rows);
+    const lines = rows
+        .filter((row) => row.live)
+        .map((row) => `- \`${row.path}\``);
+    const start = "<!-- LIVE-CONFIG-KEYS-START -->";
+    const end = "<!-- LIVE-CONFIG-KEYS-END -->";
+    const before = current.indexOf(start);
+    const after = current.indexOf(end, before + start.length);
+    if (before < 0 || after < 0) throw new Error("GitHub live-key block is missing");
+    const existing = current.slice(before + start.length, after);
+    // Keep explanatory rows that are not bare live-key bullets alongside generated keys.
+    const annotated = existing.split("\n").filter((line) => /^- `[^`]+` \S/.test(line));
+    return (
+        current.slice(0, before + start.length) +
+        "\n" +
+        [...lines, ...annotated].sort().join("\n") +
+        "\n" +
+        current.slice(after)
+    );
+}
+
 async function main() {
     const rootDir = path.resolve(import.meta.dir, "..", "..", "..");
     const outputPath = path.join(
@@ -304,6 +329,9 @@ async function main() {
     );
     await Bun.write(outputPath, buildConfigDocs());
     console.log(`✓ Config reference generated: ${outputPath}`);
+    const githubPath = path.join(rootDir, "CONFIGURATION.md");
+    await Bun.write(githubPath, buildGitHubLiveKeys(await Bun.file(githubPath).text()));
+    console.log(`✓ GitHub live keys generated: ${githubPath}`);
 }
 
 if (import.meta.main) {

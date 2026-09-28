@@ -6597,7 +6597,9 @@ impl McHandler {
                 historian_context_limit_tokens: cfg
                     .historian_context_limit_known
                     .then_some(cfg.historian_context_limit_tokens),
-                max_output_tokens: historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS,
+                max_output_tokens: parsed
+                    .historian_max_output_tokens
+                    .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
                 boundary,
                 memory_enabled: cfg.memory_enabled,
                 auto_promote: cfg.auto_promote,
@@ -6833,7 +6835,9 @@ impl McHandler {
                 historian_context_limit_tokens: cfg
                     .historian_context_limit_known
                     .then_some(cfg.historian_context_limit_tokens),
-                max_output_tokens: historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS,
+                max_output_tokens: parsed
+                    .historian_max_output_tokens
+                    .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
                 boundary: boundary.clone(),
                 memory_enabled: cfg.memory_enabled,
                 auto_promote: cfg.auto_promote,
