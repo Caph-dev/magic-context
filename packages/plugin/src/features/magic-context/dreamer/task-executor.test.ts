@@ -1062,7 +1062,8 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
             now,
         });
         const scheduled = getTaskScheduleState(db, project, "verify");
-        // The same slice arithmetic would time out again in fifteen minutes.
+        // Retrying in fifteen minutes would split the deadline into the same
+        // too-short batch slices, so the batch would time out again.
         expect(scheduled?.retryCount).toBe(0);
         expect(scheduled?.nextDueAt).toBeGreaterThan(now);
         expect(scheduled?.lastStatus).toBe("failed");
