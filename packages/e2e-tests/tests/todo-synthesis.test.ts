@@ -258,6 +258,9 @@ forEachHost(import.meta.url, "synthetic todowrite e2e", (host) => {
             magicContextConfig: {
                 execute_threshold_percentage: 20,
                 dreamer: { disable: true },
+                // Pi only registers Magic Context's todowrite tool when it is enabled;
+                // it is off by default. OpenCode ignores this setting.
+                todowrite: { enabled: true },
             },
         });
     });
