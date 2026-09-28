@@ -171,7 +171,7 @@ impl Fixture {
         store
             .execute_batch(
                 "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
-                 VALUES (1, 'git:store-wins', '[\"a.rs\",\"b.rs\"]', 4000),
+                 VALUES (4, 'git:store-wins', '[\"a.rs\",\"b.rs\"]', 4000),
                         (5, 'git:store-wins', 'null', 4000);
                  UPDATE mc_privilege_state SET note_caller_project = 'git:store-wins' WHERE id = 1;
                  INSERT INTO mc_notes(type, project_path, session_id, content, status, created_at_ms, updated_at_ms)
@@ -415,16 +415,30 @@ fn references_name_the_new_ids() {
         format!("[5,{five}]"),
         "store 1 is context 5, store 5 is context {five}"
     );
-    let files: Vec<(String, i64)> = context
-        .prepare("SELECT file_path, verified_at FROM memory_verifications WHERE memory_id = 5 ORDER BY file_path")
+}
+
+#[test]
+fn a_file_list_becomes_one_unverified_row_per_file_and_null_writes_none() {
+    let fixture = Fixture::new(Extras::default());
+    fixture.migrate();
+    let context = fixture.context();
+    let four = context_id_of(&context, "store four");
+    let five = context_id_of(&context, "store five");
+    let files: Vec<(String, i64, i64)> = context
+        .prepare(
+            "SELECT file_path, verified_at, mapped_at FROM memory_verifications
+              WHERE memory_id = ?1 ORDER BY file_path",
+        )
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map(params![four], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(
         files,
-        vec![("a.rs".to_string(), 0), ("b.rs".to_string(), 0)]
+        vec![("a.rs".to_string(), 0, 4000), ("b.rs".to_string(), 0, 4000)]
     );
     let independent: i64 = context
         .query_row(
