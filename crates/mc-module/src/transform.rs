@@ -9582,6 +9582,7 @@ fn timestamp_temporal_marks(
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
 ) -> Vec<TemporalMarkInput> {
+    let first_text_blocks = first_text_block_by_message(projection);
     let mut previous = None;
     let mut marks = Vec::new();
     for message in &req.messages {
@@ -9601,14 +9602,10 @@ fn timestamp_temporal_marks(
                 )
             });
             if let Some(marker_text) = marker_text {
-                if let Some(block_id) = projection.blocks.iter().find_map(|block| {
-                    (block.mid == message.mid
-                        && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
-                    .then(|| block.id.clone())
-                }) {
+                if let Some(block_id) = first_text_blocks.get(message.mid.as_str()) {
                     marks.push(TemporalMarkInput {
                         ordinal: message.ordinal,
-                        block_id,
+                        block_id: (*block_id).to_string(),
                         marker_text,
                     });
                 }
@@ -9617,6 +9614,18 @@ fn timestamp_temporal_marks(
         previous = Some(message);
     }
     marks
+}
+
+/// The id of each message's first text block, in projection order. Equivalent to searching
+/// the projection from the front for a message's first text block, built in one pass.
+fn first_text_block_by_message(projection: &FlatProjection) -> HashMap<&str, &str> {
+    let mut first = HashMap::new();
+    for block in &projection.blocks {
+        if matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+            first.entry(block.mid.as_str()).or_insert(block.id.as_str());
+        }
+    }
+    first
 }
 
 fn temporal_parity_transition_needed(
@@ -10053,6 +10062,84 @@ fn user_hint_target_was_served(meta: &ModuleMeta, block_id: &str) -> bool {
     overlay_target_was_served(&meta.served_output_fingerprint, block_id)
 }
 
+/// Each message's text blocks in projection order, so a message's blocks are found without
+/// scanning the whole projection.
+fn text_blocks_by_message_id(projection: &FlatProjection) -> HashMap<&str, Vec<&FlatBlock>> {
+    let mut by_message = HashMap::<&str, Vec<&FlatBlock>>::new();
+    for block in &projection.blocks {
+        if matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+            by_message
+                .entry(block.mid.as_str())
+                .or_default()
+                .push(block);
+        }
+    }
+    by_message
+}
+
+/// The first of a message's text blocks (in projection order) that has a tag mint time, with
+/// that time.
+fn first_minted_text_block(
+    text_blocks: Option<&Vec<&FlatBlock>>,
+    mint_by_block: &HashMap<&str, i64>,
+) -> Option<(String, i64)> {
+    text_blocks.into_iter().flatten().find_map(|block| {
+        mint_by_block
+            .get(block.id.as_str())
+            .copied()
+            .map(|created_at| (block.id.clone(), created_at))
+    })
+}
+
+/// Reconcile the canonical timestamp marks with the stored temporal rows. A mark whose block
+/// already has a row keeps that row's text unless a temporal rewrite is in progress; a mark
+/// without a row is stored only when it is past the overlay frontier or a rewrite is in
+/// progress. Every existing mark is checked regardless of its age. Returns the marks this pass
+/// decided or rewrote, in canonical order.
+fn reconcile_canonical_temporal_marks(
+    temporal_rows: &mut Vec<TemporalMarkRow>,
+    canonical_marks: Vec<TemporalMarkInput>,
+    rewrite_temporal_marks: bool,
+    frontier: Option<u64>,
+    now_ms: i64,
+    decided_temporal: &mut HashSet<String>,
+) -> Vec<TemporalMarkInput> {
+    let mut temporal_marks = Vec::new();
+    // Position of the first stored row for each block, kept current as rows are appended, so
+    // each canonical mark finds the same row a front-to-back search would.
+    let mut temporal_row_by_block = HashMap::<String, usize>::with_capacity(temporal_rows.len());
+    for (index, row) in temporal_rows.iter().enumerate() {
+        temporal_row_by_block
+            .entry(row.block_id.clone())
+            .or_insert(index);
+    }
+    for mark in canonical_marks {
+        if let Some(&index) = temporal_row_by_block.get(mark.block_id.as_str()) {
+            let existing = &mut temporal_rows[index];
+            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                existing.marker_text = mark.marker_text.clone();
+                temporal_marks.push(mark);
+            }
+            continue;
+        }
+        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+        if !rewrite_temporal_marks && !is_new {
+            continue;
+        }
+        temporal_row_by_block
+            .entry(mark.block_id.clone())
+            .or_insert(temporal_rows.len());
+        temporal_rows.push(TemporalMarkRow {
+            block_id: mark.block_id.clone(),
+            marker_text: mark.marker_text.clone(),
+            created_at: now_ms,
+        });
+        decided_temporal.insert(mark.block_id.clone());
+        temporal_marks.push(mark);
+    }
+    temporal_marks
+}
+
 fn compute_active_overlay_decisions(
     input: OverlayComputation<'_, '_>,
 ) -> Result<PendingOverlayDecisions, TransformError> {
@@ -10135,34 +10222,20 @@ fn compute_active_overlay_decisions(
         .iter()
         .map(|row| row.block_id.clone())
         .collect::<HashSet<_>>();
-    let mut temporal_marks = Vec::new();
-    for mark in canonical_marks {
-        if let Some(existing) = temporal_rows
-            .iter_mut()
-            .find(|row| row.block_id == mark.block_id)
-        {
-            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
-                existing.marker_text = mark.marker_text.clone();
-                temporal_marks.push(mark);
-            }
-            continue;
-        }
-        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
-        if !rewrite_temporal_marks && !is_new {
-            continue;
-        }
-        temporal_rows.push(TemporalMarkRow {
-            block_id: mark.block_id.clone(),
-            marker_text: mark.marker_text.clone(),
-            created_at: ctx.now_ms,
-        });
-        decided_temporal.insert(mark.block_id.clone());
-        temporal_marks.push(mark);
-    }
+    let mut temporal_marks = reconcile_canonical_temporal_marks(
+        temporal_rows,
+        canonical_marks,
+        rewrite_temporal_marks,
+        frontier,
+        ctx.now_ms,
+        &mut decided_temporal,
+    );
 
     // Timestamp-free callers retain the legacy first-sight basis for the live tail. OpenCode
     // supplies immutable per-message times, so its messages are already covered above.
     let authored_tail = eligible_authored_user_tail(req);
+    // Text blocks per message in projection order, built only if some message is new.
+    let mut text_blocks_by_message: Option<HashMap<&str, Vec<&FlatBlock>>> = None;
     let mut previous_new_user_mint = None;
     for message in req.messages.iter().filter(|message| {
         !message.ck.meta.synthetic
@@ -10177,20 +10250,10 @@ fn compute_active_overlay_decisions(
             previous_new_user_mint = None;
             continue;
         }
-        let Some((block_id, current_mint)) = projection
-            .blocks
-            .iter()
-            .filter(|block| block.mid == message.mid)
-            .find_map(|block| {
-                matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
-                    .then(|| {
-                        mint_by_block
-                            .get(block.id.as_str())
-                            .copied()
-                            .map(|created_at| (block.id.clone(), created_at))
-                    })
-                    .flatten()
-            })
+        let text_blocks =
+            text_blocks_by_message.get_or_insert_with(|| text_blocks_by_message_id(projection));
+        let Some((block_id, current_mint)) =
+            first_minted_text_block(text_blocks.get(message.mid.as_str()), &mint_by_block)
         else {
             previous_new_user_mint = None;
             continue;
@@ -16556,6 +16619,210 @@ pub(crate) mod tests {
             }
             assert_eq!(calls.get(), 0, "carrier count={count}, bytes={bytes}");
         }
+    }
+
+    /// A timestamped conversation for the temporal differential: users with one or two text
+    /// blocks, assistants with and without completion times, gaps from seconds to days, and
+    /// one user repeated under the same id.
+    fn temporal_fixture(messages: usize) -> TransformRequest {
+        let mut created = 1_700_000_000_000i64;
+        let mut out = Vec::new();
+        for n in 0..messages {
+            let role = if n % 2 == 0 { "user" } else { "assistant" };
+            let texts: &[&str] = if n % 6 == 0 { &["a", "b"] } else { &["only"] };
+            let mid = if n == 40 {
+                "u0".to_string()
+            } else {
+                format!("u{n}")
+            };
+            let mut message = wire_item(role, &mid, n as u64 + 1, texts);
+            created += [1_000, 90_000, 4_000_000, 90_000_000, 7][n % 5];
+            message.ck.meta.created_at_ms = (n % 17 != 3).then_some(created);
+            message.ck.meta.completed_at_ms =
+                (role == "assistant" && n % 3 == 0).then_some(created + 500);
+            out.push(message);
+        }
+        req("temporal-diff", "cfg0", out)
+    }
+
+    /// `timestamp_temporal_marks` before the first-text-block index: a front-to-back
+    /// projection search per authored user. Kept only as the differential reference.
+    fn scanning_timestamp_temporal_marks(
+        req: &TransformRequest,
+        projection: &FlatProjection,
+        mutation_exempt_mid: Option<&str>,
+        lineage_anchor_mid: Option<&str>,
+    ) -> Vec<TemporalMarkInput> {
+        let mut previous = None;
+        let mut marks = Vec::new();
+        for message in &req.messages {
+            if is_authored_user_message(message)
+                && mutation_exempt_mid != Some(message.mid.as_str())
+                && lineage_anchor_mid != Some(message.mid.as_str())
+            {
+                let marker_text = previous.and_then(|prior: &CkIngressMessage| {
+                    let previous_created = prior.ck.meta.created_at_ms?;
+                    let current_created = message.ck.meta.created_at_ms?;
+                    let previous_end = prior.ck.meta.completed_at_ms.unwrap_or(previous_created);
+                    Some(
+                        current_created
+                            .checked_sub(previous_end)
+                            .and_then(temporal_gap_prefix)
+                            .unwrap_or_default(),
+                    )
+                });
+                if let Some(marker_text) = marker_text {
+                    if let Some(block_id) = projection.blocks.iter().find_map(|block| {
+                        (block.mid == message.mid
+                            && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
+                        .then(|| block.id.clone())
+                    }) {
+                        marks.push(TemporalMarkInput {
+                            ordinal: message.ordinal,
+                            block_id,
+                            marker_text,
+                        });
+                    }
+                }
+            }
+            previous = Some(message);
+        }
+        marks
+    }
+
+    /// The canonical-mark reconciliation before the row index: a front-to-back row search
+    /// per mark. Kept only as the differential reference.
+    fn scanning_reconcile_canonical_temporal_marks(
+        temporal_rows: &mut Vec<TemporalMarkRow>,
+        canonical_marks: Vec<TemporalMarkInput>,
+        rewrite_temporal_marks: bool,
+        frontier: Option<u64>,
+        now_ms: i64,
+        decided_temporal: &mut HashSet<String>,
+    ) -> Vec<TemporalMarkInput> {
+        let mut temporal_marks = Vec::new();
+        for mark in canonical_marks {
+            if let Some(existing) = temporal_rows
+                .iter_mut()
+                .find(|row| row.block_id == mark.block_id)
+            {
+                if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                    existing.marker_text = mark.marker_text.clone();
+                    temporal_marks.push(mark);
+                }
+                continue;
+            }
+            let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+            if !rewrite_temporal_marks && !is_new {
+                continue;
+            }
+            temporal_rows.push(TemporalMarkRow {
+                block_id: mark.block_id.clone(),
+                marker_text: mark.marker_text.clone(),
+                created_at: now_ms,
+            });
+            decided_temporal.insert(mark.block_id.clone());
+            temporal_marks.push(mark);
+        }
+        temporal_marks
+    }
+
+    /// Indexed temporal overlays must reproduce the scanning implementation exactly: the
+    /// canonical marks, the reconciled rows (including rewrites of old marks far behind the
+    /// frontier, duplicate stored rows and rows for absent blocks), the decided set, and the
+    /// timestamp-free first-minted-text-block choice for every message.
+    #[test]
+    fn indexed_temporal_overlays_match_scanning_reference() {
+        let request = temporal_fixture(240);
+        let projection = project_messages(&request.messages).unwrap();
+        for (exempt, anchor) in [(None, None), (Some("u12"), Some("u30"))] {
+            let canonical = timestamp_temporal_marks(&request, &projection, exempt, anchor);
+            assert_eq!(
+                canonical,
+                scanning_timestamp_temporal_marks(&request, &projection, exempt, anchor)
+            );
+            assert!(canonical.iter().any(|mark| !mark.marker_text.is_empty()));
+            // Stored rows: some old marks with stale text, a duplicated block, an absent block.
+            let mut stored = Vec::new();
+            for (index, mark) in canonical.iter().enumerate().filter(|(i, _)| i % 3 == 0) {
+                stored.push(TemporalMarkRow {
+                    block_id: mark.block_id.clone(),
+                    marker_text: if index % 2 == 0 {
+                        mark.marker_text.clone()
+                    } else {
+                        "stale".to_string()
+                    },
+                    created_at: index as i64,
+                });
+            }
+            stored.push(stored[0].clone());
+            stored.push(TemporalMarkRow {
+                block_id: "absent#0".to_string(),
+                marker_text: String::new(),
+                created_at: 1,
+            });
+            for rewrite in [false, true] {
+                for frontier in [None, Some(0), Some(120), Some(10_000)] {
+                    let mut rows = stored.clone();
+                    let mut decided = rows.iter().map(|row| row.block_id.clone()).collect();
+                    let marks = reconcile_canonical_temporal_marks(
+                        &mut rows,
+                        canonical.clone(),
+                        rewrite,
+                        frontier,
+                        99,
+                        &mut decided,
+                    );
+                    let mut reference_rows = stored.clone();
+                    let mut reference_decided = reference_rows
+                        .iter()
+                        .map(|row| row.block_id.clone())
+                        .collect();
+                    let reference_marks = scanning_reconcile_canonical_temporal_marks(
+                        &mut reference_rows,
+                        canonical.clone(),
+                        rewrite,
+                        frontier,
+                        99,
+                        &mut reference_decided,
+                    );
+                    let case = format!("rewrite={rewrite} frontier={frontier:?}");
+                    assert_eq!(marks, reference_marks, "{case}");
+                    assert_eq!(rows, reference_rows, "{case}");
+                    assert_eq!(decided, reference_decided, "{case}");
+                }
+            }
+        }
+        // Timestamp-free path: the first minted text block per message.
+        let minted = projection
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 4 != 1)
+            .map(|(index, block)| (block.id.as_str(), index as i64))
+            .collect::<HashMap<_, _>>();
+        let text_blocks = text_blocks_by_message_id(&projection);
+        let mut found = 0;
+        for message in &request.messages {
+            let reference = projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == message.mid)
+                .find_map(|block| {
+                    matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
+                        .then(|| {
+                            minted
+                                .get(block.id.as_str())
+                                .copied()
+                                .map(|created_at| (block.id.clone(), created_at))
+                        })
+                        .flatten()
+                });
+            let indexed = first_minted_text_block(text_blocks.get(message.mid.as_str()), &minted);
+            found += usize::from(indexed.is_some());
+            assert_eq!(indexed, reference, "{}", message.mid);
+        }
+        assert!(found > 100);
     }
 
     #[test]
