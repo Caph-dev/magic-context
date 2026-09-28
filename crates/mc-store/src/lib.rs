@@ -5263,16 +5263,6 @@ pub struct StoredNote {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NoteDelivery {
-    pub delivery_id: String,
-    pub note_id: i64,
-    pub session_id: String,
-    pub delivered_pass_fingerprint: String,
-    pub transform_pass_id: String,
-    pub acked_at: Option<i64>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteCasOutcome {
     Applied(StoredNote),
@@ -14923,76 +14913,6 @@ impl McStore {
         })
     }
 
-    /// The project's ready smart notes, each with a delivery handle for this pass.
-    ///
-    /// `context.db` has no delivery table and no in-flight surfacing states: a note is
-    /// `ready` until something dismisses it, which is what every other writer of the file
-    /// understands. The handle is derived from the pass, so a retried pass gets the same
-    /// one, and acknowledging or refusing it changes nothing durable.
-    pub fn claim_note_delivery(
-        &self,
-        project_path: &str,
-        session_id: &str,
-        delivered_pass_fingerprint: &str,
-        transform_pass_id: &str,
-        _now_ms: i64,
-    ) -> Result<Vec<(StoredNote, NoteDelivery)>, McStoreError> {
-        let notes = self.context_read(|conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {NOTE_SELECT_COLUMNS} FROM notes
-                 WHERE project_path = ?1 AND type = 'smart' AND status = 'ready'
-                 ORDER BY updated_at ASC, id ASC"
-            ))?;
-            let rows = stmt
-                .query_map(params![project_path], stored_note_from_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })?;
-        Ok(notes
-            .into_iter()
-            .map(|note| {
-                let delivery = NoteDelivery {
-                    delivery_id: format!(
-                        "{}:{project_path}:{}:{session_id}:{transform_pass_id}:{}",
-                        project_path.len(),
-                        session_id.len(),
-                        note.id
-                    ),
-                    note_id: note.id,
-                    session_id: session_id.to_string(),
-                    delivered_pass_fingerprint: delivered_pass_fingerprint.to_string(),
-                    transform_pass_id: transform_pass_id.to_string(),
-                    acked_at: None,
-                };
-                (note, delivery)
-            })
-            .collect())
-    }
-
-    /// Acknowledge a pass's note deliveries. Nothing durable records a delivery, so there
-    /// is nothing to change; see [`Self::claim_note_delivery`].
-    pub fn ack_note_delivery(
-        &self,
-        _project_path: &str,
-        _session_id: &str,
-        _transform_pass_id: &str,
-        _now_ms: i64,
-    ) -> Result<usize, McStoreError> {
-        Ok(0)
-    }
-
-    /// Refuse a pass's note deliveries. The notes stay `ready`; see
-    /// [`Self::claim_note_delivery`].
-    pub fn nack_note_delivery(
-        &self,
-        _project_path: &str,
-        _session_id: &str,
-        _transform_pass_id: &str,
-        _now_ms: i64,
-    ) -> Result<usize, McStoreError> {
-        Ok(0)
-    }
-
     pub fn search_notes_like(
         &self,
         project_path: &str,
@@ -23425,7 +23345,7 @@ mod tests {
     }
 
     #[test]
-    fn project_notes_use_cas_and_stay_ready_until_dismissed() {
+    fn project_notes_use_cas_from_pending_to_ready_to_dismissed() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
         let note = store
@@ -23497,39 +23417,22 @@ mod tests {
         };
         assert_eq!(ready.status, "ready");
 
-        // context.db has no delivery states: a ready note is offered on every pass until
-        // something dismisses it, and acknowledging a pass changes nothing durable.
-        let first = store
-            .claim_note_delivery("git:proj", "serve-session", "pass-1", "pass-1", 40)
-            .unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(
-            store
-                .ack_note_delivery("git:proj", "serve-session", "pass-1", 60)
-                .unwrap(),
-            0
-        );
-        let again = store
-            .claim_note_delivery("git:proj", "serve-session", "pass-2", "pass-2", 70)
-            .unwrap();
-        assert_eq!(again.len(), 1);
-        assert_eq!(again[0].0.status, "ready");
-
+        let ready_status_version = store
+            .get_note_by_id("git:proj", "serve-session", note.id)
+            .unwrap()
+            .unwrap()
+            .status_version;
         let dismissed = store
             .dismiss_note_cas(
                 "git:proj",
                 note.id,
                 "ready",
-                again[0].0.status_version,
+                ready_status_version,
                 Some("done"),
                 80,
             )
             .unwrap();
         assert!(matches!(dismissed, NoteCasOutcome::Applied(note) if note.status == "dismissed"));
-        assert!(store
-            .claim_note_delivery("git:proj", "serve-session", "pass-4", "pass-4", 90)
-            .unwrap()
-            .is_empty());
     }
 
     #[test]

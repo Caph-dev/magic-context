@@ -35363,6 +35363,86 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_ready_note_is_never_injected_and_defers_replay_while_it_stays_ready() {
+        // The module renders nothing for ready smart notes: not in m1, not in the tail,
+        // not as a reminder. The host's note nudger owns surfacing them. So a ready note
+        // must not appear in any served byte, a bust with the note ready must not change
+        // anything about it, and defers must replay the served bytes exactly while it
+        // stays ready.
+        const NOTE_TEXT: &str = "ready note the module must not inject";
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let boot = transform(&s, &execute_req, &ctx).unwrap();
+        assert_eq!(boot.action, "HARD");
+
+        let note = s
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("ses"),
+                content: NOTE_TEXT,
+                surface_condition: Some("condition true"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            s.write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: note.status_version,
+                verdict: true,
+                compiled_check: None,
+                manifest_json: None,
+                check_hash: None,
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap(),
+            NoteCasOutcome::Applied(note) if note.status == "ready"
+        ));
+        let ready = s
+            .get_note_by_id("git:proj", "ses", note.id)
+            .unwrap()
+            .unwrap();
+
+        // A bust (explicit refresh) and a HARD (a new render config) with the note ready.
+        s.arm_soft_refresh("ses").unwrap();
+        let soft = transform(&s, &execute_req, &ctx).unwrap();
+        assert_eq!(soft.action, "SOFT");
+        let hard_req = with_usage(req("ses", "cfg1", vec![item("a", 1, "raw")]), 70, 100);
+        let hard = transform(&s, &hard_req, &ctx).unwrap();
+        assert_eq!(hard.action, "HARD");
+        let served = serde_json::to_vec(&hard.ck_messages).unwrap();
+        for response in [&boot, &soft, &hard] {
+            let bytes = serde_json::to_string(&response.ck_messages).unwrap();
+            assert!(!bytes.contains(NOTE_TEXT), "{}", response.action);
+        }
+
+        let defer_req = with_usage(req("ses", "cfg1", vec![item("a", 1, "raw")]), 10, 100);
+        for _ in 0..3 {
+            let deferred = transform(&s, &defer_req, &ctx).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
+            assert_eq!(serde_json::to_vec(&deferred.ck_messages).unwrap(), served);
+        }
+        let after = s
+            .get_note_by_id("git:proj", "ses", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, "ready", "serving passes must not consume the note");
+        assert_eq!(after.status_version, ready.status_version);
+    }
+
+    #[test]
     fn pressure_refold_keeps_ready_notes_out_of_m1_and_ready() {
         // Ready smart notes reach the agent through the host's deferred-notes reminder
         // and `ctx_note read`, never through m1. A pressure refold with a ready note in
