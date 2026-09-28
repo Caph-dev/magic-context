@@ -42,6 +42,7 @@ import type {
 } from "@magic-context/core/shared/subagent-runner";
 import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import { type PiHarnessKind, resolvePiHarnessKind } from "./pi-harness-kind";
+import { SubagentTelemetry, subagentStepCap } from "./subagent-telemetry";
 
 const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
 const PI_CODING_AGENT_PACKAGE_NAMES = new Set([
@@ -599,12 +600,6 @@ const DREAMER_ACTION_AGENTS: ReadonlySet<string> = new Set([
 	"dreamer",
 	"magic-context-dreamer",
 ]);
-const HISTORIAN_AGENTS: ReadonlySet<string> = new Set([
-	"magic-context-historian",
-	"historian",
-	"historian-recomp",
-	"historian-editor",
-]);
 const SEARCH_ONLY_SUBAGENT_TOOL_AGENTS: ReadonlySet<string> = new Set([
 	"dreamer-retrospective",
 	// Loads the lean extension so ctx_search is REGISTERED (the strict allow-list
@@ -1086,10 +1081,23 @@ export class PiSubagentRunner implements SubagentRunner {
 	): Promise<SubagentRunResult> {
 		const startTime = Date.now();
 		let recordedAccounting = false;
+		const cap = subagentStepCap(options.agent);
+		const telemetry = new SubagentTelemetry(options.systemPrompt, (line) =>
+			sessionLog(options.accountingSessionId ?? "subagent", line),
+		);
+		let loggedTelemetry = false;
 		const recordAccounting = (
 			result: SubagentRunResult,
 			messages: unknown[] = [],
 		) => {
+			if (!loggedTelemetry) {
+				loggedTelemetry = true;
+				telemetry.finish(
+					options.agent,
+					result.ok ? "completed" : result.reason,
+					cap,
+				);
+			}
 			if (!options.accountingSessionId || recordedAccounting) return;
 			recordedAccounting = true;
 			recordChildInvocation({
@@ -1290,6 +1298,13 @@ export class PiSubagentRunner implements SubagentRunner {
 						env: {
 							...process.env,
 							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
+							MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
+							MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
+								/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
+									options.agent,
+								)
+									? undefined
+									: "1",
 							...(options.temperature !== undefined
 								? {
 										MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(
@@ -1365,8 +1380,20 @@ export class PiSubagentRunner implements SubagentRunner {
 			// than only at child exit (a hung child wouldn't surface this
 			// otherwise).
 			let stderr = "";
+			let stderrLine = "";
 			child.stderr?.on("data", (chunk: Buffer) => {
 				const text = chunk.toString("utf8");
+				// Pi 0.87 redirects extension stdout writes to stderr to protect its
+				// protocol. Accept only our content-free provenance event there.
+				stderrLine += text;
+				const lines = stderrLine.split("\n");
+				stderrLine = (lines.pop() ?? "").slice(-4096);
+				for (const line of lines) {
+					if (settled || !line.startsWith('{"type":"mc_system_prompt"'))
+						continue;
+					const parsed = parsePiEventLine(line);
+					if (parsed.ok) telemetry.observe(parsed.event);
+				}
 				stderr += text;
 				// Cap to prevent unbounded growth on chatty failures.
 				if (stderr.length > 16_000) {
@@ -1455,7 +1482,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			accountingMessages = accumulatedMessages;
 
 			rl.on("line", (line) => {
-				if (line.length === 0) return;
+				if (settled || line.length === 0) return;
 				const parsed = parsePiEventLine(line);
 				if (!parsed.ok) {
 					// Non-JSON stdout noise from co-loaded extensions is
@@ -1475,6 +1502,24 @@ export class PiSubagentRunner implements SubagentRunner {
 					messages?: unknown;
 					message?: unknown;
 				};
+
+				telemetry.observe(event);
+				if (cap !== undefined && telemetry.steps > cap) {
+					if (e.type === "message_end") accumulatedMessages.push(e.message);
+					if (e.type === "agent_end" && Array.isArray(e.messages))
+						accountingMessages = e.messages;
+					if (timeoutHandle) clearTimeout(timeoutHandle);
+					if (drainTimerHandle) clearTimeout(drainTimerHandle);
+					terminateChild(child);
+					settle({
+						ok: false,
+						reason: "step_limit",
+						error: `MC-D10: Pi subagent ${options.agent} exceeded its ${cap}-step limit`,
+						durationMs: Date.now() - startTime,
+						meta: { cap, steps: telemetry.steps },
+					});
+					return;
+				}
 
 				const isFirstEvent = eventCount === 0;
 				eventCount += 1;
@@ -2110,7 +2155,10 @@ export function buildArgs(
 		opts?.historianCalibrationEntryPath === undefined
 			? HISTORIAN_CALIBRATION_ENTRY_PATH
 			: opts.historianCalibrationEntryPath;
-	if (HISTORIAN_AGENTS.has(options.agent) && historianCalibrationEntryPath) {
+	if (
+		subagentStepCap(options.agent) !== undefined &&
+		historianCalibrationEntryPath
+	) {
 		args.push("--extension", historianCalibrationEntryPath);
 	}
 

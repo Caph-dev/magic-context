@@ -23,6 +23,7 @@ import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magi
 import { log } from "@magic-context/core/shared/logger";
 import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
 import type { CompletedSubagentToolCall } from "@magic-context/core/shared/subagent-runner";
+import { HiddenAgentStepLimit } from "@magic-context/core/v2/hooks/hidden-child";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { PiSubagentRunner } from "../subagent-runner";
 import { createPiPrimerRawProviderFactory } from "./primer-raw-provider-pi";
@@ -575,6 +576,12 @@ function createPiDreamerClient(
 				const result = await runPromise;
 				assertRegistrationOwnerActive();
 				if (!result.ok) {
+					if (result.reason === "step_limit") {
+						throw new HiddenAgentStepLimit(
+							"pi-dreamer",
+							Number(result.meta?.cap),
+						);
+					}
 					const error = new Error(
 						`Pi dreamer subagent failed (${result.reason}): ${result.error}`,
 					);
