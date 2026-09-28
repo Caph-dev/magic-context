@@ -22,7 +22,11 @@ function tableExists(db: Database, table: string): boolean {
 }
 
 /** Join only observed session bindings; never infer that two repositories should be merged. */
-export function findIdentitySplits(db: Database, host: Database): IdentitySplit[] {
+export function findIdentitySplits(
+    db: Database,
+    host: Database,
+    includeSingles = false,
+): IdentitySplit[] {
     if (!tableExists(db, "session_projects")) return [];
     const directories = new Map<string, Set<string>>();
     for (const table of ["session", "session_v2"]) {
@@ -67,7 +71,7 @@ export function findIdentitySplits(db: Database, host: Database): IdentitySplit[
               ).n
             : 0;
     return [...byDirectory]
-        .filter(([, identities]) => identities.size > 1)
+        .filter(([, identities]) => includeSingles || identities.size > 1)
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([directory, identities]) => ({
             directory,

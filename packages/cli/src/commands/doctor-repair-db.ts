@@ -70,7 +70,7 @@ interface SalvageResult {
     schemaVersionAfter?: number;
 }
 
-function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
+export function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
     const rpc = inspectRpcServerDiscovery(storageDir);
     if (rpc.state === "unreadable") {
         const arm = rpc.unreadableArm === "parse" ? "could not be parsed" : "could not be read";
@@ -128,7 +128,7 @@ function copyBackupBundle(dbPath: string, stamp: string): BackupBundle {
     return { basePath, copiedPaths };
 }
 
-function copyDatabaseBundle(sourceBase: string, destinationBase: string): string[] {
+export function copyDatabaseBundle(sourceBase: string, destinationBase: string): string[] {
     const copiedPaths: string[] = [];
     for (const suffix of DATABASE_SUFFIXES) {
         const source = `${sourceBase}${suffix}`;
