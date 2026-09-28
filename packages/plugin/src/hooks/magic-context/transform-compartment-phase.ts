@@ -7,6 +7,7 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared/logger";
 import type { ModelInput } from "../../shared/model-resolution";
+import { withoutSqliteTransformPass } from "../../shared/sqlite";
 import {
     type ActiveCompartmentRun,
     getActiveCompartmentRun,
@@ -498,11 +499,13 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             if (args.client && !activeRun.notificationSent) {
                 activeRun.notificationSent = true;
                 const notifParams = args.getNotificationParams?.() ?? {};
-                void sendStatusNotification(
-                    args.client,
-                    args.sessionId,
-                    `⏳ Context at ${args.contextUsage.percentage.toFixed(0)}% — Magic Context is comparting history before continuing. This may take up to ${HISTORIAN_INLINE_JOIN_BUDGET_MS / 1000} seconds.`,
-                    notifParams,
+                void withoutSqliteTransformPass(() =>
+                    sendStatusNotification(
+                        args.client,
+                        args.sessionId,
+                        `⏳ Context at ${args.contextUsage.percentage.toFixed(0)}% — Magic Context is comparting history before continuing. This may take up to ${HISTORIAN_INLINE_JOIN_BUDGET_MS / 1000} seconds.`,
+                        notifParams,
+                    ),
                 );
             }
             const awaitResult = await awaitCompartmentRun(

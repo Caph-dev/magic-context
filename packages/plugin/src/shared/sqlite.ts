@@ -39,6 +39,7 @@
  * `run()` → {changes,lastInsertRowid}) is identical and was verified directly.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { statSync } from "node:fs";
 // Type import only — runtime is loaded dynamically below. @types/better-sqlite3
 // has the richest definitions and is a structural superset of the API surface
@@ -487,6 +488,33 @@ export type Database = BetterSqlite3.Database;
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
+const transformPassScope = new AsyncLocalStorage<{ active: boolean } | undefined>();
+
+/** Only an awaited foreground transform may spend the extra acquisition budget.
+ * The mutable lease also expires for detached descendants when that pass ends. */
+export function withSqliteTransformPass<T>(operation: () => T): T {
+    const lease = { active: true };
+    return transformPassScope.run(lease, () => {
+        try {
+            const result = operation();
+            if (result && typeof (result as { then?: unknown }).then === "function") {
+                return Promise.resolve(result).finally(() => {
+                    lease.active = false;
+                }) as T;
+            }
+            lease.active = false;
+            return result;
+        } catch (error) {
+            lease.active = false;
+            throw error;
+        }
+    });
+}
+
+/** Start detached maintenance work without borrowing a foreground pass's budget. */
+export function withoutSqliteTransformPass<T>(operation: () => T): T {
+    return transformPassScope.run(undefined, operation);
+}
 
 /** Bun names SQLite codes; node:sqlite exposes the numeric (possibly extended) errcode. */
 export function isTransientSqliteError(error: unknown): boolean {
@@ -510,6 +538,12 @@ export class SqliteAcquisitionBusyError extends Error {
 
 /** Retry only acquisition: no privilege flag, callback or in-memory mutation has run yet. */
 function retryAcquisition(acquire: () => unknown, stage: string): void {
+    // Maintenance writers retry on their next tick. Multiplying their native
+    // busy timeout here would stall every session sharing the host event loop.
+    if (!transformPassScope.getStore()?.active) {
+        acquire();
+        return;
+    }
     const delays = [500, 1000];
     for (let attempt = 0; ; attempt++) {
         try {

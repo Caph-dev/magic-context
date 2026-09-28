@@ -6767,6 +6767,115 @@ describe("Rust stalled transform probe", () => {
             });
         });
 
+    it("direct Rust entry grants acquisition retries to the awaited pass", async () => {
+        const sessionId = `rust-foreground-scope-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let injecting = false;
+        let attempts = 0;
+        let callbacks = 0;
+        const exec = db.exec.bind(db);
+        const intercepted = spyOn(db, "exec").mockImplementation((sql) => {
+            if (injecting && sql === "BEGIN IMMEDIATE" && ++attempts === 1)
+                throw Object.assign(new Error("busy"), { code: "SQLITE_BUSY" });
+            return exec(sql);
+        });
+        const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                injecting = true;
+                try {
+                    withPrivilegedWriter(db, () => {
+                        callbacks++;
+                    });
+                } finally {
+                    injecting = false;
+                }
+                return {
+                    decision: "SOFT+",
+                    native_messages: [
+                        { role: "assistant", parts: [{ type: "text", text: "scoped result" }] },
+                    ],
+                };
+            },
+        };
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const output = { messages: [] as unknown[] };
+            await transform.run(
+                sessionId,
+                makeMessages(sessionId),
+                output,
+                makeMeta(db, sessionId),
+            );
+            expect(attempts).toBe(2);
+            expect(callbacks).toBe(1);
+            expect(JSON.stringify(output.messages)).toContain("scoped result");
+        } finally {
+            intercepted.mockRestore();
+            wait.mockRestore();
+        }
+    });
+
+    it("gives need_full_sync a fresh full-wire budget after a nearly exhausted delta", async () => {
+        const sessionId = `rust-full-sync-fresh-budget-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const clock = fakeClock();
+        const calls: Array<{ body: Record<string, unknown>; timeoutMs?: number; at: number }> = [];
+        const native = [
+            { role: "assistant", parts: [{ type: "text", text: "slow full retry completed" }] },
+        ];
+        const moduleClient: RustModeModuleClient = {
+            invalidateStateSyncCapabilities: () => undefined,
+            call: async ({ method, body, timeoutMs }) => {
+                if (method !== "transform") return { ok: true };
+                calls.push({
+                    body: structuredClone(body) as Record<string, unknown>,
+                    timeoutMs,
+                    at: clock.now(),
+                });
+                if (calls.length === 2) {
+                    await new Promise((resolve) => clock.setTimeout(resolve, 14000));
+                    return { status: "need_full_sync" };
+                }
+                if (calls.length === 3)
+                    await new Promise((resolve) => clock.setTimeout(resolve, 20000));
+                return { decision: "SOFT+", native_messages: native };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            clockForTests: clock,
+        });
+        const first = makeMessages(sessionId);
+        await transform.run(sessionId, first, { messages: [...first] }, makeMeta(db, sessionId));
+        const second = makeMessages(sessionId);
+        const output = { messages: [...second] as unknown[] };
+        const outcome = transform.run(sessionId, second, output, makeMeta(db, sessionId)).then(
+            () => "served",
+            (error) => error,
+        );
+        await clock.waitForDelay(14000);
+        expect(calls[1].body.tail_delta).toBeDefined();
+        expect(calls[1].timeoutMs).toBe(15000);
+        await clock.advance(14000);
+        await clock.waitForDelay(20000);
+        expect(calls[2].body.tail_delta).toBeUndefined();
+        expect(calls[2].at).toBe(14000);
+        expect(calls[2].timeoutMs).toBe(45000);
+        await clock.advance(20000);
+        expect(await outcome).toBe("served");
+        expect(clock.now()).toBe(34000);
+        expect(calls).toHaveLength(3);
+        expect(output.messages).toEqual(native);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+    });
+
     it("polls an applying final page until committed without another execution", async () => {
         const sessionId = `rust-applying-replay-${Date.now()}`;
         sessions.push(sessionId);

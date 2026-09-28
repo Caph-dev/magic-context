@@ -28,7 +28,7 @@ for (const seconds of [7, 60]) {
                 const session = new Proxy(context.session, { get(target, key) {
                     if (key !== 'hook') return Reflect.get(target, key);
                     return (name, callback) => target.hook(name, async draft => {
-                        if (name === 'context' && armed && callback.toString().includes('rememberHostMedia')) {
+                        if (name === 'context' && armed && callback.toString().includes('runManagedContext')) {
                             armed = false;
                             writeFileSync(${JSON.stringify(ready)}, 'ready');
                             while (!existsSync(${JSON.stringify(locked)})) await new Promise(resolve => setTimeout(resolve, 20));
@@ -124,7 +124,7 @@ test("OpenCode 2 busy LKG replays the exact served prefix and system together", 
             const session = new Proxy(context.session, { get(target, key) {
                 if (key !== 'hook') return Reflect.get(target, key);
                 return (name, callback) => target.hook(name, async draft => {
-                    if (name !== 'context' || !callback.toString().includes('rememberHostMedia')) return callback(draft);
+                    if (name !== 'context' || !callback.toString().includes('runManagedContext')) return callback(draft);
                     if (++seen === 2) {
                         writeFileSync(${JSON.stringify(ready)}, 'ready');
                         while (!existsSync(${JSON.stringify(locked)})) await new Promise(resolve => setTimeout(resolve, 20));
@@ -186,3 +186,72 @@ test("OpenCode 2 busy LKG replays the exact served prefix and system together", 
         await host.stop();
     }
 }, 180000);
+
+
+test("OpenCode 2 background contention releases the server after one busy timeout", async () => {
+    const fixture = isolation();
+    const version = spawnSync(CLI, ["--version"], {env:fixture.env,cwd:fixture.cwd,encoding:"utf8"});
+    expect(version.status).toBe(0);
+    console.info(`storage-busy CLI=${CLI} version=${version.stdout.trim()}`);
+    const probe = join(fixture.root,"background-probe"); mkdirSync(probe);
+    const trigger = join(fixture.root,"trigger");
+    const started = join(fixture.root,"started");
+    const result = join(fixture.root,"background-result.json");
+    const dbPath = join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR!,"context.db");
+    writeFileSync(join(probe,"server.js"), `
+        import { Database } from ${JSON.stringify(new URL("../../../plugin/src/shared/sqlite.ts", import.meta.url).pathname)};
+        import { existsSync, writeFileSync } from 'node:fs';
+        export default { id:'background-contention-probe', async setup() {
+            const db = new Database(${JSON.stringify(dbPath)});
+            db.exec('PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS scope_background_probe(value INTEGER)');
+            const timer = setInterval(() => {
+                if (!existsSync(${JSON.stringify(trigger)})) return;
+                clearInterval(timer);
+                const begin = performance.now();
+                writeFileSync(${JSON.stringify(started)}, String(Date.now()));
+                let calls = 0;
+                try { db.transaction(() => { calls++; db.exec('INSERT INTO scope_background_probe VALUES (1)'); }).immediate(); }
+                catch (error) { writeFileSync(${JSON.stringify(result)}, JSON.stringify({elapsed:performance.now()-begin, calls, code:error.code, name:error.name})); }
+                finally { db.close(); }
+            }, 20);
+        }};
+    `);
+    const host = await spawnOpencode2({existingIsolation:fixture,probePlugin:probe,magicContextConfig:{dreamer:{disable:true},memory:{enabled:false},historian:{disable:true}}});
+    let locker: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+        const client = OpenCode.make({baseUrl:host.url,headers:{authorization:`Basic ${btoa(`opencode:${host.password}`)}`}});
+        await client.session.create({location:{directory:host.cwd},model:{providerID:"openai",id:"mock-model"}});
+        const second = await client.session.create({title:"independent session",location:{directory:host.cwd},model:{providerID:"openai",id:"mock-model"}});
+        await waitForPluginActive(client,host.cwd);
+        expect((await client.session.get({sessionID:second.id})).id).toBe(second.id);
+        await Bun.sleep(2500);
+        locker = Bun.spawn(["python3","-u","-c","import sqlite3,sys,time; db=sqlite3.connect(sys.argv[1]); db.execute('BEGIN IMMEDIATE'); print('locked',flush=True); time.sleep(30); db.rollback()",dbPath],{env:fixture.env,stdout:"pipe",stderr:"pipe"});
+        const reader = (locker.stdout as ReadableStream<Uint8Array>).getReader();
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain("locked"); reader.releaseLock();
+        for (const pid of [host.pid,locker.pid]) {
+            const fds=spawnSync("lsof",["-p",String(pid),"-Fn"],{encoding:"utf8"});
+            expect(fds.status).toBe(0);
+            const paths=fds.stdout.split("\n").filter(line=>line.startsWith("n")).map(line=>line.slice(1));
+            assertOpenPaths(paths,fixture.root);
+            expect(paths.some(path=>path===dbPath)).toBe(true);
+            console.info(`background lsof pid=${pid} root=${fixture.root} context_db=${dbPath}`);
+        }
+        writeFileSync(trigger,"go");
+        const deadline=Date.now()+10000;
+        while (!existsSync(started) && Date.now()<deadline) await Bun.sleep(10);
+        expect(existsSync(started)).toBe(true);
+        const requestStarted=performance.now();
+        const response=await client.session.get({sessionID:second.id},{signal:AbortSignal.timeout(9000)});
+        const latency=performance.now()-requestStarted;
+        expect(response.id).toBe(second.id);
+        expect(latency).toBeLessThan(7500);
+        expect(locker.exitCode).toBeNull();
+        expect(existsSync(result)).toBe(true);
+        const recorded=JSON.parse(readFileSync(result,"utf8"));
+        expect(recorded.calls).toBe(0);
+        expect(recorded.code).toBe("SQLITE_BUSY");
+        expect(recorded.elapsed).toBeGreaterThanOrEqual(4500);
+        expect(recorded.elapsed).toBeLessThan(7500);
+        console.info(`background elapsed_ms=${recorded.elapsed} second_session_response_ms=${latency}; lock still held`);
+    } finally { locker?.kill(); await host.stop(); }
+},120000);

@@ -62,7 +62,11 @@ import { log, sessionLog } from "../../shared/logger";
 import { getSdkOutputLimit, getSdkWindowGeometry } from "../../shared/models-dev-cache";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
 import { createPromptSurfaceGuidanceEpochCache } from "../../shared/prompt-surface-runtime";
-import { isTransientSqliteError } from "../../shared/sqlite";
+import {
+    isTransientSqliteError,
+    withoutSqliteTransformPass,
+    withSqliteTransformPass,
+} from "../../shared/sqlite";
 import type { WindowGeometryResult } from "../../shared/window-geometry";
 import {
     cachedToolPermissionDenied,
@@ -1844,8 +1848,10 @@ export function createRustModeTransform(
     const promptSurfaceGuidanceEpochs = deps.promptSurfaceRuntime
         ? createPromptSurfaceGuidanceEpochCache(deps.promptSurfaceRuntime)
         : undefined;
-    const scheduleLkgCapture =
+    const captureScheduler =
         options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
+    const scheduleLkgCapture = (capture: () => void) =>
+        withoutSqliteTransformPass(() => captureScheduler(capture));
     const installNativeMessages = options.installNativeMessagesForTests ?? replaceMessagesInPlace;
     const rawFallbackEstimator =
         options.rawFallbackEstimatorForTests ?? estimateFinalWireInputTokens;
@@ -3457,6 +3463,9 @@ export function createRustModeTransform(
                 detail = "",
             ): Promise<TransformSeriesResult> => {
                 const pagingStartedAt = performance.now();
+                // Classify the payload being sent, not the original pass: need_full_sync
+                // replaces a cheap tail delta with a potentially large full-array request.
+                const fullWire = !isRecord(payload.tail_delta);
                 // A one-page content-addressed envelope lets the module replay a completed
                 // request when only its response was lost, without executing the transform twice.
                 const pages = buildPagedModuleTransformPayloads(
@@ -3490,11 +3499,11 @@ export function createRustModeTransform(
                             options.moduleTimeoutMs ??
                             (attemptClass === "transform_series_execute"
                                 ? Math.max(
-                                      wireDelta
-                                          ? timeoutMs
-                                          : transformColdStartExecuteTimeoutMs(seedMessageCount),
+                                      fullWire
+                                          ? transformColdStartExecuteTimeoutMs(seedMessageCount)
+                                          : timeoutMs,
                                       protectionFloorCacheBustingPass ||
-                                          !wireDelta ||
+                                          fullWire ||
                                           passInputs.emergency_recovery_armed === true
                                           ? 45_000
                                           : timeoutMs,
@@ -4201,7 +4210,7 @@ export function createRustModeTransform(
                 (projectionKey === null || state.compartmentMirrorProjectionKey !== projectionKey);
             if ((memoryMirrorDue || compartmentMirrorDue) && !state.mirrorProjectionInFlight) {
                 state.mirrorProjectionInFlight = true;
-                void (async () => {
+                void withoutSqliteTransformPass(async () => {
                     if (memoryMirrorDue) {
                         const mirrorPullStartedAt = performance.now();
                         try {
@@ -4274,7 +4283,7 @@ export function createRustModeTransform(
                             );
                         }
                     }
-                })().finally(() => {
+                }).finally(() => {
                     state.mirrorProjectionInFlight = false;
                 });
             }
@@ -4385,13 +4394,13 @@ export function createRustModeTransform(
             sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
         ): Promise<void> => {
             try {
-                await run(sessionId, messages, output, sessionMeta);
+                await withSqliteTransformPass(() => run(sessionId, messages, output, sessionMeta));
             } finally {
                 // The pass is the loop's clock. A run can only be queued by a pass, so
                 // looking right after one is when there is most likely something to
                 // take. Never awaited: the fold the loop picks up takes minutes and the
                 // response this pass just built is already correct without it.
-                void resolveHostRunner()?.pump(sessionId);
+                void withoutSqliteTransformPass(() => resolveHostRunner()?.pump(sessionId));
             }
         },
         async clearSession(sessionId: string): Promise<void> {

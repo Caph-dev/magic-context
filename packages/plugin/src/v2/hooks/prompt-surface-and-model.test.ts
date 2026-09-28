@@ -131,11 +131,18 @@ describe("catalogModels", () => {
 // later request on the host. This pins the call out of the hook body; the only
 // permitted registration is the one-time setup in tools.ts.
 describe("v2 context hook never registers a persistent tool transform", () => {
-    it("has no context.tool.transform call after the context hook opens", () => {
+    it("has no context.tool.transform call in the context pass or its registration", () => {
         const source = readFileSync(join(import.meta.dir, "context.ts"), "utf8");
+        // Include the named body as well as its scope wrapper; registration alone
+        // no longer contains the actual context-pass operations.
+        const bodyStart = source.indexOf("const runManagedContext =");
         const hookStart = source.indexOf('context.session.hook("context"');
-        expect(hookStart).toBeGreaterThan(0);
-        const hookBody = source.slice(hookStart);
+        expect(bodyStart).toBeGreaterThan(0);
+        expect(hookStart).toBeGreaterThan(bodyStart);
+        expect(source.slice(hookStart)).toContain(
+            "withSqliteTransformPass(() => runManagedContext(draft))",
+        );
+        const hookBody = source.slice(bodyStart);
         expect(hookBody).not.toContain("context.tool.transform(");
         expect(hookBody).toContain("applyV2PromptSurfaceTools(draft");
     });

@@ -1,5 +1,10 @@
 # Storage-busy adversarial pins: F2–F6
 
+> The subsequent [foreground-scope revision](storage-busy-foreground-scope.md)
+> narrows F3's retry policy, makes read-only callers explicit, and adds a fresh
+> full-array budget after `need_full_sync`. The records below describe this pin
+> delivery before that follow-up.
+
 This follow-up implements the pins in `storage-busy-policy-gate.md` on the gate
 branch. The original report describes the initial `38a6a6cd` delivery, not the
 corrected acquisition coverage or fallback behavior below.

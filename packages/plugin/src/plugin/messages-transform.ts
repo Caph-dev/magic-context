@@ -19,7 +19,7 @@ import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-ref
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { replayRustModeBindingMismatchStrips } from "../hooks/magic-context/transform-postprocess-phase";
 import { log, sessionLog } from "../shared/logger";
-import { isTransientSqliteError } from "../shared/sqlite";
+import { isTransientSqliteError, withSqliteTransformPass } from "../shared/sqlite";
 
 export const ASSISTANT_TERMINAL_RETRY_MESSAGE =
     "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue.";
@@ -479,18 +479,23 @@ export function createMessagesTransformHandler(args: {
         return output.messages;
     };
 
-    return async (input, output): Promise<MessageWithParts[]> => {
-        const inputMessages = [...output.messages];
-        // Read before the transform runs: it mutates the shared message objects.
-        const inputTailRole = wireTailRole(output.messages);
-        enforcePersistedUserTerminatedTail(output.messages);
-        try {
-            return await run(input, output);
-        } finally {
-            preserveUserTerminatedTail(output.messages, inputMessages);
-            reportAssistantTerminatedTail(output.messages, inputTailRole, resolveSessionId(output));
-        }
-    };
+    return (input, output): Promise<MessageWithParts[]> =>
+        withSqliteTransformPass(async () => {
+            const inputMessages = [...output.messages];
+            // Read before the transform runs: it mutates the shared message objects.
+            const inputTailRole = wireTailRole(output.messages);
+            enforcePersistedUserTerminatedTail(output.messages);
+            try {
+                return await run(input, output);
+            } finally {
+                preserveUserTerminatedTail(output.messages, inputMessages);
+                reportAssistantTerminatedTail(
+                    output.messages,
+                    inputTailRole,
+                    resolveSessionId(output),
+                );
+            }
+        });
 }
 
 function resolveSessionId(output: MessagesTransformOutput): string | null {

@@ -12,7 +12,7 @@ import { join } from "node:path";
 // `bun test` cannot reach. Node's ESM type-stripping resolver requires the
 // extension. The file is excluded from tsconfig.scripts.json for the same
 // reason (running it IS the validation).
-import { Database } from "../src/shared/sqlite.ts";
+import { Database, withSqliteTransformPass } from "../src/shared/sqlite.ts";
 
 let failures = 0;
 function check(name: string, cond: boolean, detail?: string): void {
@@ -141,8 +141,10 @@ try {
         let callbacks = 0;
         const callback = () => { callbacks++; writer.prepare("INSERT INTO t(v,flag) VALUES(?,?)").run(mode, 1); };
         try {
-            if (mode === "literal") { writer.exec("BEGIN IMMEDIATE"); callback(); writer.exec("COMMIT"); }
-            else { const tx = writer.transaction(callback); if (mode === "default") tx(); else tx[mode](); }
+            withSqliteTransformPass(() => {
+                if (mode === "literal") { writer.exec("BEGIN IMMEDIATE"); callback(); writer.exec("COMMIT"); }
+                else { const tx = writer.transaction(callback); if (mode === "default") tx(); else tx[mode](); }
+            });
             check(`${mode} acquisition retries before callback under node:sqlite`, callbacks === 1);
         } finally { await exited; }
     }

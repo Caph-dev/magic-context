@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database, withPrivilegedWriter } from "./sqlite";
+import { Database, withPrivilegedWriter, withSqliteTransformPass } from "./sqlite";
 import { startSqliteWriteLocker } from "./sqlite-write-locker-test-support";
 
 for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
@@ -19,14 +19,18 @@ for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
             return "managed";
         };
         try {
-            if (mode === "literal") {
-                db.exec("BEGIN IMMEDIATE");
-                write();
-                db.exec("COMMIT");
-            } else {
-                const transaction = db.transaction(write);
-                expect(mode === "default" ? transaction() : transaction[mode]()).toBe("managed");
-            }
+            withSqliteTransformPass(() => {
+                if (mode === "literal") {
+                    db.exec("BEGIN IMMEDIATE");
+                    write();
+                    db.exec("COMMIT");
+                } else {
+                    const transaction = db.transaction(write);
+                    expect(mode === "default" ? transaction() : transaction[mode]()).toBe(
+                        "managed",
+                    );
+                }
+            });
             expect(calls).toBe(1);
             expect(db.prepare("SELECT * FROM result").all()).toEqual([{ value: "once" }]);
         } finally {
@@ -50,7 +54,9 @@ test("routed transactions preserve nesting, receiver, arguments and rollback wit
         throw Object.assign(new Error("busy after writes"), { code: "SQLITE_BUSY" });
     });
     try {
-        expect(() => transaction.call({ prefix: "outer-" }, "value")).toThrow("busy after writes");
+        expect(() =>
+            withSqliteTransformPass(() => transaction.call({ prefix: "outer-" }, "value")),
+        ).toThrow("busy after writes");
         expect(calls).toBe(1);
         expect(db.prepare("SELECT * FROM result").all()).toEqual([]);
     } finally {
@@ -74,7 +80,7 @@ test("exhausted routed acquisition never enters the callback or multiplies privi
             () => withPrivilegedWriter(db, () => callbacks++),
         ]) {
             wait.mockClear();
-            expect(run).toThrow("after 3 attempts");
+            expect(() => withSqliteTransformPass(run)).toThrow("after 3 attempts");
             expect(wait).toHaveBeenCalledTimes(2);
             expect(callbacks).toBe(0);
         }

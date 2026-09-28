@@ -1,5 +1,13 @@
 import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
-import { Database, isTransientSqliteError, withPrivilegedWriter } from "./sqlite";
+import {
+    Database,
+    isTransientSqliteError,
+    withSqliteTransformPass,
+    withPrivilegedWriter as writePrivileged,
+} from "./sqlite";
+
+const withPrivilegedWriter = <T>(db: Database, operation: () => T): T =>
+    withSqliteTransformPass(() => writePrivileged(db, operation));
 
 const wait = spyOn(Atomics, "wait");
 afterEach(() => wait.mockClear());

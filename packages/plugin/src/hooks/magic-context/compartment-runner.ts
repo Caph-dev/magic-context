@@ -8,6 +8,7 @@ import {
 } from "../../features/magic-context/compartment-lease";
 import { isWrapupInProgress, updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { sessionLog } from "../../shared/logger";
+import { withoutSqliteTransformPass } from "../../shared/sqlite";
 import { runCompartmentAgent } from "./compartment-runner-incremental";
 import {
     executePartialRecompInternal,
@@ -113,9 +114,17 @@ function startLeaseRenewal(
     }, COMPARTMENT_LEASE_RENEWAL_MS);
 }
 
+/** Historian work and its lease timers remain background work even when a pass starts them. */
 export function startCompartmentAgent(
     deps: HiddenCompartmentRunnerDeps,
     runAgent: typeof runCompartmentAgent = runCompartmentAgent,
+): void {
+    withoutSqliteTransformPass(() => startBackgroundCompartmentAgent(deps, runAgent));
+}
+
+function startBackgroundCompartmentAgent(
+    deps: HiddenCompartmentRunnerDeps,
+    runAgent: typeof runCompartmentAgent,
 ): void {
     // Intentional: this check-then-set is safe in Bun's single-threaded event loop.
     // The synchronous code between activeRuns.get() and activeRuns.set() cannot interleave,

@@ -90,7 +90,12 @@ import {
 } from "../../shared/prompt-surface-runtime";
 import { pushNotification } from "../../shared/rpc-notifications";
 import { MagicContextRpcServer } from "../../shared/rpc-server";
-import { isTransientSqliteError, withPrivilegedWriter } from "../../shared/sqlite";
+import {
+    isTransientSqliteError,
+    withoutSqliteTransformPass,
+    withPrivilegedWriter,
+    withSqliteTransformPass,
+} from "../../shared/sqlite";
 import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
 import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-descriptions";
 import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
@@ -510,12 +515,18 @@ export async function registerContext(context: V2Context) {
      * the provider.
      */
     const storeStorageNotice = (sessionID: string, text: string, what: string): void => {
-        void context.session
-            .wait({ sessionID })
-            .then(() => deliverSynthetic(context, sessionID, text))
-            .catch((error: unknown) =>
-                sessionLog(sessionID, `v2 storage ${what} notice could not be delivered:`, error),
-            );
+        void withoutSqliteTransformPass(() =>
+            context.session
+                .wait({ sessionID })
+                .then(() => deliverSynthetic(context, sessionID, text))
+                .catch((error: unknown) =>
+                    sessionLog(
+                        sessionID,
+                        `v2 storage ${what} notice could not be delivered:`,
+                        error,
+                    ),
+                ),
+        );
     };
     /**
      * Tell the user why a turn is refused for missing storage. The host records a
@@ -1019,7 +1030,7 @@ export async function registerContext(context: V2Context) {
                 reader.close();
             }
         });
-    await context.session.hook("context", async (draft) => {
+    const runManagedContext = async (draft: SessionContext): Promise<void> => {
         // Learn the host's message and attachment classes, so attachments on rows restored
         // after a host checkpoint can be rebuilt in the host's own shape.
         rememberHostMedia(draft.messages);
@@ -1065,7 +1076,8 @@ export async function registerContext(context: V2Context) {
             modelID: draft.model.id,
         });
         variants.set(draft.sessionID, draft.model.variant);
-        if (!modelLimitCacheWarm()) void warmModelLimitCacheFromCatalog(context);
+        if (!modelLimitCacheWarm())
+            void withoutSqliteTransformPass(() => warmModelLimitCacheFromCatalog(context));
         agents.set(draft.sessionID, draft.agent);
         // Per-model descriptions are applied to this request's draft only.
         // `context.tool.transform` must never be called from here: the host keeps
@@ -1265,7 +1277,10 @@ export async function registerContext(context: V2Context) {
                 onRustModeParked: (sessionId, message) =>
                     pushNotification(
                         "toast",
-                        { message: `Rust Magic Context paused: ${message}`, variant: "warning" },
+                        {
+                            message: `Rust Magic Context paused: ${message}`,
+                            variant: "warning",
+                        },
                         sessionId,
                     ),
                 // A session can resolve a project other than the launch directory,
@@ -1539,10 +1554,13 @@ export async function registerContext(context: V2Context) {
                 console.warn("[magic-context] v2 context unavailable", error);
             }
         }
-    });
+    };
+    await context.session.hook("context", (draft) =>
+        withSqliteTransformPass(() => runManagedContext(draft)),
+    );
     // Warm eagerly for cold sidebar/status reads; a failed startup warm releases
     // its latch and the context hook above retries after the host catalog settles.
-    void warmModelLimitCacheFromCatalog(context);
+    void withoutSqliteTransformPass(() => warmModelLimitCacheFromCatalog(context));
     // OpenCode 2 never runs the v1 server() lane. Start the RPC surface here so
     // the terminal TUI can read the v2 lane's draft-authoritative session state.
     const rpcLiveSessionState = createV2RpcLiveSessionState({

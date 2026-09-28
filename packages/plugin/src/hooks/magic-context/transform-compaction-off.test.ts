@@ -53,7 +53,7 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache } from "../../shared/models-dev-cache";
-import { Database } from "../../shared/sqlite";
+import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { __ignoredNotificationTest } from "./send-session-notification";
@@ -737,6 +737,40 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         }
         expect(allText(guarded)).not.toContain("persisted note reminder");
         expect(allText(guarded)).not.toContain("persisted search hint");
+    });
+
+    it("does not lend the foreground retry budget to automatic embedding work", async () => {
+        useTempDataHome("co-embedding-scope-");
+        let launches = 0;
+        let attempts = 0;
+        let failure: unknown;
+        const { db, transform } = makeOffTransform({
+            sessionId: "ses-1",
+            maybeAutoEmbedSession: () => {
+                launches++;
+                const exec = spyOn(db, "exec").mockImplementation(() => {
+                    attempts++;
+                    throw Object.assign(new Error("embedding busy"), { code: "SQLITE_BUSY" });
+                });
+                const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+                try {
+                    withPrivilegedWriter(db, () => undefined);
+                } catch (error) {
+                    failure = error;
+                } finally {
+                    exec.mockRestore();
+                    wait.mockRestore();
+                }
+            },
+        });
+        const handler = createMessagesTransformHandler({
+            magicContext: { "experimental.chat.messages.transform": transform },
+            compactionOff: true,
+        });
+        await handler({}, { messages: makeMessages("ses-1") });
+        expect(launches).toBe(1);
+        expect(attempts).toBe(1);
+        expect((failure as Error).message).toBe("embedding busy");
     });
 
     it("keeps retained inputs read-only and shallow-restores them after a full-pass exception", async () => {
