@@ -38,6 +38,12 @@ pub trait ContextDomain: Send + Sync {
         tables: &[&str],
         write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
     ) -> Result<(), McStoreError>;
+
+    /// What the domain reports on the status surface: where it is and what its schema
+    /// fence found. Null when it has nothing to report.
+    fn status(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
 }
 
 /// The `McStoreError` a failed `context.db` operation reports.

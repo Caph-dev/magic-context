@@ -2270,7 +2270,6 @@ fn render_check(
             // Only where the store's memories won can the two memory blocks be expected to
             // agree: where context.db wins, its differing twins are kept on purpose.
             memory_enabled: store_wins.contains(&project) && !sample.memory_disabled,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 1e15,
             user_profile_budget_tokens: 0.0,
             inject_docs: false,

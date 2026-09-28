@@ -1,9 +1,8 @@
 //! Single-store writer: the module writing the host's `context.db` domain tables.
 //!
-//! Today the module owns `store.db` and a changefeed mirror copies domain rows into
-//! `context.db`, which every interactive seat reads. This module is the first half of
-//! removing that seam: it writes the domain tables directly, under the same discipline
-//! the TypeScript host writes them under.
+//! `context.db` is the only copy of the module's memories, notes and session history. The
+//! module writes those tables directly, under the same discipline the TypeScript host
+//! writes them under; `store.db` keeps only the module's cache.
 //!
 //! Three rules shape everything here.
 //!
@@ -33,14 +32,13 @@
 //!    the compartments, their facts, their events — all land in the final chunk. A reader
 //!    between chunks sees the session exactly as it was before the fold started.
 //!
-//! In this slice the writers are shadow/verify only. `single_store: "on"` is refused by
-//! name; `"shadow"` writes to a scratch copy of the file and reports how the rows it
-//! produced differ from the rows already in `context.db`.
+//! Everyday writes go through [`HostStore::with_domain_transaction`], one transaction per
+//! write; the chunked [`HostStore::publish_fold`] writer is kept for bulk publishes.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -50,12 +48,8 @@ use sha2::{Digest, Sha256};
 /// Whether this binary can serve a store whose project rows live in the host's own
 /// database ("single-store mode"), as `session.status` reports it.
 ///
-/// This is the store's own constant, not a second copy: `mc_store` is what refuses to
-/// open a store carrying the single-store marker, so the status surface has to report
-/// the same answer that refusal acts on. The writers in this file run only against a
-/// scratch copy (`shadow`) and `on` is refused, so this build cannot serve a moved
-/// store yet and reports `false`; the slice that adds the readers flips the store's
-/// constant and this follows.
+/// This is the store's own constant, not a second copy, so the status surface reports the
+/// same answer the store acts on.
 pub const SINGLE_STORE_CAPABLE: bool = mc_store::SINGLE_STORE_CAPABLE;
 
 /// The `context.db` upstream migration lane this binary was built against.
@@ -144,60 +138,6 @@ pub const PUBLISH_CHUNK_BUDGET_US: i64 = 250_000;
 /// A historian fold is a handful of compartments, far below this ceiling.
 pub const MAX_VISIBILITY_CHUNK_ROWS: usize = 256;
 
-// ── Mode ────────────────────────────────────────────────────────────────────
-
-/// Module config `single_store`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SingleStoreMode {
-    /// The module does not open `context.db` at all. The mirror remains the only path.
-    #[default]
-    Off,
-    /// The module runs its writers against a scratch copy and reports how the rows it
-    /// produced differ from the rows already in `context.db`. Nothing is written to the
-    /// real file.
-    Shadow,
-    /// The module writes `context.db` for real. Refused in this slice.
-    On,
-}
-
-impl SingleStoreMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SingleStoreMode::Off => "off",
-            SingleStoreMode::Shadow => "shadow",
-            SingleStoreMode::On => "on",
-        }
-    }
-
-    /// Parse a config value. An unrecognized value is not silently treated as `off`:
-    /// the caller is told, so a typo in a config file surfaces as a warning rather than
-    /// as a feature that quietly never runs.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "off" => Some(SingleStoreMode::Off),
-            "shadow" => Some(SingleStoreMode::Shadow),
-            "on" => Some(SingleStoreMode::On),
-            _ => None,
-        }
-    }
-
-    fn code(self) -> u8 {
-        match self {
-            SingleStoreMode::Off => 0,
-            SingleStoreMode::Shadow => 1,
-            SingleStoreMode::On => 2,
-        }
-    }
-
-    fn from_code(code: u8) -> Self {
-        match code {
-            1 => SingleStoreMode::Shadow,
-            2 => SingleStoreMode::On,
-            _ => SingleStoreMode::Off,
-        }
-    }
-}
-
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 /// Why the module will not write `context.db`.
@@ -229,11 +169,6 @@ pub enum HostStoreError {
         expected: String,
         found: String,
     },
-    /// `single_store: "on"` was requested. The writers exist but are shadow/verify only
-    /// in this slice.
-    ModeRefused {
-        mode: &'static str,
-    },
     /// The privilege row could not be flipped, or did not read back as flipped inside
     /// the transaction. Writing on regardless would hit the authority guards mid-publish
     /// and leave a partially applied chunk.
@@ -264,7 +199,6 @@ impl HostStoreError {
             HostStoreError::FenceMissing { .. } => "single_store_fence_missing",
             HostStoreError::TableMissing { .. } => "single_store_table_missing",
             HostStoreError::FingerprintMismatch { .. } => "single_store_fingerprint_mismatch",
-            HostStoreError::ModeRefused { .. } => "single_store_mode_refused",
             HostStoreError::PrivilegeFlipFailed { .. } => "single_store_privilege_flip_failed",
             HostStoreError::ChunkBudgetExceeded { .. } => "single_store_chunk_budget_exceeded",
             HostStoreError::Busy { .. } => "single_store_busy",
@@ -305,10 +239,6 @@ impl fmt::Display for HostStoreError {
             } => write!(
                 formatter,
                 "context.db table {table} has schema fingerprint {found}, not the {expected} this module was built against; domain writes to {table} are refused"
-            ),
-            HostStoreError::ModeRefused { mode } => write!(
-                formatter,
-                "single_store mode {mode} is not available in this build: the context.db writers are shadow/verify only"
             ),
             HostStoreError::PrivilegeFlipFailed { reason } => write!(
                 formatter,
@@ -990,8 +920,29 @@ impl HostStore {
             .collect()
     }
 
+    /// Run `writes` in one `BEGIN IMMEDIATE` transaction under the privileged-writer bracket,
+    /// after re-checking the schema of the fingerprinted tables among `tables`. A table the
+    /// module writes but does not fingerprint (the mutation logs, `memory_verifications`)
+    /// is not a fence input and is skipped here.
+    pub fn with_domain_transaction(
+        &mut self,
+        tables: &[&str],
+        writes: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+    ) -> Result<(), HostStoreError> {
+        let fenced: Vec<&str> = tables
+            .iter()
+            .copied()
+            .filter(|table| DOMAIN_TABLES.contains(table))
+            .collect();
+        let fence = self.fence.clone();
+        with_privileged_transaction(&mut self.conn, &fence, &fenced, |tx| {
+            writes(tx).map_err(HostStoreError::from)
+        })
+        .map(|_| ())
+    }
+
     /// The health block the status surface reports.
-    pub fn health_value(&self, mode: SingleStoreMode) -> Value {
+    pub fn health_value(&self) -> Value {
         let mut tables = serde_json::Map::new();
         for table in DOMAIN_TABLES.iter().chain(std::iter::once(&BRACKET_TABLE)) {
             let state = match self.fence.check_write(table) {
@@ -1006,7 +957,6 @@ impl HostStore {
         }
         json!({
             "capable": SINGLE_STORE_CAPABLE,
-            "mode": mode.as_str(),
             "path": self.path.display().to_string(),
             "fence": {
                 "persisted_version": self.fence.persisted_version,
@@ -1014,22 +964,6 @@ impl HostStore {
                 "lane_ahead": self.fence.lane_ahead(),
             },
             "tables": Value::Object(tables),
-        })
-    }
-
-    /// Health for a module that could not open the file, or was never asked to.
-    pub fn unavailable_health_value(
-        mode: SingleStoreMode,
-        error: Option<&HostStoreError>,
-    ) -> Value {
-        json!({
-            "capable": SINGLE_STORE_CAPABLE,
-            "mode": mode.as_str(),
-            "path": Value::Null,
-            "fence": Value::Null,
-            "tables": Value::Null,
-            "error_code": error.map(HostStoreError::code),
-            "detail": error.map(ToString::to_string),
         })
     }
 }
@@ -1912,385 +1846,6 @@ fn apply_chunk(
     Ok(result)
 }
 
-// ── Shadow verification ─────────────────────────────────────────────────────
-
-/// One column that differs between the rows the module produced and the rows already in
-/// `context.db` for the same publish.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowDivergence {
-    pub table: String,
-    /// The natural key of the row, so a report names which row diverged.
-    pub key: String,
-    pub column: String,
-    /// What `context.db` holds. `None` means the mirror has no such row at all.
-    pub mirror: Option<String>,
-    /// What the module's writer produced.
-    pub module: Option<String>,
-}
-
-/// The outcome of one shadow publish.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ShadowReport {
-    pub scratch_path: String,
-    pub divergences: Vec<ShadowDivergence>,
-    pub chunk_rows: Vec<usize>,
-    pub chunk_durations_us: Vec<i64>,
-}
-
-impl ShadowReport {
-    /// A one-line summary for the log, naming the tables and columns that diverged rather
-    /// than only counting them.
-    pub fn summary(&self) -> String {
-        if self.divergences.is_empty() {
-            return format!(
-                "single_store shadow: {} chunks, no divergence",
-                self.chunk_rows.len()
-            );
-        }
-        let mut by_table: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for divergence in &self.divergences {
-            by_table
-                .entry(divergence.table.as_str())
-                .or_default()
-                .push(divergence.column.as_str());
-        }
-        let detail = by_table
-            .into_iter()
-            .map(|(table, mut columns)| {
-                columns.sort_unstable();
-                columns.dedup();
-                format!("{table}({})", columns.join(","))
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!(
-            "single_store shadow: {} chunks, {} diverging column(s): {detail}",
-            self.chunk_rows.len(),
-            self.divergences.len()
-        )
-    }
-}
-
-/// Columns compared per table. Autoincrement ids are excluded: two writers appending to
-/// the same table pick different ids by construction, and comparing them would report a
-/// divergence on every row while hiding the content ones.
-fn shadow_compare_columns(table: &str) -> &'static [&'static str] {
-    match table {
-        "compartments" => &[
-            "sequence",
-            "start_message",
-            "end_message",
-            "start_message_id",
-            "end_message_id",
-            "title",
-            "content",
-            "p1",
-            "p2",
-            "p3",
-            "p4",
-            "importance",
-            "episode_type",
-            "legacy",
-            "created_at",
-            "harness",
-        ],
-        "session_facts" => &["category", "content", "created_at", "updated_at", "harness"],
-        "compartment_events" => &["kind", "at_compartment", "fields_json", "harness"],
-        "memories" => &[
-            "project_path",
-            "category",
-            "content",
-            "normalized_hash",
-            "importance",
-            "scope",
-            "shareable",
-            "source_session_id",
-            "source_type",
-            "seen_count",
-            "retrieval_count",
-            "status",
-            "expires_at",
-            "verification_status",
-            "metadata_json",
-        ],
-        "primer_candidates" => &[
-            "project_path",
-            "harness",
-            "session_id",
-            "question",
-            "normalized_question",
-            "source_compartment_start",
-            "source_compartment_end",
-            "source_start_message_id",
-            "source_end_message_id",
-            "source_message_time",
-        ],
-        "user_memory_candidates" => &[
-            "content",
-            "session_id",
-            "source_compartment_start",
-            "source_compartment_end",
-        ],
-        "user_memories" => &["content", "status", "source_candidate_ids"],
-        "notes" => &["type", "status", "content", "session_id", "harness"],
-        _ => &[],
-    }
-}
-
-/// The natural key a row is matched on across the two databases.
-fn shadow_key_columns(table: &str) -> &'static [&'static str] {
-    match table {
-        "compartments" => &["session_id", "sequence"],
-        "session_facts" => &["session_id", "category", "content"],
-        "compartment_events" => &["session_id", "kind", "at_compartment"],
-        "memories" => &["project_path", "category", "content"],
-        "primer_candidates" => &["project_path", "session_id", "source_start_message_id"],
-        "user_memory_candidates" => &["session_id", "content"],
-        "user_memories" => &["content"],
-        "notes" => &["session_id", "content"],
-        _ => &[],
-    }
-}
-
-fn read_rows(
-    conn: &Connection,
-    table: &str,
-    scope_column: &str,
-    scope_value: &str,
-) -> Result<BTreeMap<String, BTreeMap<String, Option<String>>>, HostStoreError> {
-    let keys = shadow_key_columns(table);
-    let columns = shadow_compare_columns(table);
-    if keys.is_empty() || columns.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let mut selected: Vec<&str> = keys.to_vec();
-    for column in columns {
-        if !selected.contains(column) {
-            selected.push(column);
-        }
-    }
-    let sql = format!(
-        "SELECT {} FROM {table} WHERE {scope_column} = ?1",
-        selected.join(", ")
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let mut rows = statement.query(params![scope_value])?;
-    let mut out = BTreeMap::new();
-    while let Some(row) = rows.next()? {
-        let mut values = BTreeMap::new();
-        for (index, column) in selected.iter().enumerate() {
-            let value: Option<String> = row.get::<_, Option<String>>(index).or_else(|_| {
-                row.get::<_, Option<i64>>(index)
-                    .map(|value| value.map(|value| value.to_string()))
-            })?;
-            values.insert((*column).to_string(), value);
-        }
-        let key = keys
-            .iter()
-            .map(|column| {
-                values
-                    .get(*column)
-                    .cloned()
-                    .flatten()
-                    .unwrap_or_else(|| "\u{0}".to_string())
-            })
-            .collect::<Vec<_>>()
-            .join("\u{1f}");
-        out.insert(key, values);
-    }
-    Ok(out)
-}
-
-/// The table's scope column and the publish value that scopes it.
-fn shadow_scope<'a>(table: &str, publish: &'a FoldPublish) -> (&'static str, &'a str) {
-    match table {
-        "memories" | "primer_candidates" => ("project_path", publish.project_path.as_str()),
-        "user_memories" => ("status", "active"),
-        _ => ("session_id", publish.session_id.as_str()),
-    }
-}
-
-impl HostStore {
-    /// Remove the rows this publish would produce, so the writers run against the state
-    /// that existed before the fold.
-    ///
-    /// Only ever called on a scratch copy. The point of shadow verification is to compare
-    /// the module's rows against the mirror's rows for the same publish, and that needs
-    /// both writers to start from the same place: without this, a fold the mirror had
-    /// already drained would meet its own rows on the way in. The deletes are keyed the
-    /// same way the comparison is, which is deliberately blunt — a scratch file is thrown
-    /// away, so over-deleting there costs nothing and under-deleting would silently
-    /// weaken the comparison.
-    fn rewind_publish_scope(&mut self, publish: &FoldPublish) -> Result<(), HostStoreError> {
-        let fence = self.fence.clone();
-        let tables: Vec<&str> = DOMAIN_TABLES.to_vec();
-        let (_, _) = with_privileged_transaction(&mut self.conn, &fence, &tables, |tx| {
-            tx.execute(
-                "DELETE FROM compartment_events WHERE session_id = ?1",
-                params![publish.session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM session_facts WHERE session_id = ?1",
-                params![publish.session_id],
-            )?;
-            for compartment in &publish.compartments {
-                tx.execute(
-                    "DELETE FROM compartments WHERE session_id = ?1 AND sequence = ?2",
-                    params![publish.session_id, compartment.sequence],
-                )?;
-            }
-            for memory in &publish.memories {
-                tx.execute(
-                    "DELETE FROM memories WHERE project_path = ?1 AND content = ?2",
-                    params![publish.project_path, memory.content],
-                )?;
-            }
-            for note in &publish.notes {
-                tx.execute(
-                    "DELETE FROM notes WHERE session_id = ?1 AND content = ?2",
-                    params![publish.session_id, note.content],
-                )?;
-            }
-            for candidate in &publish.primer_candidates {
-                tx.execute(
-                    "DELETE FROM primer_candidates
-                      WHERE project_path = ?1 AND harness = ?2 AND session_id = ?3
-                        AND source_start_message_id = ?4 AND source_end_message_id = ?5",
-                    params![
-                        publish.project_path,
-                        publish.harness,
-                        publish.session_id,
-                        candidate.source_start_message_id,
-                        candidate.source_end_message_id,
-                    ],
-                )?;
-            }
-            for observation in &publish.user_observations {
-                tx.execute(
-                    "DELETE FROM user_memory_candidates WHERE session_id = ?1 AND content = ?2",
-                    params![publish.session_id, observation.content.trim()],
-                )?;
-            }
-            for memory in &publish.user_memories {
-                tx.execute(
-                    "DELETE FROM user_memories WHERE content = ?1",
-                    params![memory.content],
-                )?;
-            }
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    /// Run the writers against a scratch copy of `context.db` and report how the rows
-    /// they produce differ from the rows already there.
-    ///
-    /// `VACUUM INTO` rather than a file copy: it takes a consistent snapshot of a live
-    /// WAL database from inside SQLite, so a seat writing concurrently cannot leave the
-    /// scratch copy torn.
-    pub fn shadow_publish(
-        &mut self,
-        publish: &FoldPublish,
-        scratch_dir: &Path,
-    ) -> Result<ShadowReport, HostStoreError> {
-        counted(self.shadow_publish_inner(publish, scratch_dir))
-    }
-
-    fn shadow_publish_inner(
-        &mut self,
-        publish: &FoldPublish,
-        scratch_dir: &Path,
-    ) -> Result<ShadowReport, HostStoreError> {
-        std::fs::create_dir_all(scratch_dir).map_err(|error| HostStoreError::OpenFailed {
-            path: scratch_dir.display().to_string(),
-            reason: error.to_string(),
-        })?;
-        let scratch_path = scratch_dir.join(format!(
-            "single-store-shadow-{}.db",
-            publish
-                .session_id
-                .replace(|c: char| !c.is_alphanumeric(), "_")
-        ));
-        // VACUUM INTO refuses to overwrite, so a previous run's file is removed first.
-        let _ = std::fs::remove_file(&scratch_path);
-        let _ = std::fs::remove_file(scratch_path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(scratch_path.with_extension("db-shm"));
-        self.conn
-            .execute("VACUUM INTO ?1", params![scratch_path.to_string_lossy()])?;
-
-        let mut scratch = HostStore::open_with_fence(&scratch_path, self.fence.built_version)?;
-        scratch.set_chunk_budget(self.chunk_budget);
-        scratch.set_visibility_budget(self.visibility_budget);
-        scratch.rewind_publish_scope(publish)?;
-        let outcome = scratch.publish_fold(publish)?;
-
-        let mut divergences = Vec::new();
-        for table in DOMAIN_TABLES {
-            if shadow_key_columns(table).is_empty() {
-                continue;
-            }
-            let (scope_column, scope_value) = shadow_scope(table, publish);
-            let mirror = read_rows(&self.conn, table, scope_column, scope_value)?;
-            let module = read_rows(&scratch.conn, table, scope_column, scope_value)?;
-            for (key, module_row) in &module {
-                let mirror_row = mirror.get(key);
-                for column in shadow_compare_columns(table) {
-                    let module_value = module_row.get(*column).cloned().flatten();
-                    let mirror_value = mirror_row
-                        .and_then(|row| row.get(*column).cloned())
-                        .flatten();
-                    let missing_row = mirror_row.is_none();
-                    if missing_row || module_value != mirror_value {
-                        divergences.push(ShadowDivergence {
-                            table: (*table).to_string(),
-                            key: key.clone(),
-                            column: (*column).to_string(),
-                            mirror: mirror_value,
-                            module: module_value,
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok(ShadowReport {
-            scratch_path: scratch_path.display().to_string(),
-            divergences,
-            chunk_rows: outcome.chunk_rows,
-            chunk_durations_us: outcome.chunk_durations_us,
-        })
-    }
-}
-
-// ── Mode gate ───────────────────────────────────────────────────────────────
-
-/// The process-wide single-store mode.
-///
-/// A publish consults this on a path that runs for every fold, so the common answer —
-/// `Off`, meaning "do nothing, the mirror still owns this" — has to cost one relaxed
-/// atomic load and no allocation.
-static SINGLE_STORE_MODE: AtomicU8 = AtomicU8::new(0);
-
-/// Set the process-wide mode from resolved config.
-pub fn set_mode(mode: SingleStoreMode) {
-    SINGLE_STORE_MODE.store(mode.code(), Ordering::Relaxed);
-}
-
-pub fn mode() -> SingleStoreMode {
-    SingleStoreMode::from_code(SINGLE_STORE_MODE.load(Ordering::Relaxed))
-}
-
-/// Check a requested mode before anything opens the file.
-///
-/// `on` is refused by name rather than silently downgraded to `shadow`: a project that
-/// asked for real writes and got verification instead would look like it was working.
-pub fn admit_mode(mode: SingleStoreMode) -> Result<SingleStoreMode, HostStoreError> {
-    match mode {
-        SingleStoreMode::On => Err(HostStoreError::ModeRefused { mode: "on" }),
-        other => Ok(other),
-    }
-}
-
 // ── Locating context.db ─────────────────────────────────────────────────
 
 /// Where the host keeps `context.db`.
@@ -2335,203 +1890,6 @@ pub fn resolve_context_db_path() -> PathBuf {
             .join("magic-context")
     };
     storage_dir.join("context.db")
-}
-
-/// Where a shadow run puts its scratch copy: a temp directory, never beside the real
-/// database, so a scratch file can never be mistaken for the host's own.
-pub fn shadow_scratch_dir() -> PathBuf {
-    std::env::temp_dir()
-        .join("magic-context")
-        .join("single-store-shadow")
-}
-
-// ── The shadow verification hook ───────────────────────────────────────
-
-/// The last shadow outcome, for the status surface.
-static LAST_SHADOW: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
-    std::sync::OnceLock::new();
-
-fn last_shadow_slot() -> &'static std::sync::Mutex<Option<String>> {
-    LAST_SHADOW.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-fn record_shadow_outcome(summary: String) {
-    *last_shadow_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary);
-}
-
-/// What the last shadow publish reported, if one has run in this process.
-pub fn last_shadow_summary() -> Option<String> {
-    last_shadow_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-}
-
-/// The refusal that made the resolved mode fall back to `off`, if any.
-static MODE_REFUSAL: std::sync::OnceLock<std::sync::Mutex<Option<(String, &'static str)>>> =
-    std::sync::OnceLock::new();
-
-fn mode_refusal_slot() -> &'static std::sync::Mutex<Option<(String, &'static str)>> {
-    MODE_REFUSAL.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Remember that a configured mode was refused, so the status surface can say why the
-/// module is doing nothing instead of leaving the operator to guess.
-pub fn record_mode_refusal(error: &HostStoreError) {
-    *mode_refusal_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((error.to_string(), error.code()));
-}
-
-pub fn mode_refusal() -> Option<(String, &'static str)> {
-    mode_refusal_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-}
-
-/// The single-store block for `session.status`.
-///
-/// Reports capability, the resolved mode, and — when the mode asks the module to touch
-/// `context.db` — what the fence and the per-table fingerprints found. In the default
-/// `off` mode this opens nothing: the answer is that the module is not touching the file,
-/// and opening it to say so would contradict the answer.
-pub fn status_value() -> Value {
-    let mode = mode();
-    let refusal = mode_refusal();
-    let mut block = match mode {
-        SingleStoreMode::Off => json!({
-            "capable": SINGLE_STORE_CAPABLE,
-            "mode": mode.as_str(),
-            "path": Value::Null,
-            "fence": Value::Null,
-            "tables": Value::Null,
-        }),
-        SingleStoreMode::Shadow | SingleStoreMode::On => {
-            let path = resolve_context_db_path();
-            match HostStore::open(&path) {
-                Ok(store) => store.health_value(mode),
-                Err(error) => HostStore::unavailable_health_value(mode, Some(&error)),
-            }
-        }
-    };
-    if let Some(object) = block.as_object_mut() {
-        object.insert(
-            "built_fence_version".to_string(),
-            json!(BUILT_CONTEXT_FENCE_VERSION),
-        );
-        object.insert(
-            "chunk_budget_rows".to_string(),
-            json!(DEFAULT_PUBLISH_CHUNK_ROWS),
-        );
-        object.insert(
-            "visibility_budget_rows".to_string(),
-            json!(MAX_VISIBILITY_CHUNK_ROWS),
-        );
-        object.insert("busy_refusals".to_string(), json!(busy_refusal_count()));
-        object.insert(
-            "last_shadow".to_string(),
-            match last_shadow_summary() {
-                Some(summary) => json!(summary),
-                None => Value::Null,
-            },
-        );
-        if let Some((detail, code)) = refusal {
-            object.insert("refused_mode_detail".to_string(), json!(detail));
-            object.insert("refused_mode_code".to_string(), json!(code));
-        }
-    }
-    block
-}
-
-/// What [`apply_publish_for_mode`] did with one fold publish.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModePublish {
-    /// `shadow`: the writers ran against a scratch copy; `context.db` was not written.
-    Shadow(ShadowReport),
-    /// `on`: the publish was written to `context.db`, including its embedding watermark.
-    Written(PublishOutcome),
-}
-
-/// Hand one fold publish to whatever the resolved mode asks for.
-///
-/// `off` returns `None` after one relaxed atomic load and opens nothing. `shadow` runs
-/// [`verify_publish_in_shadow`], which writes only a scratch copy. `on` writes the real
-/// `context.db`, so the rows and the embedding watermark that asks the host to embed them
-/// land where the host's drain reads them. `on` is still refused by [`admit_mode`], so in
-/// this build that arm is reached only by a caller that sets the mode directly.
-///
-/// A failure is recorded for the status surface and swallowed: the fold has already
-/// committed to the module's own store, and nothing here may fail it retroactively.
-pub fn apply_publish_for_mode(publish: &FoldPublish) -> Option<ModePublish> {
-    match mode() {
-        SingleStoreMode::Off => None,
-        SingleStoreMode::Shadow => verify_publish_in_shadow(publish).map(ModePublish::Shadow),
-        SingleStoreMode::On => {
-            let path = resolve_context_db_path();
-            if !path.exists() {
-                record_shadow_outcome(format!(
-                    "single_store on: no context.db at {}",
-                    path.display()
-                ));
-                return None;
-            }
-            match HostStore::open(&path).and_then(|mut store| store.publish_fold(publish)) {
-                Ok(outcome) => {
-                    record_shadow_outcome(format!(
-                        "single_store on: {} chunks, {} rows written",
-                        outcome.chunk_rows.len(),
-                        outcome.total_rows()
-                    ));
-                    Some(ModePublish::Written(outcome))
-                }
-                Err(error) => {
-                    record_shadow_outcome(format!(
-                        "single_store on refused ({}): {error}",
-                        error.code()
-                    ));
-                    None
-                }
-            }
-        }
-    }
-}
-
-/// Verify one fold publish against `context.db`, if the mode asks for it.
-///
-/// Returns `None` when single-store is off, which is the default and the only state this
-/// slice ships enabled: the cost on that path is one relaxed atomic load. A failure here
-/// is recorded and swallowed, never propagated — verification must not be able to fail a
-/// publish that already succeeded in the module's own store.
-pub fn verify_publish_in_shadow(publish: &FoldPublish) -> Option<ShadowReport> {
-    if mode() != SingleStoreMode::Shadow {
-        return None;
-    }
-    let path = resolve_context_db_path();
-    if !path.exists() {
-        record_shadow_outcome(format!(
-            "single_store shadow: no context.db at {}",
-            path.display()
-        ));
-        return None;
-    }
-    let report = HostStore::open(&path)
-        .and_then(|mut store| store.shadow_publish(publish, &shadow_scratch_dir()));
-    match report {
-        Ok(report) => {
-            record_shadow_outcome(report.summary());
-            Some(report)
-        }
-        Err(error) => {
-            record_shadow_outcome(format!(
-                "single_store shadow refused ({}): {error}",
-                error.code()
-            ));
-            None
-        }
-    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -3475,116 +2833,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mode_on_is_refused_by_name() {
-        let error = admit_mode(SingleStoreMode::On).unwrap_err();
-        assert_eq!(error.code(), "single_store_mode_refused");
-        assert!(error.to_string().contains("shadow/verify only"));
-        assert_eq!(
-            admit_mode(SingleStoreMode::Off).unwrap(),
-            SingleStoreMode::Off
-        );
-        assert_eq!(
-            admit_mode(SingleStoreMode::Shadow).unwrap(),
-            SingleStoreMode::Shadow
-        );
-    }
-
-    #[test]
-    fn mode_parses_the_three_documented_values_and_nothing_else() {
-        assert_eq!(SingleStoreMode::parse("off"), Some(SingleStoreMode::Off));
-        assert_eq!(
-            SingleStoreMode::parse(" Shadow "),
-            Some(SingleStoreMode::Shadow)
-        );
-        assert_eq!(SingleStoreMode::parse("ON"), Some(SingleStoreMode::On));
-        assert_eq!(SingleStoreMode::parse("enabled"), None);
-        assert_eq!(SingleStoreMode::default(), SingleStoreMode::Off);
-    }
-
-    // ── Shadow verification ─────────────────────────────────────────────────
-
-    #[test]
-    fn shadow_mode_writes_nothing_to_the_real_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fixture_db(dir.path(), "context.db");
-        mark_managed(&path, "git:fixture");
-        let mut store = HostStore::open(&path).unwrap();
-        let report = store
-            .shadow_publish(&sample_publish(), &dir.path().join("scratch"))
-            .unwrap();
-
-        let conn = Connection::open(&path).unwrap();
-        for table in ["compartments", "memories", "session_facts"] {
-            let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(count, 0, "shadow mode wrote to {table} in the real file");
-        }
-        assert!(
-            !report.divergences.is_empty(),
-            "every row is new here, so every compared column must be reported"
-        );
-        assert!(report.summary().contains("diverging column"));
-    }
-
-    #[test]
-    fn shadow_mode_reports_the_columns_that_differ_from_the_mirrors_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fixture_db(dir.path(), "context.db");
-        mark_managed(&path, "git:fixture");
-
-        // Stand in for the mirror: the same publish, already landed, except that one
-        // column carries a different value.
-        {
-            let mut seeded = HostStore::open(&path).unwrap();
-            let mut mirrored = sample_publish();
-            mirrored.compartments[0].title = "a different title".to_string();
-            seeded.publish_fold(&mirrored).unwrap();
-        }
-
-        let mut store = HostStore::open(&path).unwrap();
-        let report = store
-            .shadow_publish(&sample_publish(), &dir.path().join("scratch"))
-            .unwrap();
-
-        let compartment_titles: Vec<&ShadowDivergence> = report
-            .divergences
-            .iter()
-            .filter(|divergence| divergence.table == "compartments" && divergence.column == "title")
-            .collect();
-        assert_eq!(compartment_titles.len(), 1, "{:?}", report.divergences);
-        assert_eq!(
-            compartment_titles[0].mirror.as_deref(),
-            Some("a different title")
-        );
-        assert_eq!(compartment_titles[0].module.as_deref(), Some("first"));
-        assert!(report.summary().contains("compartments(title)"));
-    }
-
-    #[test]
-    fn shadow_mode_reports_no_divergence_when_the_rows_already_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fixture_db(dir.path(), "context.db");
-        mark_managed(&path, "git:fixture");
-        {
-            let mut seeded = HostStore::open(&path).unwrap();
-            seeded.publish_fold(&sample_publish()).unwrap();
-        }
-        let mut store = HostStore::open(&path).unwrap();
-        let report = store
-            .shadow_publish(&sample_publish(), &dir.path().join("scratch"))
-            .unwrap();
-        assert!(
-            report.divergences.is_empty(),
-            "identical rows must not be reported as divergence: {:?}",
-            report.divergences
-        );
-        assert!(report.summary().contains("no divergence"));
-    }
-
     // ── Health surface ──────────────────────────────────────────────────────
 
     #[test]
@@ -3597,10 +2845,8 @@ mod tests {
                 .unwrap();
         }
         let store = HostStore::open(&path).unwrap();
-        let health = store.health_value(SingleStoreMode::Shadow);
-        // Reports the store's answer: this build cannot serve a moved store.
-        assert_eq!(health["capable"], json!(false));
-        assert_eq!(health["mode"], json!("shadow"));
+        let health = store.health_value();
+        assert_eq!(health["capable"], json!(true));
         assert_eq!(
             health["fence"]["persisted_version"],
             json!(BUILT_CONTEXT_FENCE_VERSION)
@@ -3615,43 +2861,6 @@ mod tests {
     }
 
     #[test]
-    fn the_status_block_in_off_mode_opens_nothing() {
-        set_mode(SingleStoreMode::Off);
-        let block = status_value();
-        // Reports the store's answer: this build cannot serve a moved store.
-        assert_eq!(block["capable"], json!(false));
-        assert_eq!(block["mode"], json!("off"));
-        assert!(
-            block["path"].is_null(),
-            "off mode must not name a file it did not open"
-        );
-        assert!(block["fence"].is_null());
-        assert_eq!(
-            block["built_fence_version"],
-            json!(BUILT_CONTEXT_FENCE_VERSION)
-        );
-        assert_eq!(
-            block["chunk_budget_rows"],
-            json!(DEFAULT_PUBLISH_CHUNK_ROWS)
-        );
-    }
-
-    #[test]
-    fn a_refused_mode_is_named_in_the_status_block() {
-        record_mode_refusal(&HostStoreError::ModeRefused { mode: "on" });
-        set_mode(SingleStoreMode::Off);
-        let block = status_value();
-        assert_eq!(
-            block["refused_mode_code"],
-            json!("single_store_mode_refused")
-        );
-        assert!(block["refused_mode_detail"]
-            .as_str()
-            .unwrap()
-            .contains("shadow/verify only"));
-    }
-
-    #[test]
     fn the_context_db_path_follows_the_hosts_own_resolution_order() {
         // Resolution is read from the process environment, which several tests share, so
         // this asserts the shape of the answer rather than mutating that environment.
@@ -3663,25 +2872,6 @@ mod tests {
             "resolved {}",
             resolved.display()
         );
-    }
-
-    #[test]
-    fn shadow_verification_is_inert_while_the_mode_is_off() {
-        set_mode(SingleStoreMode::Off);
-        assert!(verify_publish_in_shadow(&sample_publish()).is_none());
-    }
-
-    #[test]
-    fn unavailable_health_carries_the_error_code() {
-        let error = HostStoreError::FenceMissing {
-            path: "/tmp/example/context.db".to_string(),
-        };
-        let health = HostStore::unavailable_health_value(SingleStoreMode::Shadow, Some(&error));
-        assert_eq!(health["error_code"], json!("single_store_fence_missing"));
-        assert!(health["detail"]
-            .as_str()
-            .unwrap()
-            .contains("/tmp/example/context.db"));
     }
 
     // ── Chunk budget measurement ────────────────────────────────────────────

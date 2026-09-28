@@ -42,6 +42,7 @@ pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
 pub mod project_docs;
+pub mod project_identity;
 pub mod prompt_surface;
 pub mod protection_window;
 mod retained_size;
@@ -51,6 +52,7 @@ pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
 pub mod single_store_migrate;
+pub mod single_store_reads;
 mod state_sync_timing;
 mod tail_hygiene;
 pub mod transform;
@@ -64,7 +66,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use mc_store::MEMORY_VISIBILITY_MUTATION_CATEGORY;
 use tokio::sync::Notify;
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
@@ -78,16 +79,15 @@ use mc_store::single_store_schema::{
 #[cfg(test)]
 use mc_store::TagNumberRow;
 use mc_store::{
-    canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
+    canonical_root, validate_state_import_compartments, DeferredExecuteState,
     FacadeMemoryMutationError, FacadeMutationOutcome, HistorianChunkRange, HistorianDecision,
-    HistorianPhase, HistorianRecentDecision, HostMemoryIdentityAck, InsertMemoryInput, LoadedState,
-    MappingUpdate, McStore, McStoreError, McTagRow, ModuleDropSeedRow, ModuleMemoryMutationRow,
-    ModuleMemoryRow, ModuleStateSyncError, ModuleStateSyncRequest, ModuleStripSeedRow,
-    ModuleWorkspaceMemberRow, ModuleWorkspaceRow, NoteCasOutcome, NoteDismissOutcome,
+    HistorianPhase, HistorianRecentDecision, InsertMemoryInput, LoadedState, MappingUpdate,
+    McStore, McStoreError, McTagRow, ModuleDropSeedRow, ModuleStateSyncError,
+    ModuleStateSyncRequest, ModuleStripSeedRow, NoteCasOutcome, NoteDismissOutcome,
     NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
     PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
     StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
-    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
+    StoredCompartment, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
     VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
     STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
 };
@@ -1359,7 +1359,6 @@ const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
 /// this minimum at zero so it does not impose an additional minimum-token requirement.
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 0;
 /// Maximum number of newly published compartments returned by one status page.
-const SESSION_STATUS_COMPARTMENT_PAGE_LIMIT: usize = 50;
 /// After a historian abandon, suppress refires for this long so a persistently
 /// failing model does not burn a full summarization pass on every transform.
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
@@ -1417,15 +1416,6 @@ const MAX_IN_FLIGHT_SNAPSHOT_ENTRIES: usize = 4_096;
 const WRAPUP_REQUEST_MARGIN: Duration = Duration::from_secs(5);
 const HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND: usize = 32;
 
-fn deserialize_nullable_workspace<'de, D>(
-    deserializer: D,
-) -> Result<Option<Option<ModuleWorkspaceWire>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<ModuleWorkspaceWire>::deserialize(deserializer).map(Some)
-}
-
 #[derive(Debug, Deserialize)]
 struct ModuleStateSyncWire {
     #[serde(default)]
@@ -1445,22 +1435,7 @@ struct ModuleStateSyncWire {
     #[serde(default)]
     seed_boundary_id: Option<String>,
     #[serde(default)]
-    compartments: Vec<ModuleCompartmentWire>,
-    #[serde(default)]
-    memories: Vec<ModuleMemoryWire>,
-    #[serde(default)]
-    memory_mutations: Vec<ModuleMemoryMutationWire>,
-    #[serde(default)]
-    user_profile: Option<Vec<String>>,
-    /// None means omitted; Some(None) is an explicit workspace clear.
-    #[serde(default, deserialize_with = "deserialize_nullable_workspace")]
-    workspace: Option<Option<ModuleWorkspaceWire>>,
-    #[serde(default)]
     last_todo_state: Option<String>,
-    #[serde(default)]
-    project_memory_epoch: Option<u64>,
-    #[serde(default)]
-    user_profile_version: Option<u64>,
     #[serde(default)]
     acked_watermarks: Option<Value>,
     #[serde(default)]
@@ -2404,95 +2379,8 @@ struct ModuleCompartmentWire {
     created_at: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ModuleWorkspaceWire {
-    fingerprint: String,
-    members: Vec<ModuleWorkspaceMemberWire>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ModuleWorkspaceMemberWire {
-    project_path: String,
-    #[serde(default)]
-    share_categories: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ModuleMemoryWire {
-    id: i64,
-    #[serde(default)]
-    project_path: Option<String>,
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    normalized_hash: Option<String>,
-    #[serde(default)]
-    importance: Option<i32>,
-    #[serde(default = "default_memory_scope")]
-    scope: String,
-    #[serde(default)]
-    shareable: i32,
-    #[serde(default)]
-    source_session_id: Option<String>,
-    #[serde(default)]
-    source_type: Option<String>,
-    #[serde(default = "default_seen_count")]
-    seen_count: i64,
-    #[serde(default)]
-    retrieval_count: i64,
-    #[serde(default)]
-    first_seen_at: i64,
-    #[serde(default)]
-    created_at: i64,
-    #[serde(default)]
-    updated_at: i64,
-    #[serde(default)]
-    last_seen_at: i64,
-    #[serde(default)]
-    last_retrieved_at: Option<i64>,
-    #[serde(default = "default_memory_status")]
-    status: String,
-    #[serde(default)]
-    expires_at: Option<i64>,
-    #[serde(default = "default_verification_status")]
-    verification_status: String,
-    #[serde(default)]
-    verified_at: Option<i64>,
-    #[serde(default)]
-    classified_at: Option<i64>,
-    #[serde(default)]
-    superseded_by_memory_id: Option<i64>,
-    #[serde(default)]
-    merged_from: Option<String>,
-    #[serde(default)]
-    metadata_json: Option<String>,
-    #[serde(default)]
-    mural_cue: Option<String>,
-    #[serde(default)]
-    mural_cue_hash: Option<String>,
-    #[serde(default)]
-    mural_cue_at: Option<i64>,
-    #[serde(default)]
-    mural_cue_rejection_count: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ModuleMemoryMutationWire {
-    id: i64,
-    #[serde(default)]
-    project_path: Option<String>,
-    mutation_type: String,
-    target_memory_id: i64,
-    #[serde(default)]
-    superseded_by_id: Option<i64>,
-    #[serde(default)]
-    category: Option<String>,
-    #[serde(default)]
-    new_content: Option<String>,
-    #[serde(default)]
-    queued_at: i64,
+fn default_importance() -> i32 {
+    50
 }
 
 struct FacadeScope {
@@ -2502,27 +2390,6 @@ struct FacadeScope {
     route_project_root: String,
     conversation_key: String,
     memory_enabled: bool,
-    host_backed_memory_ids: bool,
-}
-
-fn default_importance() -> i32 {
-    50
-}
-
-fn default_memory_scope() -> String {
-    "project".to_string()
-}
-
-fn default_seen_count() -> i64 {
-    1
-}
-
-fn default_memory_status() -> String {
-    "active".to_string()
-}
-
-fn default_verification_status() -> String {
-    "unverified".to_string()
 }
 
 impl From<ModuleCompartmentWire> for StoredCompartment {
@@ -2545,66 +2412,6 @@ impl From<ModuleCompartmentWire> for StoredCompartment {
             episode_type: value.episode_type,
             legacy: value.legacy,
             created_at: value.created_at,
-        }
-    }
-}
-
-impl ModuleMemoryWire {
-    fn into_row(self, project_path: String) -> ModuleMemoryRow {
-        let normalized_hash = self
-            .normalized_hash
-            .unwrap_or_else(|| mc_store::compute_normalized_memory_hash(&self.content));
-        ModuleMemoryRow {
-            id: self.id,
-            host_row_id: Some(self.id),
-            project_path,
-            category: self.category,
-            content: self.content,
-            normalized_hash,
-            importance: self.importance,
-            scope: self.scope,
-            shareable: self.shareable,
-            source_session_id: self.source_session_id,
-            source_type: self.source_type,
-            seen_count: self.seen_count,
-            retrieval_count: self.retrieval_count,
-            first_seen_at: self.first_seen_at,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            last_seen_at: self.last_seen_at,
-            last_retrieved_at: self.last_retrieved_at,
-            status: self.status,
-            expires_at: self.expires_at,
-            verification_status: self.verification_status,
-            verified_at: self.verified_at,
-            classified_at: self.classified_at,
-            superseded_by_memory_id: self.superseded_by_memory_id,
-            merged_from: self.merged_from,
-            metadata_json: self.metadata_json,
-            mural_cue: self.mural_cue,
-            mural_cue_hash: self.mural_cue_hash,
-            mural_cue_at: self.mural_cue_at,
-            mural_cue_rejection_count: self.mural_cue_rejection_count,
-        }
-    }
-}
-
-impl ModuleMemoryMutationWire {
-    fn into_row(self, project_path: String) -> ModuleMemoryMutationRow {
-        let visibility_changed =
-            self.category.as_deref() == Some(MEMORY_VISIBILITY_MUTATION_CATEGORY);
-        ModuleMemoryMutationRow {
-            project_path,
-            mutation: StoredMemoryMutation {
-                id: self.id,
-                mutation_type: self.mutation_type,
-                target_memory_id: self.target_memory_id,
-                superseded_by_id: self.superseded_by_id,
-                category: self.category,
-                new_content: self.new_content,
-                visibility_changed,
-                queued_at: self.queued_at,
-            },
         }
     }
 }
@@ -3822,78 +3629,6 @@ struct RuntimeStoreError {
     at_ms: i64,
 }
 
-const MEMORY_MIRROR_STALL_THRESHOLD_MS: u64 = 40_000;
-const MEMORY_MIRROR_STALLED_CODE: &str = "MC-M01";
-
-#[derive(Debug, Clone, Copy)]
-struct MemoryMirrorHealthSnapshot {
-    feed_head: u64,
-    module_live_rows: u64,
-    host_cursor: u64,
-    host_cursor_updated_at_ms: u64,
-    cursor_age_ms: u64,
-    pending_rows: u64,
-    stalled: bool,
-}
-
-struct MemoryMirrorHealth {
-    feed_head: AtomicU64,
-    module_live_rows: AtomicU64,
-    host_cursor: AtomicU64,
-    host_cursor_updated_at_ms: AtomicU64,
-}
-
-impl MemoryMirrorHealth {
-    const fn new() -> Self {
-        Self {
-            feed_head: AtomicU64::new(0),
-            module_live_rows: AtomicU64::new(0),
-            host_cursor: AtomicU64::new(0),
-            host_cursor_updated_at_ms: AtomicU64::new(0),
-        }
-    }
-
-    fn observe_frontier(&self, feed_head: i64, module_live_rows: i64) {
-        self.feed_head
-            .store(feed_head.max(0) as u64, Ordering::Relaxed);
-        self.module_live_rows
-            .store(module_live_rows.max(0) as u64, Ordering::Relaxed);
-    }
-
-    fn observe_pull(&self, cursor: i64, observed_at_ms: u64) {
-        self.host_cursor
-            .store(cursor.max(0) as u64, Ordering::Relaxed);
-        self.host_cursor_updated_at_ms
-            .store(observed_at_ms, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self, now_ms: u64) -> MemoryMirrorHealthSnapshot {
-        let feed_head = self.feed_head.load(Ordering::Relaxed);
-        let module_live_rows = self.module_live_rows.load(Ordering::Relaxed);
-        let host_cursor = self.host_cursor.load(Ordering::Relaxed);
-        let host_cursor_updated_at_ms = self.host_cursor_updated_at_ms.load(Ordering::Relaxed);
-        let cursor_age_ms = if host_cursor_updated_at_ms == 0 {
-            0
-        } else {
-            now_ms.saturating_sub(host_cursor_updated_at_ms)
-        };
-        let pending_rows = feed_head.saturating_sub(host_cursor);
-        let stalled = host_cursor_updated_at_ms > 0
-            && module_live_rows > 0
-            && pending_rows > 0
-            && cursor_age_ms >= MEMORY_MIRROR_STALL_THRESHOLD_MS;
-        MemoryMirrorHealthSnapshot {
-            feed_head,
-            module_live_rows,
-            host_cursor,
-            host_cursor_updated_at_ms,
-            cursor_age_ms,
-            pending_rows,
-            stalled,
-        }
-    }
-}
-
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -3910,6 +3645,12 @@ pub struct McHandler {
     /// Which runner each session's most recent historian and dreamer completion
     /// used in this process, and why. Read by the status and health surfaces.
     runner_choices: Arc<Mutex<runner_choices::RunnerChoiceLog>>,
+    /// Project identities of route roots whose session the host has not recorded.
+    project_identities: Arc<project_identity::ProjectIdentityResolver>,
+    /// Tests bind routes to paths that do not exist and key their rows by that path, so
+    /// the resolver is used only when a test asks for it.
+    #[cfg(test)]
+    resolve_project_identity_for_test: AtomicBool,
     #[cfg(test)]
     fixed_config: Option<McModuleConfig>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
@@ -3982,7 +3723,6 @@ pub struct McHandler {
     /// while the transport shim is upgraded, without rejecting the mutation.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
     runtime_store_errors: Mutex<HashMap<String, RuntimeStoreError>>,
-    memory_mirror_health: MemoryMirrorHealth,
 }
 
 #[async_trait]
@@ -4538,6 +4278,9 @@ impl McHandler {
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
+            project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
+            #[cfg(test)]
+            resolve_project_identity_for_test: AtomicBool::new(false),
             #[cfg(test)]
             fixed_config: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -4592,7 +4335,6 @@ impl McHandler {
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
             runtime_store_errors: Mutex::new(HashMap::new()),
-            memory_mirror_health: MemoryMirrorHealth::new(),
         }
     }
 
@@ -4819,9 +4561,22 @@ impl McHandler {
         }
     }
 
+    /// Open `store.db`, then attach `context.db`, where every domain row lives. The pair is
+    /// served only when both record the same single-store migration; otherwise the open
+    /// fails with the refusal that names why, before any request is served.
     async fn open_store_once(descriptor: &StorageDescriptor) -> Result<McStore, McStoreError> {
         let descriptor = descriptor.clone();
-        match tokio::task::spawn_blocking(move || McStore::open(&descriptor)).await {
+        let open = move || {
+            let store = McStore::open(&descriptor)?;
+            let store_path = match &descriptor.backend {
+                StorageBackend::Sqlite { path } => Some(PathBuf::from(path)),
+                StorageBackend::Postgres { .. } => None,
+            };
+            let context_path = single_store_reads::context_db_path_for(store_path.as_deref());
+            single_store_reads::attach(&store, &context_path)?;
+            Ok(store)
+        };
+        match tokio::task::spawn_blocking(open).await {
             Ok(result) => result,
             Err(error) => panic!("store open worker failed: {error}"),
         }
@@ -4868,7 +4623,6 @@ impl McHandler {
                 prompt_surface_guidance_override: None,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
-                single_store: crate::host_store::SingleStoreMode::Off,
             },
         )
     }
@@ -4901,6 +4655,9 @@ impl McHandler {
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
+            project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
+            #[cfg(test)]
+            resolve_project_identity_for_test: AtomicBool::new(false),
             fixed_config: Some(config),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -4944,7 +4701,6 @@ impl McHandler {
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
             runtime_store_errors: Mutex::new(HashMap::new()),
-            memory_mirror_health: MemoryMirrorHealth::new(),
         }
     }
 
@@ -5534,24 +5290,38 @@ impl McHandler {
             })
     }
 
-    /// Persist the route's transport-to-identity mapping when a route becomes bound to an
-    /// authority-managed project. Unbound administrative calls have no route vocabulary to
-    /// record and remain valid.
-    fn bind_authority_route(
+    /// The project identity a bound route's rows are keyed by in `context.db`: the one the
+    /// host recorded for the session, or else the identity of the route root computed the
+    /// way the host computes it. A root with no computable identity refuses by name rather
+    /// than reading under a key nobody writes.
+    fn route_project_identity(
         &self,
         store: &McStore,
-        channel: u16,
-        context_store_uuid: &str,
-        project: &str,
-    ) -> Result<(), McStoreError> {
-        let Ok(binding) = self.facade_binding(channel) else {
-            return Ok(());
-        };
-        store.bind_authority_route(
-            context_store_uuid,
-            project,
-            binding.project_root.to_string_lossy().as_ref(),
-        )
+        binding: &SessionBinding,
+    ) -> Result<String, HandlerOutcome> {
+        match store.session_project_identity(&binding.session) {
+            Ok(Some(identity)) => return Ok(identity),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                })
+            }
+        }
+        #[cfg(test)]
+        if !self
+            .resolve_project_identity_for_test
+            .load(Ordering::Relaxed)
+        {
+            return Ok(binding.project_root.to_string_lossy().to_string());
+        }
+        self.project_identities
+            .resolve(&binding.project_root)
+            .map_err(|error| HandlerOutcome::Error {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            })
     }
 
     fn effective_config(&self, project_root: &Path) -> McModuleConfig {
@@ -5564,40 +5334,7 @@ impl McHandler {
             .lock()
             .expect("config mutex")
             .effective_for_project(project_root);
-        // The publish path runs deep inside the historian, far from any config handle, so
-        // the resolved single-store mode is published here where config is already being
-        // read. `on` is refused rather than silently downgraded: the writers in this build
-        // are shadow/verify only, and a project that asked for real writes must be told.
-        match crate::host_store::admit_mode(config.single_store) {
-            Ok(mode) => crate::host_store::set_mode(mode),
-            Err(error) => {
-                crate::host_store::set_mode(crate::host_store::SingleStoreMode::Off);
-                crate::host_store::record_mode_refusal(&error);
-            }
-        }
         config
-    }
-
-    fn observe_memory_mirror_frontier(&self, store: &McStore) -> Result<i64, McStoreError> {
-        let feed_head = store.changefeed_head("memories")?;
-        let live_rows = store.live_memory_row_count()?;
-        self.memory_mirror_health
-            .observe_frontier(feed_head, live_rows);
-        Ok(feed_head)
-    }
-
-    fn memory_mirror_status_value(&self, now: u64) -> Value {
-        let mirror = self.memory_mirror_health.snapshot(now);
-        json!({
-            "feed_head": mirror.feed_head,
-            "module_live_rows": mirror.module_live_rows,
-            "host_cursor": mirror.host_cursor,
-            "host_cursor_updated_at_ms": mirror.host_cursor_updated_at_ms,
-            "cursor_age_ms": mirror.cursor_age_ms,
-            "pending_rows": mirror.pending_rows,
-            "stalled": mirror.stalled,
-            "code": mirror.stalled.then_some(MEMORY_MIRROR_STALLED_CODE),
-        })
     }
 
     /// Resolve the historian runner for a firing, record it for the status and
@@ -5637,32 +5374,6 @@ impl McHandler {
             report.detail = Some(match report.detail {
                 Some(detail) => format!("{detail}; {summary}"),
                 None => summary,
-            });
-        }
-        report
-    }
-
-    fn augment_memory_mirror_health(&self, mut report: HealthReport, now: u64) -> HealthReport {
-        let mirror = self.memory_mirror_health.snapshot(now);
-        if let Some(metrics) = report.metrics.as_mut().and_then(Value::as_object_mut) {
-            metrics.insert(
-                "memory_mirror".to_string(),
-                self.memory_mirror_status_value(now),
-            );
-        }
-        if mirror.stalled {
-            report.status = HealthStatus::Degraded;
-            let mirror_detail = format!(
-                "{MEMORY_MIRROR_STALLED_CODE} memory mirror cursor stalled: cursor={} feed_head={} pending_rows={} live_rows={} age_ms={}; send another message to resume it, or run ck doctor drain-authority",
-                mirror.host_cursor,
-                mirror.feed_head,
-                mirror.pending_rows,
-                mirror.module_live_rows,
-                mirror.cursor_age_ms,
-            );
-            report.detail = Some(match report.detail {
-                Some(detail) => format!("{detail}; {mirror_detail}"),
-                None => mirror_detail,
             });
         }
         report
@@ -8039,9 +7750,8 @@ impl McHandler {
     /// conversation transcript — so without this scope a second project's host
     /// process can list and claim the first project's runs and read its transcripts.
     ///
-    /// The project is resolved through the authority route exactly as the transform
-    /// that queued the run resolved it, so a workspace member and its authority
-    /// project agree on one key rather than two spellings of the same project.
+    /// The project is resolved exactly as the transform that queued the run resolved it,
+    /// so both agree on one key.
     fn historian_lane_binding(
         &self,
         channel: u16,
@@ -8061,23 +7771,14 @@ impl McHandler {
             })
     }
 
-    /// The project key a bound channel's runs are queued under: the authority route
-    /// resolution the transform applied when it queued them, so a workspace member
-    /// and its authority project are one key rather than two spellings.
+    /// The project key a bound channel's runs are queued under: the same project identity
+    /// the transform resolved when it queued them.
     fn historian_lane_project(
         &self,
         binding: &SessionBinding,
         store: &McStore,
     ) -> Result<String, HandlerOutcome> {
-        let route_project_root = binding.project_root.to_string_lossy().to_string();
-        match store.authority_project_for_route(&route_project_root, "memories") {
-            Ok(Some(project)) => Ok(project),
-            Ok(None) => Ok(route_project_root),
-            Err(error) => Err(HandlerOutcome::Error {
-                code: "authority_project_resolution_failed".to_string(),
-                message: error.to_string(),
-            }),
-        }
+        self.route_project_identity(store, binding)
     }
 
     /// `historian.pending {session_id?}` — runs waiting for a claimant.
@@ -8393,17 +8094,6 @@ impl McHandler {
             };
             return respond(json!({ "state_sync": status }));
         }
-        let include_compartments_after_seq = match request.get("include_compartments_after_seq") {
-            Some(value) => {
-                let Some(after_sequence) = value.as_i64().filter(|value| *value >= -1) else {
-                    return invalid_params_error(
-                        "include_compartments_after_seq must be an integer >= -1",
-                    );
-                };
-                Some((after_sequence, SESSION_STATUS_COMPARTMENT_PAGE_LIMIT))
-            }
-            None => None,
-        };
         let sample_wrapup_latch = || {
             self.wrapup_sessions
                 .lock()
@@ -8413,7 +8103,7 @@ impl McHandler {
         };
         let latch_before = sample_wrapup_latch();
         let mut snapshot =
-            match store.load_session_status_snapshot(&session_id, include_compartments_after_seq) {
+            match store.load_session_status_snapshot(&session_id) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     return HandlerOutcome::Error {
@@ -8435,9 +8125,7 @@ impl McHandler {
         if latch_before != wrapup_latch {
             // Holding the latch mutex across SQLite I/O would block wrapup progress. A single
             // bounded re-read instead places the durable snapshot after the observed latch edge.
-            snapshot = match store
-                .load_session_status_snapshot(&session_id, include_compartments_after_seq)
-            {
+            snapshot = match store.load_session_status_snapshot(&session_id) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     return HandlerOutcome::Error {
@@ -8453,7 +8141,6 @@ impl McHandler {
         let pending_drop_count = snapshot.pending_drop_count;
         let tag_count = snapshot.tag_count;
         let pass_trace = snapshot.pass_trace;
-        let compartment_page = snapshot.compartment_page;
         let coverage = loaded
             .meta
             .coverage_ordinal
@@ -8570,39 +8257,6 @@ impl McHandler {
             500,
         );
         let wrapup_active = wrapup_latch.map(|(_, rounds)| rounds);
-        if let Err(error) = self.observe_memory_mirror_frontier(store) {
-            return HandlerOutcome::Error {
-                code: "store_load_failed".to_string(),
-                message: error.to_string(),
-            };
-        }
-        let route_project_root = binding.project_root.to_string_lossy();
-        let authority_status = |domain: &str| -> Result<Value, McStoreError> {
-            Ok(
-                match store.authority_project_state_for_route(&route_project_root, domain)? {
-                    Some((project, state)) => json!({ "project": project, "state": state }),
-                    None => Value::Null,
-                },
-            )
-        };
-        let memory_authority = match authority_status("memories") {
-            Ok(authority) => authority,
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "authority_status_failed".to_string(),
-                    message: error.to_string(),
-                }
-            }
-        };
-        let notes_authority = match authority_status("notes") {
-            Ok(authority) => authority,
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "authority_status_failed".to_string(),
-                    message: error.to_string(),
-                }
-            }
-        };
         // Which runner this session's completions used and why. A session with no
         // completion in this process yet reports what its route resolves to now.
         let (historian_runner_status, dreamer_runner_status) = {
@@ -8627,7 +8281,7 @@ impl McHandler {
                 ),
             )
         };
-        let mut response = json!({
+        let response = json!({
             "ok": true,
             "summary": summary,
             "wrapup_active": wrapup_active.is_some(),
@@ -8666,13 +8320,8 @@ impl McHandler {
             // `last_divergence` field so stable status reads cannot imply a fresh bust.
             "pass_trace": pass_trace,
             "runtime_store_error": self.runtime_store_error_value(&session_id),
-            "memory_mirror": self.memory_mirror_status_value(now_ms().max(0) as u64),
-            "single_store": crate::host_store::status_value(),
+            "single_store": store.context_domain_status(),
             "publish_timing": store.load_publish_timing(&session_id).ok().flatten(),
-            "authority": {
-                "memories": memory_authority,
-                "notes": notes_authority,
-            },
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "fake_compaction": {
                 "compaction_seen": descent_counters.compaction_seen,
@@ -8707,35 +8356,6 @@ impl McHandler {
             },
             "tail_hygiene": tail_hygiene,
         });
-        if let Some(page) = compartment_page {
-            let compartments = page
-                .compartments
-                .into_iter()
-                .map(|compartment| {
-                    json!({
-                        "sequence": compartment.sequence,
-                        "start_message": compartment.start_message,
-                        "end_message": compartment.end_message,
-                        "start_message_id": compartment.start_message_id,
-                        "end_message_id": compartment.end_message_id,
-                        "title": compartment.title,
-                        "content": compartment.content,
-                        "p1": compartment.p1,
-                        "p2": compartment.p2,
-                        "p3": compartment.p3,
-                        "p4": compartment.p4,
-                        "importance": compartment.importance,
-                        "episode_type": compartment.episode_type,
-                        "created_at": compartment.created_at,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let body = response
-                .as_object_mut()
-                .expect("session.status response is an object");
-            body.insert("compartments".to_string(), Value::Array(compartments));
-            body.insert("max_sequence".to_string(), json!(page.max_sequence));
-        }
         respond(response)
     }
 
@@ -8931,17 +8551,9 @@ impl McHandler {
             Some(store) => Arc::clone(store),
             None => return self.store_refusal(),
         };
-        let route_project_root = binding.project_root.to_string_lossy().to_string();
-        let project_path = match store.authority_project_for_route(&route_project_root, "memories")
-        {
-            Ok(Some(project)) => project,
-            Ok(None) => route_project_root,
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "authority_project_resolution_failed".to_string(),
-                    message: error.to_string(),
-                };
-            }
+        let project_path = match self.route_project_identity(&store, &binding) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
         };
         if let Some(command_id) = command_id {
             match store.load_wrapup_command(&session_id, command_id) {
@@ -9459,385 +9071,6 @@ impl McHandler {
         }
     }
 
-    fn handle_authority_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
-            return invalid_params_error(
-                "authority.status requires context_store_uuid, project, and domain",
-            );
-        };
-        match store.authority_status(context_store_uuid, project, domain) {
-            Ok(Some(row)) => {
-                if row.state == "MODULE" {
-                    if let Err(error) =
-                        self.bind_authority_route(store, channel, context_store_uuid, project)
-                    {
-                        return HandlerOutcome::Error {
-                            code: "authority_route_binding_failed".to_string(),
-                            message: error.to_string(),
-                        };
-                    }
-                }
-                respond(json!({ "ok": true, "authority": row }))
-            }
-            Ok(None) => respond(json!({ "ok": true, "authority": null })),
-            Err(error) => HandlerOutcome::Error {
-                code: "authority_status_failed".to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn handle_authority_prepare_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
-            return invalid_params_error(
-                "authority.prepare requires context_store_uuid, project, and domain",
-            );
-        };
-        let phase = request
-            .get("phase")
-            .and_then(Value::as_str)
-            .unwrap_or("begin");
-        let result = match phase {
-            "begin" => store.authority_begin_prepare(context_store_uuid, project, domain),
-            "complete" => {
-                let Some(expected_generation) = request.get("generation").and_then(Value::as_u64)
-                else {
-                    return invalid_params_error("authority.prepare complete requires generation");
-                };
-                let expected = request
-                    .get("checksum_expected")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let actual =
-                    match store.authority_seed_checksum(context_store_uuid, project, domain) {
-                        Ok(checksum) => checksum,
-                        Err(error) => {
-                            return HandlerOutcome::Error {
-                                code: "authority_checksum_failed".to_string(),
-                                message: error.to_string(),
-                            };
-                        }
-                    };
-                store.authority_verify_prepare(
-                    context_store_uuid,
-                    project,
-                    domain,
-                    expected_generation,
-                    expected,
-                    &actual,
-                )
-            }
-            "ack" => {
-                let Some(expected_generation) = request.get("generation").and_then(Value::as_u64)
-                else {
-                    return invalid_params_error("authority.prepare ack requires generation");
-                };
-                store.authority_ack_prepare(
-                    context_store_uuid,
-                    project,
-                    domain,
-                    expected_generation,
-                )
-            }
-            "abort" => {
-                let Some(expected_generation) = request.get("generation").and_then(Value::as_u64)
-                else {
-                    return invalid_params_error("authority.prepare abort requires generation");
-                };
-                store.authority_abort_prepare(
-                    context_store_uuid,
-                    project,
-                    domain,
-                    expected_generation,
-                )
-            }
-            _ => {
-                return invalid_params_error(
-                    "authority.prepare phase must be begin, complete, ack, or abort",
-                );
-            }
-        };
-        match result {
-            Ok(row) => {
-                if row.state == "MODULE" {
-                    if let Err(error) =
-                        self.bind_authority_route(store, channel, context_store_uuid, project)
-                    {
-                        return HandlerOutcome::Error {
-                            code: "authority_route_binding_failed".to_string(),
-                            message: error.to_string(),
-                        };
-                    }
-                }
-                respond(json!({ "ok": true, "authority": row }))
-            }
-            Err(error) => HandlerOutcome::Error {
-                code: "authority_prepare_failed".to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn handle_authority_seed_value(&self, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
-            return invalid_params_error(
-                "authority.seed requires context_store_uuid, project, and domain",
-            );
-        };
-        let Some(rows) = request.get("rows").and_then(Value::as_array) else {
-            return invalid_params_error("authority.seed requires a rows array");
-        };
-        let mut seed_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let source_row_id = row
-                .get("source_row_id")
-                .and_then(Value::as_i64)
-                .or_else(|| {
-                    row.get("snapshot")
-                        .and_then(|value| value.get("id"))
-                        .and_then(Value::as_i64)
-                });
-            let Some(source_row_id) = source_row_id else {
-                return invalid_params_error("authority.seed rows require source_row_id");
-            };
-            let snapshot = row.get("snapshot").unwrap_or(row);
-            if snapshot.get("project_path").and_then(Value::as_str) != Some(project) {
-                return HandlerOutcome::Error {
-                    code: "authority_seed_project_mismatch".to_string(),
-                    message: "seed snapshot project_path did not match the authority project"
-                        .to_string(),
-                };
-            }
-            seed_rows.push(AuthoritySeedRow {
-                source_row_id,
-                snapshot: snapshot.clone(),
-            });
-        }
-        let module_row_ids =
-            match store.seed_authority_rows(context_store_uuid, project, domain, &seed_rows) {
-                Ok(ids) => ids,
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "authority_seed_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            };
-        respond(
-            json!({ "ok": true, "seeded": module_row_ids.len(), "module_row_ids": module_row_ids }),
-        )
-    }
-
-    fn handle_authority_drain_value(&self, request: &Value, method: &str) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
-            return invalid_params_error(
-                "authority drain requires context_store_uuid, project, and domain",
-            );
-        };
-        let action = request
-            .get("action")
-            .and_then(Value::as_str)
-            .or_else(|| method.strip_prefix("authority.drain."))
-            .unwrap_or("step");
-        let result = match action {
-            "begin" => {
-                let lease = request.get("lease").and_then(Value::as_str).unwrap_or("");
-                let expires = request
-                    .get("lease_expires_at")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                let started_at = request
-                    .get("lease_started_at")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_else(now_ms);
-                store.authority_begin_drain(
-                    context_store_uuid,
-                    project,
-                    domain,
-                    lease,
-                    expires,
-                    started_at,
-                )
-            }
-            "finish" | "flip" => {
-                let Some(generation) = request.get("generation").and_then(Value::as_u64) else {
-                    return invalid_params_error("authority drain finish requires generation");
-                };
-                let token = request
-                    .get("coordinator_token")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let now = request
-                    .get("now_ms")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_else(now_ms);
-                store.authority_finish_drain(
-                    context_store_uuid,
-                    project,
-                    domain,
-                    generation,
-                    request
-                        .get("checksum_expected")
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
-                    request
-                        .get("checksum_actual")
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
-                    request
-                        .get("verified")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    token,
-                    now,
-                )
-            }
-            step => {
-                let Some(generation) = request.get("generation").and_then(Value::as_u64) else {
-                    return invalid_params_error("authority drain step requires generation");
-                };
-                let step = step.strip_prefix("drain_").unwrap_or(step);
-                let token = request
-                    .get("coordinator_token")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let now = request
-                    .get("now_ms")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_else(now_ms);
-                store.authority_drain_step(
-                    context_store_uuid,
-                    project,
-                    domain,
-                    generation,
-                    step,
-                    request.get("cursor").and_then(Value::as_i64),
-                    token,
-                    now,
-                )
-            }
-        };
-        match result {
-            Ok(row) => respond(json!({ "ok": true, "authority": row })),
-            Err(McStoreError::AuthorityFeedHeadAdvanced { captured, found }) => {
-                HandlerOutcome::Error {
-                    code: "authority_feed_head_advanced".to_string(),
-                    message: format!(
-                        "authority_feed_head_advanced: captured {captured}, found {found}"
-                    ),
-                }
-            }
-            Err(error) => HandlerOutcome::Error {
-                code: "authority_drain_failed".to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn handle_mirror_memory_value(&self, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let Some(module_row_id) = request.get("module_row_id").and_then(Value::as_i64) else {
-            return invalid_params_error("mirror.memory requires module_row_id");
-        };
-        match store.pull_memory_changefeed_row(module_row_id) {
-            Ok(row) => respond(json!({ "ok": true, "row": row })),
-            Err(error) => HandlerOutcome::Error {
-                code: "mirror_memory_failed".to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn handle_memory_identity_ack_value(&self, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let Some(project) = request.get("project").and_then(Value::as_str) else {
-            return invalid_params_error("memory.identity.ack requires project");
-        };
-        let Some(rows) = request.get("rows").and_then(Value::as_array) else {
-            return invalid_params_error("memory.identity.ack requires rows");
-        };
-        let acknowledgements = rows
-            .iter()
-            .map(|row| {
-                Some(HostMemoryIdentityAck {
-                    module_row_id: row.get("module_row_id")?.as_i64()?,
-                    host_row_id: row.get("context_row_id")?.as_i64()?,
-                })
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(acknowledgements) = acknowledgements else {
-            return invalid_params_error(
-                "memory.identity.ack rows require module_row_id and context_row_id",
-            );
-        };
-        match store.acknowledge_host_memory_ids(project, &acknowledgements) {
-            Ok(acknowledged) => respond(json!({ "ok": true, "acknowledged": acknowledged })),
-            Err(error) => HandlerOutcome::Error {
-                code: "memory_identity_ack_failed".to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn handle_mirror_pull_value(&self, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let Some(domain) = request.get("domain").and_then(Value::as_str) else {
-            return invalid_params_error("mirror.pull requires domain");
-        };
-        let cursor = request.get("cursor").and_then(Value::as_i64).unwrap_or(0);
-        let limit = request.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-        let live_only = request
-            .get("live_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let page = if live_only {
-            if domain != "memories" {
-                return invalid_params_error("live mirror snapshots currently support memories");
-            }
-            store.pull_live_memory_snapshot(cursor, limit)
-        } else {
-            store.pull_changefeed(domain, cursor, limit)
-        };
-        match page {
-            Ok(page) => {
-                if domain == "memories" && !live_only {
-                    if let (Ok(feed_head), Ok(live_rows)) = (
-                        store.changefeed_head("memories"),
-                        store.live_memory_row_count(),
-                    ) {
-                        self.memory_mirror_health
-                            .observe_frontier(feed_head, live_rows);
-                    }
-                    self.memory_mirror_health
-                        .observe_pull(page.next_cursor, now_ms().max(0) as u64);
-                }
-                respond(json!({ "ok": true, "page": page }))
-            }
-            Err(error) => HandlerOutcome::Error {
-                code: "mirror_pull_failed".to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-
     fn freeze_prompt_surface_selection(
         &self,
         session_id: &str,
@@ -10283,12 +9516,6 @@ impl McHandler {
             None => return self.store_refusal(),
         };
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
-            if let Err(error) = self.observe_memory_mirror_frontier(&store) {
-                return HandlerOutcome::Error {
-                    code: "store_load_failed".to_string(),
-                    message: error.to_string(),
-                };
-            }
             return match store.load("__health__") {
                 Ok(state) => respond(json!({
                     "ok": true,
@@ -10305,7 +9532,6 @@ impl McHandler {
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
-                    "memory_mirror": self.memory_mirror_status_value(now_ms().max(0) as u64),
                 })),
                 Err(e) => HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -10608,30 +9834,22 @@ impl McHandler {
             .expect("transform snapshots mutex")
             .begin(&parsed.session_id);
         let route_project_root = binding.project_root.to_string_lossy().to_string();
-        // Resolve the route root to the memory and note owner keys before any store read.
-        // Keep the filesystem directory only for project documents and configuration below.
-        let project_path = match store.authority_project_for_route(&route_project_root, "memories")
-        {
-            Ok(Some(project)) => project,
-            Ok(None) => route_project_root.clone(),
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "authority_project_resolution_failed".to_string(),
-                    message: error.to_string(),
-                };
-            }
+        // Resolve the route root to the identity memories and notes are keyed by before any
+        // store read. Keep the filesystem directory only for project documents and
+        // configuration below.
+        let project_path = match self.route_project_identity(&store, &binding) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
         };
-        let note_project_path =
-            match store.authority_project_for_route(&route_project_root, "notes") {
-                Ok(Some(project)) => project,
-                Ok(None) => route_project_root.clone(),
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "authority_project_resolution_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            };
+        let note_project_path = project_path.clone();
+        // A compartment write an earlier pass left half-done (its context.db half pending)
+        // lands before this pass reads the session. A failure leaves it for the next pass.
+        if let Err(error) = store.resume_pending_context_write(&parsed.session_id) {
+            tracing::warn!(
+                "mc-module: pending context.db write for session {} not finished yet: {error}",
+                parsed.session_id
+            );
+        }
         match serializer_profile {
             Some(SerializerProfile::OpencodeAiSdk) => {
                 if let Some((data_url, content_hash)) = host_mural_artifact(parsed.mural.as_ref()) {
@@ -11178,12 +10396,6 @@ impl McHandler {
                 retained_bytes,
             );
         let snapshot_store_ms = snapshot_store_started_at.elapsed().as_secs_f64() * 1_000.0;
-        match self.observe_memory_mirror_frontier(&store) {
-            Ok(feed_head) => response.memory_mirror_head = Some(feed_head),
-            Err(error) => {
-                tracing::error!("mc-module: memory mirror frontier probe failed: {error}");
-            }
-        }
         if let Some(timings) = response.timings.as_mut() {
             timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
             timings.request_decode = request_decode_ms;
@@ -11793,13 +11005,9 @@ impl McHandler {
         &self,
         binding: &SessionBinding,
         store: &McStore,
-        mut parsed: ModuleStateSyncWire,
+        parsed: ModuleStateSyncWire,
     ) -> HandlerOutcome {
         let note_evaluation_available = parsed.note_evaluation_available.unwrap_or(false);
-        let user_profile_present = parsed.user_profile.is_some();
-        let user_profile = parsed.user_profile.take().unwrap_or_default();
-        let workspace_present = parsed.workspace.is_some();
-        let workspace = parsed.workspace.take().flatten();
         let drop_seeds: Vec<ModuleDropSeedRow> = parsed
             .drop_seeds
             .into_iter()
@@ -11851,85 +11059,9 @@ impl McHandler {
                 seed.last_execute_ordinal,
             )
         });
-        let compartments = parsed
-            .compartments
-            .into_iter()
-            .map(StoredCompartment::from)
-            .collect::<Vec<_>>();
-        if !compartments.is_empty() {
-            let historian_phase = match store.load(&binding.session) {
-                Ok(loaded) => loaded.meta.historian.state,
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "store_load_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            };
-            if historian_phase != HistorianPhase::Idle {
-                // Do not stage or adopt compartment rows while a historian owns the
-                // snapshot. The TS sender treats this typed rejection as retry-later,
-                // retaining its acknowledged sequence and watermarks instead of forcing
-                // a full re-seed on every active historian pass.
-                return historian_compartment_sync_busy_error(historian_phase);
-            }
-        }
         let root_path = binding.project_root.to_string_lossy().to_string();
-        let authority_project = match store.authority_project_for_route(&root_path, "memories") {
-            Ok(project) => project,
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "authority_project_resolution_failed".to_string(),
-                    message: error.to_string(),
-                };
-            }
-        };
-        let store_project_path = authority_project.as_deref().unwrap_or(&root_path);
-        let has_workspace = workspace.is_some();
-        let (workspace, member_paths) =
-            match prepare_authority_workspace(store_project_path, workspace) {
-                Ok(prepared) => prepared,
-                Err(error) => return invalid_params_error(error),
-            };
-        let memories = match parsed
-            .memories
-            .into_iter()
-            .map(|memory| {
-                authority_source_path(
-                    memory.project_path.as_deref(),
-                    store_project_path,
-                    &member_paths,
-                    has_workspace,
-                )
-                .map(|project_path| memory.into_row(project_path))
-            })
-            .collect::<Result<Vec<ModuleMemoryRow>, String>>()
-        {
-            Ok(memories) => memories,
-            Err(error) => return invalid_params_error(error),
-        };
-        let memory_mutations = match parsed
-            .memory_mutations
-            .into_iter()
-            .map(|mutation| {
-                authority_source_path(
-                    mutation.project_path.as_deref(),
-                    store_project_path,
-                    &member_paths,
-                    has_workspace,
-                )
-                .map(|project_path| mutation.into_row(project_path))
-            })
-            .collect::<Result<Vec<ModuleMemoryMutationRow>, String>>()
-        {
-            Ok(mutations) => mutations,
-            Err(error) => return invalid_params_error(error),
-        };
         let acked_watermarks = parsed.acked_watermarks.unwrap_or_else(|| {
             json!({
-                "compartment_seq": compartments.iter().map(|c| c.sequence).max(),
-                "memory_id": memories.iter().map(|m| m.id).max(),
-                "memory_mutation_id": memory_mutations.iter().map(|m| m.mutation.id).max(),
                 "last_todo_state": parsed.last_todo_state.is_some(),
             })
         });
@@ -11977,16 +11109,7 @@ impl McHandler {
                 .collect::<Vec<_>>(),
             strip_seed_skipped: parsed.strip_seed_skipped,
             reasoning_cleared_through_tag: parsed.reasoning_cleared_through_tag,
-            compartments: &compartments,
-            memories: &memories,
-            memory_mutations: &memory_mutations,
-            user_profile: &user_profile,
-            user_profile_present,
-            workspace: workspace.as_ref(),
-            workspace_present,
             last_todo_state: parsed.last_todo_state,
-            project_memory_epoch: parsed.project_memory_epoch,
-            user_profile_version: parsed.user_profile_version,
             acked_watermarks,
         }) {
             Ok(result) => {
@@ -11999,7 +11122,6 @@ impl McHandler {
                     "shadow_generation": result.shadow_generation,
                     "shadow_seq": result.shadow_seq,
                     "row_version": result.row_version,
-                    "memories_skipped": result.memories_skipped,
                     "drop_seeds_skipped": result.drop_seeds_skipped,
                     "pending_agent_drops_seeded": result.pending_agent_drops_seeded,
                     "pending_agent_drops_skipped": result.pending_agent_drops_skipped,
@@ -12393,73 +11515,12 @@ impl McHandler {
         if command_id.trim().is_empty() || command_id.len() > 256 {
             return invalid_params_error("dreamer.run_task command_id must be 1-256 bytes");
         }
-        let Some(authority_generation) =
-            request.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("dreamer.run_task requires authority_generation");
-        };
-        let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(project) = (match store.authority_project_for_route(&route_root, "memories") {
+        // Classification writes land in context.db under the route's project identity.
+        // An `authority_generation` sent by an older host is accepted and ignored.
+        let authority_project = match self.route_project_identity(&store, &binding) {
             Ok(project) => project,
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "authority_lookup_failed".to_string(),
-                    message: error.to_string(),
-                };
-            }
-        }) else {
-            return HandlerOutcome::Error {
-                code: "authority_not_module".to_string(),
-                message: "memories authority for this route is not MODULE".to_string(),
-            };
+            Err(outcome) => return outcome,
         };
-        let Some((context_store_uuid, authority_project)) =
-            (match store.module_authority_for_project(&project, "memories") {
-                Ok(authority) => authority,
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "authority_lookup_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            })
-        else {
-            return HandlerOutcome::Error {
-                code: "authority_not_module".to_string(),
-                message: "memories authority for this route is not MODULE".to_string(),
-            };
-        };
-        let authority =
-            match store.authority_status(&context_store_uuid, &authority_project, "memories") {
-                Ok(Some(authority)) => authority,
-                Ok(None) => {
-                    return HandlerOutcome::Error {
-                        code: "authority_not_module".to_string(),
-                        message: "memories authority row is missing".to_string(),
-                    };
-                }
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "authority_lookup_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            };
-        if authority.state != "MODULE" {
-            return HandlerOutcome::Error {
-                code: "authority_not_module".to_string(),
-                message: format!("memories authority is {}", authority.state),
-            };
-        }
-        if authority.generation != authority_generation {
-            return HandlerOutcome::Error {
-                code: "authority_generation_mismatch".to_string(),
-                message: format!(
-                    "authority generation is {}, request used {authority_generation}",
-                    authority.generation
-                ),
-            };
-        }
         let Some(payload) = request.get("payload").and_then(Value::as_object) else {
             return invalid_params_error("dreamer.run_task requires an object payload");
         };
@@ -12763,39 +11824,18 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return self.store_refusal();
         };
-        let authority_project =
-            match store.authority_project_state_for_route(&route_root, "memories") {
-                Ok(Some((project, state))) if state == "MODULE" => project,
-                Ok(Some(_)) => return authority_draining_error("memories"),
-                Ok(None) => {
-                    return HandlerOutcome::Error {
-                        code: "authority_not_module".to_string(),
-                        message: "classification requires MODULE memories authority".to_string(),
-                    };
-                }
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "authority_lookup_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            };
-        if authority_project != memory_project {
+        let route_project = match self.route_project_identity(store, &binding) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
+        if route_project != memory_project {
             return HandlerOutcome::Error {
                 code: "facade_project_vocabulary_mismatch".to_string(),
                 message: format!(
-                    "classification route is owned by {authority_project}, not {memory_project}"
+                    "classification route is owned by {route_project}, not {memory_project}"
                 ),
             };
         }
-        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
-        else {
-            return invalid_params_error("memory.set_classification requires context_store_uuid");
-        };
-        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("memory.set_classification requires authority_generation");
-        };
         let Some(rows) = args.get("rows").and_then(Value::as_array) else {
             return invalid_params_error("memory.set_classification requires rows");
         };
@@ -12834,36 +11874,12 @@ impl McHandler {
             hook();
         }
         match store.with_facade_mutation(&route_root, "memories", || {
-            store.set_memory_classification(
-                context_store_uuid,
-                memory_project,
-                authority_generation,
-                &updates,
-                now_ms(),
-            )
+            store.set_memory_classification(memory_project, &updates, now_ms())
         }) {
             Ok(result) => respond(json!({
                 "accepted": result.accepted,
                 "rejected": result.rejected.iter().map(|row| json!({ "memory_id": row.memory_id, "reason": row.reason })).collect::<Vec<_>>(),
             })),
-            Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
-                HandlerOutcome::Error {
-                    code: "authority_generation_mismatch".to_string(),
-                    message: format!("authority generation is {found}, request used {expected}"),
-                }
-            }
-            Err(McStoreError::AuthorityStateMismatch { found, .. }) if found == "DRAINING" => {
-                authority_draining_error("memories")
-            }
-            Err(McStoreError::AuthorityStateMismatch { expected, found }) => {
-                HandlerOutcome::Error {
-                    code: "authority_state_mismatch".to_string(),
-                    message: format!("authority state is {found}, expected {expected}"),
-                }
-            }
-            Err(error) if store_error_is_authority_draining(&error) => {
-                authority_draining_error("memories")
-            }
             Err(error) => HandlerOutcome::Error {
                 code: "classification_apply_failed".to_string(),
                 message: error.to_string(),
@@ -12900,14 +11916,6 @@ impl McHandler {
                 return replayed;
             }
         }
-        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
-        else {
-            return invalid_params_error("memory.set_mural_cue requires context_store_uuid");
-        };
-        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("memory.set_mural_cue requires authority_generation");
-        };
         let Some(rows) = args.get("rows").and_then(Value::as_array) else {
             return invalid_params_error("memory.set_mural_cue requires rows");
         };
@@ -12951,9 +11959,7 @@ impl McHandler {
                 command_id,
                 |tx| {
                     let result = tx.set_memory_mural_cue(
-                        context_store_uuid,
                         memory_project,
-                        authority_generation,
                         &updates,
                         now,
                     )?;
@@ -13008,14 +12014,6 @@ impl McHandler {
                 return replayed;
             }
         }
-        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
-        else {
-            return invalid_params_error("memory.set_verification requires context_store_uuid");
-        };
-        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("memory.set_verification requires authority_generation");
-        };
         let Some(rows) = args.get("rows").and_then(Value::as_array) else {
             return invalid_params_error("memory.set_verification requires rows");
         };
@@ -13059,9 +12057,7 @@ impl McHandler {
                 command_id,
                 |tx| {
                     let result = tx.set_memory_verification(
-                        context_store_uuid,
                         memory_project,
-                        authority_generation,
                         &updates,
                         now,
                     )?;
@@ -13109,14 +12105,6 @@ impl McHandler {
                 return replayed;
             }
         }
-        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
-        else {
-            return invalid_params_error("memory.set_mapping requires context_store_uuid");
-        };
-        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("memory.set_mapping requires authority_generation");
-        };
         let Some(rows) = args.get("rows").and_then(Value::as_array) else {
             return invalid_params_error("memory.set_mapping requires rows");
         };
@@ -13174,9 +12162,7 @@ impl McHandler {
                 command_id,
                 |tx| {
                     let result = tx.set_memory_mapping(
-                        context_store_uuid,
                         memory_project,
-                        authority_generation,
                         &updates,
                         now,
                     )?;
@@ -13230,11 +12216,13 @@ impl McHandler {
         }
     }
 
+    /// Refuse a write whose `memory_project` names a project other than the route's own
+    /// identity. A write that names none writes under the route's identity.
     fn bind_facade_route_for_write(
         &self,
         channel: u16,
         arguments: &Map<String, Value>,
-        authority_domain: &str,
+        domain: &str,
     ) -> Result<(), HandlerOutcome> {
         let Some(requested_project) = non_empty_string_arg(arguments, "memory_project") else {
             return Ok(());
@@ -13242,36 +12230,18 @@ impl McHandler {
         let binding = self
             .facade_binding(channel)
             .map_err(|_| session_unresolved_error())?;
-        let route_project_root = binding.project_root.to_string_lossy().to_string();
         let Some(store) = self.store.get() else {
             return Err(self.facade_store_refusal());
         };
-        let authority = store
-            .facade_authority_for_project(requested_project, authority_domain)
-            .map_err(|error| {
-                tracing::error!(
-                    "mc-module: {authority_domain} route lookup failed code=authority_route_lookup_failed: {error}"
-                );
-                HandlerOutcome::Error {
-                    code: "authority_route_lookup_failed".to_string(),
-                    message: capability_refusal_message(authority_domain).to_string(),
-                }
-            })?;
-        if let Some((context_store_uuid, project, state)) = authority {
-            if state != "MODULE" {
-                return Err(authority_draining_error(authority_domain));
-            }
-            store
-                .bind_authority_route(&context_store_uuid, &project, &route_project_root)
-                .map_err(|error| {
-                    tracing::error!(
-                        "mc-module: {authority_domain} route bind failed code=authority_route_bind_failed: {error}"
-                    );
-                    HandlerOutcome::Error {
-                        code: "authority_route_bind_failed".to_string(),
-                        message: capability_refusal_message(authority_domain).to_string(),
-                    }
-                })?;
+        let identity = self.route_project_identity(store, &binding)?;
+        if identity != requested_project {
+            tracing::warn!(
+                "mc-module: {domain} write for {requested_project} on a route whose project is {identity}"
+            );
+            return Err(HandlerOutcome::Error {
+                code: "facade_project_vocabulary_mismatch".to_string(),
+                message: capability_refusal_message(domain).to_string(),
+            });
         }
         Ok(())
     }
@@ -13281,7 +12251,7 @@ impl McHandler {
         channel: u16,
         arguments: Option<&Map<String, Value>>,
         authority_domain: &str,
-        bind_authority_for_write: bool,
+        _bind_for_write: bool,
     ) -> Result<FacadeScope, HandlerOutcome> {
         let binding = self
             .facade_binding(channel)
@@ -13294,20 +12264,20 @@ impl McHandler {
         let route_project_root = binding.project_root.to_string_lossy().to_string();
         let requested_project =
             arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
-        let mut authority_route = match self.store.get() {
-            Some(store) => store
-                .authority_project_state_for_route(&route_project_root, authority_domain)
-                .map_err(|error| {
-                    tracing::error!(
-                        "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
-                    );
-                    HandlerOutcome::Error {
-                        code: "authority_project_resolution_failed".to_string(),
-                        message: capability_refusal_message(authority_domain).to_string(),
-                    }
-                })?,
-            None => None,
+        let memory_project_path = match self.store.get() {
+            Some(store) => self.route_project_identity(store, &binding)?,
+            None => return Err(self.facade_store_refusal()),
         };
+        if requested_project.is_some_and(|requested| requested != memory_project_path) {
+            tracing::warn!(
+                "mc-module: {authority_domain} route {route_project_root} project mismatch: expected {memory_project_path}, received {}",
+                requested_project.unwrap_or_default()
+            );
+            return Err(HandlerOutcome::Error {
+                code: "facade_project_vocabulary_mismatch".to_string(),
+                message: capability_refusal_message(authority_domain).to_string(),
+            });
+        }
         // Both OpenCode entry points use server-observed transform state as the session proof.
         // Wrapper labels and authority routes alone are insufficient: either could otherwise
         // rebind a known project to a second root without a host session lookup.
@@ -13340,57 +12310,11 @@ impl McHandler {
             }
         };
 
-        if bind_authority_for_write {
-            if let Some(arguments) = arguments {
-                self.bind_facade_route_for_write(channel, arguments, authority_domain)?;
-            }
-            if authority_route.is_none() {
-                authority_route = match self.store.get() {
-                    Some(store) => store
-                        .authority_project_state_for_route(&route_project_root, authority_domain)
-                        .map_err(|error| {
-                            tracing::error!(
-                                "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
-                            );
-                            HandlerOutcome::Error {
-                                code: "authority_project_resolution_failed".to_string(),
-                                message: capability_refusal_message(authority_domain).to_string(),
-                            }
-                        })?,
-                    None => None,
-                };
-            }
-        }
-
-        let memory_project_path = match authority_route {
-            Some((authority_project, authority_state)) => {
-                if requested_project.is_some_and(|requested| requested != authority_project) {
-                    tracing::warn!(
-                        "mc-module: {authority_domain} route {route_project_root} project mismatch: expected {authority_project}, received {}",
-                        requested_project.unwrap_or_default()
-                    );
-                    return Err(HandlerOutcome::Error {
-                        code: "facade_project_vocabulary_mismatch".to_string(),
-                        message: capability_refusal_message(authority_domain).to_string(),
-                    });
-                }
-                if bind_authority_for_write && authority_state != "MODULE" {
-                    // Reads and transforms may keep using the module identity while authority
-                    // drains, but facade mutations must retry instead of writing after ownership changes.
-                    return Err(authority_draining_error(authority_domain));
-                }
-                authority_project
-            }
-            // A route without an authority binding remains path-scoped. Lookup failures are
-            // retryable errors: silently using the route could read or write the wrong owner.
-            None => route_project_root.clone(),
-        };
         Ok(FacadeScope {
             memory_project_path,
             route_project_root,
             conversation_key,
             memory_enabled: binding.config.memory_enabled,
-            host_backed_memory_ids: binding.harness != "claude-code",
         })
     }
 
@@ -13557,52 +12481,12 @@ impl McHandler {
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
-        let id_lane = match memory_id_lane(args) {
-            Ok(lane) => lane,
-            Err(error) => return tool_error_result(format!("Error: {error}.")),
-        };
-        let module_request_ids = memory_ids(args, action);
-        let requested_host_ids = host_memory_ids(args);
-        let mut host_id_by_module = HashMap::new();
-        if id_lane == MemoryIdLane::Host {
-            if module_request_ids.len() != requested_host_ids.len() {
-                return tool_error_result(
-                    "Error: host memory ids must accompany every translated module id.".to_string(),
-                );
-            }
-            for (module_id, host_id) in module_request_ids
-                .iter()
-                .copied()
-                .zip(requested_host_ids.iter().copied())
-            {
-                let acknowledged = store
-                    .get_memory_full(module_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|memory| memory.host_row_id);
-                if acknowledged != Some(host_id) {
-                    return tool_error_result(format!(
-                        "Error: memory id {host_id} has no module mapping yet — it was written seconds ago or the mirror is behind; retry or use the id shown in <project-memory>."
-                    ));
-                }
-                host_id_by_module.insert(module_id, host_id);
-            }
-        } else if !requested_host_ids.is_empty() {
-            return tool_error_result("Error: host_ids require memory_id_lane 'host'.".to_string());
+        // Every memory id the module renders and accepts is a context.db id. A host that
+        // still sends the retired host-id lane is refused rather than silently misread.
+        if let Err(error) = refuse_retired_memory_id_lane(args) {
+            return invalid_params_error(error);
         }
-        let request_context = MemoryFacadeRequestContext {
-            lane: id_lane,
-            host_id_by_module,
-        };
-        if is_mutation {
-            if let Err(error) = store.enforce_facade_project_vocabulary(
-                facade_scope.route_project_root.as_str(),
-                memory_project,
-                "memories",
-            ) {
-                return tool_error_result(format!("Error: {error}"));
-            }
-        }
+        let request_context = MemoryFacadeRequestContext;
         let command_id = if is_mutation {
             match command_id_from_facade_request(request, args) {
                 Ok(command_id) => command_id,
@@ -13663,11 +12547,7 @@ impl McHandler {
                                         FacadeMemoryMutationError::Storage(error),
                                     )
                                 })?;
-                            let text = if id_lane == MemoryIdLane::Host {
-                                format!("Saved memory in {category}. Its id will appear in <project-memory> on the next pass.")
-                            } else {
-                                format!("Saved memory [ID: {id}] in {category}.")
-                            };
+                            let text = format!("Saved memory [ID: {id}] in {category}.");
                             mcp_memory_result(
                                 text,
                                 false,
@@ -13675,7 +12555,6 @@ impl McHandler {
                             )
                         },
                     ),
-                    "memories",
                 )
             }
             "update" => {
@@ -13714,17 +12593,7 @@ impl McHandler {
                                     now_ms(),
                                 )
                                 .map_err(|error| request_context.render_mutation_error(error))?;
-                            let rendered_id = if id_lane == MemoryIdLane::Host {
-                                request_context
-                                    .host_id_by_module
-                                    .get(&memory.id)
-                                    .copied()
-                                    .ok_or_else(|| {
-                                        "translated host memory identity disappeared".to_string()
-                                    })?
-                            } else {
-                                memory.id
-                            };
+                            let rendered_id = memory.id;
                             facade_text_response(
                                 format!(
                                     "Updated memory [ID: {rendered_id}] in {}.",
@@ -13734,7 +12603,6 @@ impl McHandler {
                             )
                         },
                     ),
-                    "memories",
                 )
             }
             "archive" => {
@@ -13764,23 +12632,7 @@ impl McHandler {
                                     false,
                                 )
                             } else {
-                                let rendered_ids = if id_lane == MemoryIdLane::Host {
-                                    archived
-                                        .iter()
-                                        .map(|id| {
-                                            request_context
-                                                .host_id_by_module
-                                                .get(id)
-                                                .copied()
-                                                .ok_or_else(|| {
-                                                    "translated host memory identity disappeared"
-                                                        .to_string()
-                                                })
-                                        })
-                                        .collect::<Result<Vec<_>, _>>()?
-                                } else {
-                                    archived
-                                };
+                                let rendered_ids = archived;
                                 facade_text_response(
                                     format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
                                     false,
@@ -13788,7 +12640,6 @@ impl McHandler {
                             }
                         },
                     ),
-                    "memories",
                 )
             }
             "merge" => {
@@ -13838,35 +12689,9 @@ impl McHandler {
                                     )
                                     .map_err(|error| request_context.render_mutation_error(error))?;
                             }
-                            let rendered_inputs = if id_lane == MemoryIdLane::Host {
-                                requested_host_ids.clone()
-                            } else {
-                                ids.clone()
-                            };
-                            let rendered_superseded = if id_lane == MemoryIdLane::Host {
-                                superseded_ids
-                                    .iter()
-                                    .filter_map(|id| {
-                                        request_context.host_id_by_module.get(id).copied()
-                                    })
-                                    .collect::<Vec<_>>()
-                            } else {
-                                superseded_ids.clone()
-                            };
-                            let text = if id_lane == MemoryIdLane::Host {
-                                match memory.host_row_id {
-                                    Some(host_id) => format!(
-                                        "Merged memories [{}] into canonical memory [ID: {host_id}] in {}; superseded [{}].",
-                                        join_i64s(&rendered_inputs),
-                                        memory.category,
-                                        join_i64s(&rendered_superseded)
-                                    ),
-                                    None => format!(
-                                        "Merged memories [{}] into a canonical memory in {}. Its id will appear in <project-memory> on the next pass.",
-                                        join_i64s(&rendered_inputs), memory.category
-                                    ),
-                                }
-                            } else {
+                            let rendered_inputs = ids.clone();
+                            let rendered_superseded = superseded_ids.clone();
+                            let text = {
                                 format!(
                                     "Merged memories [{}] into canonical memory [ID: {}] in {}; superseded [{}].",
                                     join_i64s(&rendered_inputs),
@@ -13887,7 +12712,6 @@ impl McHandler {
                             )
                         },
                     ),
-                    "memories",
                 )
             }
             "list" => {
@@ -13908,19 +12732,10 @@ impl McHandler {
                         if rows.is_empty() {
                             return mcp_text_result("No active memories found.".to_string(), false);
                         }
-                        let pending_host_id = id_lane == MemoryIdLane::Host
-                            && rows.iter().any(|memory| memory.host_row_id.is_none());
                         let body = rows
                             .iter()
                             .map(|memory| {
-                                let prefix = if id_lane == MemoryIdLane::Host {
-                                    memory.host_row_id.map_or_else(
-                                        || "Memory".to_string(),
-                                        |id| format!("Memory [ID: {id}]"),
-                                    )
-                                } else {
-                                    format!("Memory [ID: {}]", memory.id)
-                                };
+                                let prefix = format!("Memory [ID: {}]", memory.id);
                                 format!(
                                     "{prefix} in {} (status: {}): {}",
                                     memory.category,
@@ -13934,16 +12749,11 @@ impl McHandler {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
-                        let mirror_note = if pending_host_id {
-                            "\nNote: one or more memory ids are waiting for the host mirror; retry after the next pass."
-                        } else {
-                            ""
-                        };
                         // `get` returns rows of any status; claim "active" only when every row is.
                         let all_active = rows.iter().all(|memory| memory.status == "active");
                         mcp_text_result(
                             format!(
-                                "Found {} {}{}:\n\n{body}{mirror_note}",
+                                "Found {} {}{}:\n\n{body}",
                                 rows.len(),
                                 if all_active { "active " } else { "" },
                                 if rows.len() == 1 {
@@ -13972,15 +12782,7 @@ impl McHandler {
                         let lines = ids
                             .iter()
                             .map(|id| {
-                                let rendered_id = if id_lane == MemoryIdLane::Host {
-                                    request_context
-                                        .host_id_by_module
-                                        .get(id)
-                                        .copied()
-                                        .expect("host lane ids were validated before facade dispatch")
-                                } else {
-                                    *id
-                                };
+                                let rendered_id = *id;
                                 match by_id.get(id) {
                                     Some(memory) => format!(
                                         "Memory [ID: {rendered_id}] in {} (status: {}): {}",
@@ -14056,22 +12858,11 @@ impl McHandler {
             Ok(membership) => membership,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
-        let visible_memory_ids = if facade_scope.host_backed_memory_ids {
-            let paths = workspace_membership
-                .as_ref()
-                .map(|workspace| workspace.union_identities.clone())
-                .unwrap_or_else(|| vec![memory_project.to_string()]);
-            match store.module_memory_ids_for_host_ids(&paths, &state.meta.rendered_memory_ids) {
-                Ok(mapped) => mapped.values().copied().collect::<BTreeSet<_>>(),
-                Err(error) => return tool_error_result(format!("Error: {error}")),
-            }
-        } else {
-            state
-                .meta
-                .rendered_memory_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>()
-        };
+        let visible_memory_ids = state
+            .meta
+            .rendered_memory_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>();
 
         if include_memories {
             if let Some(ids) = parse_search_memory_ids(query) {
@@ -14371,10 +13162,10 @@ impl McHandler {
             }
             _ => None,
         };
-        let ids = match NoteIdSpace::from_args(args) {
-            Ok(ids) => ids,
-            Err(error) => return tool_error_result(format!("Error: {error}.")),
-        };
+        // Every note id is a context.db id; a host still translating ids is refused.
+        if let Err(error) = refuse_retired_note_id_lane(args) {
+            return invalid_params_error(error);
+        }
         let is_mutation = matches!(action, "write" | "update" | "dismiss");
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "notes", is_mutation)
@@ -14391,15 +13182,6 @@ impl McHandler {
         let session = facade_scope.conversation_key.as_str();
         let filter = string_arg(args, "filter");
         let now = now_ms();
-        if is_mutation {
-            if let Err(error) = store.enforce_facade_project_vocabulary(
-                facade_scope.route_project_root.as_str(),
-                project,
-                "notes",
-            ) {
-                return tool_error_result(format!("Error: {error}"));
-            }
-        }
         let command_id = if is_mutation {
             match command_id_from_facade_request(request, args) {
                 Ok(command_id) => command_id,
@@ -14465,7 +13247,7 @@ impl McHandler {
                                 note_write_response(
                                     format!(
                                         "Created smart note {}. Dreamer will evaluate the condition during nightly runs:\n- Content: {}\n- Condition: {}",
-                                        rendered_note_id(ids.visible_id(note.id)),
+                                        format!("#{}", note.id),
                                         note.content,
                                         condition
                                     ),
@@ -14473,7 +13255,6 @@ impl McHandler {
                                 )
                             },
                         ),
-                        "notes",
                     )
                 } else {
                     facade_command_outcome(
@@ -14503,12 +13284,11 @@ impl McHandler {
                                     .active_session_note_tray(project, session)
                                     .map_err(|error| error.to_string())?;
                                 note_write_response(
-                                    format_write_reply(ids.visible_id(note.id), tray, now),
+                                    format_write_reply(note.id, tray, now),
                                     note.id,
                                 )
                             },
                         ),
-                        "notes",
                     )
                 }
             }
@@ -14516,23 +13296,10 @@ impl McHandler {
                 if let Some(requested) = note_ids.as_deref() {
                     let mut notes = Vec::with_capacity(requested.len());
                     for note_id in requested {
-                        let row = match ids.route(*note_id) {
-                            NoteIdRoute::Module(module_id) => {
-                                match store.get_note_by_id(project, session, module_id) {
-                                    Ok(Some(note)) => {
-                                        // Render the id the caller asked with.
-                                        let mut note = present_note_status(note);
-                                        note.id = *note_id;
-                                        NoteByIdRow::Found(Box::new(note))
-                                    }
-                                    Ok(None) => NoteByIdRow::Missing,
-                                    Err(error) => {
-                                        return tool_error_result(format!("Error: {error}"))
-                                    }
-                                }
-                            }
-                            NoteIdRoute::Pending => NoteByIdRow::Pending,
-                            NoteIdRoute::Unknown => NoteByIdRow::Missing,
+                        let row = match store.get_note_by_id(project, session, *note_id) {
+                            Ok(Some(note)) => NoteByIdRow::Found(Box::new(present_note_status(note))),
+                            Ok(None) => NoteByIdRow::Missing,
+                            Err(error) => return tool_error_result(format!("Error: {error}")),
                         };
                         notes.push((*note_id, row));
                     }
@@ -14579,7 +13346,7 @@ impl McHandler {
                     &session_statuses,
                     &smart_statuses,
                 ) {
-                    Ok(notes) => notes.into_iter().map(|note| ids.present(note)).collect(),
+                    Ok(notes) => notes.into_iter().map(present_note_status).collect(),
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 };
                 mcp_text_result(
@@ -14592,15 +13359,7 @@ impl McHandler {
                     .as_deref()
                     .and_then(|ids| ids.first().copied())
                     .unwrap_or(0);
-                let module_note_id = match ids.route(note_id) {
-                    NoteIdRoute::Module(module_id) => module_id,
-                    NoteIdRoute::Pending => {
-                        return tool_error_result(format!(
-                            "Error: Note #{note_id} {NOTE_ID_PENDING_ADVICE}"
-                        ))
-                    }
-                    NoteIdRoute::Unknown => 0,
-                };
+                let module_note_id = note_id;
                 let content = string_arg(args, "content");
                 let condition = string_arg(args, "surface_condition")
                     .map(str::trim)
@@ -14672,24 +13431,13 @@ impl McHandler {
                             }
                         },
                     ),
-                    "notes",
                 )
             }
             "dismiss" => {
                 let resolution = string_arg(args, "content");
                 let requested = note_ids.as_deref().unwrap_or(&[]);
-                let routes = requested
-                    .iter()
-                    .map(|note_id| (*note_id, ids.route(*note_id)))
-                    .collect::<Vec<_>>();
                 if requested.len() > 1 {
-                    let module_note_ids = routes
-                        .iter()
-                        .filter_map(|(_, route)| match route {
-                            NoteIdRoute::Module(module_id) => Some(*module_id),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>();
+                    let module_note_ids = requested.to_vec();
                     return facade_command_outcome(
                         store.with_facade_command(
                             facade_scope.route_project_root.as_str(),
@@ -14700,10 +13448,7 @@ impl McHandler {
                             action,
                             command_id.as_deref(),
                             |tx| {
-                                // Outcomes come back in the order the module ids were
-                                // sent, which is request order with unaddressable ids
-                                // left out; re-thread them into request order.
-                                let mut module_outcomes = tx
+                                let outcomes = tx
                                     .dismiss_notes(
                                         project,
                                         session,
@@ -14711,49 +13456,32 @@ impl McHandler {
                                         resolution,
                                         now,
                                     )
-                                    .map_err(|error| error.to_string())?
-                                    .into_iter();
+                                    .map_err(|error| error.to_string())?;
                                 let mut dismissed_count = 0usize;
-                                let mut details = Vec::with_capacity(routes.len());
-                                for (note_id, route) in &routes {
-                                    let text = match route {
-                                        NoteIdRoute::Module(_) => {
-                                            let (_, outcome) = module_outcomes
-                                                .next()
-                                                .ok_or("dismiss outcome missing")?;
-                                            if outcome == NoteDismissOutcome::Dismissed {
-                                                dismissed_count += 1;
-                                            }
-                                            note_dismiss_outcome_text(outcome)
-                                        }
-                                        NoteIdRoute::Pending => NOTE_ID_PENDING_ADVICE,
-                                        NoteIdRoute::Unknown => "not_found",
-                                    };
-                                    details.push(format!("- Note #{note_id}: {text}"));
+                                let mut details = Vec::with_capacity(outcomes.len());
+                                for (note_id, outcome) in &outcomes {
+                                    if *outcome == NoteDismissOutcome::Dismissed {
+                                        dismissed_count += 1;
+                                    }
+                                    details.push(format!(
+                                        "- Note #{note_id}: {}",
+                                        note_dismiss_outcome_text(*outcome)
+                                    ));
                                 }
                                 facade_text_response(
                                     format!(
                                         "Dismissed {dismissed_count} of {} notes.\n{}",
-                                        routes.len(),
+                                        outcomes.len(),
                                         details.join("\n")
                                     ),
                                     false,
                                 )
                             },
                         ),
-                        "notes",
                     );
                 }
-                let (note_id, route) = routes[0];
-                let module_note_id = match route {
-                    NoteIdRoute::Module(module_id) => module_id,
-                    NoteIdRoute::Pending => {
-                        return tool_error_result(format!(
-                            "Error: Note #{note_id} {NOTE_ID_PENDING_ADVICE}"
-                        ))
-                    }
-                    NoteIdRoute::Unknown => 0,
-                };
+                let note_id = requested.first().copied().unwrap_or(0);
+                let module_note_id = note_id;
                 facade_command_outcome(
                     store.with_facade_command(
                         facade_scope.route_project_root.as_str(),
@@ -14781,7 +13509,6 @@ impl McHandler {
                             }
                         },
                     ),
-                    "notes",
                 )
             }
             _ => tool_error_result("Error: Unknown ctx_note action.".to_string()),
@@ -14824,9 +13551,7 @@ impl ModuleHandler for McHandler {
         } else if let Some(failed) = self.store_open.failed_report() {
             failed
         } else {
-            self.augment_runner_choice_health(
-                self.augment_memory_mirror_health(DISPATCH_HEALTH.report(now), now),
-            )
+            self.augment_runner_choice_health(DISPATCH_HEALTH.report(now))
         };
         with_pinned_epochs_health(report)
     }
@@ -14913,23 +13638,6 @@ impl McHandler {
                 // Proves the store opened end-to-end and, when a session_id is supplied,
                 // returns the session's stored trace state directly from the module.
                 "health" | "status" | "diagnostics" => self.handle_status_value(&request),
-                "authority.status" => self.handle_authority_status_value(channel, &request),
-                "authority.prepare" => self.handle_authority_prepare_value(channel, &request),
-                "authority.seed" => self.handle_authority_seed_value(&request),
-                "authority.drain.begin"
-                | "authority.drain.step"
-                | "authority.drain.finish"
-                | "authority.drain_seed"
-                | "authority.drain_memories"
-                | "authority.drain_notes"
-                | "authority.drain_compartments"
-                | "authority.drain_reconcile"
-                | "authority.drain_verify"
-                | "authority.drain_flip"
-                | "authority.drain_finish" => self.handle_authority_drain_value(&request, method),
-                "mirror.pull" => self.handle_mirror_pull_value(&request),
-                "mirror.memory" => self.handle_mirror_memory_value(&request),
-                "memory.identity.ack" => self.handle_memory_identity_ack_value(&request),
                 "guidance.get" => self.handle_guidance_value(channel, &request),
                 "manifest.get" => self.handle_prompt_surface_manifest_value(channel, &request),
                 "dreamer.run_task" => self.handle_dreamer_run_task(channel, &request).await,
@@ -16715,20 +15423,13 @@ fn assemble_state_sync_seed(
         .rev()
         .find_map(|batch| batch.note_evaluation_available);
     let mut final_batch = batches.pop().expect("final seed batch");
-    let mut compartments = Vec::new();
-    let mut memories = Vec::new();
-    let mut memory_mutations = Vec::new();
     let mut drop_seeds = Vec::new();
     let mut pending_agent_drops = Vec::new();
     let mut auto_search_hint_decisions = Vec::new();
     let mut note_nudge_anchors = Vec::new();
     let mut note_nudge_anchors_present = false;
     let mut strip_seeds = Vec::new();
-    let mut user_profile = None;
     for mut batch in batches {
-        compartments.append(&mut batch.compartments);
-        memories.append(&mut batch.memories);
-        memory_mutations.append(&mut batch.memory_mutations);
         drop_seeds.append(&mut batch.drop_seeds);
         pending_agent_drops.append(&mut batch.pending_agent_drops);
         auto_search_hint_decisions.append(&mut batch.auto_search_hint_decisions);
@@ -16737,15 +15438,7 @@ fn assemble_state_sync_seed(
             note_nudge_anchors.extend(anchors);
         }
         strip_seeds.append(&mut batch.strip_seeds);
-        if let Some(mut profile) = batch.user_profile.take() {
-            user_profile
-                .get_or_insert_with(Vec::new)
-                .append(&mut profile);
-        }
     }
-    compartments.append(&mut final_batch.compartments);
-    memories.append(&mut final_batch.memories);
-    memory_mutations.append(&mut final_batch.memory_mutations);
     drop_seeds.append(&mut final_batch.drop_seeds);
     pending_agent_drops.append(&mut final_batch.pending_agent_drops);
     auto_search_hint_decisions.append(&mut final_batch.auto_search_hint_decisions);
@@ -16754,9 +15447,6 @@ fn assemble_state_sync_seed(
         note_nudge_anchors.extend(anchors);
     }
     strip_seeds.append(&mut final_batch.strip_seeds);
-    if let Some(profile) = final_batch.user_profile.take() {
-        user_profile.get_or_insert_with(Vec::new).extend(profile);
-    }
     ModuleStateSyncWire {
         session_id: final_batch.session_id,
         shadow_generation: generation,
@@ -16767,14 +15457,7 @@ fn assemble_state_sync_seed(
         seed_batch_total: None,
         seed_complete: None,
         seed_boundary_id: final_batch.seed_boundary_id,
-        compartments,
-        memories,
-        memory_mutations,
-        user_profile,
-        workspace: final_batch.workspace,
         last_todo_state: final_batch.last_todo_state,
-        project_memory_epoch: final_batch.project_memory_epoch,
-        user_profile_version: final_batch.user_profile_version,
         acked_watermarks: final_batch.acked_watermarks,
         drop_seeds,
         drop_seed_skipped: final_batch.drop_seed_skipped,
@@ -16837,27 +15520,6 @@ fn capability_refusal_message(domain: &str) -> &'static str {
         "notes" => "Note changes are paused while the engine syncs. Retry in a moment. (MC-C03)",
         _ => CONTEXT_SERVICE_UNAVAILABLE_MESSAGE,
     }
-}
-
-fn authority_draining_error(domain: &str) -> HandlerOutcome {
-    HandlerOutcome::Error {
-        code: "authority_draining".to_string(),
-        message: capability_refusal_message(domain).to_string(),
-    }
-}
-
-fn store_error_is_authority_draining(error: &impl std::fmt::Display) -> bool {
-    error.to_string().contains("authority_draining")
-}
-
-fn authority_request_key(request: &Value) -> Option<(&str, &str, &str)> {
-    let uuid = request.get("context_store_uuid").and_then(Value::as_str)?;
-    let project = request.get("project").and_then(Value::as_str)?;
-    let domain = request.get("domain").and_then(Value::as_str)?;
-    if uuid.is_empty() || project.is_empty() || domain.is_empty() {
-        return None;
-    }
-    Some((uuid, project, domain))
 }
 
 fn invalid_params_error(message: impl Into<String>) -> HandlerOutcome {
@@ -18048,28 +16710,6 @@ fn clip_note_title(content: &str, max: usize) -> String {
     format!("{}…", characters[..max].iter().collect::<String>())
 }
 
-/// Placeholder for a note id the caller cannot use yet. On a host-backed harness the
-/// agent addresses notes by host (context.db) ids; a note the module created is
-/// rendered with this text until the host mirror has assigned it one. It can never
-/// be mistaken for an id.
-const NOTE_ID_PENDING: &str = "(id pending)";
-
-/// Shown when the caller names its own note by a host id the host has not yet paired
-/// with a module row (the host mirror has not pulled the note's latest change yet).
-/// Retrying after the next mirror pull is the one action that helps.
-const NOTE_ID_PENDING_ADVICE: &str =
-    "not mirrored yet — it was written seconds ago or the mirror is behind; retry.";
-
-/// `#<id>` for an addressable note, or the pending placeholder. Callers mark a note
-/// with no caller-visible id by setting its id to 0 (module row ids start at 1).
-fn rendered_note_id(note_id: i64) -> String {
-    if note_id > 0 {
-        format!("#{note_id}")
-    } else {
-        NOTE_ID_PENDING.to_string()
-    }
-}
-
 /// The status vocabulary the agent sees. `surfacing`/`surfaced` are module
 /// delivery states from an earlier design; the host read model already shows them
 /// as `ready`, and so must every ctx_note reply, or the reminder and the reply
@@ -18081,129 +16721,25 @@ fn present_note_status(mut note: StoredNote) -> StoredNote {
     note
 }
 
-/// How one requested note id resolves to a module row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NoteIdRoute {
-    Module(i64),
-    Pending,
-    Unknown,
-}
-
-/// The id space of one ctx_note call.
-///
-/// Claude Code talks to the module directly and addresses module row ids. A
-/// host-backed harness (OpenCode) shows its agent context.db ids, so its host
-/// translates at the tool boundary: it sends the agent's ids in `note_ids`, the
-/// project-scoped host↔module pairs it knows in `note_id_map`, and the agent's own
-/// not-yet-mirrored ids in `pending_note_ids`. Every id this module renders back is
-/// then a host id, or the pending placeholder when it has none yet.
-struct NoteIdSpace {
-    host_lane: bool,
-    module_by_host: HashMap<i64, i64>,
-    host_by_module: HashMap<i64, i64>,
-    pending_hosts: HashSet<i64>,
-}
-
-impl NoteIdSpace {
-    fn from_args(args: &Map<String, Value>) -> Result<Self, String> {
-        let host_lane = match string_arg(args, "note_id_lane") {
-            None | Some("module") => false,
-            Some("host") => true,
-            Some(_) => return Err("note_id_lane must be 'host' or 'module'".to_string()),
-        };
-        let mut space = NoteIdSpace {
-            host_lane,
-            module_by_host: HashMap::new(),
-            host_by_module: HashMap::new(),
-            pending_hosts: HashSet::new(),
-        };
-        if !host_lane {
-            if args.get("note_id_map").is_some() || args.get("pending_note_ids").is_some() {
-                return Err(
-                    "note_id_map and pending_note_ids require note_id_lane 'host'".to_string(),
-                );
-            }
-            return Ok(space);
-        }
-        let pair_error = || {
-            "note_id_map entries must be [host_id, module_id] pairs of positive integers"
-                .to_string()
-        };
-        for entry in args
-            .get("note_id_map")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            let pair = entry
-                .as_array()
-                .filter(|pair| pair.len() == 2)
-                .ok_or_else(pair_error)?;
-            let host = pair[0]
-                .as_i64()
-                .filter(|id| *id > 0)
-                .ok_or_else(pair_error)?;
-            let module = pair[1]
-                .as_i64()
-                .filter(|id| *id > 0)
-                .ok_or_else(pair_error)?;
-            // One mirror identity per row on each side; a conflicting pair would
-            // let one agent id address two notes.
-            if space
-                .module_by_host
-                .insert(host, module)
-                .is_some_and(|previous| previous != module)
-                || space
-                    .host_by_module
-                    .insert(module, host)
-                    .is_some_and(|previous| previous != host)
-            {
-                return Err("note_id_map maps one note to two ids".to_string());
-            }
-        }
-        for value in args
-            .get("pending_note_ids")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            let host = value
-                .as_i64()
-                .filter(|id| *id > 0)
-                .ok_or_else(|| "pending_note_ids must be positive integers".to_string())?;
-            space.pending_hosts.insert(host);
-        }
-        Ok(space)
-    }
-
-    fn route(&self, requested: i64) -> NoteIdRoute {
-        if !self.host_lane {
-            return NoteIdRoute::Module(requested);
-        }
-        if let Some(module) = self.module_by_host.get(&requested) {
-            NoteIdRoute::Module(*module)
-        } else if self.pending_hosts.contains(&requested) {
-            NoteIdRoute::Pending
-        } else {
-            NoteIdRoute::Unknown
+/// Refuse the retired host note-id lane. Every note id is a `context.db` id now.
+fn refuse_retired_note_id_lane(args: &Map<String, Value>) -> Result<(), String> {
+    match string_arg(args, "note_id_lane") {
+        None | Some("module") => {}
+        Some(_) => {
+            return Err(
+                "note_id_lane is retired: note ids are context.db ids; send them as is"
+                    .to_string(),
+            )
         }
     }
-
-    /// The caller-visible id of a module row; 0 when it has none yet.
-    fn visible_id(&self, module_id: i64) -> i64 {
-        if self.host_lane {
-            self.host_by_module.get(&module_id).copied().unwrap_or(0)
-        } else {
-            module_id
+    for retired in ["note_id_map", "pending_note_ids"] {
+        if args.get(retired).is_some() {
+            return Err(format!(
+                "{retired} is retired: note ids are context.db ids; send them as is"
+            ));
         }
     }
-
-    /// A stored note ready to render for this caller: agent-visible status and id.
-    fn present(&self, note: StoredNote) -> StoredNote {
-        let mut note = present_note_status(note);
-        note.id = self.visible_id(note.id);
-        note
-    }
+    Ok(())
 }
 
 /// One glance row: `#id · age · title`, plus `· <status>` for anything that is
@@ -18224,7 +16760,7 @@ fn format_glance_row(note: &StoredNote, now_ms: i64) -> String {
     };
     format!(
         "{} · {} · {}{}",
-        rendered_note_id(note.id),
+        format!("#{}", note.id),
         format_note_age(touched_at, now_ms),
         clip_note_title(&note.content, GLANCE_TITLE_MAX),
         suffix
@@ -18296,7 +16832,7 @@ fn format_note_body(note: &StoredNote, now_ms: i64) -> String {
         .unwrap_or_default();
     let head = format!(
         "- **{}** · {} · {}: {}{}",
-        rendered_note_id(note.id),
+        format!("#{}", note.id),
         format_note_age(touched_at, now_ms),
         note.status,
         note.content,
@@ -18330,8 +16866,6 @@ enum NoteByIdRow {
     Found(Box<StoredNote>),
     /// Unknown, or owned by someone else: one text for both.
     Missing,
-    /// The caller's own note whose host mirror identity has not arrived yet.
-    Pending,
 }
 
 /// Bodies-by-id view. Ids that are unknown or owned by someone else render the
@@ -18345,7 +16879,6 @@ fn render_notes_by_id(notes: Vec<(i64, NoteByIdRow)>, now_ms: i64) -> String {
             .map(|(note_id, row)| match row {
                 NoteByIdRow::Found(note) => format_note_body(&note, now_ms),
                 NoteByIdRow::Missing => format!("- Note #{note_id}: not_found"),
-                NoteByIdRow::Pending => format!("- Note #{note_id}: {NOTE_ID_PENDING_ADVICE}"),
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -18373,7 +16906,7 @@ fn finish_read_reply(body: String) -> String {
 /// The write reply: the saved-note line plus the tray line, so the writer sees
 /// the backlog at the moment they add to it.
 fn format_write_reply(note_id: i64, tray: (usize, Option<i64>), now_ms: i64) -> String {
-    let base = format!("Saved session note {}.", rendered_note_id(note_id));
+    let base = format!("Saved session note #{note_id}.");
     match tray {
         (count, Some(oldest)) if count > 0 => {
             format!(
@@ -18445,40 +16978,25 @@ fn join_i64s(ids: &[i64]) -> String {
         .join(", ")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemoryIdLane {
-    Module,
-    Host,
-}
-
-struct MemoryFacadeRequestContext {
-    lane: MemoryIdLane,
-    host_id_by_module: HashMap<i64, i64>,
-}
+/// Renders facade errors for the agent. Every id is a `context.db` id, rendered as is.
+struct MemoryFacadeRequestContext;
 
 impl MemoryFacadeRequestContext {
-    fn rendered_id(&self, module_id: i64, known_host_id: Option<i64>) -> Option<i64> {
-        match self.lane {
-            MemoryIdLane::Module => Some(module_id),
-            MemoryIdLane::Host => self
-                .host_id_by_module
-                .get(&module_id)
-                .copied()
-                .or(known_host_id),
-        }
+    fn rendered_id(&self, id: i64) -> Option<i64> {
+        Some(id)
     }
 
     fn render_mutation_error(&self, error: FacadeMemoryMutationError) -> String {
         match error {
             FacadeMemoryMutationError::Storage(error) => error,
             FacadeMemoryMutationError::Unavailable { id } => {
-                self.rendered_id(id, None).map_or_else(
+                self.rendered_id(id).map_or_else(
                     || "memory was not found".to_string(),
                     |id| format!("memory {id} was not found"),
                 )
             }
-            FacadeMemoryMutationError::DuplicateContent { id, host_id } => {
-                self.rendered_id(id, host_id).map_or_else(
+            FacadeMemoryMutationError::DuplicateContent { id } => {
+                self.rendered_id(id).map_or_else(
                     || "memory content already exists".to_string(),
                     |id| format!("memory content already exists as ID {id}"),
                 )
@@ -18489,7 +17007,7 @@ impl MemoryFacadeRequestContext {
 
     fn render_store_error(&self, error: McStoreError) -> String {
         match error {
-            McStoreError::MemoryDuplicateContent { id } => self.rendered_id(id, None).map_or_else(
+            McStoreError::MemoryDuplicateContent { id } => self.rendered_id(id).map_or_else(
                 || "memory content already exists".to_string(),
                 |id| format!("memory content already exists as ID {id}"),
             ),
@@ -18503,26 +17021,26 @@ impl MemoryFacadeRequestContext {
                 format!("store: {}", self.render_store_error(error))
             }
             memory_tool::MemoryToolError::DuplicateSourceId { id } => {
-                self.rendered_id(id, None).map_or_else(
+                self.rendered_id(id).map_or_else(
                     || "duplicate source memory id".to_string(),
                     |id| format!("duplicate source memory id {id}"),
                 )
             }
             memory_tool::MemoryToolError::NotFound { id } => {
-                self.rendered_id(id, None).map_or_else(
+                self.rendered_id(id).map_or_else(
                     || "memory was not found".to_string(),
                     |id| format!("memory {id} was not found"),
                 )
             }
             memory_tool::MemoryToolError::Inactive { id, status } => {
-                self.rendered_id(id, None).map_or_else(
+                self.rendered_id(id).map_or_else(
                     || format!("memory is not mutable in status {status}"),
                     |id| format!("memory {id} is not mutable in status {status}"),
                 )
             }
             memory_tool::MemoryToolError::Superseded { id, superseded_by } => {
-                let id = self.rendered_id(id, None);
-                let superseded_by = self.rendered_id(superseded_by, None);
+                let id = self.rendered_id(id);
+                let superseded_by = self.rendered_id(superseded_by);
                 match (id, superseded_by) {
                     (Some(id), Some(superseded_by)) => {
                         format!("memory {id} was superseded by {superseded_by}")
@@ -18536,19 +17054,22 @@ impl MemoryFacadeRequestContext {
     }
 }
 
-fn memory_id_lane(args: &Map<String, Value>) -> Result<MemoryIdLane, String> {
+/// Refuse the retired host-id lane. Every id is a `context.db` id now, so a host that
+/// still translates would address the wrong memory.
+fn refuse_retired_memory_id_lane(args: &Map<String, Value>) -> Result<(), String> {
     match string_arg(args, "memory_id_lane") {
-        None | Some("module") => Ok(MemoryIdLane::Module),
-        Some("host") => Ok(MemoryIdLane::Host),
-        Some(_) => Err("memory_id_lane must be 'host' or 'module'".to_string()),
+        None | Some("module") => {}
+        Some(_) => {
+            return Err(
+                "memory_id_lane is retired: memory ids are context.db ids; send them as is"
+                    .to_string(),
+            )
+        }
     }
-}
-
-fn host_memory_ids(args: &Map<String, Value>) -> Vec<i64> {
-    args.get("host_ids")
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(Value::as_i64).collect())
-        .unwrap_or_default()
+    if args.get("host_ids").is_some() {
+        return Err("host_ids is retired: memory ids are context.db ids; send them as is".to_string());
+    }
+    Ok(())
 }
 
 fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
@@ -18713,22 +17234,6 @@ fn dream_apply_command_outcome(
         Ok(FacadeMutationOutcome::Applied(bytes) | FacadeMutationOutcome::Duplicate(bytes)) => {
             HandlerOutcome::Response(bytes)
         }
-        Err(error) if store_error_is_authority_draining(&error) => {
-            authority_draining_error("memories")
-        }
-        Err(error) if error.to_string().contains("authority_generation_mismatch:") => {
-            HandlerOutcome::Error {
-                code: "authority_generation_mismatch".to_string(),
-                message: "memory authority generation changed while applying the command"
-                    .to_string(),
-            }
-        }
-        Err(error) if error.to_string().contains("authority_state_mismatch:") => {
-            HandlerOutcome::Error {
-                code: "authority_state_mismatch".to_string(),
-                message: "memory authority state changed while applying the command".to_string(),
-            }
-        }
         Err(error) => HandlerOutcome::Error {
             code: failure_code.to_string(),
             message: error.to_string(),
@@ -18736,10 +17241,7 @@ fn dream_apply_command_outcome(
     }
 }
 
-fn facade_command_outcome(
-    result: Result<FacadeMutationOutcome, McStoreError>,
-    domain: &str,
-) -> HandlerOutcome {
+fn facade_command_outcome(result: Result<FacadeMutationOutcome, McStoreError>) -> HandlerOutcome {
     match result {
         Ok(FacadeMutationOutcome::Applied(bytes)) => HandlerOutcome::Response(bytes),
         Ok(FacadeMutationOutcome::Duplicate(bytes)) => {
@@ -18752,100 +17254,8 @@ fn facade_command_outcome(
             }
             HandlerOutcome::Response(bytes)
         }
-        Err(error) if store_error_is_authority_draining(&error) => authority_draining_error(domain),
         Err(error) => tool_error_result(format!("Error: {error}")),
     }
-}
-
-fn authority_source_path(
-    source_path: Option<&str>,
-    store_project_path: &str,
-    member_paths: &HashMap<String, String>,
-    has_workspace: bool,
-) -> Result<String, String> {
-    let Some(source_path) = source_path else {
-        return Ok(store_project_path.to_string());
-    };
-    if !has_workspace {
-        // Wire paths are assertions, not alternate keys: accepting a route root or a third
-        // identity here would let one atomic state-sync mint rows outside the bound owner.
-        return (source_path == store_project_path)
-            .then(|| store_project_path.to_string())
-            .ok_or_else(|| {
-                format!(
-                    "authority memory project must equal the resolved project key {store_project_path}: {source_path}"
-                )
-            });
-    }
-    member_paths
-        .get(source_path)
-        .cloned()
-        .ok_or_else(|| format!("authority memory project is not a workspace member: {source_path}"))
-}
-
-fn prepare_authority_workspace(
-    authority_project_path: &str,
-    workspace: Option<ModuleWorkspaceWire>,
-) -> Result<(Option<ModuleWorkspaceRow>, HashMap<String, String>), String> {
-    let Some(workspace) = workspace else {
-        return Ok((None, HashMap::new()));
-    };
-    let Some(owner) = workspace.members.first() else {
-        return Err("authority workspace must include its owning project first".to_string());
-    };
-    let share_categories = owner.share_categories.clone();
-    if workspace
-        .members
-        .iter()
-        .any(|member| member.share_categories != share_categories)
-    {
-        return Err(
-            "authority workspace members must carry one consistent share policy".to_string(),
-        );
-    }
-
-    let mut member_paths = HashMap::new();
-    let mut members = Vec::with_capacity(workspace.members.len());
-    for (index, member) in workspace.members.into_iter().enumerate() {
-        if member.project_path.is_empty() {
-            return Err("authority workspace member project_path must not be empty".to_string());
-        }
-        let stored_path = if index == 0 {
-            authority_project_path.to_string()
-        } else {
-            member.project_path.clone()
-        };
-        if member_paths
-            .insert(member.project_path.clone(), stored_path.clone())
-            .is_some()
-        {
-            return Err("authority workspace contains a duplicate member".to_string());
-        }
-        let display_name = Path::new(&member.project_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or(&member.project_path)
-            .to_string();
-        members.push(ModuleWorkspaceMemberRow {
-            project_path: stored_path,
-            display_name,
-            display_path: member.project_path,
-        });
-    }
-    let name = format!(
-        "authority-workspace-{}-{}",
-        sha256_hex(authority_project_path.as_bytes()),
-        workspace.fingerprint
-    );
-    Ok((
-        Some(ModuleWorkspaceRow {
-            name,
-            share_categories,
-            members,
-        }),
-        member_paths,
-    ))
 }
 
 fn canonical_value(value: &Value) -> String {
@@ -22305,7 +20715,6 @@ mod tests {
             prompt_surface_guidance_override: None,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
-            single_store: crate::host_store::SingleStoreMode::Off,
         }
     }
 
@@ -28825,6 +27234,7 @@ mod tests {
             .unwrap();
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: Some(1),
                 expected_revert_epoch: 0,
@@ -38458,6 +36868,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: loaded.row_version,
                 expected_revert_epoch: 0,
@@ -41519,6 +39930,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                harness: None,
                 session_id,
                 expected_row_version: store.load(session_id).unwrap().row_version,
                 expected_revert_epoch: 0,

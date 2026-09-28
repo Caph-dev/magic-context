@@ -70,6 +70,9 @@ pub(crate) enum PendingContextWrite {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FoldWrite {
     pub project_path: String,
+    /// The harness label for the fold's rows; `None` falls back to the session's own.
+    #[serde(default)]
+    pub harness: Option<String>,
     /// The fold's compartments with their durable sequences already assigned.
     pub compartments: Vec<StoredCompartment>,
     pub facts: Vec<FactCandidate>,
@@ -269,7 +272,10 @@ fn apply_fold_tx(
     session_id: &str,
     fold: &FoldWrite,
 ) -> rusqlite::Result<Vec<PromotedRef>> {
-    let harness = session_harness_tx(tx, session_id)?;
+    let harness = match &fold.harness {
+        Some(harness) => harness.clone(),
+        None => session_harness_tx(tx, session_id)?,
+    };
     let upsert = upsert_compartments_tx(tx, session_id, &fold.compartments, &harness)?;
     if upsert.updated > 0 {
         // A fold normally only appends. Sequences it found occupied by different rows

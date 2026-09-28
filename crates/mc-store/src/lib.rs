@@ -3890,6 +3890,9 @@ pub struct TruncateOutcome {
 
 pub struct HistorianPublishRequest<'a> {
     pub session_id: &'a str,
+    /// The harness label the session's `context.db` rows carry. `None` takes the label the
+    /// host recorded for the session in `session_projects`, or `opencode`.
+    pub harness: Option<&'a str>,
     pub expected_row_version: Option<u64>,
     pub expected_revert_epoch: u64,
     pub predicate: &'a HistorianPublishPredicate,
@@ -7274,6 +7277,30 @@ impl McStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(domain);
     }
 
+    /// The project identity the host recorded for `session_id` in `context.db`'s
+    /// `session_projects`, if it recorded one.
+    pub fn session_project_identity(&self, session_id: &str) -> Result<Option<String>, McStoreError> {
+        self.context_read(|conn| {
+            conn.query_row(
+                "SELECT project_path FROM session_projects
+                  WHERE session_id = ?1 AND project_path <> ''
+                  ORDER BY updated_at DESC LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        })
+    }
+
+    /// The installed `context.db` domain's status block, or null when none is installed.
+    pub fn context_domain_status(&self) -> Value {
+        self.context
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(Value::Null, |domain| domain.status())
+    }
+
     /// Whether a `context.db` domain is installed.
     pub fn has_context_domain(&self) -> bool {
         self.context
@@ -7303,11 +7330,21 @@ impl McStore {
         let domain = self.context_domain()?;
         let mut read = Some(read);
         let mut output = None;
-        domain.read(&mut |conn| {
+        let mut failure = None;
+        let outcome = domain.read(&mut |conn| {
             let read = read.take().expect("a context read runs its callback once");
-            output = Some(read(conn)?);
-            Ok(())
-        })?;
+            match read(conn) {
+                Ok(value) => {
+                    output = Some(value);
+                    Ok(())
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    Err(rusqlite::Error::InvalidQuery)
+                }
+            }
+        });
+        Self::context_outcome(outcome, failure)?;
         Ok(output.expect("a successful context read produced its value"))
     }
 
@@ -7321,12 +7358,45 @@ impl McStore {
         let domain = self.context_domain()?;
         let mut write = Some(write);
         let mut output = None;
-        domain.write(tables, &mut |tx| {
+        let mut failure = None;
+        let outcome = domain.write(tables, &mut |tx| {
             let write = write.take().expect("a context write runs its callback once");
-            output = Some(write(tx)?);
-            Ok(())
-        })?;
+            match write(tx) {
+                Ok(value) => {
+                    output = Some(value);
+                    Ok(())
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    Err(rusqlite::Error::InvalidQuery)
+                }
+            }
+        });
+        Self::context_outcome(outcome, failure)?;
         Ok(output.expect("a successful context write produced its value"))
+    }
+
+    /// An error the callback itself returned is reported the way the same error from a
+    /// `store.db` callback always was, so callers and their messages do not depend on which
+    /// file a row lives in. Anything else is the domain's own failure (busy, schema fence).
+    fn context_outcome(
+        outcome: Result<(), McStoreError>,
+        callback_error: Option<rusqlite::Error>,
+    ) -> Result<(), McStoreError> {
+        match (outcome, callback_error) {
+            (Ok(()), _) => Ok(()),
+            (Err(_), Some(error)) => {
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) {
+                    Err(single_store_domain::context_sql_error(error))
+                } else {
+                    Err(McStoreError::Store(StoreError::Backend(error.to_string())))
+                }
+            }
+            (Err(error), None) => Err(error),
+        }
     }
 
     /// Open a store for a test, with a `context.db` beside it (created from the schema
@@ -7450,6 +7520,20 @@ impl McStore {
         self.inner
             .with_conn(read_single_store_marker)
             .map_err(Into::into)
+    }
+
+    /// Re-stamp the single-store marker with the stamp `context.db` records. Only a fresh
+    /// store (one `McStore::open` just created, holding no rows) adopts a stamp this way;
+    /// it binds the rebuilt cache to the already-migrated `context.db`.
+    pub fn adopt_single_store_stamp(&self, stamp: i64) -> Result<(), McStoreError> {
+        self.inner.with_conn(|conn| {
+            conn.execute(
+                "UPDATE mc_privilege_state SET single_store_set_at_ms = ?1 WHERE id = 1",
+                params![stamp],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Stamp the single-store marker.
@@ -12864,6 +12948,7 @@ impl McStore {
         // compartments must still land.
         let fold = context_writes::FoldWrite {
             project_path: request.project_path.to_string(),
+            harness: request.harness.map(str::to_string),
             compartments: numbered.clone(),
             facts: request.facts.to_vec(),
             promote_facts: request.promote_facts,
@@ -16639,6 +16724,12 @@ pub fn compute_normalized_memory_hash(content: &str) -> String {
         .join(" ");
     let digest = md5::compute(normalized.as_bytes());
     format!("{digest:032x}")
+}
+
+/// The lowercase hex MD5 of `input`'s UTF-8 bytes. The host's `dir:` project identity is
+/// an MD5 prefix, and the module has to compute the same one.
+pub fn md5_hex(input: &str) -> String {
+    format!("{:032x}", md5::compute(input.as_bytes()))
 }
 
 fn stable_content_hash(content: &str) -> u64 {
@@ -23759,6 +23850,7 @@ mod tests {
 
         let first = store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -23791,6 +23883,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -23846,6 +23939,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -23913,6 +24007,7 @@ mod tests {
 
             store
                 .publish_historian_chunk(HistorianPublishRequest {
+                    harness: None,
                     session_id: "ses",
                     expected_row_version: expected,
                     expected_revert_epoch: 0,
@@ -23991,6 +24086,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -24038,6 +24134,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -24077,6 +24174,7 @@ mod tests {
         };
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: Some(99),
                 expected_revert_epoch: 0,
@@ -24125,6 +24223,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -24167,6 +24266,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -24220,6 +24320,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -24750,6 +24851,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -24801,6 +24903,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -24841,6 +24944,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
@@ -24960,6 +25064,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,

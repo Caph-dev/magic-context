@@ -312,9 +312,8 @@ pub struct M1Composition {
 /// compose). Reads compartments + memories; never call on a defer. `_note_project_path`
 /// is accepted for call-site stability only: ready smart notes are not rendered into m1.
 ///
-/// `host_backed_memory_ids` must be the same choice the m0 render made for this request's
-/// serializer profile: true for every harness except Claude Code. It selects which id space
-/// m1 renders, and which id space `meta.rendered_memory_ids` (written by m0) is in.
+/// Every id m1 renders, and every id in `meta.rendered_memory_ids`, is a `context.db`
+/// memory id, whatever the harness.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_m1_from_store(
     store: &McStore,
@@ -324,7 +323,6 @@ pub fn compose_m1_from_store(
     meta: &ModuleMeta,
     now_ms: i64,
     memory_enabled: bool,
-    host_backed_memory_ids: bool,
     memory_budget_tokens: f64,
     user_profile_budget_tokens: f64,
     temporal_awareness: bool,
@@ -378,15 +376,8 @@ pub fn compose_m1_from_store(
             .map(|workspace| workspace.union_identities.clone())
             .unwrap_or_else(|| vec![project_path.to_string()]);
 
-        let baseline_module_ids = if host_backed_memory_ids {
-            let mapped = store.module_memory_ids_for_host_ids(&paths, &meta.rendered_memory_ids)?;
-            meta.rendered_memory_ids
-                .iter()
-                .filter_map(|id| mapped.get(id).copied())
-                .collect::<Vec<_>>()
-        } else {
-            meta.rendered_memory_ids.clone()
-        };
+        // Rendered ids are context.db ids, the same ids the mutation log targets.
+        let baseline_module_ids = meta.rendered_memory_ids.clone();
 
         // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
         // The store also returns visibility-transition markers for rows omitted from m0 and
@@ -481,61 +472,9 @@ pub fn compose_m1_from_store(
                 Some(mutation)
             })
             .collect::<Vec<_>>();
-        let (
-            rendered_mutations,
-            rendered_resolvable_ids,
-            rendered_delta_memories,
-            rendered_sources,
-        ) = if host_backed_memory_ids {
-            let mutation_ids = mutations
-                .iter()
-                .flat_map(|mutation| [Some(mutation.target_memory_id), mutation.superseded_by_id])
-                .flatten()
-                .chain(delta_memories.iter().map(|memory| memory.id))
-                .collect::<Vec<_>>();
-            let host_ids = store.host_memory_ids_for_module_ids(&mutation_ids)?;
-            let rendered_mutations = mutations
-                .iter()
-                .filter_map(|mutation| {
-                    let target_memory_id = *host_ids.get(&mutation.target_memory_id)?;
-                    let mut rendered = mutation.clone();
-                    rendered.target_memory_id = target_memory_id;
-                    rendered.superseded_by_id = mutation
-                        .superseded_by_id
-                        .and_then(|id| host_ids.get(&id).copied());
-                    Some(rendered)
-                })
-                .collect::<Vec<_>>();
-            let rendered_resolvable_ids = resolvable_ids
-                .iter()
-                .filter_map(|id| host_ids.get(id).copied())
-                .collect::<HashSet<_>>();
-            let mut rendered_delta_memories = delta_memories.clone();
-            for memory in &mut rendered_delta_memories {
-                memory.id = memory.host_row_id.unwrap_or(0);
-            }
-            let rendered_sources = membership
-                .as_ref()
-                .map(|workspace| workspace_source_names(&rendered_delta_memories, workspace))
-                .unwrap_or_default();
-            (
-                rendered_mutations,
-                rendered_resolvable_ids,
-                rendered_delta_memories,
-                rendered_sources,
-            )
-        } else {
-            (
-                mutations.clone(),
-                resolvable_ids,
-                delta_memories,
-                source_name_by_id,
-            )
-        };
-        let memory_updates_block =
-            render_memory_updates(&rendered_mutations, &rendered_resolvable_ids);
+        let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
         let new_memories_block =
-            render_memory_block(&rendered_delta_memories, "new-memories", &rendered_sources);
+            render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
         (mutations, memory_updates_block, new_memories_block)
     } else {
         (Vec::new(), String::new(), String::new())
@@ -1093,7 +1032,6 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
-                host_backed_memory_ids: false,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: false,
@@ -1183,7 +1121,6 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
-                host_backed_memory_ids: false,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: false,

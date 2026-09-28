@@ -1637,10 +1637,6 @@ pub struct TransformResponse {
     /// filter search results, using the module manifest rather than its TypeScript render cache.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rendered_memory_ids: Option<Vec<i64>>,
-    /// Newest memories changefeed sequence observed while producing this response. The host
-    /// folds it into its mirror projection key so unrendered memory changes still schedule a pull.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub memory_mirror_head: Option<i64>,
     /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
     /// subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1715,7 +1711,6 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -1754,7 +1749,6 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -2775,13 +2769,7 @@ fn compose_additive_m0(
         ctx.memory_budget_tokens,
         estimate_tokens,
     );
-    let host_backed_memory_ids = serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
-    let mut rendered_memories = selected_memories;
-    if host_backed_memory_ids {
-        for memory in &mut rendered_memories {
-            memory.id = memory.host_row_id.unwrap_or(0);
-        }
-    }
+    let rendered_memories = selected_memories;
     let source_name_by_id = membership
         .as_ref()
         .map(|value| workspace_source_names(&rendered_memories, value))
@@ -3145,7 +3133,6 @@ fn apply_additive_only(
                 &additive_meta,
                 meta.expiry_cutoff_ms,
                 ctx.memory_enabled,
-                serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic),
                 ctx.memory_budget_tokens,
                 ctx.user_profile_budget_tokens,
                 ctx.temporal_awareness,
@@ -3368,7 +3355,6 @@ fn apply_additive_only(
             committed: commit_required,
             coverage_ordinal: None,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -5060,8 +5046,6 @@ fn apply_once(
                         ),
                         covered_system_messages: &covered_system_messages,
                         memory_enabled: ctx.memory_enabled,
-                        host_backed_memory_ids: serializer_profile
-                            != Some(SerializerProfile::ClaudeCodeAnthropic),
                         memory_budget_tokens: ctx.memory_budget_tokens,
                         user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                         inject_docs: ctx.inject_docs,
@@ -5168,8 +5152,6 @@ fn apply_once(
                                         ),
                                     covered_system_messages: &recut_covered_system_messages,
                                     memory_enabled: ctx.memory_enabled,
-                                    host_backed_memory_ids: serializer_profile
-                                        != Some(SerializerProfile::ClaudeCodeAnthropic),
                                     memory_budget_tokens: ctx.memory_budget_tokens,
                                     user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                                     inject_docs: ctx.inject_docs,
@@ -5381,7 +5363,6 @@ fn apply_once(
                     &meta,
                     meta.expiry_cutoff_ms,
                     ctx.memory_enabled,
-                    serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic),
                     ctx.memory_budget_tokens,
                     ctx.user_profile_budget_tokens,
                     ctx.temporal_awareness,
@@ -5429,8 +5410,6 @@ fn apply_once(
                             ),
                             covered_system_messages: &covered_system_messages,
                             memory_enabled: ctx.memory_enabled,
-                            host_backed_memory_ids: serializer_profile
-                                != Some(SerializerProfile::ClaudeCodeAnthropic),
                             memory_budget_tokens: ctx.memory_budget_tokens,
                             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                             inject_docs: ctx.inject_docs,
@@ -6564,7 +6543,6 @@ fn apply_once(
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
-            memory_mirror_head: None,
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
             lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
             cache_ttl: None,
@@ -8370,8 +8348,6 @@ fn compose_hard_fold_m0(
             ),
             covered_system_messages: &covered_system_messages,
             memory_enabled: ctx.memory_enabled,
-            host_backed_memory_ids: serializer_profile
-                != Some(SerializerProfile::ClaudeCodeAnthropic),
             memory_budget_tokens: ctx.memory_budget_tokens,
             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
             inject_docs: ctx.inject_docs,
@@ -27598,6 +27574,7 @@ pub(crate) mod tests {
             if !interleaved.replace(true) {
                 store
                     .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                        harness: None,
                         session_id: "astro-publish-race",
                         expected_row_version: Some(publish_row_version),
                         expected_revert_epoch: loaded.meta.revert_epoch,
@@ -27704,6 +27681,7 @@ pub(crate) mod tests {
             hook_ran_for_publish.store(true, Ordering::SeqCst);
             store
                 .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                    harness: None,
                     session_id: "astro-torn-read",
                     expected_row_version: Some(publish_row_version),
                     expected_revert_epoch,

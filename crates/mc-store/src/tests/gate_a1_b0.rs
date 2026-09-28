@@ -356,6 +356,7 @@ fn gate_a_prior_attempts_report_is_refused_at_every_predicate_site() {
     let loaded = store.load("ses").unwrap();
     let error = store
         .publish_historian_chunk(HistorianPublishRequest {
+            harness: None,
             session_id: "ses",
             expected_row_version: loaded.row_version,
             expected_revert_epoch: 0,
@@ -386,6 +387,7 @@ fn gate_a_prior_attempts_report_is_refused_at_every_predicate_site() {
     let loaded = store.load("ses").unwrap();
     let published = store
         .publish_historian_chunk(HistorianPublishRequest {
+            harness: None,
             session_id: "ses",
             expected_row_version: loaded.row_version,
             expected_revert_epoch: 0,
