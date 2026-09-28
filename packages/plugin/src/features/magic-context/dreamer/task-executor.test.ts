@@ -1012,6 +1012,68 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         expect(task.failure?.provider_error).toContain("custody accounts exhausted");
         expect(task.failure?.provider_error).toContain("provider=synthetic");
     });
+    test("a verify batch timeout waits for the next scheduled run instead of hot-retrying", async () => {
+        db = freshDb();
+        const project = "/repo/verify-batch-timeout";
+        seedTaskScheduleState(db, project, "verify", null, null, "0 3 * * *");
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "Mapped fact whose batch times out.",
+        });
+        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "verify-batch-timeout" } })),
+                // Bun's fetch rejects this way when the host client's request timer fires.
+                prompt: mock(async () => {
+                    throw new DOMException("The operation timed out.", "TimeoutError");
+                }),
+                abort: mock(async () => ({})),
+                messages: mock(async () => ({ data: [] })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const now = Date.now();
+        writeTaskScheduleState(db, {
+            projectPath: project,
+            task: "verify",
+            lastRunAt: null,
+            nextDueAt: now - 1_000,
+            schedule: "0 3 * * *",
+            lastStatus: null,
+            lastError: null,
+            retryCount: 0,
+        });
+        await runDueTasksForProject({
+            db,
+            projectIdentity: project,
+            tasks: [
+                {
+                    task: "verify",
+                    schedule: "0 3 * * *",
+                    model: "synthetic/model",
+                    timeoutMinutes: 20,
+                },
+            ],
+            executor,
+            now,
+        });
+        const scheduled = getTaskScheduleState(db, project, "verify");
+        // Retrying in fifteen minutes would split the deadline into the same
+        // too-short batch slices, so the batch would time out again.
+        expect(scheduled?.retryCount).toBe(0);
+        expect(scheduled?.nextDueAt).toBeGreaterThan(now);
+        expect(scheduled?.lastStatus).toBe("failed");
+        expect(scheduled?.lastError).toContain("timed out");
+        expect(client.session.abort).toHaveBeenCalledTimes(1);
+    });
     test("records cycle progress as a completed run result instead of an error status", async () => {
         db = freshDb();
         const project = "/repo/verify-broad-result";

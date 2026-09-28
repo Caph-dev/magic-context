@@ -164,6 +164,11 @@ export function createV1HiddenCompletionExecutor(
     db: Database,
     directory: string,
 ): HiddenCompletionExecutor {
+    // Dreamer tasks run long tool loops. Their children send with prompt_async and
+    // poll for idle so no single request stays open long enough to meet the host
+    // client's request timer; the caller's slice stays the only timer. Historian
+    // runs keep the synchronous prompt.
+    const asyncChildren = new Set<string>();
     return {
         capabilities: { tools: true, harness: "opencode" },
         async open(run) {
@@ -179,10 +184,15 @@ export function createV1HiddenCompletionExecutor(
                 preferResponseOnMissingData: true,
             });
             const id = typeof created?.id === "string" ? created.id : "";
+            if (id && run.kind === "dreamer-task") asyncChildren.add(id);
             return { id, childSessionId: id || undefined };
         },
-        async attempt(_handle, request) {
+        async attempt(handle, request) {
             if (!client) throw new Error("Hidden completion client is unavailable");
+            if (asyncChildren.has(handle.id) && shared.supportsPromptAsync(client)) {
+                await shared.promptAsyncAndWaitForIdle(client, request);
+                return;
+            }
             await client.session.prompt(request as Parameters<typeof client.session.prompt>[0]);
         },
         async collect(handle, limit) {
@@ -213,6 +223,7 @@ export function createV1HiddenCompletionExecutor(
             };
         },
         async close(handle, settlement) {
+            if (handle?.id) asyncChildren.delete(handle.id);
             if (!client) return;
             await teardownChildSession({
                 client,

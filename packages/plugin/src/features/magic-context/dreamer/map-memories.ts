@@ -25,6 +25,7 @@ import {
 } from "../memory";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
+import { readFailedChildMessages } from "./failed-invocation-evidence";
 import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
@@ -142,10 +143,10 @@ export function computeMapBatchSliceMs(remainingMs: number, batchesRemaining: nu
     );
 }
 
-/** The shared prompt helper uses this exact error shape for a deadline expiry.
- * Validation and provider failures remain ordinary per-batch retries. */
+/** Our own slice expiry and the host client's request timer both count as
+ * timeouts. Validation and provider failures remain ordinary per-batch retries. */
 function isTimeoutClassError(error: unknown): boolean {
-    return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
+    return shared.isPromptTimeoutError(error);
 }
 
 /** Re-queue predicate: a file-independent mapping (sentinel, no real files)
@@ -390,6 +391,9 @@ async function mapOneBatch(
                 },
             },
             {
+                // Send without holding a request open for the whole batch, so the
+                // slice below is the only timer (see prompt-async-transport.ts).
+                transport: shared.createPromptAsyncTransport(client, agentSessionId),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,
@@ -435,7 +439,15 @@ async function mapOneBatch(
             `[dreamer] map-memories batch failed: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: failedInvocationStatus(error), error });
+        recordInvocation(args, startedAt, {
+            status: failedInvocationStatus(error),
+            error,
+            messages: await readFailedChildMessages(
+                args.client,
+                agentSessionId,
+                args.sessionDirectory,
+            ),
+        });
         if (error instanceof DreamerModuleFailureError) throw error;
         // Swallow per-batch failures: the batch's memories stay unmapped and are
         // retried next run. Only an abort/lease-loss should stop the whole task.

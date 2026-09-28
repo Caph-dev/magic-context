@@ -133,6 +133,29 @@ export interface PromptFailureDetail {
 
 const promptFailureDetails = new WeakMap<object, PromptFailureDetail>();
 
+/**
+ * True for a request timer that fired inside the host client rather than ours.
+ * Bun's fetch rejects with a DOMException named "TimeoutError" ("The operation
+ * timed out.", legacy code 23) when its default per-request timer expires, and
+ * `AbortSignal.timeout` produces the same shape. Some OpenCode 1 builds hand
+ * plugins an SDK client whose fetch keeps Bun's default timer (about five to six
+ * minutes), so a synchronous `session.prompt` that stays open for a whole agent
+ * loop fails this way while the host keeps running the child session.
+ */
+export function isHostTimeoutError(error: unknown): boolean {
+    return (
+        error !== null &&
+        typeof error === "object" &&
+        (error as { name?: unknown }).name === "TimeoutError"
+    );
+}
+
+/** Our own slice expiry (see `promptWithTimeout`) or a host request timer. */
+export function isPromptTimeoutError(error: unknown): boolean {
+    if (isHostTimeoutError(error)) return true;
+    return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
+}
+
 export function getPromptFailureDetail(error: unknown): PromptFailureDetail | null {
     return error !== null && typeof error === "object"
         ? (promptFailureDetails.get(error) ?? null)
@@ -260,6 +283,15 @@ async function promptWithTimeout(
             }
             throw new Error(`prompt timed out after ${timeoutMs}ms`);
         }
+        if (isHostTimeoutError(error)) {
+            // The host client's own request timer fired. Only our side of the
+            // request ended: the child's run loop is still going on the server and
+            // would keep calling the model, so stop it the same way as above. The
+            // original error is kept so the ledger still shows which timer fired.
+            if (!transport || transport.childSessionId) {
+                await abortChildRun(client, transport?.childSessionId ?? args.path.id);
+            }
+        }
         throw error;
     } finally {
         clearTimeout(timeout);
@@ -328,6 +360,9 @@ function isNonRetryable(error: unknown, externalSignal?: AbortSignal): boolean {
         if (error.message === "prompt aborted by external signal") return true;
         if (/^prompt timed out after \d+ms$/.test(error.message)) return true;
     }
+    // A host request timer is a timeout too. Retrying would send the next model
+    // into the same child session, where it meets the same timer.
+    if (isHostTimeoutError(error)) return true;
 
     if (detectOverflow(error).isOverflow) return true;
 
@@ -361,7 +396,9 @@ function classifyPromptFailure(
     if (externalSignal?.aborted || message === "prompt aborted by external signal") {
         return "child_aborted";
     }
-    if (/^prompt timed out after \d+ms$/.test(message)) return "provider_timeout";
+    if (/^prompt timed out after \d+ms$/.test(message) || isHostTimeoutError(error)) {
+        return "provider_timeout";
+    }
     if (phase === "validation") {
         if (/returned no (?:assistant )?output|no assistant output/i.test(message)) {
             return "empty_completion";

@@ -582,6 +582,9 @@ async function confirmReadOnly(
                     },
                 },
                 {
+                    // Send without holding a request open for the whole tool loop, so
+                    // the deadline below is the only timer (see prompt-async-transport.ts).
+                    transport: shared.createPromptAsyncTransport(client, childSessionId),
                     timeoutMs: Math.max(1_000, args.deadline - Date.now()),
                     signal: promptSignal.signal,
                     fallbackModels: args.fallbackModels,

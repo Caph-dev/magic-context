@@ -2376,6 +2376,51 @@
             "hosts": [
                 "opencode"
             ]
+        },
+        {
+            "path": "tests/dreamer-verify-budget.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "verify's per-batch floor on a real OpenCode 1 host: a verify-broad scope too big for the old even split banks its first batch and stops before a batch that cannot get the floor; takes several minutes of wall clock, so it runs by hand outside the mode lanes",
+            "contract_refs": [
+                "DREAMER-TIMEOUTS"
+            ],
+            "hosts": [
+                "opencode"
+            ]
+        },
+        {
+            "path": "tests/dreamer-verify-slice-authority.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "a verify batch longer than Bun's 300-360 s fetch timer on a real OpenCode 1 host ends on its own slice, records the model on the failed row, aborts the child and waits for the next scheduled run; takes about eight minutes of wall clock, so it runs by hand outside the mode lanes",
+            "contract_refs": [
+                "DREAMER-TIMEOUTS"
+            ],
+            "hosts": [
+                "opencode"
+            ]
+        },
+        {
+            "path": "tests/dreamer-host-timeout.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "a real Bun fetch TimeoutError from a plain-fetch SDK client against a real OpenCode 1 host is filed as provider_timeout, stops the fallback chain and aborts the child; waits out the 300-360 s host timer, so it runs by hand outside the mode lanes",
+            "contract_refs": [
+                "DREAMER-TIMEOUTS"
+            ],
+            "hosts": [
+                "opencode"
+            ]
         }
     ]
 }

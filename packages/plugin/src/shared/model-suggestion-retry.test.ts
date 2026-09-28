@@ -577,3 +577,76 @@ describe("promptSyncWithValidatedOutputRetry", () => {
         expect(messages).toHaveBeenCalledTimes(2);
     });
 });
+
+/**
+ * Bun's fetch rejects with this exact object when its default request timer
+ * fires on a plugin SDK request (the name is "TimeoutError", legacy code 23).
+ * The dreamer ledger shows it as `TimeoutError message="The operation timed out." code=23`.
+ */
+function hostFetchTimeout(): Error {
+    return new DOMException("The operation timed out.", "TimeoutError") as unknown as Error;
+}
+
+describe("host fetch TimeoutError is a timeout", () => {
+    test("validated retry stops the chain, aborts the child, and reports provider_timeout", async () => {
+        const prompt = mock(async () => {
+            throw hostFetchTimeout();
+        });
+        const abort = mock(async () => ({}));
+        const client = createClient(prompt, abort);
+
+        let caught: unknown;
+        try {
+            await promptSyncWithValidatedOutputRetry(client, createArgs(), {
+                fallbackModels: ["anthropic/claude-sonnet-4-6", "google/gemini-3-flash"],
+                fetchOutput: async () => "unused",
+                validateOutput: (output: string) => output,
+            });
+        } catch (error) {
+            caught = error;
+        }
+
+        expect((caught as Error | undefined)?.name).toBe("TimeoutError");
+        // Another model would be sent into the same still-running child session and
+        // hit the same host timer, so the chain must stop at the first attempt.
+        expect(prompt).toHaveBeenCalledTimes(1);
+        expect(getPromptFailureDetail(caught)?.failureClass).toBe("provider_timeout");
+        // The host loop keeps running after the client-side timer fires unless the
+        // child is aborted explicitly.
+        expect(abort).toHaveBeenCalledTimes(1);
+        expect(abort.mock.calls[0]?.[0]).toEqual({ path: { id: "ses-test" } });
+    });
+
+    test("unvalidated retry stops the chain and aborts the child", async () => {
+        const prompt = mock(async () => {
+            throw hostFetchTimeout();
+        });
+        const abort = mock(async () => ({}));
+        const client = createClient(prompt, abort);
+
+        await expect(
+            promptSyncWithModelSuggestionRetry(client, createArgs(), {
+                fallbackModels: ["anthropic/claude-sonnet-4-6"],
+            }),
+        ).rejects.toThrow("The operation timed out.");
+
+        expect(prompt).toHaveBeenCalledTimes(1);
+        expect(abort).toHaveBeenCalledTimes(1);
+    });
+
+    test("an ordinary provider error still falls back and does not abort the child", async () => {
+        const prompt = mock(async () => {
+            if (prompt.mock.calls.length === 1) throw new Error("upstream 502");
+            return {};
+        });
+        const abort = mock(async () => ({}));
+        const client = createClient(prompt, abort);
+
+        await promptSyncWithModelSuggestionRetry(client, createArgs(), {
+            fallbackModels: ["anthropic/claude-sonnet-4-6"],
+        });
+
+        expect(prompt).toHaveBeenCalledTimes(2);
+        expect(abort).not.toHaveBeenCalled();
+    });
+});

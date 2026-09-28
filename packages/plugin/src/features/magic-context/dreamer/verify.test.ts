@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import * as shared from "../../../shared";
 import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
@@ -25,10 +26,17 @@ import {
 import { normalizeVerificationFiles } from "../memory/verification-paths";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { getSubagentInvocations } from "../storage-subagent-invocations";
 import { acquireLease } from "./lease";
 import { DreamerProviderOutputFailureError } from "./provider-output-failure";
 import { getTaskScheduleState, seedTaskScheduleState } from "./storage-task-schedule";
-import { applyVerifyManifest, runVerify, type VerifyArgs } from "./verify";
+import {
+    applyVerifyManifest,
+    computeVerifyBatchSliceMs,
+    runVerify,
+    VERIFY_BATCH_FLOOR_MS,
+    type VerifyArgs,
+} from "./verify";
 
 const tempDirs: string[] = [];
 
@@ -89,7 +97,7 @@ function verifyArgs(db: Database, sessionDirectory: string, projectIdentity: str
         sessionDirectory,
         holderId,
         leaseKey,
-        deadline: Date.now() + 60_000,
+        deadline: Date.now() + VERIFY_BATCH_FLOOR_MS + 60_000,
     };
 }
 
@@ -642,7 +650,7 @@ describe("runVerify disposition", () => {
             )?.lastBroadRunAt;
             expect(cycleStart).toBeGreaterThan(0);
 
-            args.deadline = Date.now() + 60_000;
+            args.deadline = Date.now() + VERIFY_BATCH_FLOOR_MS + 60_000;
             args.client = successfulVerifyClient() as never;
             const second = await runVerify(args);
             expect(second.verified).toBe(1);
@@ -781,7 +789,7 @@ describe("runVerify disposition", () => {
             expect(cycleStart).toBeGreaterThan(0);
 
             args.client = successfulVerifyClient() as never;
-            args.deadline = Date.now() + 60_000;
+            args.deadline = Date.now() + VERIFY_BATCH_FLOOR_MS + 60_000;
             const resumed = await runVerify(args);
             expect(resumed.inScope).toBe(1);
             expect(resumed.verified).toBe(1);
@@ -790,6 +798,192 @@ describe("runVerify disposition", () => {
             expect(
                 getTaskScheduleState(db, projectIdentity, "verify-broad")?.lastBroadRunAt,
             ).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("does not start a batch when the remaining budget is below the batch floor", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-below-floor";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 51);
+            const scripted = scriptedVerifyClient(() => ({ kind: "manifest" }));
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.client = scripted.client as never;
+            args.deadline = Date.now() + VERIFY_BATCH_FLOOR_MS - 5_000;
+
+            const result = await runVerify(args);
+
+            expect(scripted.promptCalls()).toBe(0);
+            expect(result.complete).toBe(false);
+            expect(result.remaining).toBe(51);
+            expect(result.stopReason).toBe("deadline");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("gives a batch at least the floor when an even split would starve it", async () => {
+        const db = freshDb();
+        const slices: number[] = [];
+        const original = shared.promptSyncWithValidatedOutputRetry;
+        const spy = spyOn(shared, "promptSyncWithValidatedOutputRetry").mockImplementation(((
+            client: never,
+            promptArgs: never,
+            options: { timeoutMs?: number },
+        ) => {
+            slices.push(options.timeoutMs ?? 0);
+            return original(client, promptArgs, options as never);
+        }) as never);
+        try {
+            const projectIdentity = "git:verify-floor-slice";
+            const dir = tempProject();
+            // Ten batches in a 20-minute run: an even split would be 120 s each,
+            // shorter than a 50-memory tool loop needs.
+            addMappedMemories(db, projectIdentity, 500);
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.deadline = Date.now() + 20 * 60_000;
+            args.client = successfulVerifyClient(() => {
+                args.deadline = Date.now() - 1;
+            }) as never;
+
+            const result = await runVerify(args);
+
+            expect(slices).toHaveLength(1);
+            expect(slices[0]).toBeGreaterThanOrEqual(VERIFY_BATCH_FLOOR_MS);
+            expect(result.verified).toBe(50);
+            expect(result.complete).toBe(false);
+        } finally {
+            spy.mockRestore();
+            closeQuietly(db);
+        }
+    });
+
+    test("computeVerifyBatchSliceMs floors the even split and never exceeds the budget", () => {
+        expect(computeVerifyBatchSliceMs(20 * 60_000, 10)).toBe(VERIFY_BATCH_FLOOR_MS);
+        expect(computeVerifyBatchSliceMs(20 * 60_000, 2)).toBe(10 * 60_000);
+        expect(computeVerifyBatchSliceMs(VERIFY_BATCH_FLOOR_MS + 1, 5)).toBe(VERIFY_BATCH_FLOOR_MS);
+    });
+
+    for (const [label, timeoutError] of [
+        ["our slice timer", () => new Error("prompt timed out after 240000ms")],
+        [
+            "the host request timer",
+            () => new DOMException("The operation timed out.", "TimeoutError"),
+        ],
+    ] as const) {
+        test(`a batch timeout from ${label} banks earlier batches and stops cleanly`, async () => {
+            const db = freshDb();
+            try {
+                const projectIdentity = `git:verify-batch-timeout-${label.replaceAll(" ", "-")}`;
+                const dir = tempProject();
+                addMappedMemories(db, projectIdentity, 150);
+                let promptCalls = 0;
+                let manifest = "";
+                const aborted: string[] = [];
+                const args = verifyArgs(db, dir, projectIdentity);
+                args.deadline = Date.now() + 20 * 60_000;
+                args.client = {
+                    session: {
+                        create: async () => ({ data: { id: `verify-child-${promptCalls + 1}` } }),
+                        prompt: async (promptArgs: {
+                            body?: { parts?: Array<{ text?: string }> };
+                        }) => {
+                            promptCalls += 1;
+                            if (promptCalls === 2) throw timeoutError();
+                            const text = promptArgs.body?.parts?.[0]?.text ?? "";
+                            const ids = [...text.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                                Number(match[1]),
+                            );
+                            manifest = `<verify>${ids.map((id) => `<verified id="${id}"/>`).join("")}</verify>`;
+                            return {};
+                        },
+                        abort: async (abortArgs: { path: { id: string } }) => {
+                            aborted.push(abortArgs.path.id);
+                            return {};
+                        },
+                        messages: async () => ({ data: assistantMessages(manifest) }),
+                        delete: async () => ({}),
+                    },
+                } as never;
+
+                const result = await runVerify(args);
+
+                // The timed-out batch does not end the run with a thrown failure, and
+                // the third batch is not started with the same doomed budget.
+                expect(promptCalls).toBe(2);
+                expect(result.verified).toBe(50);
+                expect(result.remaining).toBe(100);
+                expect(result.complete).toBe(false);
+                expect(result.stopReason).toBe("batch-timeout");
+                // This double throws our slice message directly rather than letting a
+                // real slice timer fire, so only the host-timer case reaches the
+                // abort that follows a timeout.
+                if (label === "the host request timer") {
+                    expect(aborted).toEqual(["verify-child-2"]);
+                }
+            } finally {
+                closeQuietly(db);
+            }
+        });
+    }
+
+    test("a failed batch row records the child's tokens and model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-failed-row-evidence";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 1);
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.parentSessionId = "ses-parent-verify";
+            let prompted = false;
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "verify-child" } }),
+                    prompt: async () => {
+                        prompted = true;
+                        throw new DOMException("The operation timed out.", "TimeoutError");
+                    },
+                    abort: async () => ({}),
+                    // The child spent tokens on tool steps before the host timer fired.
+                    messages: async () => ({
+                        data: prompted
+                            ? [
+                                  {
+                                      info: {
+                                          role: "assistant",
+                                          providerID: "anthropic",
+                                          modelID: "claude-verify",
+                                          time: { created: 1, completed: 2 },
+                                          tokens: {
+                                              input: 1_200,
+                                              output: 300,
+                                              cache: { read: 50, write: 0 },
+                                          },
+                                      },
+                                      parts: [{ type: "tool" }],
+                                  },
+                              ]
+                            : [],
+                    }),
+                    delete: async () => ({}),
+                },
+            } as never;
+
+            await runVerify(args);
+
+            const [row] = getSubagentInvocations(db, "ses-parent-verify", { subagent: "dreamer" });
+            expect(row).toMatchObject({
+                task: "verify",
+                status: "timed_out",
+                providerId: "anthropic",
+                modelId: "claude-verify",
+                inputTokens: 1_200,
+                outputTokens: 300,
+                cacheReadTokens: 50,
+            });
         } finally {
             closeQuietly(db);
         }
