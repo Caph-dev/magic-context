@@ -433,9 +433,9 @@ run_host_e2e() {
   run_e2e_group "ts" "pi" "$E2E_PI_FILES"
 }
 
-# Rust stays on the host: its daemon and private sibling path dependencies cross
-# the container boundary. The shared executable owns the exact manifest selection,
-# prerequisites, and true-green summary check used by release CI as well.
+# Rust stays on the host because its daemon and sibling path dependencies cross
+# the container boundary. The shared runner selects the manifest tests, checks
+# prerequisites, and requires a positive test summary just like release CI.
 if [[ -n "$CI_GATE_SHA" ]]; then
   echo "  [e2e] host legs: covered by master CI on $CI_GATE_SHA"
 else
