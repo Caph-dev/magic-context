@@ -1118,7 +1118,7 @@ mod tests {
     const PROJECT: &str = "git:proj";
 
     fn open_store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
+        McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,

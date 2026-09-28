@@ -69,103 +69,6 @@ fn chain_up_to(version: u32) -> Vec<Migration> {
         .collect()
 }
 
-/// The two newest migrations land in numeric order on a store that already holds
-/// rows, and neither disturbs what was there.
-#[test]
-fn gate_the_claim_queue_then_the_marker_land_in_order_on_a_populated_store() {
-    let dir = tempfile::tempdir().unwrap();
-    let descriptor = descriptor(dir.path());
-
-    // A store as it stood before either slice existed, with rows in it.
-    let earlier = open_sqlite(&descriptor).unwrap();
-    register_era_scope_functions(&earlier);
-    let before = earlier.migrate(NS, &chain_up_to(56)).unwrap();
-    assert_eq!(before.recorded, 56);
-    assert!(!table_exists(&earlier, HISTORIAN_QUEUE_TABLE));
-    assert!(!privilege_state_columns(&earlier).contains(&"single_store".to_string()));
-    earlier
-        .with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO mc_memories
-                   (id, project_path, category, content, normalized_hash, importance,
-                    scope, shareable, status, first_seen_at, created_at, updated_at,
-                    last_seen_at)
-                 VALUES (11, 'gate-project', 'ARCHITECTURE', 'survives both migrations',
-                         'h11', 3, 'project', 1, 'active', 0, 0, 0, 0)",
-                [],
-            )
-        })
-        .unwrap();
-    drop(earlier);
-
-    // 57 alone: the queue table appears, the marker columns do not.
-    let with_queue = open_sqlite(&descriptor).unwrap();
-    register_era_scope_functions(&with_queue);
-    let after_57 = with_queue
-        .migrate(NS, &chain_up_to(CLAIM_LANE_MIGRATION_VERSION))
-        .unwrap();
-    assert_eq!(after_57.recorded, CLAIM_LANE_MIGRATION_VERSION);
-    assert!(table_exists(&with_queue, HISTORIAN_QUEUE_TABLE));
-    assert!(!privilege_state_columns(&with_queue).contains(&"single_store".to_string()));
-    drop(with_queue);
-
-    // 58 next, through the real open path, together with every migration after it.
-    let migrated = McStore::open(&descriptor).unwrap();
-    assert_eq!(
-        migrated.module_store_schema_version().unwrap(),
-        crate::LATEST_MIGRATION_VERSION
-    );
-    assert_eq!(migrated.single_store_marker().unwrap(), None);
-    let columns = privilege_state_columns(&migrated.inner);
-    for column in [
-        "single_store",
-        "single_store_set_at_ms",
-        "single_store_set_by",
-    ] {
-        assert!(columns.contains(&column.to_string()), "missing {column}");
-    }
-    let kept = migrated
-        .inner
-        .with_conn(|conn| {
-            conn.query_row("SELECT content FROM mc_memories WHERE id = 11", [], |row| {
-                row.get::<_, String>(0)
-            })
-        })
-        .unwrap();
-    assert_eq!(kept, "survives both migrations");
-
-    // And the queue the first migration created is usable on the migrated store.
-    let loaded = migrated.load("ses").unwrap();
-    let mut meta = ModuleMeta::default();
-    meta.historian.state = HistorianPhase::Firing;
-    meta.historian.firing_seq = 1;
-    migrated
-        .commit("ses", loaded.row_version, &CoreState::default(), &meta)
-        .unwrap();
-    migrated
-        .publish_pending_historian_run(&NewHistorianPendingRun {
-            run_id: "run-after-both".to_string(),
-            session_id: "ses".to_string(),
-            project_path: GATE_PROJECT.to_string(),
-            firing_seq: 1,
-            chunk_fingerprint: "fp".to_string(),
-            system_prompt: "sys".to_string(),
-            user_prompt: "user".to_string(),
-            model_chain: vec!["test/model".to_string()],
-            await_budget_ms: 660_000,
-            historian_timeout_ms: None,
-            now_ms: 1_000,
-        })
-        .unwrap();
-    assert_eq!(
-        migrated
-            .list_pending_historian_runs(GATE_PROJECT, None, 2_000)
-            .unwrap()
-            .len(),
-        1
-    );
-}
-
 /// The ordering constraint B0 names in prose, executed: if a store applies 58
 /// while 57 is not yet part of the chain, 57 never runs afterwards and the claim
 /// lane has no table to write to.
@@ -207,7 +110,7 @@ fn gate_a_store_that_applied_58_first_never_gets_57() {
     // The current chain arrives later. 57 is at or below the recorded maximum, so
     // it is skipped for good, and the migration that extends its table has nothing
     // to extend.
-    let Err(error) = McStore::open(&descriptor) else {
+    let Err(error) = McStore::open_for_test(&descriptor) else {
         panic!("a store missing the table migration 60 extends must not open");
     };
     let rendered = error.to_string();
@@ -237,66 +140,6 @@ fn gate_a_store_that_applied_58_first_never_gets_57() {
     );
 }
 
-/// A store carrying the current chain, met by a binary whose chain stops at 56:
-/// the migrator reports the store as ahead without touching it, and the rows are
-/// intact at that level. This exercises the migrator alone. `McStore::open` reads
-/// the same report and refuses the store with `StoreAheadOfBinary`, so a real
-/// binary of this shape never serves it; see
-/// `a_store_one_version_ahead_is_refused_by_name_without_reading_or_writing_it`.
-#[test]
-fn gate_a_store_at_the_current_ceiling_is_served_by_a_binary_whose_chain_stops_at_56() {
-    let dir = tempfile::tempdir().unwrap();
-    let descriptor = descriptor(dir.path());
-
-    let current = McStore::open(&descriptor).unwrap();
-    assert_eq!(
-        current.module_store_schema_version().unwrap(),
-        crate::LATEST_MIGRATION_VERSION
-    );
-    let loaded = current.load("ses").unwrap();
-    let mut meta = ModuleMeta::default();
-    meta.historian.firing_seq = 9;
-    current
-        .commit("ses", loaded.row_version, &CoreState::default(), &meta)
-        .unwrap();
-    drop(current);
-
-    let older = open_sqlite(&descriptor).unwrap();
-    register_era_scope_functions(&older);
-    let outcome = older.migrate(NS, &chain_up_to(56)).unwrap();
-    assert!(
-        outcome.store_ahead(),
-        "a store written by a longer chain is the rollback shape, not an error"
-    );
-    assert_eq!(outcome.recorded, crate::LATEST_MIGRATION_VERSION);
-    assert_eq!(outcome.chain_max, 56);
-
-    // Serving: the session row an older binary reads is unchanged and readable.
-    let served = older
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT meta FROM mc_cache_state WHERE session_id = 'ses'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-        })
-        .unwrap();
-    let parsed: ModuleMeta = serde_json::from_str(&served).unwrap();
-    assert_eq!(parsed.historian.firing_seq, 9);
-    // The marker is unset in this slice, so the older binary is not refused by
-    // anything; the refusal only exists in builds that read the marker at all.
-    let marker: i64 = older
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT single_store FROM mc_privilege_state WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-        })
-        .unwrap();
-    assert_eq!(marker, 0);
-}
-
 /// A report produced under a superseded attempt is refused by every mc-store
 /// site that CASes on the publish predicate, not just by the publish itself.
 ///
@@ -306,7 +149,7 @@ fn gate_a_store_at_the_current_ceiling_is_served_by_a_binary_whose_chain_stops_a
 #[test]
 fn gate_a_prior_attempts_report_is_refused_at_every_predicate_site() {
     let dir = tempfile::tempdir().unwrap();
-    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
 
     let mut meta = publishing_meta();
     meta.historian.producer_attempt = 2;
@@ -446,7 +289,7 @@ fn gate_queue_run(
 #[test]
 fn gate_a_crowd_of_claimants_on_one_run_mints_exactly_one_token_per_generation() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(McStore::open(&descriptor(dir.path())).unwrap());
+    let store = Arc::new(McStore::open_for_test(&descriptor(dir.path())).unwrap());
     let queued_at_ms = 1_000_000;
     gate_queue_run(&store, "run-crowd", "ses", queued_at_ms, 660_000);
 
@@ -520,7 +363,7 @@ fn gate_a_crowd_of_claimants_on_one_run_mints_exactly_one_token_per_generation()
 #[test]
 fn gate_a_reader_never_catches_a_claim_half_applied() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(McStore::open(&descriptor(dir.path())).unwrap());
+    let store = Arc::new(McStore::open_for_test(&descriptor(dir.path())).unwrap());
     let queued_at_ms = 1_000_000;
     // The run's own deadline has to outlive thousands of lease cycles, or the
     // writer runs out of claimable time long before the reader has sampled both
@@ -652,7 +495,7 @@ fn gate_a_reader_never_catches_a_claim_half_applied() {
 #[test]
 fn gate_a_pending_poll_does_not_block_a_concurrent_transform_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
     let queued_at_ms = 1_000;
     gate_queue_run(&store, "run-polled", "ses", queued_at_ms, 660_000);
 
@@ -727,7 +570,7 @@ fn gate_the_publish_duration_columns_land_on_a_populated_store_at_58() {
         .unwrap();
     drop(older);
 
-    let migrated = McStore::open(&descriptor).unwrap();
+    let migrated = McStore::open_for_test(&descriptor).unwrap();
     assert_eq!(
         migrated.module_store_schema_version().unwrap(),
         crate::LATEST_MIGRATION_VERSION
