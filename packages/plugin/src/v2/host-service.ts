@@ -210,20 +210,21 @@ export async function removeHostSession(
     owner: HostServiceOwner | undefined,
     env: NodeJS.ProcessEnv = process.env,
     fetchSession: typeof fetch = fetch,
+    directory?: string,
 ): Promise<void> {
     const service = resolveOwnerHostService(owner, env);
+    const query = directory === undefined ? "" : `?directory=${encodeURIComponent(directory)}`;
     const response = await fetchSession(
-        `${service.url}/api/session/${encodeURIComponent(sessionID)}`,
+        `${service.url}/api/session/${encodeURIComponent(sessionID)}${query}`,
         {
             method: "DELETE",
             headers: service.headers,
             signal: AbortSignal.timeout(60_000),
         },
     );
-    // A session the owning host no longer has is the state the caller asked for. This is only
-    // meaningful because the request went to the owner: the same 404 from any other service would
-    // mean the session was never there.
-    if (!response.ok && response.status !== 404) {
+    // A 404 may mean the directory scope is wrong, not that the session is already gone.
+    // Keep the retired entry for a later retry rather than silently claiming deletion.
+    if (!response.ok) {
         throw new Error(`OpenCode session delete answered ${response.status}`);
     }
 }

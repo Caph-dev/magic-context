@@ -64,7 +64,7 @@ async function withStub(
         const url = new URL(request.url);
         seen.push({
             method: request.method,
-            path: url.pathname,
+            path: url.pathname + url.search,
             authorization: request.headers.get("authorization"),
         });
         return new Response(null, { status });
@@ -269,6 +269,7 @@ describe("OpenCode 2 host session removal", () => {
                     },
                     env,
                     fetchSession,
+                    "C:\\worktrees\\child project",
                 );
             } finally {
                 cleanup();
@@ -277,13 +278,13 @@ describe("OpenCode 2 host session removal", () => {
         expect(seen).toEqual([
             {
                 method: "DELETE",
-                path: "/api/session/ses_abc%2F1",
+                path: "/api/session/ses_abc%2F1?directory=C%3A%5Cworktrees%5Cchild%20project",
                 authorization: `Basic ${Buffer.from("opencode:s3cret", "utf8").toString("base64")}`,
             },
         ]);
     });
 
-    test("treats an already-deleted session as done when the owner answers 404", async () => {
+    test("reports a directory-scoped 404 instead of forgetting a possibly live child", async () => {
         await withStub(404, async (url, fetchSession) => {
             const { env, dir, cleanup } = stateHome([{ channel: "latest", url, pid: process.pid }]);
             try {
@@ -294,7 +295,7 @@ describe("OpenCode 2 host session removal", () => {
                         env,
                         fetchSession,
                     ),
-                ).resolves.toBeUndefined();
+                ).rejects.toThrow("404");
             } finally {
                 cleanup();
             }

@@ -4,6 +4,7 @@ import { openDatabase } from "../../../plugin/src/features/magic-context/storage
 import { getDataDir } from "../../../plugin/src/shared/data-path";
 import { createV2HiddenCompletionExecutor } from "../../../plugin/src/v2/hidden-completion";
 import {
+    HIDDEN_DREAMER_AGENT,
     HiddenChildHook,
     registerHiddenChildAgents,
 } from "../../../plugin/src/v2/hooks/hidden-child";
@@ -26,6 +27,8 @@ interface Command {
     maxOutputTokens?: number;
     /** Selects which executor answers, so a run can arrive as if a new host build had booted. */
     generation?: string;
+    keepSubagents?: boolean;
+    dreamer?: boolean;
 }
 
 export default {
@@ -44,16 +47,17 @@ export default {
 
         // Exactly what the shipped plugin does: bind each child to the registration THIS process
         // wrote, and delete over that host's HTTP route. Nothing here is handed in by the harness.
-        const remove = (input: { sessionID: string; owner?: HostServiceOwner }) =>
-            removeHostSession(input.sessionID, input.owner);
+        const remove = (input: { sessionID: string; owner?: HostServiceOwner; directory?: string }) =>
+            removeHostSession(input.sessionID, input.owner, process.env, fetch, input.directory);
 
 
         const executors = new Map<
             string,
             Promise<Awaited<ReturnType<typeof createV2HiddenCompletionExecutor>>>
         >();
-        const executorFor = (generation: string) => {
-            const existing = executors.get(generation);
+        const executorFor = (generation: string, keepSubagents = false) => {
+            const key = `${generation}:${keepSubagents}`;
+            const existing = executors.get(key);
             if (existing) return existing;
             const created = createV2HiddenCompletionExecutor(
                 { ...context.session, remove },
@@ -67,24 +71,25 @@ export default {
                             gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
                         ),
                     generation,
+                    keepSubagents,
                     removalSpacingMs: 50,
                 },
             );
-            executors.set(generation, created);
+            executors.set(key, created);
             return created;
         };
         await executorFor("ga-proof-generation");
         writeFileSync(readyPath, "ready\n");
 
         const run = async (command: Command) => {
-            const executor = await executorFor(command.generation ?? "ga-proof-generation");
+            const executor = await executorFor(command.generation ?? "ga-proof-generation", command.keepSubagents);
             let handle: Awaited<ReturnType<typeof executor.open>> | null = null;
             let settled = false;
             try {
                 handle = await executor.open({
                     parentSessionId: command.parentSessionID,
-                    agent: "historian",
-                    kind: "historian",
+                    agent: command.dreamer ? HIDDEN_DREAMER_AGENT : "historian",
+                    kind: command.dreamer ? "dreamer-task" : "historian",
                     system: `EXACT_HISTORIAN_SYSTEM_${command.seq}`,
                     model: "openai/mock-model-cheap",
                     configuredModels: ["openai/mock-model-cheap"],

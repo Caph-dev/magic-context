@@ -50,6 +50,8 @@ interface PersistedHiddenChild {
      * be left behind and reported.
      */
     owner?: HostServiceOwner;
+    /** Directory passed to the host when creating this session, independent of later caller cwd. */
+    directory?: string;
     /**
      * True once any run in this child has completed with a settled reply. A child is reused across
      * many runs, so this stays true whatever a later run does, and it is carried onto the retired
@@ -64,7 +66,7 @@ interface RetiredHiddenChild extends PersistedHiddenChild {
 }
 
 /** The parts of a retired child that deleting its session needs. */
-type RetirableChild = Pick<PersistedHiddenChild, "id" | "owner">;
+type RetirableChild = Pick<PersistedHiddenChild, "id" | "owner" | "directory">;
 
 /** The parts of a retired child that the `keep_subagents` retention rule looks at. */
 type RetentionFacts = Pick<PersistedHiddenChild, "role" | "ever_settled">;
@@ -103,7 +105,11 @@ export interface HiddenChildHost {
      * because the host surface this adapter is handed does not always carry it; when it is missing,
      * a retired child keeps its entry in the retired list and the next boot sweep tries again.
      */
-    remove?(input: { sessionID: string; owner?: HostServiceOwner }): Promise<void>;
+    remove?(input: {
+        sessionID: string;
+        owner?: HostServiceOwner;
+        directory?: string;
+    }): Promise<void>;
 }
 
 export interface HiddenChildRows {
@@ -207,7 +213,8 @@ function isPersistedChild(value: unknown): value is PersistedHiddenChild {
         typeof child.created_at === "number" &&
         typeof child.title_reasserted === "boolean" &&
         (child.ever_settled === undefined || typeof child.ever_settled === "boolean") &&
-        (child.owner === undefined || isOwner(child.owner))
+        (child.owner === undefined || isOwner(child.owner)) &&
+        (child.directory === undefined || typeof child.directory === "string")
     );
 }
 
@@ -666,24 +673,29 @@ export async function createV2HiddenCompletionExecutor(
 
     const removeChildSession = async (child: RetirableChild): Promise<void> => {
         const remove = host.remove;
-        if (!remove) return;
+        if (!remove) {
+            note(
+                `[magic-context] hidden child ${child.id} cannot be deleted: host removal route unavailable`,
+            );
+            return;
+        }
         try {
             await remove({
                 sessionID: child.id,
                 ...(child.owner === undefined ? {} : { owner: child.owner }),
+                ...(child.directory === undefined ? {} : { directory: child.directory }),
             });
         } catch (error) {
             // The host was unreachable, refused, or is not the one that created this child. Keep
             // the entry so a later sweep retries it; cleanup is never allowed to fail the hidden
             // run that triggered it.
             if (error instanceof HostServiceUnavailable) {
-                // Nothing in this process can delete it. Say so once, everywhere the user looks,
-                // rather than repeating an unactionable line in the log on every sweep.
-                if (declareHostLimitation("hidden_cleanup_unbound")) {
-                    note(
-                        `[magic-context] hidden child ${child.id} has no owner-bound deletion route and stays recorded for retry: ${errorText(error)}`,
-                    );
-                }
+                // The user-facing limitation is shared, but every stranded session needs its
+                // own id in the log so operators can identify the backlog.
+                declareHostLimitation("hidden_cleanup_unbound");
+                note(
+                    `[magic-context] hidden child ${child.id} has no owner-bound deletion route and stays recorded for retry: ${errorText(error)}`,
+                );
                 return;
             }
             note(
@@ -705,12 +717,16 @@ export async function createV2HiddenCompletionExecutor(
      * a hidden run must not wait on host cleanup.
      */
     const scheduleRemoval = (child: RetirableChild): void => {
-        if (!host.remove || queued.has(child.id)) return;
+        if (queued.has(child.id)) return;
         queued.add(child.id);
         removals = removals
             .then(() => pause(spacing))
             .then(() => removeChildSession(child))
-            .catch(() => {})
+            .catch((error) => {
+                note(
+                    `[magic-context] hidden child ${child.id} removal queue failed: ${errorText(error)}`,
+                );
+            })
             .finally(() => {
                 queued.delete(child.id);
             });
@@ -761,6 +777,7 @@ export async function createV2HiddenCompletionExecutor(
             model,
             created_at: Date.now(),
             title_reasserted: false,
+            directory: identity.directory,
             ...(owner === undefined ? {} : { owner }),
         };
         store.put(child);

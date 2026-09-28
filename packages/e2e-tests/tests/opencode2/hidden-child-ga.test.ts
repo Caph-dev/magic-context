@@ -108,7 +108,7 @@ test("OpenCode 2 hidden historian retires a child after a provider error and del
 
         const command = async (
             seq: number,
-            options: { temperature?: number; maxOutputTokens?: number; generation?: string } = {},
+            options: { temperature?: number; maxOutputTokens?: number; generation?: string; keepSubagents?: boolean; dreamer?: boolean } = {},
         ) => {
             const resultPath = join(host.cwd, `hidden-child-result-${seq}.json`);
             writeFileSync(
@@ -294,6 +294,36 @@ test("OpenCode 2 hidden historian retires a child after a provider error and del
         expect(
             host.mock.requests().filter((request) => request.body.model === "mock-model-user"),
         ).toHaveLength(0);
+
+        // A successful hidden child can serve later runs. When a new generation retires it,
+        // keep_subagents preserves its host session instead of deleting it.
+        const kept = await command(6, {
+            generation: "ga-proof-generation-5",
+            keepSubagents: true,
+        });
+        expect(kept.ok).toBe(true);
+        const next = await command(7, {
+            generation: "ga-proof-generation-6",
+            keepSubagents: true,
+        });
+        expect(next.ok).toBe(true);
+        expect(storedSession(storePath, kept.childID).exists).toBe(true);
+        const keptRoots = await client.session.list({ directory: host.cwd, parentID: null });
+        expect(keptRoots.data.some((session) => session.id === kept.childID)).toBe(true);
+
+        const dreamerFirst = await command(8, { dreamer: true });
+        expect(dreamerFirst.ok).toBe(true);
+        const dreamerSecond = await command(9, { dreamer: true });
+        expect(dreamerSecond.ok).toBe(true);
+        expect(dreamerSecond.childID).toBe(dreamerFirst.childID);
+        const dreamerThird = await command(10, {
+            dreamer: true,
+            generation: "ga-proof-generation-7",
+        });
+        expect(dreamerThird.ok).toBe(true);
+        await eventually(() => !storedSession(storePath, dreamerFirst.childID).exists);
+        const dreamerRoots = await client.session.list({ directory: host.cwd, parentID: null });
+        expect(dreamerRoots.data.some((session) => session.id === dreamerFirst.childID)).toBe(false);
     } catch (error) {
         console.error(host.stdout(), host.stderr(), JSON.stringify(host.mock.requests()));
         throw error;

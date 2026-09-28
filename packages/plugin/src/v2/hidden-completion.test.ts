@@ -210,7 +210,7 @@ async function setup(
     const interrupts: string[] = [];
     const requests: SessionContext[] = [];
     const removed: string[] = [];
-    const removals: Array<{ sessionID: string; owner?: HostServiceOwner }> = [];
+    const removals: Array<{ sessionID: string; owner?: HostServiceOwner; directory?: string }> = [];
     let nextID = 0;
     let failPrompt = false;
     let promptError: Error | undefined;
@@ -315,7 +315,11 @@ async function setup(
         // none either; the tests that cover cleanup opt the capability in.
         ...(capabilities.remove
             ? {
-                  async remove(input: { sessionID: string; owner?: HostServiceOwner }) {
+                  async remove(input: {
+                      sessionID: string;
+                      owner?: HostServiceOwner;
+                      directory?: string;
+                  }) {
                       removals.push(structuredClone(input));
                       if (removeError) throw removeError;
                       removed.push(input.sessionID);
@@ -869,7 +873,9 @@ describe("OpenCode 2 hidden child completion", () => {
             await close(state.executor, second, false);
 
             await eventually(() => state.removed.includes("child-1"));
-            expect(state.removals).toEqual([{ sessionID: "child-1", owner }]);
+            expect(state.removals).toEqual([
+                { sessionID: "child-1", owner, directory: "/project" },
+            ]);
         } finally {
             state.db.close();
         }
@@ -896,7 +902,11 @@ describe("OpenCode 2 hidden child completion", () => {
             await close(restarted, next, true);
 
             await eventually(() => state.removed.includes("child-1"));
-            expect(state.removals[0]).toEqual({ sessionID: "child-1", owner });
+            expect(state.removals[0]).toEqual({
+                sessionID: "child-1",
+                owner,
+                directory: "/project",
+            });
         } finally {
             state.db.close();
         }
@@ -920,7 +930,7 @@ describe("OpenCode 2 hidden child completion", () => {
             await close(state.executor, handle, false);
 
             await eventually(() => state.removals.length === 1);
-            expect(state.removals).toEqual([{ sessionID: "child-1" }]);
+            expect(state.removals).toEqual([{ sessionID: "child-1", directory: "/project" }]);
             expect(state.removed).toEqual([]);
             // Still recorded, so a later process inside a registered service retries it.
             expect(state.meta().retired_children.map((child) => child.id)).toEqual(["child-1"]);
@@ -931,16 +941,41 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
-    test("keeps a retired entry when deletion cannot reach the host", async () => {
-        const state = await setup("host-generation-1", { remove: true });
+    test("logs a missing removal route with the child id and retains it", async () => {
+        const logs: string[] = [];
+        const state = await setup("host-generation-1", { logs });
         try {
-            state.setRemoveError(new Error("connection refused"));
             state.setFailPrompt(true);
             const handle = await state.executor.open(run);
             await expect(state.executor.attempt(handle, request())).rejects.toThrow(
                 "provider unavailable",
             );
             await close(state.executor, handle, false);
+            await eventually(() =>
+                logs.some((line) => line.includes("host removal route unavailable")),
+            );
+            expect(logs).toContainEqual(expect.stringContaining("hidden child child-1"));
+            expect(state.meta().retired_children.map((child) => child.id)).toEqual(["child-1"]);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("keeps a retired entry when deletion cannot reach the host", async () => {
+        const logs: string[] = [];
+        const state = await setup("host-generation-1", { remove: true, logs });
+        try {
+            state.setRemoveError(new Error("Session not found (wrong directory)"));
+            state.setFailPrompt(true);
+            const handle = await state.executor.open(run);
+            await expect(state.executor.attempt(handle, request())).rejects.toThrow(
+                "provider unavailable",
+            );
+            await close(state.executor, handle, false);
+            await eventually(() =>
+                logs.some((line) => line.includes("Session not found (wrong directory)")),
+            );
+            expect(logs).toContainEqual(expect.stringContaining("hidden child child-1"));
             expect(state.meta().retired_children).toMatchObject([{ id: "child-1" }]);
 
             // A failed cleanup must not stop the next run from working.
