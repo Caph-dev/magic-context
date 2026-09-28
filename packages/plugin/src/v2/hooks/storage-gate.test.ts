@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, type readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -57,7 +57,7 @@ function thrownBy(run: () => unknown): unknown {
 }
 
 describe("createV2StorageGate", () => {
-    it("re-attempts a failed open at most once per interval and names the failure", () => {
+    it("re-attempts a failed open at most once per interval and names the failure", async () => {
         const clock = manualClock();
         let opens = 0;
         const reported: FailClosedReason[] = [];
@@ -70,7 +70,7 @@ describe("createV2StorageGate", () => {
             onUnavailable: (reason) => reported.push(reason),
         });
 
-        expect(gate.probe()).toBeUndefined();
+        expect(await gate.probe()).toBeUndefined();
         expect(opens).toBe(1);
 
         const first = thrownBy(() => gate.require());
@@ -84,12 +84,13 @@ describe("createV2StorageGate", () => {
 
         clock.advance(1);
         thrownBy(() => gate.require());
+        await gate.probe();
         expect(opens).toBe(2);
         // The same reason twice is reported once, so the console is not flooded.
         expect(reported).toEqual([{ kind: "storage_failure", cause: "disk I/O error" }]);
     });
 
-    it("returns the database and reports recovery once a later attempt opens it", () => {
+    it("returns the database and reports recovery once a later attempt opens it", async () => {
         const clock = manualClock();
         const database = openDatabase();
         let available = false;
@@ -105,10 +106,12 @@ describe("createV2StorageGate", () => {
             },
         });
 
-        expect(gate.probe()).toBeUndefined();
+        expect(await gate.probe()).toBeUndefined();
         available = true;
         clock.advance(V2_STORAGE_REOPEN_INTERVAL_MS);
 
+        thrownBy(() => gate.require());
+        await gate.probe();
         expect(gate.require()).toBe(database);
         expect(gate.current()).toBe(database);
         expect(gate.reason()).toBeNull();
@@ -169,7 +172,7 @@ describe("createV2StorageGate against a migration blocked by another live host",
         }
     }
 
-    it("refuses with the blocking PID, then migrates on the first attempt after the blocker is gone", () => {
+    it("refuses with the blocking PID, then migrates on the first attempt after the blocker is gone", async () => {
         const { dbPath, blocker } = blockedStore();
         const clock = manualClock();
         let opens = 0;
@@ -181,7 +184,7 @@ describe("createV2StorageGate against a migration blocked by another live host",
             },
         });
 
-        expect(gate.probe()).toBeUndefined();
+        expect(await gate.probe()).toBeUndefined();
         const refusal = thrownBy(() => gate.require()) as Error;
         expect(refusal.message).toContain(`OpenCode server (PID ${process.pid})`);
         expect(refusal.message).toContain(
@@ -195,6 +198,8 @@ describe("createV2StorageGate against a migration blocked by another live host",
         expect(opens).toBe(1);
 
         clock.advance(V2_STORAGE_REOPEN_INTERVAL_MS);
+        thrownBy(() => gate.require());
+        await gate.probe();
         const db: ContextDatabase = gate.require();
 
         expect(opens).toBe(2);
@@ -202,4 +207,43 @@ describe("createV2StorageGate against a migration blocked by another live host",
         expect(gate.reason()).toBeNull();
         expect(persistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
     });
+});
+
+test("storage gate returns before a slow synchronous opener and never piles up retries", async () => {
+    const clock = manualClock();
+    let release!: () => void;
+    let calls = 0;
+    const gate = createV2StorageGate({
+        now: clock.now,
+        open: () => {
+            calls++;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+            return new Promise<null>((resolve) => {
+                release = () => resolve(null);
+            });
+        },
+    });
+    const started = performance.now();
+    const first = gate.probe();
+    thrownBy(() => gate.require());
+    expect(performance.now() - started).toBeLessThan(40);
+    expect(calls).toBe(0);
+    await Promise.resolve();
+    clock.advance(60_000);
+    for (let i = 0; i < 100; i++) {
+        thrownBy(() => gate.require());
+        expect(gate.probe()).toBe(first);
+    }
+    expect(calls).toBe(1);
+    release();
+    await first;
+    clock.advance(V2_STORAGE_REOPEN_INTERVAL_MS - 1);
+    expect(await gate.probe()).toBeUndefined();
+    expect(calls).toBe(1);
+    clock.advance(1);
+    const next = gate.probe();
+    await Promise.resolve();
+    expect(calls).toBe(2);
+    release();
+    await next;
 });

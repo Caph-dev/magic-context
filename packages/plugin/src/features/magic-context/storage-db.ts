@@ -20,8 +20,10 @@ import { getErrorMessage } from "../../shared/error-message";
 import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
+    type AsyncProcessInspection,
     classifyProcessKind,
     inspectLivePiProcesses,
+    inspectProcessesAsync,
     isOwnRpcServerRecord,
     isPidAlive,
     isPidIdentityPlausible,
@@ -524,7 +526,10 @@ function classifyJunkDiscovery(
  * evidence is fail-closed because it could be a concurrent write or an I/O
  * permission problem.
  */
-export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscovery {
+export function inspectRpcServerDiscovery(
+    storageDir: string,
+    processes?: AsyncProcessInspection,
+): RpcServerDiscovery {
     const rpcRoot = join(storageDir, "rpc");
     let projectEntries: Dirent[];
     try {
@@ -582,12 +587,14 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
         // still holding an older one. Skipped before the liveness check so the file
         // is neither reported as a blocker nor deleted as stale.
         if (isOwnRpcServerRecord(record)) continue;
-        const liveness = isPidAlive(record.pid);
+        const liveness = processes ? processes.liveness(record.pid) : isPidAlive(record.pid);
         if (liveness === "dead") {
             staleFiles.push(portFile);
             continue;
         }
-        const evidence = readProcessProbeEvidence(record.pid);
+        const evidence = processes
+            ? processes.evidence(record.pid)
+            : readProcessProbeEvidence(record.pid);
         const identity = isPidIdentityPlausible(record, evidence);
         if (identity === "plausible") {
             pids.add(record.pid);
@@ -744,21 +751,32 @@ function enforceMigrationOnOpenGuard(
     dbPath: string,
     dbDir: string,
     latestSupportedVersion: number,
+    processes?: AsyncProcessInspection,
 ): boolean {
     const persistedVersion = getPersistedSchemaVersion(db);
     if (persistedVersion >= latestSupportedVersion) {
         lastMigrationOnOpenRefusal = null;
         return true;
     }
-    const discovery = inspectRpcServerDiscovery(dbDir);
-    const piDiscovery = inspectLivePiProcesses();
+    const discovery = inspectRpcServerDiscovery(dbDir, processes);
+    const piDiscovery = processes?.pi ?? inspectLivePiProcesses();
     const piPids = migrationBlockingPiPids(dbPath, discovery, piDiscovery.processIds);
     const serverProcesses =
         discovery.serverProcesses ??
         (discovery.state === "live"
             ? discovery.serverPids.map((pid) => ({ kind: "process" as const, pid }))
             : []);
-    const blockingProcesses = [...serverProcesses, ...piPids.map(createPiBlockingProcess)];
+    const blockingProcesses = [
+        ...serverProcesses,
+        ...piPids.map((pid) =>
+            processes
+                ? attachFailClosedBlockingProcessEvidence(
+                      { kind: "Pi", pid },
+                      processes.evidence(pid),
+                  )
+                : createPiBlockingProcess(pid),
+        ),
+    ];
     if (
         (discovery.state === "absent" ||
             discovery.state === "stale" ||
@@ -2504,7 +2522,13 @@ export async function openDatabaseAsync(
                 closeQuietly(db);
                 return null;
             }
-            if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
+            const processes =
+                getPersistedSchemaVersion(db) < latestSupportedVersion
+                    ? await inspectProcessesAsync()
+                    : undefined;
+            if (
+                !enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion, processes)
+            ) {
                 guardMs = performance.now() - guardStartedAt;
                 closeQuietly(db);
                 return null;

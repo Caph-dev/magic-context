@@ -19,7 +19,7 @@ import {
     registerNotificationSink,
 } from "./rpc-notifications";
 import {
-    isPidAlive,
+    inspectProcessesAsync,
     parseRpcPortFile,
     registerOwnRpcServerInstance,
     rpcPortDir,
@@ -176,7 +176,7 @@ export class MagicContextRpcServer {
         // supported: TUI discovery scans all live files and picks the most
         // recent instead of cross-wiring via one shared project file.
         try {
-            this.warnIfOtherLiveInstance();
+            void this.warnIfOtherLiveInstance();
             const dir = dirname(this.portFilePath);
             // The port file carries the RPC bearer token. The normal policy keeps
             // it owner-only; a trusted-group deployment explicitly delegates every
@@ -263,12 +263,14 @@ export class MagicContextRpcServer {
         this.unregisterOwnInstance = null;
     }
 
-    private warnIfOtherLiveInstance(): void {
+    private async warnIfOtherLiveInstance(): Promise<void> {
         try {
             for (const entry of readdirSync(this.portDir)) {
                 if (!entry.startsWith("port-") || !entry.endsWith(".json")) continue;
                 const record = parseRpcPortFile(readFileSync(`${this.portDir}/${entry}`, "utf-8"));
-                if (!record || record.pid === process.pid || !isPidAlive(record.pid)) continue;
+                if (!record || record.pid === process.pid) continue;
+                const processes = await inspectProcessesAsync();
+                if (processes.liveness(record.pid) !== "alive") continue;
                 log(
                     `[rpc] another Magic Context RPC server is active for this project (pid ${record.pid}, port ${record.port}); starting separate instance on a new port`,
                 );

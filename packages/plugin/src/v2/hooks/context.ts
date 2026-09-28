@@ -488,7 +488,12 @@ export async function registerContext(context: V2Context) {
             log(`[magic-context] v2 storage unavailable: ${message}`);
         },
     });
-    let db: ReturnType<typeof openDatabase> | undefined = storage.probe();
+    // Storage recovery must not hold the host's setup promise. Healthy local
+    // stores usually open immediately; slow discovery continues behind the gate.
+    let db: ReturnType<typeof openDatabase> | undefined = await Promise.race([
+        storage.probe(),
+        new Promise<undefined>((resolve) => setTimeout(resolve, 100)),
+    ]);
     const storageOpenedAtBoot = db !== undefined;
     let storageRecoveryAnnounced = false;
     const storageNoticeBySession = new Map<string, string>();
@@ -787,6 +792,9 @@ export async function registerContext(context: V2Context) {
     ): Promise<boolean> => {
         let unsafe = false;
         try {
+            // A turn may await the one in-flight recovery; unlike setup it needs
+            // durable state before transforming. Process discovery yields meanwhile.
+            await storage.probe();
             db = storage.require();
             getOrCreateSessionMeta(db, draft.sessionID);
             const reader = new V2StoreReader(
@@ -1467,6 +1475,13 @@ export async function registerContext(context: V2Context) {
         config,
         client: undefined,
         liveSessionState: rpcLiveSessionState,
+        getDatabase: () => {
+            try {
+                return storage.require();
+            } catch {
+                return null;
+            }
+        },
         rustModeModuleClient,
         hiddenCompletionExecutor: storageOpenedAtBoot
             ? hiddenCompletionExecutor

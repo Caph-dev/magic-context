@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -686,14 +686,18 @@ function readPosixParentPid(pid: number): number | null {
  * plugin runs. Bound the walk and stop on cycles so a broken parent map
  * cannot loop.
  */
-function collectAncestorPids(selfPid: number, parentByPid: Map<number, number>): Set<number> {
+function collectAncestorPids(
+    selfPid: number,
+    parentByPid: Map<number, number>,
+    probeParents = true,
+): Set<number> {
     const ancestors = new Set<number>();
     let current = selfPid;
     for (let depth = 0; depth < MAX_ANCESTOR_WALK_DEPTH; depth += 1) {
         let ppid: number | null = null;
         if (parentByPid.has(current)) {
             ppid = parentByPid.get(current) ?? null;
-        } else if (rpcIdentityPlatform !== "win32") {
+        } else if (rpcIdentityPlatform !== "win32" && probeParents) {
             ppid = readPosixParentPid(current);
             if (ppid == null && current === process.pid && process.ppid > 0) {
                 ppid = process.ppid;
@@ -710,8 +714,11 @@ function collectAncestorPids(selfPid: number, parentByPid: Map<number, number>):
     return ancestors;
 }
 
-function classifyLivePiSnapshot(snapshot: ProcessSnapshot): PiProcessDiscovery {
-    const ancestors = collectAncestorPids(process.pid, snapshot.parentByPid);
+function classifyLivePiSnapshot(
+    snapshot: ProcessSnapshot,
+    probeParents = true,
+): PiProcessDiscovery {
+    const ancestors = collectAncestorPids(process.pid, snapshot.parentByPid, probeParents);
     const processIds = new Set<number>();
     const inconclusivePids = new Set<number>();
     const skippedAncestorPids: number[] = [];
@@ -847,4 +854,121 @@ export function parseRpcPortFile(content: string, fallbackPid = 0): RpcPortFileR
 
 function isValidPort(port: number): boolean {
     return Number.isInteger(port) && port > 0 && port <= 65535;
+}
+
+/** One bounded, shared process scan for asynchronous storage opens. */
+export interface AsyncProcessInspection {
+    pi: PiProcessDiscovery;
+    evidence(pid: number): ProcessProbeEvidence;
+    liveness(pid: number): PidLiveness;
+}
+
+function execProcessListAsync(file: string, args: string[], timeout: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+        execFile(
+            file,
+            args,
+            { encoding: "utf8", timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+            (error, stdout) => {
+                if (error) reject(error);
+                else resolve(stdout);
+            },
+        );
+    });
+}
+
+let asyncProcessExec = execProcessListAsync;
+let asyncInspection: Promise<AsyncProcessInspection> | undefined;
+let asyncInspectionExpires = 0;
+let lastAsyncSnapshot: ProcessSnapshot | null = null;
+
+/** Inject only the asynchronous transport; legacy synchronous probes stay isolated. */
+export function __setAsyncProcessProbeForTests(probe?: typeof execProcessListAsync): void {
+    asyncProcessExec = probe ?? execProcessListAsync;
+    asyncInspection = undefined;
+    asyncInspectionExpires = 0;
+    lastAsyncSnapshot = null;
+}
+
+export function inspectProcessesAsync(): Promise<AsyncProcessInspection> {
+    if (asyncInspection && rpcIdentityNowMs() < asyncInspectionExpires) return asyncInspection;
+    asyncInspectionExpires = Number.POSITIVE_INFINITY;
+    asyncInspection = (async () => {
+        let snapshot: ProcessSnapshot | null = null;
+        try {
+            if (rpcIdentityPlatform === "win32") {
+                try {
+                    const output = await asyncProcessExec(
+                        "powershell",
+                        ["-NoProfile", "-Command", WINDOWS_CIM_COMMAND],
+                        WINDOWS_CIM_PROBE_TIMEOUT_MS,
+                    );
+                    const facts = parseWindowsCimOutput(output);
+                    if (facts) snapshot = snapshotFromFacts(facts, "cim");
+                } catch {
+                    /* tasklist is the bounded fallback when CIM is unavailable. */
+                }
+                if (!snapshot) {
+                    const entries = parseTasklistOutput(
+                        await asyncProcessExec("tasklist", ["/FO", "CSV"], PS_PROBE_TIMEOUT_MS),
+                    );
+                    if (entries)
+                        snapshot = snapshotFromFacts(
+                            entries.map(({ pid, command }) => ({
+                                pid,
+                                parentPid: null,
+                                commandLine: null,
+                                imageName: command,
+                                startTime: null,
+                            })),
+                            "tasklist",
+                        );
+                }
+            } else {
+                const output = await asyncProcessExec(
+                    "ps",
+                    ["-axo", "pid=,ppid=,lstart=,command="],
+                    PS_PROBE_TIMEOUT_MS,
+                );
+                const facts: ProcessFacts[] = [];
+                for (const line of output.split(/\r?\n/)) {
+                    const match =
+                        /^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+(.+)$/.exec(
+                            line,
+                        );
+                    if (!match) continue;
+                    const startTime = Date.parse(match[3]);
+                    facts.push({
+                        pid: Number(match[1]),
+                        parentPid: Number(match[2]),
+                        commandLine: match[4],
+                        imageName: null,
+                        startTime: Number.isFinite(startTime) ? startTime : null,
+                    });
+                }
+                snapshot = facts.length > 0 ? snapshotFromFacts(facts, "ps") : null;
+            }
+        } catch {
+            /* Missing process evidence is inconclusive, never proof of death. */
+        }
+        // A timed-out refresh cannot prove that a process blocking migration has
+        // exited. Keep its evidence until a successful scan can establish death.
+        const fresh = snapshot !== null;
+        if (snapshot) lastAsyncSnapshot = snapshot;
+        else snapshot = lastAsyncSnapshot;
+        const byPid = new Map(snapshot?.facts.map((fact) => [fact.pid, fact]));
+        return {
+            pi: snapshot
+                ? classifyLivePiSnapshot(snapshot, false)
+                : { state: "unreadable", processIds: [] },
+            evidence: (pid: number) => ({
+                startTime: byPid.get(pid)?.startTime ?? null,
+                commandLine: byPid.get(pid)?.commandLine ?? byPid.get(pid)?.imageName ?? null,
+            }),
+            liveness: (pid: number) => (byPid.has(pid) ? "alive" : fresh ? "dead" : "inconclusive"),
+        } satisfies AsyncProcessInspection;
+    })().finally(() => {
+        asyncInspectionExpires = rpcIdentityNowMs() + WINDOWS_PROCESS_SNAPSHOT_TTL_MS;
+    });
+    return asyncInspection;
 }

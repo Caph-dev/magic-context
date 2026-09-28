@@ -46,7 +46,10 @@ function createTestDb(): Database {
 
 type TestRpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
-function registeredRpcMethods(debugRpc: boolean): Map<string, TestRpcHandler> {
+function registeredRpcMethods(
+    debugRpc: boolean,
+    getDatabase?: () => Database | null,
+): Map<string, TestRpcHandler> {
     const handlers = new Map<string, TestRpcHandler>();
     const rpcServer = {
         handle(method: string, handler: TestRpcHandler) {
@@ -58,6 +61,7 @@ function registeredRpcMethods(debugRpc: boolean): Map<string, TestRpcHandler> {
         config: MagicContextConfigSchema.parse({ debug_rpc: debugRpc }),
         client: {},
         liveSessionState: createLiveSessionState(),
+        getDatabase,
     });
     return handlers;
 }
@@ -1155,4 +1159,16 @@ describe("buildStatusDetail — Rust host paths", () => {
             closeQuietly(db);
         }
     });
+});
+
+test("sidebar uses the host storage gate instead of reopening a refused database", async () => {
+    let calls = 0;
+    const handlers = registeredRpcMethods(false, () => {
+        calls++;
+        return null;
+    });
+    expect(await handlers.get("sidebar-snapshot")!({ sessionId: "blocked" })).toEqual({
+        error: "unavailable",
+    });
+    expect(calls).toBe(1);
 });
