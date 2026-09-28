@@ -3846,6 +3846,8 @@ pub struct McHandler {
     #[cfg(test)]
     transform_historian_followup_budget: Mutex<Option<Duration>>,
     #[cfg(test)]
+    transform_historian_wait_budgets: Mutex<Vec<Duration>>,
+    #[cfg(test)]
     wrapup_operation_budget: Mutex<Option<Duration>>,
     #[cfg(test)]
     unknown_module_retry_delay: Mutex<Option<Duration>>,
@@ -4473,6 +4475,8 @@ impl McHandler {
             #[cfg(test)]
             transform_historian_followup_budget: Mutex::new(None),
             #[cfg(test)]
+            transform_historian_wait_budgets: Mutex::new(Vec::new()),
+            #[cfg(test)]
             wrapup_operation_budget: Mutex::new(None),
             #[cfg(test)]
             unknown_module_retry_delay: Mutex::new(None),
@@ -4830,6 +4834,8 @@ impl McHandler {
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
             transform_historian_followup_budget: Mutex::new(None),
+            #[cfg(test)]
+            transform_historian_wait_budgets: Mutex::new(Vec::new()),
             wrapup_operation_budget: Mutex::new(None),
             unknown_module_retry_delay: Mutex::new(None),
             status_snapshot_hook: Mutex::new(None),
@@ -7125,6 +7131,16 @@ impl McHandler {
         task: HistorianFiringTask,
         wait_budget: Duration,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
+        #[cfg(test)]
+        assert!(
+            wait_budget <= self.transform_historian_followup_budget(),
+            "historian wait budget must remain within the configured follow-up budget"
+        );
+        #[cfg(test)]
+        self.transform_historian_wait_budgets
+            .lock()
+            .expect("transform historian wait budgets mutex")
+            .push(wait_budget);
         let factory = Arc::clone(&self.producer_factory);
         let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
         let wait_started_at = Instant::now();
@@ -37659,18 +37675,34 @@ mod tests {
             .expect("transform historian follow-up budget mutex") = Some(Duration::from_secs(1));
         let messages = big_messages();
 
-        let started_at = Instant::now();
+        let budget = Duration::from_secs(1);
         let first = call_transform_with_usage(&handler, messages.clone(), 48_000, 50_000).await;
         assert!(first["action"].is_string());
         assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
-        assert!(started_at.elapsed() >= Duration::from_secs(1));
-        assert!(started_at.elapsed() < Duration::from_secs(5));
+        {
+            let wait_budgets = handler
+                .transform_historian_wait_budgets
+                .lock()
+                .expect("transform historian wait budgets mutex");
+            assert_eq!(wait_budgets.len(), 1, "the first transform waits once");
+            assert!(
+                wait_budgets[0] <= budget,
+                "the stuck historian wait must not exceed its configured follow-up budget"
+            );
+        }
 
-        let retry_started_at = Instant::now();
         let retry = call_transform_with_usage(&handler, messages, 48_000, 50_000).await;
         assert!(retry["action"].is_string());
-        assert!(retry_started_at.elapsed() < Duration::from_secs(5));
         assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            handler
+                .transform_historian_wait_budgets
+                .lock()
+                .expect("transform historian wait budgets mutex")
+                .len(),
+            1,
+            "retrying must not wait on or restart the stuck historian"
+        );
 
         producer.block_output.store(false, Ordering::SeqCst);
         producer.notify.notify_waiters();
