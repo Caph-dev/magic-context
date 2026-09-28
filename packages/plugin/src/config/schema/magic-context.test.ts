@@ -38,7 +38,7 @@ describe("MagicContextConfigSchema", () => {
                     retrieval_count_promotion_threshold: 3,
                 },
                 todowrite: {
-                    enabled: true,
+                    enabled: false,
                     overlay: true,
                 },
             });
@@ -48,6 +48,21 @@ describe("MagicContextConfigSchema", () => {
             expect(result.pi).toBeUndefined();
             expect(result.mural).toEqual({ enabled: false });
         });
+    });
+
+    it("defaults todowrite off but honors explicit enablement and disablement", () => {
+        expect(MagicContextConfigSchema.parse({}).todowrite).toEqual({
+            enabled: false,
+            overlay: true,
+        });
+        expect(MagicContextConfigSchema.parse({ todowrite: {} }).todowrite.enabled).toBe(false);
+        expect(MagicContextConfigSchema.parse({ todowrite: { enabled: true } }).todowrite).toEqual({
+            enabled: true,
+            overlay: true,
+        });
+        expect(
+            MagicContextConfigSchema.parse({ todowrite: { enabled: false } }).todowrite.enabled,
+        ).toBe(false);
     });
 
     describe("budget configuration", () => {

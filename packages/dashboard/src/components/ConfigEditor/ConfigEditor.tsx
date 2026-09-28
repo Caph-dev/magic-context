@@ -1797,7 +1797,7 @@ function ConfigForm(props: {
               (getNestedValue(formData(), "todowrite") as
                 | { enabled?: boolean; overlay?: boolean }
                 | undefined) ?? {};
-            const todowriteEnabled = () => todowrite().enabled ?? true;
+            const todowriteEnabled = () => todowrite().enabled ?? false;
             const todowriteOverlay = () => todowrite().overlay ?? true;
             const setTodowrite = (patch: Record<string, unknown>) =>
               handleFieldChange("todowrite", { ...todowrite(), ...patch });

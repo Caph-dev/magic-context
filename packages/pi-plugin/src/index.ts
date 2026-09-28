@@ -537,6 +537,23 @@ export function resetClaimedProtectedTagsDeprecationNoticeForTesting(): void {
 	protectedTagsDeprecationClaimed = false;
 }
 
+export function registerConfiguredTodoLifecycle(
+	pi: ExtensionAPI,
+	options: {
+		configured: boolean;
+		overlay: boolean;
+		readLastTodoState: (sessionId: string) => string | null | undefined;
+	},
+): TodoOverlayUpdater | undefined {
+	if (!options.configured) return undefined;
+	registerTodoStateLifecycle(pi, {
+		readLastTodoState: options.readLastTodoState,
+	});
+	return options.overlay
+		? registerTodoOverlay(pi, { readLastTodoState: options.readLastTodoState })
+		: undefined;
+}
+
 export const __test = {
 	logPiConfigLoad,
 	resetLoggedPiConfigDirs(): void {
@@ -1368,6 +1385,7 @@ async function startPiMagicContextRuntime(
 		language: cfg.language,
 		autoSearch: auto,
 		resolveForProject: resolveContextOptionsForProject,
+		todowriteEnabled: cfg.todowrite.enabled,
 		compactionOff,
 		allowHomeProject: cfg.allow_home_project,
 		// Automatic history embedding: silent (no timeline messages) and not
@@ -1538,9 +1556,9 @@ async function startPiMagicContextRuntime(
 		});
 	}
 	registerPiDroppedInputGuard(pi);
-	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
+	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled;
 	const todowriteOverlayEnabled =
-		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
+		todowriteEnabled && bootProjectDeps.config.todowrite.overlay;
 
 	// Register the agent-facing tools. Reuses the same business logic
 	// the OpenCode plugin uses (insertMemory, unifiedSearch, addNote, …)
@@ -1635,14 +1653,11 @@ async function startPiMagicContextRuntime(
 
 	const readLastTodoState = (sessionId: string) =>
 		getOrCreateSessionMeta(db, sessionId).lastTodoState;
-	if (todowriteEnabled) {
-		registerTodoStateLifecycle(pi, { readLastTodoState });
-	}
-	const todoOverlay = todowriteOverlayEnabled
-		? registerTodoOverlay(pi, {
-				readLastTodoState,
-			})
-		: undefined;
+	const todoOverlay = registerConfiguredTodoLifecycle(pi, {
+		configured: todowriteEnabled,
+		overlay: bootProjectDeps.config.todowrite.overlay,
+		readLastTodoState,
+	});
 	info(
 		todowriteOverlayEnabled
 			? "registered todowrite overlay"

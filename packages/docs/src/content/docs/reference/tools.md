@@ -5,7 +5,7 @@ description: What Magic Context tools your agent calls mean in transcripts and h
 
 Magic Context registers tools for your agent, not for you. You will see `ctx_reduce`, `ctx_search`, and others in transcripts when the model trims context or looks something up. This page explains each tool, when the agent tends to use it, and how to read typical results.
 
-For reduction behavior see [Context reduction](/concepts/context-reduction/). For durable facts vs session notes see [Memory](/concepts/memory/). Tool registration follows the active mode: `compaction.enabled: false` removes only `ctx_reduce`; `ctx_expand`, `ctx_note`, `ctx_search`, and `ctx_memory` keep their normal gates. With `memory.enabled: false`, `ctx_memory` is omitted while `ctx_search` still covers conversation and enabled git-commit sources. Pi's `todowrite` registration is controlled separately by `todowrite.enabled`.
+For reduction behavior see [Context reduction](/concepts/context-reduction/). For durable facts vs session notes see [Memory](/concepts/memory/). Tool registration follows the active mode: `compaction.enabled: false` removes only `ctx_reduce`; `ctx_expand`, `ctx_note`, `ctx_search`, and `ctx_memory` keep their normal gates. With `memory.enabled: false`, `ctx_memory` is omitted while `ctx_search` still covers conversation and enabled git-commit sources. Pi's `todowrite` tool, `/todos` command, and overlay are off by default; set `todowrite.enabled: true` to opt in. The overlay defaults to on when the tool is enabled.
 
 ## ctx_reduce
 

@@ -2416,15 +2416,15 @@
     },
     "todowrite": {
       "default": {
-        "enabled": true,
+        "enabled": false,
         "overlay": true
       },
       "description": "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
       "type": "object",
       "properties": {
         "enabled": {
-          "default": true,
-          "description": "Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there.",
+          "default": false,
+          "description": "Pi only: off by default. Set todowrite.enabled=true to register Magic Context's todowrite task-list tool and /todos command. OpenCode ships its own built-in todowrite; this setting has no effect there.",
           "type": "boolean"
         },
         "overlay": {

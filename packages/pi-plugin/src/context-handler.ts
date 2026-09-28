@@ -1253,6 +1253,8 @@ export interface PiContextHandlerOptions {
 	 * cwd. Tests omit it (the static options are used directly).
 	 */
 	resolveForProject?: (projectDir: string) => PiContextHandlerOptions;
+	/** Whether the resolved Pi project config enables the todowrite tool. */
+	todowriteEnabled?: boolean;
 	/** Boot-resolved compaction-off flag. It remains fixed for this Pi process. */
 	compactionOff?: boolean;
 	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
@@ -3520,6 +3522,7 @@ export function registerPiContextHandler(
 			try {
 				const sessionMetaForTodo = sessionMeta;
 				if (
+					options.todowriteEnabled === true &&
 					!options.compactionOff &&
 					!sessionMetaForTodo.isSubagent &&
 					sessionMetaForTodo.lastTodoState !== ""

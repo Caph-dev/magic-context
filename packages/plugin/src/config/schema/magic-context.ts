@@ -1388,9 +1388,9 @@ export const MagicContextConfigSchema = z
             .object({
                 enabled: z
                     .boolean()
-                    .default(true)
+                    .default(false)
                     .describe(
-                        "Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there.",
+                        "Pi only: off by default. Set todowrite.enabled=true to register Magic Context's todowrite task-list tool and /todos command. OpenCode ships its own built-in todowrite; this setting has no effect there.",
                     ),
                 overlay: z
                     .boolean()
@@ -1399,7 +1399,7 @@ export const MagicContextConfigSchema = z
                         "Pi only: show the persistent todo overlay above the editor while tasks are active.",
                     ),
             })
-            .default({ enabled: true, overlay: true })
+            .default({ enabled: false, overlay: true })
             .describe(
                 "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
             ),
