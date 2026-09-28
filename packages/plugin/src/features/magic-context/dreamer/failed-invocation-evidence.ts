@@ -4,6 +4,12 @@ import { log } from "../../../shared/logger";
 
 /** Bound on the read: the child may be wedged, and the ledger row is best-effort. */
 const FAILED_CHILD_READ_TIMEOUT_MS = 5_000;
+/**
+ * Messages read back from a failed child. A dreamer child is capped at 60 agent
+ * steps (two messages each at most, plus the prompt), so this covers a whole
+ * run while still bounding the host's read.
+ */
+const FAILED_CHILD_MESSAGE_LIMIT = 200;
 
 /**
  * Read an OpenCode 1 child session's messages after its dreamer batch failed, so
@@ -23,10 +29,13 @@ export async function readFailedChildMessages(
     if (!client || !sessionId) return undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-        // No `limit`: a long tool loop can exceed the 100 messages the success path
-        // reads for its final text, and every assistant message carries tokens.
+        // Wider than the 100 messages the success path reads for its final text:
+        // every assistant message carries tokens, and a long tool loop exceeds 100.
         const response = await Promise.race([
-            client.session.messages({ path: { id: sessionId }, query: { directory } }),
+            client.session.messages({
+                path: { id: sessionId },
+                query: { directory, limit: FAILED_CHILD_MESSAGE_LIMIT },
+            }),
             new Promise<null>((resolve) => {
                 timer = setTimeout(() => resolve(null), FAILED_CHILD_READ_TIMEOUT_MS);
             }),

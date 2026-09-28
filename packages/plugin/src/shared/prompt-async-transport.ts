@@ -19,6 +19,9 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000;
  * lost. The host creates the user message and marks the session busy right after
  * accepting `prompt_async`, so this only has to cover a slow or contended host. */
 const DEFAULT_START_GRACE_MS = 30_000;
+/** The wait only looks at the newest messages: the ones this send appended and
+ * the ones just before it. The host returns the most recent `limit` messages. */
+const MESSAGE_WINDOW = 20;
 
 export interface PromptAsyncWaitOptions {
     pollIntervalMs?: number;
@@ -133,7 +136,7 @@ async function readMessages(
 ): Promise<unknown[]> {
     const response = await session.messages?.({
         path: { id: sessionId },
-        ...(directory ? { query: { directory } } : {}),
+        query: { ...(directory ? { directory } : {}), limit: MESSAGE_WINDOW },
         ...(signal ? { signal } : {}),
     });
     const data = unwrapData(response);
