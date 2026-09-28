@@ -123,6 +123,7 @@ import {
     listDanglingCompartmentBoundaries,
 } from "./doctor-compartment-boundaries";
 import { reportUnresolvedHarnessRelabel } from "./doctor-harness-relabel";
+import { cleanupRetiredHiddenChildren } from "./doctor-hidden-children";
 import { clearPluginCache } from "./doctor-opencode-cache";
 import { checkPluginDuplicates } from "./doctor-opencode-plugin-duplicates";
 import {
@@ -1124,6 +1125,21 @@ export async function runDoctor(
     else fail(openCodeDbCheck.message);
 
     if (openCodeDbCheck.ok) {
+        if (storeGeneration === "v2") {
+            try {
+                const cleanup = cleanupRetiredHiddenChildren({
+                    contextDbPath: authorityDbPath,
+                    hostDbPath: openCodeDbResolution.path,
+                    fix: options.fix,
+                    report: (line) => log.info(line),
+                });
+                fixed += cleanup.deleted;
+            } catch (error) {
+                fail(
+                    `Retired hidden-child cleanup refused: ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
+        }
         let markerDb: Database | null = null;
         try {
             markerDb = new Database(openCodeDbResolution.path, {

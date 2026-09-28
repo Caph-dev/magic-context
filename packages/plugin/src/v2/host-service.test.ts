@@ -2,11 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { Database } from "../shared/sqlite";
 import {
     discoverOwnHostService,
     type HostServiceOwner,
     HostServiceUnavailable,
     hostServiceOwner,
+    lookupHiddenChildDirectory,
     readServiceRegistrations,
     removeHostSession,
     resolveOwnerHostService,
@@ -284,7 +287,7 @@ describe("OpenCode 2 host session removal", () => {
         ]);
     });
 
-    test("reports a directory-scoped 404 instead of forgetting a possibly live child", async () => {
+    test("treats a 404 in the child's recorded directory as already gone", async () => {
         await withStub(404, async (url, fetchSession) => {
             const { env, dir, cleanup } = stateHome([{ channel: "latest", url, pid: process.pid }]);
             try {
@@ -294,12 +297,59 @@ describe("OpenCode 2 host session removal", () => {
                         { registration: join(dir, "service.json"), pid: process.pid },
                         env,
                         fetchSession,
+                        "/child/own/directory",
                     ),
-                ).rejects.toThrow("404");
+                ).resolves.toBeUndefined();
             } finally {
                 cleanup();
             }
         });
+    });
+
+    test("looks up only marked legacy children in the private v2 store", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-legacy-host-"));
+        const env = { XDG_DATA_HOME: root, OPENCODE_DB: "opencode2.db" } as NodeJS.ProcessEnv;
+        const path = join(root, "opencode", "opencode2.db");
+        mkdirSync(join(root, "opencode"));
+        const db = new Database(path);
+        try {
+            db.exec("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, metadata TEXT)");
+            db.prepare("INSERT INTO session_v2 VALUES (?, ?, ?)").run(
+                "hidden",
+                "C:\\own\\chat",
+                '{"magic_context":"hidden-run"}',
+            );
+            db.prepare("INSERT INTO session_v2 VALUES (?, ?, ?)").run("user", "/user", "{}");
+            expect(lookupHiddenChildDirectory("hidden", env)).toBe("C:\\own\\chat");
+            expect(lookupHiddenChildDirectory("gone", env)).toBeNull();
+            expect(() => lookupHiddenChildDirectory("user", env)).toThrow("not marked");
+        } finally {
+            db.close();
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("recovers a legacy child's directory before deleting, or accepts a missing row", async () => {
+        const seen = await withStub(204, async (url, fetchSession) => {
+            const { env, dir, cleanup } = stateHome([{ url, pid: process.pid }]);
+            try {
+                const owner = { registration: join(dir, "service.json"), pid: process.pid };
+                await removeHostSession(
+                    "legacy",
+                    owner,
+                    env,
+                    fetchSession,
+                    undefined,
+                    () => "C:\\own\\chat",
+                );
+                await removeHostSession("missing", owner, env, fetchSession, undefined, () => null);
+            } finally {
+                cleanup();
+            }
+        });
+        expect(seen.map((request) => request.path)).toEqual([
+            "/api/session/legacy?directory=C%3A%5Cown%5Cchat",
+        ]);
     });
 
     test("reports a refusal so the caller can leave the entry for a later sweep", async () => {
@@ -312,6 +362,7 @@ describe("OpenCode 2 host session removal", () => {
                         { registration: join(dir, "service.json"), pid: process.pid },
                         env,
                         fetchSession,
+                        "/verified-child-directory",
                     ),
                 ).rejects.toThrow("401");
             } finally {

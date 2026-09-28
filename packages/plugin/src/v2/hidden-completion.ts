@@ -58,6 +58,8 @@ interface PersistedHiddenChild {
      * entry. Absent on rows written before this was recorded, which count as never settled.
      */
     ever_settled?: boolean;
+    /** Number of boot attempts at resolving a legacy entry without its creation directory. */
+    cleanup_attempts?: number;
 }
 
 interface RetiredHiddenChild extends PersistedHiddenChild {
@@ -171,6 +173,7 @@ const REMOVAL_SPACING_MS = 250;
  * children) and count toward the same cap; evicting one only forgets it, its session stays.
  */
 const RETIRED_CHILDREN_LIMIT = 200;
+const LEGACY_CLEANUP_BOOT_LIMIT = 5;
 
 export function hiddenChildrenMetaKey(projectIdentity: string): string {
     return `${META_PREFIX}${projectIdentity}`;
@@ -214,7 +217,9 @@ function isPersistedChild(value: unknown): value is PersistedHiddenChild {
         typeof child.title_reasserted === "boolean" &&
         (child.ever_settled === undefined || typeof child.ever_settled === "boolean") &&
         (child.owner === undefined || isOwner(child.owner)) &&
-        (child.directory === undefined || typeof child.directory === "string")
+        (child.directory === undefined || typeof child.directory === "string") &&
+        (child.cleanup_attempts === undefined ||
+            (Number.isInteger(child.cleanup_attempts) && child.cleanup_attempts >= 0))
     );
 }
 
@@ -336,6 +341,15 @@ class HiddenChildStateStore {
             const excess = state.retired_children.length - RETIRED_CHILDREN_LIMIT;
             if (excess > 0) state.retired_children.splice(0, excess);
             delete state.active[child.role];
+        });
+    }
+
+    recordLegacyFailure(id: string): number {
+        return this.mutate((state) => {
+            const child = state.retired_children.find((entry) => entry.id === id);
+            if (!child) return 0;
+            child.cleanup_attempts = (child.cleanup_attempts ?? 0) + 1;
+            return child.cleanup_attempts;
         });
     }
 
@@ -671,12 +685,18 @@ export async function createV2HiddenCompletionExecutor(
             (timer as unknown as { unref?: () => void }).unref?.();
         });
 
-    const removeChildSession = async (child: RetirableChild): Promise<void> => {
+    const noteUnbound = () => {
+        if (declareHostLimitation("hidden_cleanup_unbound")) {
+            note(
+                `[magic-context] ${store.read().retired_children.length} retired hidden children cannot be deleted: no owner-bound host removal route; run \`doctor --fix\` with OpenCode closed`,
+            );
+        }
+    };
+
+    const removeChildSession = async (child: RetirableChild, fromBoot: boolean): Promise<void> => {
         const remove = host.remove;
         if (!remove) {
-            note(
-                `[magic-context] hidden child ${child.id} cannot be deleted: host removal route unavailable`,
-            );
+            noteUnbound();
             return;
         }
         try {
@@ -690,13 +710,20 @@ export async function createV2HiddenCompletionExecutor(
             // the entry so a later sweep retries it; cleanup is never allowed to fail the hidden
             // run that triggered it.
             if (error instanceof HostServiceUnavailable) {
-                // The user-facing limitation is shared, but every stranded session needs its
-                // own id in the log so operators can identify the backlog.
-                declareHostLimitation("hidden_cleanup_unbound");
-                note(
-                    `[magic-context] hidden child ${child.id} has no owner-bound deletion route and stays recorded for retry: ${errorText(error)}`,
-                );
+                // A server without host service registration cannot delete any retired child.
+                // Report the backlog and offline remedy once instead of logging each child.
+                noteUnbound();
                 return;
+            }
+            if (fromBoot && child.directory === undefined) {
+                const attempts = store.recordLegacyFailure(child.id);
+                if (attempts >= LEGACY_CLEANUP_BOOT_LIMIT) {
+                    store.prune(child.id);
+                    note(
+                        `[magic-context] legacy hidden child ${child.id} dropped after ${attempts} failed boot cleanup attempts: ${errorText(error)}`,
+                    );
+                    return;
+                }
             }
             note(
                 `[magic-context] hidden child ${child.id} could not be deleted, left for a later sweep: ${errorText(error)}`,
@@ -716,12 +743,12 @@ export async function createV2HiddenCompletionExecutor(
      * Queues a retired child's session for deletion. Returns immediately: a caller in the middle of
      * a hidden run must not wait on host cleanup.
      */
-    const scheduleRemoval = (child: RetirableChild): void => {
+    const scheduleRemoval = (child: RetirableChild, fromBoot = false): void => {
         if (queued.has(child.id)) return;
         queued.add(child.id);
         removals = removals
             .then(() => pause(spacing))
-            .then(() => removeChildSession(child))
+            .then(() => removeChildSession(child, fromBoot))
             .catch((error) => {
                 note(
                     `[magic-context] hidden child ${child.id} removal queue failed: ${errorText(error)}`,
@@ -790,7 +817,7 @@ export async function createV2HiddenCompletionExecutor(
     // Children the current setting keeps are skipped; turning `keep_subagents` off later lets the
     // next boot delete them, as the OpenCode 1 sweep does.
     for (const child of persisted.retired_children) {
-        if (!keptUnderRetention(child)) scheduleRemoval(child);
+        if (!keptUnderRetention(child)) scheduleRemoval(child, true);
     }
 
     const acquireRole = async (role: HiddenChildRole): Promise<() => void> => {

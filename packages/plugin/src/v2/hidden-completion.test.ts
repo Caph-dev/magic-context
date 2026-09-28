@@ -363,7 +363,12 @@ async function setup(
                         .get(hiddenChildrenMetaKey("/project")) as { value: string }
                 ).value,
             ) as {
-                retired_children: Array<{ id: string; reason: string; ever_settled?: boolean }>;
+                retired_children: Array<{
+                    id: string;
+                    reason: string;
+                    ever_settled?: boolean;
+                    cleanup_attempts?: number;
+                }>;
             },
         seedRetired(children: Array<ReturnType<typeof retiredChild> & { ever_settled?: boolean }>) {
             db.prepare(
@@ -941,7 +946,8 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
-    test("logs a missing removal route with the child id and retains it", async () => {
+    test("logs a missing removal route once with backlog count and offline remedy", async () => {
+        __resetHostLimitations();
         const logs: string[] = [];
         const state = await setup("host-generation-1", { logs });
         try {
@@ -951,12 +957,18 @@ describe("OpenCode 2 hidden child completion", () => {
                 "provider unavailable",
             );
             await close(state.executor, handle, false);
-            await eventually(() =>
-                logs.some((line) => line.includes("host removal route unavailable")),
-            );
-            expect(logs).toContainEqual(expect.stringContaining("hidden child child-1"));
-            expect(state.meta().retired_children.map((child) => child.id)).toEqual(["child-1"]);
+            await eventually(() => logs.some((line) => line.includes("doctor --fix")));
+            state.seedRetired([retiredChild("old-1", 1), retiredChild("old-2", 2)]);
+            await state.create();
+            await settleRemovals();
+            expect(logs).toEqual([expect.stringContaining("1 retired hidden children")]);
+            expect(logs[0]).toContain("with OpenCode closed");
+            expect(state.meta().retired_children.map((child) => child.id)).toEqual([
+                "old-1",
+                "old-2",
+            ]);
         } finally {
+            __resetHostLimitations();
             state.db.close();
         }
     });
@@ -986,6 +998,30 @@ describe("OpenCode 2 hidden child completion", () => {
             await close(state.executor, next, true);
             expect(state.removed).toEqual([]);
             expect(state.meta().retired_children).toMatchObject([{ id: "child-1" }]);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("bounds unresolved legacy children to five failed boot attempts", async () => {
+        const logs: string[] = [];
+        const state = await setup("host-generation-1", { remove: true, logs });
+        try {
+            state.seedRetired([retiredChild("legacy", 1)]);
+            state.setRemoveError(new Error("host lookup failed"));
+            for (let boot = 1; boot <= 5; boot++) {
+                const before = state.removals.length;
+                await state.create();
+                await eventually(() => state.removals.length > before);
+                await settleRemovals();
+                expect(state.meta().retired_children[0]?.cleanup_attempts).toBe(
+                    boot === 5 ? undefined : boot,
+                );
+            }
+            expect(state.meta().retired_children).toEqual([]);
+            expect(logs.filter((line) => line.includes("dropped after"))).toEqual([
+                expect.stringContaining("legacy hidden child legacy dropped after 5"),
+            ]);
         } finally {
             state.db.close();
         }

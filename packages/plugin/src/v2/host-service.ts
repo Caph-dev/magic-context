@@ -1,6 +1,9 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { getDataDir } from "../shared/data-path";
+import { Database } from "../shared/sqlite";
+import { gaDatabasePath } from "./store-reader";
 
 /**
  * Reaching the OpenCode 2 host's own HTTP API from inside a plugin.
@@ -205,15 +208,61 @@ export function resolveOwnerHostService(
  * up. This is the same route the OpenCode client's session removal calls, so it inherits all of
  * that.
  */
+export function lookupHiddenChildDirectory(
+    sessionID: string,
+    env: NodeJS.ProcessEnv = process.env,
+): string | null {
+    const path = gaDatabasePath(getDataDirFromEnv(env), serviceChannel(env), env);
+    const db = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+        const row = db
+            .prepare("SELECT directory, metadata FROM session_v2 WHERE id = ?")
+            .get(sessionID) as { directory: string; metadata: string | null } | undefined;
+        if (!row) return null;
+        let metadata: unknown;
+        try {
+            metadata = row.metadata ? JSON.parse(row.metadata) : null;
+        } catch {
+            throw new Error(`OpenCode hidden child ${sessionID} has invalid session metadata`);
+        }
+        if ((metadata as { magic_context?: unknown } | null)?.magic_context !== "hidden-run") {
+            throw new Error(`OpenCode session ${sessionID} is not marked as a hidden child`);
+        }
+        if (typeof row.directory !== "string" || !row.directory) {
+            throw new Error(`OpenCode hidden child ${sessionID} has no session directory`);
+        }
+        return row.directory;
+    } finally {
+        db.close();
+    }
+}
+
+function getDataDirFromEnv(env: NodeJS.ProcessEnv): string {
+    return env.XDG_DATA_HOME ?? getDataDir();
+}
+
 export async function removeHostSession(
     sessionID: string,
     owner: HostServiceOwner | undefined,
     env: NodeJS.ProcessEnv = process.env,
     fetchSession: typeof fetch = fetch,
     directory?: string,
+    lookupDirectory: (
+        sessionID: string,
+        env: NodeJS.ProcessEnv,
+    ) => string | null = lookupHiddenChildDirectory,
 ): Promise<void> {
     const service = resolveOwnerHostService(owner, env);
-    const query = directory === undefined ? "" : `?directory=${encodeURIComponent(directory)}`;
+    if (directory === undefined) {
+        if (service.path !== serviceRegistrationPath(env)) {
+            throw new Error(
+                `Cannot resolve legacy hidden child ${sessionID} in an unverified host channel`,
+            );
+        }
+        directory = lookupDirectory(sessionID, env) ?? undefined;
+        if (directory === undefined) return;
+    }
+    const query = `?directory=${encodeURIComponent(directory)}`;
     const response = await fetchSession(
         `${service.url}/api/session/${encodeURIComponent(sessionID)}${query}`,
         {
@@ -222,9 +271,9 @@ export async function removeHostSession(
             signal: AbortSignal.timeout(60_000),
         },
     );
-    // A 404 may mean the directory scope is wrong, not that the session is already gone.
-    // Keep the retired entry for a later retry rather than silently claiming deletion.
-    if (!response.ok) {
+    // The directory was recorded at creation or verified against the host's session row.
+    // A 404 from that scope means another process already removed the child.
+    if (!response.ok && response.status !== 404) {
         throw new Error(`OpenCode session delete answered ${response.status}`);
     }
 }
