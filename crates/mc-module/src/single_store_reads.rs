@@ -168,8 +168,9 @@ fn read_context_flag(conn: &Connection) -> rusqlite::Result<Option<ContextFlag>>
 /// - A store that `McStore::open` just took to migration 61 (a fresh install, marked with
 ///   the fresh-install build suffix) writes `single_store_state = migrated` with the same
 ///   stamp, in one `BEGIN IMMEDIATE`, if `context.db` does not record a migration yet.
-///   If `context.db` already records one (the cache file was deleted and rebuilt), the
-///   fresh store adopts that stamp: it holds no rows of its own to disagree with.
+///   If `context.db` already records one (the cache file was deleted and rebuilt), a fresh
+///   store that has served no session yet adopts that stamp: it holds no rows of its own
+///   to disagree with.
 /// - `context.db` recording no migration (`required`, or no table) while the store is a
 ///   migrated one is `single_store_migration_required`.
 /// - Both recording the migration with different stamps is `single_store_state_split`.
@@ -192,7 +193,10 @@ pub fn attach(store: &McStore, context_path: &Path) -> Result<Arc<ModuleContextD
     match flag.as_ref() {
         Some(flag) if flag.state == "migrated" => {
             if flag.migrated_at != Some(stamp) {
-                if fresh {
+                // Only a store that has served nothing yet may take context.db's stamp: it
+                // is a rebuilt cache for an already-migrated file. A store with sessions of
+                // its own and a different stamp belongs to another migration.
+                if fresh && store.is_cache_empty()? {
                     store.adopt_single_store_stamp(flag.migrated_at.unwrap_or_default())?;
                 } else {
                     return Err(McStoreError::SingleStoreStateSplit {
@@ -236,4 +240,124 @@ pub fn attach(store: &McStore, context_path: &Path) -> Result<Arc<ModuleContextD
         tracing::info!("mc-module: finished {resumed} pending context.db write(s) left by an earlier process");
     }
     Ok(domain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+    use mc_store::single_store_domain::CONTEXT_SCHEMA_SNAPSHOT;
+    use mc_store::single_store_schema::{
+        SINGLE_STORE_MIGRATION_REQUIRED_REASON, SINGLE_STORE_STATE_SPLIT_REASON,
+    };
+
+    fn descriptor(dir: &Path) -> StorageDescriptor {
+        StorageDescriptor {
+            module_id: "magic-context".to_string(),
+            storage_namespace: "magic-context".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.join("store.db").to_string_lossy().into_owned(),
+            },
+        }
+    }
+
+    /// A `context.db` from the schema snapshot, with `single_store_state` as given.
+    fn context_db(dir: &Path, state: Option<(&str, Option<i64>)>) -> PathBuf {
+        let path = dir.join("context.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(CONTEXT_SCHEMA_SNAPSHOT).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO context_privilege_state(id, enabled) VALUES (1, 0)",
+            [],
+        )
+        .unwrap();
+        if let Some((state, migrated_at)) = state {
+            conn.execute(
+                "INSERT INTO single_store_state(id, state, migrated_at, migrated_by, report_json)
+                 VALUES (1, ?1, ?2, 'test', '{}')",
+                rusqlite::params![state, migrated_at],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    fn context_flag(path: &Path) -> (String, Option<i64>) {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT state, migrated_at FROM single_store_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_fresh_store_flips_a_required_context_db_to_migrated_with_its_own_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = context_db(dir.path(), Some(("required", None)));
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let marker = store.single_store_marker().unwrap().unwrap();
+        attach(&store, &context).unwrap();
+        assert_eq!(
+            context_flag(&context),
+            ("migrated".to_string(), marker.set_at_ms),
+            "the two files carry equal stamps"
+        );
+        assert!(store.has_context_domain());
+    }
+
+    #[test]
+    fn stamps_that_differ_are_refused_as_a_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = context_db(dir.path(), Some(("migrated", Some(1))));
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        // A store that has served a session is not a rebuilt cache, so it may not adopt the
+        // other file's stamp.
+        store
+            .commit(
+                "served",
+                None,
+                &mc_core::CoreState::default(),
+                &mc_store::ModuleMeta::default(),
+            )
+            .unwrap();
+        let error = attach(&store, &context).err().expect("a split is refused");
+        assert!(
+            matches!(error, McStoreError::SingleStoreStateSplit { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().starts_with(SINGLE_STORE_STATE_SPLIT_REASON));
+        assert!(!store.has_context_domain());
+        assert_eq!(context_flag(&context), ("migrated".to_string(), Some(1)));
+    }
+
+    #[test]
+    fn a_rebuilt_empty_store_adopts_the_stamp_of_an_already_migrated_context_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = context_db(dir.path(), Some(("migrated", Some(7))));
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        attach(&store, &context).unwrap();
+        assert_eq!(store.single_store_marker().unwrap().unwrap().set_at_ms, Some(7));
+    }
+
+    #[test]
+    fn a_migrated_store_against_a_required_context_db_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = context_db(dir.path(), Some(("required", None)));
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        // Not a fresh install: the marker was written by the migration itself.
+        store.adopt_single_store_stamp(5).unwrap();
+        store.set_single_store_marker_build_for_test("ck-mc 0.44.0").unwrap();
+        let error = attach(&store, &context).err().expect("refused");
+        assert!(
+            error
+                .to_string()
+                .starts_with(SINGLE_STORE_MIGRATION_REQUIRED_REASON),
+            "{error}"
+        );
+        assert_eq!(context_flag(&context), ("required".to_string(), None));
+    }
 }

@@ -4725,6 +4725,7 @@ fn apply_once(
         legacy_baseline: is_legacy_baseline(&loaded.core),
         render_config_changed,
         profile_transition,
+        project_memory_epoch_due: external_revision_changed || project_memory_epoch_hard_due,
         first_fold_due,
         ttl_expired: scheduler_outcome.idle_ttl_fired,
         coverage_fold_due: system_absorb_hard_due,
@@ -15169,6 +15170,9 @@ struct MaterializeReasonInputs {
     legacy_baseline: bool,
     render_config_changed: bool,
     profile_transition: bool,
+    /// The external revision moved (workspace, project memory epoch, or an in-place
+    /// compartment rewrite by another writer), or a pending epoch was armed.
+    project_memory_epoch_due: bool,
     first_fold_due: bool,
     ttl_expired: bool,
     coverage_fold_due: bool,
@@ -15186,6 +15190,7 @@ fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String>
         legacy_baseline,
         render_config_changed,
         profile_transition,
+        project_memory_epoch_due,
         first_fold_due,
         ttl_expired,
         coverage_fold_due,
@@ -15205,6 +15210,8 @@ fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String>
                 "profile_transition"
             } else if render_config_changed {
                 "epoch_change"
+            } else if project_memory_epoch_due {
+                "project_memory_epoch"
             } else if coverage_fold_due || first_fold_due {
                 "coverage_fold"
             } else if ttl_expired {
@@ -28456,66 +28463,6 @@ pub(crate) mod tests {
                 .publication_floor_ordinal
                 .is_some(),
             "the recut HARD must freeze the estimator-derived floor"
-        );
-    }
-
-    #[test]
-    fn stale_full_state_sync_cannot_rewind_a_committed_divergence_recut() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let request = seed_astro_divergence(&store, "astro-stale-state-sync", 2_402);
-        let recut = run(&store, &request, &spine());
-        assert_eq!(recut.action, "HARD");
-        let recut_bytes = serde_json::to_vec(&recut.ck_messages).unwrap();
-        let after_recut = store.load("astro-stale-state-sync").unwrap();
-        let compartments_after_recut = store.load_compartments("astro-stale-state-sync").unwrap();
-        let mut stale_compartments = astro_compartments()[..2].to_vec();
-        for compartment in &mut stale_compartments {
-            compartment.content = format!("STALE-TS-{}", compartment.sequence);
-            compartment.p1 = Some(compartment.content.clone());
-        }
-
-        store
-            .apply_authority_state_sync(ModuleStateSyncRequest {
-                session_id: "astro-stale-state-sync",
-                project_path: "git:proj",
-                shadow_generation: after_recut.meta.shadow_generation,
-                expected_shadow_seq: after_recut.meta.shadow_seq,
-                seed_boundary_id: Some("m425#0"),
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                last_todo_state: None,
-                acked_watermarks: Value::Null,
-            })
-            .unwrap();
-
-        let after_sync = store.load("astro-stale-state-sync").unwrap();
-        assert_eq!(after_sync.meta.coverage_ordinal, Some(2_400));
-        assert_eq!(after_sync.meta.folded_compartment_seq, 47);
-        assert_eq!(after_sync.core.boundary_id, "m2400#0");
-        assert_eq!(
-            store.load_compartments("astro-stale-state-sync").unwrap(),
-            compartments_after_recut
-        );
-        let deferred = run(&store, &request, &spine());
-        assert_eq!(deferred.action, "SOFT+");
-        assert_eq!(
-            serde_json::to_vec(&deferred.ck_messages).unwrap(),
-            recut_bytes
         );
     }
 

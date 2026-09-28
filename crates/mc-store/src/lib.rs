@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-mod context_writes;
+pub mod context_writes;
 mod historian_claim;
 pub mod single_store_domain;
 pub mod single_store_schema;
@@ -3114,12 +3114,6 @@ pub const SINGLE_STORE_CAPABLE: bool = true;
 /// reads as one fact rather than two bare numbers.
 pub const SINGLE_STORE_MARKER_MIGRATION_VERSION: u32 = 58;
 
-/// The stable token a refusal carries when the store is in single-store mode and this binary is
-/// not. Health surfaces and logs are matched against this exact string, so it names the one
-/// situation rather than describing it: an operator who greps for it finds every occurrence, and
-/// a generic "open failed" cannot be mistaken for it.
-pub const SINGLE_STORE_MARKER_REFUSAL_REASON: &str = "single_store_marker";
-
 /// The stable token a refusal carries when `store.db` records a schema version newer than the
 /// newest migration this binary carries: a newer ck-mc has already migrated the store, and this
 /// older one is being run against it.
@@ -3142,9 +3136,9 @@ pub fn store_ahead_of_binary_remediation(db_version: u32, binary_max: u32) -> St
     )
 }
 
-/// What the store records when its project rows were moved into the host's database.
-///
-/// Absent means the marker is unset, which is every store today.
+/// What the store records when its project rows were moved into the host's database, or
+/// when a fresh store was created already in that shape. `McStore::open` refuses any store
+/// that has neither, so an opened store always carries one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingleStoreMarker {
     /// When the move ran, in milliseconds since the unix epoch. Absent on a marker written
@@ -3152,27 +3146,6 @@ pub struct SingleStoreMarker {
     pub set_at_ms: Option<i64>,
     /// The ck-mc build identity that ran the move, empty when the writer recorded none.
     pub set_by: String,
-}
-
-impl SingleStoreMarker {
-    /// How the refusal names the build to run. A marker written without a build identity still
-    /// has to produce a sentence an operator can act on, so the unstamped case says plainly that
-    /// the build is unknown instead of rendering an empty name.
-    fn build_label(&self) -> String {
-        if self.set_by.trim().is_empty() {
-            "an unrecorded ck-mc build".to_string()
-        } else {
-            format!("ck-mc {}", self.set_by.trim())
-        }
-    }
-
-    /// The sentence that tells an operator what happened and what to do about it.
-    pub fn remediation(&self) -> String {
-        format!(
-            "this store was migrated to single-store mode by {}; run that build or newer",
-            self.build_label()
-        )
-    }
 }
 
 /// Read the single-store marker from the privilege singleton row.
@@ -5029,6 +5002,7 @@ pub enum TodoStateSetOutcome {
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
 /// chronological order (1 = oldest).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StoredCompartment {
     pub sequence: i64,
     pub start_message: i64,
@@ -7588,6 +7562,29 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Overwrite the build the single-store marker names, for tests that need a store the
+    /// migration marked rather than a fresh install.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_single_store_marker_build_for_test(&self, build: &str) -> Result<(), McStoreError> {
+        self.inner.with_conn(|conn| {
+            conn.execute(
+                "UPDATE mc_privilege_state SET single_store_set_by = ?1 WHERE id = 1",
+                params![build],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Whether `store.db` holds no session cache rows at all, as a store just created by
+    /// `McStore::open` does.
+    pub fn is_cache_empty(&self) -> Result<bool, McStoreError> {
+        let rows: i64 = self.inner.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM mc_cache_state", [], |row| row.get(0))
+        })?;
+        Ok(rows == 0)
+    }
+
     /// Re-stamp the single-store marker with the stamp `context.db` records. Only a fresh
     /// store (one `McStore::open` just created, holding no rows) adopts a stamp this way;
     /// it binds the rebuilt cache to the already-migrated `context.db`.
@@ -10138,7 +10135,9 @@ impl McStore {
             }
 
             // The compartments themselves are already in context.db, written by the host
-            // that owns the session; the import records only that it happened.
+            // that owns the session. The import keeps their date segments, which
+            // context.db has no column for and m0 renders, and records that it happened.
+            single_store_schema::write_compartment_dates(tx, session_id, compartments)?;
             tx.execute(
                 "INSERT INTO mc_state_imports
                      (session_id, import_id, imported_count, completed_at_ms)
@@ -11963,9 +11962,11 @@ impl McStore {
                 )
                 .optional()?
                 .unwrap_or(0);
+            // Rows the module wrote itself are skipped: see MODULE_M0_MUTATION_TARGET.
             let m0_mutation_head = transaction.query_row(
-                "SELECT COALESCE(MAX(id), 0) FROM m0_mutation_log WHERE session_id = ?1",
-                params![session_id],
+                "SELECT COALESCE(MAX(id), 0) FROM m0_mutation_log
+                  WHERE session_id = ?1 AND COALESCE(target_id, 0) <> ?2",
+                params![session_id, context_writes::MODULE_M0_MUTATION_TARGET],
                 |row| row.get(0),
             )?;
             // The user profile is global: the host bumps the `__global__` row's version
@@ -20837,22 +20838,6 @@ mod tests {
         assert_eq!(
             second.module_store_schema_version().unwrap(),
             LATEST_MIGRATION_VERSION
-        );
-    }
-
-    /// A marker with no recorded build still has to produce an actionable sentence rather than a
-    /// gap where the build name belongs.
-    #[test]
-    fn a_marker_without_a_build_identity_still_reads_as_a_sentence() {
-        let marker = SingleStoreMarker {
-            set_at_ms: Some(1),
-            set_by: String::new(),
-        };
-
-        assert_eq!(
-            marker.remediation(),
-            "this store was migrated to single-store mode by an unrecorded ck-mc build; \
-             run that build or newer"
         );
     }
 

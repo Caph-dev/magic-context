@@ -234,6 +234,15 @@ fn delete_compartments_where_tx(
     )
 }
 
+/// The `target_id` the module stamps on the `m0_mutation_log` rows it writes itself.
+///
+/// No reader uses `target_id` as a row reference (the host compares only `MAX(id)`), so
+/// the value is free to say who wrote the row. The module skips its own rows when it reads
+/// the head: it already knows about its own rewrites and handles them through its own
+/// boundary machinery, and treating them as another writer's change would force a HARD
+/// on the next pass that the module's cache protection is there to avoid.
+pub const MODULE_M0_MUTATION_TARGET: i64 = -1;
+
 /// Record that the session's existing compartments were rewritten, so readers that key
 /// their cache on the highest sequence also notice an in-place change.
 pub(crate) fn append_m0_mutation_tx(
@@ -244,8 +253,8 @@ pub(crate) fn append_m0_mutation_tx(
 ) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO m0_mutation_log (session_id, mutation_type, target_id, queued_at)
-         VALUES (?1, ?2, NULL, ?3)",
-        params![session_id, mutation_type, now_ms],
+         VALUES (?1, ?2, ?3, ?4)",
+        params![session_id, mutation_type, MODULE_M0_MUTATION_TARGET, now_ms],
     )?;
     Ok(())
 }

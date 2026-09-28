@@ -402,6 +402,18 @@ fn seed_store(data_home: &Path) {
     store
         .seed_memory(5, &proj, "ARCHITECTURE", "a durable rule", 70)
         .unwrap();
+    // The host records each session's project in context.db; the module keys the
+    // session's memories by that record.
+    store
+        .with_context_conn_for_test(|tx| {
+            tx.execute(
+                "INSERT INTO session_projects (session_id, harness, project_path, updated_at)
+                 VALUES ('soft', 'opencode', ?1, 1)",
+                [&proj],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     // drop `store` here → release the single-writer lease before the module spawns
 }
 

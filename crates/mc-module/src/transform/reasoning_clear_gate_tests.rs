@@ -136,6 +136,21 @@ fn load_pre_fix_reasoning_fixture(dir: &std::path::Path) -> (McStore, TransformR
         ),
         1,
     );
+    // The captured external revision predates the single-store move, which folds two more
+    // inputs into it. Recompute it so the fixture does not price that as a baseline change.
+    if loaded.meta.m1_external_revision != 0 {
+        loaded.meta.m1_external_revision = crate::m1_compose::m1_revision_signal_parts_for_pass(
+            &db,
+            "git:fixture",
+            "git:fixture",
+            &request.session_id,
+            loaded.meta.user_profile_version,
+            true,
+            loaded.meta.expiry_cutoff_ms,
+        )
+        .unwrap()
+        .external_revision;
+    }
     db.commit(
         &request.session_id,
         loaded.row_version,
