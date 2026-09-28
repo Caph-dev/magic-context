@@ -226,6 +226,7 @@ async function setup(
     let omitCache = false;
     let rawTokens = false;
     let completion = "editor completion";
+    let reasoningOnly = false;
 
     const host: HiddenChildHost = {
         async create(input) {
@@ -288,13 +289,17 @@ async function setup(
                     });
                 return;
             }
-            const write = () =>
-                rows.append(input.sessionID, completion, {
+            const write = () => {
+                const row = rows.append(input.sessionID, completion, {
                     usage: !omitUsage,
                     cache: !omitCache,
                     rawTokens,
                     modelID: child.model.id,
+                    ...(reasoningOnly ? { finish: "length" } : {}),
                 });
+                if (reasoningOnly)
+                    row.data.content = [{ type: "reasoning", text: "private reasoning" }];
+            };
             if (delayRowMs > 0) setTimeout(write, delayRowMs);
             else write();
         },
@@ -423,6 +428,9 @@ async function setup(
         setCompletion(value: string) {
             completion = value;
         },
+        setReasoningOnly(value: boolean) {
+            reasoningOnly = value;
+        },
     };
 }
 
@@ -440,6 +448,30 @@ async function close(
 }
 
 describe("OpenCode 2 hidden child completion", () => {
+    test.each([
+        "historian",
+        "dreamer-task",
+    ] as const)("retains length-capped reasoning for %s", async (kind) => {
+        const state = await setup();
+        try {
+            state.setReasoningOnly(true);
+            const handle = await state.executor.open({
+                ...run,
+                kind,
+                agent: kind === "historian" ? "historian" : "dreamer-classifier",
+            });
+            await state.executor.attempt(handle, request("cheap"));
+            const completion = await state.executor.collect(handle, 50);
+            expect(completion).toMatchObject({
+                text: null,
+                reasoning: "private reasoning",
+                lengthCapped: true,
+            });
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
     test("sends the exact calibrated pair with options and provider usage", async () => {
         const state = await setup();
         try {

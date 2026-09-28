@@ -1233,6 +1233,14 @@
             ]
         },
         {
+            "path": "tests/opencode2/output-cap.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Real OpenCode 2 output-cap wire comparison and reasoning-only provider default regression; runs in the dedicated v2 lane",
+            "contract_refs": ["R44"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/opencode2/over-limit-recovery.test.ts",
             "tier": "excluded",
             "invocation": {

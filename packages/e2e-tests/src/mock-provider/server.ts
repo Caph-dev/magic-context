@@ -21,6 +21,8 @@ export interface MockResponse {
     content?: unknown[];
     /** OpenAI Responses output items. Used only for POST /responses. */
     openaiOutput?: unknown[];
+    /** Simulate the Responses API ending at the provider's output-token limit. */
+    openaiIncomplete?: boolean;
     /** Stop reason reported to the caller. */
     stop_reason?: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
     /**
@@ -597,9 +599,9 @@ export class MockProvider {
             id: responseId,
             object: "response",
             created_at: Math.floor(Date.now() / 1000),
-            status: "completed",
+            status: scripted.openaiIncomplete ? "incomplete" : "completed",
             error: null,
-            incomplete_details: null,
+            incomplete_details: scripted.openaiIncomplete ? { reason: "max_output_tokens" } : null,
             instructions: null,
             max_output_tokens: null,
             model,
@@ -721,7 +723,7 @@ export class MockProvider {
                     });
                 });
                 send({
-                    type: "response.completed",
+                    type: scripted.openaiIncomplete ? "response.incomplete" : "response.completed",
                     sequence_number: sequenceNumber,
                     response: completedResponse,
                 });

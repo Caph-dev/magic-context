@@ -446,6 +446,15 @@ function toolLoopMessages(attempt: HiddenChildAttempt): unknown[] {
     });
 }
 
+function assistantReasoning(row: StoreRow<"assistant">): string | null {
+    const reasoning = (row.data.content ?? [])
+        .flatMap((part) =>
+            part.type === "reasoning" && typeof part.text === "string" ? [part.text] : [],
+        )
+        .join("\n");
+    return reasoning.length > 0 ? reasoning : null;
+}
+
 function assistantText(row: StoreRow<"assistant">): string | null {
     const text = (row.data.content ?? [])
         .flatMap((part) =>
@@ -1051,7 +1060,7 @@ export async function createV2HiddenCompletionExecutor(
                     ...(hiddenToolLoop(run.identity)
                         ? { messages: toolLoopMessages(attempt) }
                         : {}),
-                    reasoning: null,
+                    reasoning: text ? null : assistantReasoning(row),
                     // If either side is numeric, retain the provider's partial usage
                     // and floor omitted components to zero. With no numeric usage,
                     // use the local meter so budget accounting remains finite.
