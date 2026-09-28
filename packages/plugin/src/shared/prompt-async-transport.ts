@@ -200,7 +200,8 @@ export async function promptAsyncAndWaitForIdle(
     const sent = await session.promptAsync?.(request);
     if (sent && typeof sent === "object" && "error" in sent) {
         const rejection = (sent as { error?: unknown }).error;
-        if (rejection) throw new Error(`prompt_async was rejected: ${describeRejection(rejection)}`);
+        if (rejection)
+            throw new Error(`prompt_async was rejected: ${describeRejection(rejection)}`);
     }
     const sentAt = Date.now();
     let sawBusy = false;

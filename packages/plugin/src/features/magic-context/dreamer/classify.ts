@@ -43,6 +43,7 @@ import {
     parseClassifyManifest,
     validateClassifyManifest,
 } from "./classify-prompt";
+import { readFailedChildMessages } from "./failed-invocation-evidence";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
 import { getModuleMemoryIdentities } from "./module-apply";
@@ -507,6 +508,11 @@ async function classifyOneChunk(
         recordInvocation(args, startedAt, {
             status: failedInvocationStatus(failure),
             error: failure,
+            // Only an OpenCode 1 child can be read back here; other carriers own
+            // their children and report no messages.
+            messages: args.hiddenCompletionExecutor
+                ? undefined
+                : await readFailedChildMessages(args.client, agentSessionId, args.sessionDirectory),
         });
         // A MODULE-authority failure is not safe to downgrade to the guarded
         // TypeScript child path. Surface it so the scheduler records a

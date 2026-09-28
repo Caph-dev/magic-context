@@ -31,6 +31,7 @@ import { computeNormalizedHash } from "../memory/normalize-hash";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
+import { readFailedChildMessages } from "./failed-invocation-evidence";
 import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
@@ -418,11 +419,22 @@ async function verifyOneBatch(
             `[dreamer] verify batch ${providerFailure ? "provider failure" : "failed"}: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: failedInvocationStatus(error), error });
+        recordInvocation(args, startedAt, {
+            status: failedInvocationStatus(error),
+            error,
+            messages: await readFailedChildMessages(
+                args.client,
+                agentSessionId,
+                args.sessionDirectory,
+            ),
+        });
         if (error instanceof DreamerModuleFailureError || signal.aborted) throw error;
         // A timeout is a budget verdict, not a failure of this run: report it so the
         // run can stop cleanly with its earlier batches banked.
-        if (promptFailure?.failureClass === "provider_timeout" || shared.isPromptTimeoutError(error)) {
+        if (
+            promptFailure?.failureClass === "provider_timeout" ||
+            shared.isPromptTimeoutError(error)
+        ) {
             return {
                 verified: 0,
                 updated: 0,

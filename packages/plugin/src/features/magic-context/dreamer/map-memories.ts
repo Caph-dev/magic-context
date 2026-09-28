@@ -25,6 +25,7 @@ import {
 } from "../memory";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
+import { readFailedChildMessages } from "./failed-invocation-evidence";
 import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
@@ -438,7 +439,15 @@ async function mapOneBatch(
             `[dreamer] map-memories batch failed: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: failedInvocationStatus(error), error });
+        recordInvocation(args, startedAt, {
+            status: failedInvocationStatus(error),
+            error,
+            messages: await readFailedChildMessages(
+                args.client,
+                agentSessionId,
+                args.sessionDirectory,
+            ),
+        });
         if (error instanceof DreamerModuleFailureError) throw error;
         // Swallow per-batch failures: the batch's memories stay unmapped and are
         // retried next run. Only an abort/lease-loss should stop the whole task.

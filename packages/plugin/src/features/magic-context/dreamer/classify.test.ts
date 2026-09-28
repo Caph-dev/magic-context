@@ -9,6 +9,7 @@ import { installAuthorityManagedMarker } from "../context-authority";
 import { getMemoryById, insertMemory } from "../memory";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { getSubagentInvocations } from "../storage-subagent-invocations";
 import {
     applyClassifications,
     type ClassifyArgs,
@@ -119,6 +120,59 @@ describe("runClassify disposition", () => {
 
             expect(result.classified).toBe(10);
             expect(system).toContain("Write human-readable prose you author in: Turkish (Türkçe).");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a failed chunk row records the child's tokens and model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-failed-row-evidence";
+            addMemoriesForDisposition(db, projectIdentity, 10);
+            const args = classifyArgs(db, projectIdentity);
+            args.parentSessionId = "ses-parent-classify";
+            // The model answered in prose instead of the classify manifest.
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "classify-child" } }),
+                    prompt: async () => ({}),
+                    messages: async () => ({
+                        data: [
+                            {
+                                info: {
+                                    role: "assistant",
+                                    providerID: "google",
+                                    modelID: "gemini-classify",
+                                    time: { created: 1, completed: 2 },
+                                    finish: "stop",
+                                    tokens: {
+                                        input: 700,
+                                        output: 90,
+                                        cache: { read: 0, write: 0 },
+                                    },
+                                },
+                                parts: [{ type: "text", text: "These all look important." }],
+                            },
+                        ],
+                    }),
+                    delete: async () => ({}),
+                },
+            } as never;
+
+            await runClassify(args);
+
+            const [row] = getSubagentInvocations(db, "ses-parent-classify", {
+                subagent: "dreamer",
+            });
+            expect(row).toMatchObject({
+                task: "classify-memories",
+                status: "failed",
+                providerId: "google",
+                modelId: "gemini-classify",
+                inputTokens: 700,
+                outputTokens: 90,
+            });
         } finally {
             closeQuietly(db);
         }

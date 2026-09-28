@@ -16,6 +16,7 @@ import {
 } from "../memory/storage-memory-verifications";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { getSubagentInvocations } from "../storage-subagent-invocations";
 import { acquireLease } from "./lease";
 import {
     applyBatchMappings,
@@ -537,6 +538,63 @@ describe("mapMemories disposition", () => {
             expect(promptCalls).toBe(2);
             expect(result.stopReason).toBe("timeout-circuit-breaker");
             expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a failed batch row records the child's tokens and model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-failed-row-evidence";
+            const dir = tempProject();
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Evidence mapping fact.",
+                sourceSessionId: "ses",
+            });
+            const args = mapArgs(db, dir, projectIdentity);
+            args.parentSessionId = "ses-parent-map";
+            // A step-capped loop ends with prose instead of a manifest.
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "map-child" } }),
+                    prompt: async () => ({}),
+                    messages: async () => ({
+                        data: [
+                            {
+                                info: {
+                                    role: "assistant",
+                                    providerID: "openai",
+                                    modelID: "gpt-map",
+                                    time: { created: 1, completed: 2 },
+                                    finish: "stop",
+                                    tokens: {
+                                        input: 900,
+                                        output: 120,
+                                        cache: { read: 0, write: 0 },
+                                    },
+                                },
+                                parts: [{ type: "text", text: "I mapped most of them." }],
+                            },
+                        ],
+                    }),
+                    delete: async () => ({}),
+                },
+            } as never;
+
+            await mapMemories(args);
+
+            const [row] = getSubagentInvocations(db, "ses-parent-map", { subagent: "dreamer" });
+            expect(row).toMatchObject({
+                task: "map-memories",
+                status: "failed",
+                providerId: "openai",
+                modelId: "gpt-map",
+                inputTokens: 900,
+                outputTokens: 120,
+            });
         } finally {
             closeQuietly(db);
         }

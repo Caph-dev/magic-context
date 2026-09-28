@@ -26,6 +26,7 @@ import {
 import { normalizeVerificationFiles } from "../memory/verification-paths";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { getSubagentInvocations } from "../storage-subagent-invocations";
 import { acquireLease } from "./lease";
 import { DreamerProviderOutputFailureError } from "./provider-output-failure";
 import { getTaskScheduleState, seedTaskScheduleState } from "./storage-task-schedule";
@@ -828,12 +829,14 @@ describe("runVerify disposition", () => {
         const db = freshDb();
         const slices: number[] = [];
         const original = shared.promptSyncWithValidatedOutputRetry;
-        const spy = spyOn(shared, "promptSyncWithValidatedOutputRetry").mockImplementation(
-            ((client: never, promptArgs: never, options: { timeoutMs?: number }) => {
-                slices.push(options.timeoutMs ?? 0);
-                return original(client, promptArgs, options as never);
-            }) as never,
-        );
+        const spy = spyOn(shared, "promptSyncWithValidatedOutputRetry").mockImplementation(((
+            client: never,
+            promptArgs: never,
+            options: { timeoutMs?: number },
+        ) => {
+            slices.push(options.timeoutMs ?? 0);
+            return original(client, promptArgs, options as never);
+        }) as never);
         try {
             const projectIdentity = "git:verify-floor-slice";
             const dir = tempProject();
@@ -861,9 +864,7 @@ describe("runVerify disposition", () => {
     test("computeVerifyBatchSliceMs floors the even split and never exceeds the budget", () => {
         expect(computeVerifyBatchSliceMs(20 * 60_000, 10)).toBe(VERIFY_BATCH_FLOOR_MS);
         expect(computeVerifyBatchSliceMs(20 * 60_000, 2)).toBe(10 * 60_000);
-        expect(computeVerifyBatchSliceMs(VERIFY_BATCH_FLOOR_MS + 1, 5)).toBe(
-            VERIFY_BATCH_FLOOR_MS,
-        );
+        expect(computeVerifyBatchSliceMs(VERIFY_BATCH_FLOOR_MS + 1, 5)).toBe(VERIFY_BATCH_FLOOR_MS);
     });
 
     for (const [label, timeoutError] of [
@@ -928,6 +929,65 @@ describe("runVerify disposition", () => {
             }
         });
     }
+
+    test("a failed batch row records the child's tokens and model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-failed-row-evidence";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 1);
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.parentSessionId = "ses-parent-verify";
+            let prompted = false;
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "verify-child" } }),
+                    prompt: async () => {
+                        prompted = true;
+                        throw new DOMException("The operation timed out.", "TimeoutError");
+                    },
+                    abort: async () => ({}),
+                    // The child spent tokens on tool steps before the host timer fired.
+                    messages: async () => ({
+                        data: prompted
+                            ? [
+                                  {
+                                      info: {
+                                          role: "assistant",
+                                          providerID: "anthropic",
+                                          modelID: "claude-verify",
+                                          time: { created: 1, completed: 2 },
+                                          tokens: {
+                                              input: 1_200,
+                                              output: 300,
+                                              cache: { read: 50, write: 0 },
+                                          },
+                                      },
+                                      parts: [{ type: "tool" }],
+                                  },
+                              ]
+                            : [],
+                    }),
+                    delete: async () => ({}),
+                },
+            } as never;
+
+            await runVerify(args);
+
+            const [row] = getSubagentInvocations(db, "ses-parent-verify", { subagent: "dreamer" });
+            expect(row).toMatchObject({
+                task: "verify",
+                status: "timed_out",
+                providerId: "anthropic",
+                modelId: "claude-verify",
+                inputTokens: 1_200,
+                outputTokens: 300,
+                cacheReadTokens: 50,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
 
     test("reports a swallowed batch failure as incomplete", async () => {
         const db = freshDb();
