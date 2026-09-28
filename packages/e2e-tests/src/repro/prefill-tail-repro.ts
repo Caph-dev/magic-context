@@ -3,10 +3,9 @@
  * message prefill. The conversation must end with a user message."
  *
  * Boots a real `opencode serve` (any 1.x binary) under a throwaway root, points
- * it at a mock Anthropic endpoint that applies the provider's own rule — HTTP 400
- * with exactly that message whenever the last request message is not role
- * `user` — and runs an orchestrator session that spawns a subagent through the
- * `task` tool. The subagent runs a tool loop whose reported input grows with the
+ * it at a mock Anthropic or Google endpoint that rejects trailing model turns
+ * and empty assistant content, and runs an orchestrator session that spawns a
+ * subagent through the `task` tool. The subagent runs a tool loop whose reported input grows with the
  * real request size, so a small configured window walks it through Magic
  * Context's execute threshold and into the emergency bands.
  *
@@ -17,7 +16,8 @@
  *   bun run src/repro/prefill-tail-repro.ts --opencode <bin> --plugin <entry|none>
  *     --out <dir> [--window 40000] [--sub-steps 24] [--agent-steps 0]
  *     [--text-with-tool] [--agent worker] [--big-tokens 1500]
- *     [--thinking every|none|alternate]
+ *     [--thinking every|none|alternate] [--idle-ms 305000]
+ *     [--google] [--missing-finish] [--empty-step]
  */
 import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -37,6 +37,10 @@ interface Args {
     textWithTool: boolean;
     agent: string;
     bigTokens: number;
+    idleMs: number;
+    google: boolean;
+    missingFinish: boolean;
+    emptyStep: boolean;
     /** every: thinking on every step; none: never; alternate: odd steps only. */
     thinking: "every" | "none" | "alternate";
 }
@@ -58,11 +62,20 @@ function parseArgs(argv: string[]): Args {
         textWithTool: argv.includes("--text-with-tool"),
         agent: get("agent", "worker"),
         bigTokens: Number(get("big-tokens", "1500")),
+        idleMs: Number(get("idle-ms", "0")),
+        google: argv.includes("--google"),
+        missingFinish: argv.includes("--missing-finish"),
+        emptyStep: argv.includes("--empty-step"),
         thinking: get("thinking", "every") as Args["thinking"],
     };
 }
 
-type Block = { type?: string; text?: string; tool_use_id?: string; name?: string };
+type Block = {
+    type?: string;
+    text?: string;
+    tool_use_id?: string;
+    name?: string;
+};
 type Msg = { role: string; content: unknown };
 
 function blocks(message: Msg): Block[] {
@@ -70,13 +83,34 @@ function blocks(message: Msg): Block[] {
     return Array.isArray(message.content) ? (message.content as Block[]) : [];
 }
 
-function firstUserText(messages: Msg[]): string {
-    const first = messages.find((m) => m.role === "user");
-    return first ? blocks(first).map((b) => b.text ?? "").join(" ") : "";
+export function rejectionReason(messages: Msg[]): "model-tail" | "empty-assistant" | undefined {
+    if (messages.at(-1)?.role !== "user") return "model-tail";
+    if (
+        messages.some(
+            (message) =>
+                message.role === "assistant" &&
+                (blocks(message).length === 0 ||
+                    blocks(message).every((block) => block.type === "text" && !block.text?.trim())),
+        )
+    )
+        return "empty-assistant";
+    return undefined;
+}
+
+function userText(messages: Msg[]): string {
+    return messages
+        .filter((message) => message.role === "user")
+        .flatMap((message) => blocks(message).map((block) => block.text ?? ""))
+        .join(" ");
 }
 
 function tailShape(messages: Msg[]): string[] {
-    return messages.slice(-3).map((m) => `${m.role}:${blocks(m).map((b) => b.type).join("+")}`);
+    return messages.slice(-3).map(
+        (m) =>
+            `${m.role}:${blocks(m)
+                .map((b) => b.type)
+                .join("+")}`,
+    );
 }
 
 async function main(): Promise<void> {
@@ -103,7 +137,97 @@ async function main(): Promise<void> {
     }
 
     const mock = new MockProvider();
-    const { baseURL } = await mock.start();
+    const { baseURL: anthropicURL } = await mock.start();
+    const google = args.google
+        ? Bun.serve({
+              hostname: "127.0.0.1",
+              port: 0,
+              async fetch(req) {
+                  const body = (await req.json()) as {
+                      contents: Array<{
+                          role: string;
+                          parts: Array<Record<string, any>>;
+                      }>;
+                      tools?: Array<{ functionDeclarations?: unknown[] }>;
+                  };
+                  appendFileSync(
+                      join(args.out, "google-requests.jsonl"),
+                      `${JSON.stringify(body)}\n`,
+                  );
+                  const messages = body.contents.map((message) => ({
+                      role: message.role === "model" ? "assistant" : message.role,
+                      content: message.parts.map((part) =>
+                          part.functionCall
+                              ? {
+                                    type: "tool_use",
+                                    id: part.functionCall.id,
+                                    name: part.functionCall.name,
+                                    input: part.functionCall.args,
+                                }
+                              : part.functionResponse
+                                ? {
+                                      type: "tool_result",
+                                      tool_use_id:
+                                          part.functionResponse.name === "task"
+                                              ? "toolu_task"
+                                              : part.functionResponse.id,
+                                      content: part.functionResponse.response,
+                                  }
+                                : {
+                                      type: part.thought ? "thinking" : "text",
+                                      text: part.text,
+                                  },
+                      ),
+                  }));
+                  const response = await fetch(`${anthropicURL}/messages`, {
+                      method: "POST",
+                      headers: { "content-type": "application/json" },
+                      body: JSON.stringify({
+                          model: "mock-sonnet",
+                          messages,
+                          tools: body.tools?.flatMap((tool) => tool.functionDeclarations ?? []),
+                          stream: false,
+                      }),
+                  });
+                  const answer = (await response.json()) as Record<string, any>;
+                  if (!response.ok)
+                      return Response.json(
+                          {
+                              error: {
+                                  code: 400,
+                                  message:
+                                      "Requests ending with a model turn or containing empty model content are not supported.",
+                                  status: "INVALID_ARGUMENT",
+                              },
+                          },
+                          { status: 400 },
+                      );
+                  const parts = answer.content.map((part: Record<string, any>) =>
+                      part.type === "tool_use"
+                          ? {
+                                functionCall: {
+                                    id: part.id,
+                                    name: part.name,
+                                    args: part.input,
+                                },
+                                thoughtSignature: "mock-signature",
+                            }
+                          : part.type === "thinking"
+                            ? {
+                                  text: part.thinking,
+                                  thought: true,
+                                  thoughtSignature: "mock-signature",
+                              }
+                            : { text: part.text },
+                  );
+                  return new Response(
+                      `data: ${JSON.stringify({ candidates: [{ content: { role: "model", parts }, finishReason: args.missingFinish && answer.content.some((part: Record<string, any>) => part.text === "subagent finished") ? undefined : "STOP" }], usageMetadata: { promptTokenCount: answer.usage.input_tokens, candidatesTokenCount: 40, totalTokenCount: answer.usage.input_tokens + 40 } })}\n\n`,
+                      { headers: { "content-type": "text/event-stream" } },
+                  );
+              },
+          })
+        : undefined;
+    const baseURL = google ? `http://127.0.0.1:${google.port}` : anthropicURL;
     let subStep = 0;
     let prefillHits = 0;
     let requestIndex = 0;
@@ -112,13 +236,15 @@ async function main(): Promise<void> {
         requestIndex += 1;
         const messages = (body.messages ?? []) as Msg[];
         const tools = (body.tools ?? []) as Array<{ name?: string }>;
-        const first = firstUserText(messages);
+        const first = userText(messages);
         const lane = first.includes("SUBAGENT_RUN")
             ? "subagent"
             : first.includes("PARENT_RUN")
               ? "parent"
               : "other";
         const lastRole = messages.at(-1)?.role ?? "none";
+        const rejection = rejectionReason(messages);
+        const rejected = rejection !== undefined;
         // Input grows with the real request so drops show up as real relief.
         const inputTokens = Math.ceil(JSON.stringify(body).length / 4);
         const record = {
@@ -129,20 +255,25 @@ async function main(): Promise<void> {
             tail: tailShape(messages),
             inputTokens,
             pct: Number(((inputTokens / args.window) * 100).toFixed(1)),
-            rejected: lastRole !== "user",
+            rejected,
+            rejection,
         };
         appendFileSync(requestLog, `${JSON.stringify(record)}\n`);
 
         // The provider's own rule: an assistant-terminated conversation is a
         // prefill request, which these models reject outright.
-        if (lastRole !== "user") {
+        if (rejected) {
             prefillHits += 1;
             writeFileSync(
                 join(args.out, `prefill-${requestIndex}.json`),
                 JSON.stringify(body, null, 2),
             );
             return {
-                error: { status: 400, type: "invalid_request_error", message: PREFILL_MESSAGE },
+                error: {
+                    status: 400,
+                    type: "invalid_request_error",
+                    message: PREFILL_MESSAGE,
+                },
             };
         }
         const usage = { input_tokens: inputTokens, output_tokens: 40 };
@@ -152,7 +283,11 @@ async function main(): Promise<void> {
                 blocks(m).some((b) => b.type === "tool_result" && b.tool_use_id === "toolu_task"),
             );
             if (taskDone || !tools.some((t) => t.name === "task")) {
-                return { text: "parent done", stop_reason: "end_turn", usage } satisfies MockResponse;
+                return {
+                    text: "parent done",
+                    stop_reason: "end_turn",
+                    usage,
+                } satisfies MockResponse;
             }
             return {
                 content: [
@@ -186,13 +321,17 @@ async function main(): Promise<void> {
                     signature: `sig-${subStep}`,
                 });
             }
-            if (args.textWithTool) content.push({ type: "text", text: `Reading batch ${subStep}.` });
+            if (args.textWithTool)
+                content.push({ type: "text", text: `Reading batch ${subStep}.` });
             for (let i = 0; i < parallel; i += 1) {
                 content.push({
                     type: "tool_use",
                     id: `toolu_s${subStep}_${i}`,
                     name: "bash",
-                    input: { command: `cat f${(subStep + i) % 4}.txt`, description: "read file" },
+                    input: {
+                        command: `cat f${(subStep + i) % 4}.txt`,
+                        description: "read file",
+                    },
                 });
             }
             return { content, stop_reason: "tool_use", usage };
@@ -219,16 +358,32 @@ async function main(): Promise<void> {
         prompt: "You read files.",
     };
     if (args.agentSteps > 0) worker.steps = args.agentSteps;
+    const plugins = args.plugin === "none" ? [] : [`file://${resolve(args.plugin)}`];
+    if (args.emptyStep) {
+        // Insert an empty host message before Magic Context, not directly into
+        // the provider request, to exercise plugin replay and host conversion.
+        const fixture = join(dirs.work, "empty-step-plugin.js");
+        writeFileSync(
+            fixture,
+            `export default async () => ({
+            "experimental.chat.messages.transform": async (_, output) => {
+                const assistant = output.messages.find((message) => message.info.role === "assistant");
+                if (assistant) output.messages.splice(1, 0, { info: { ...assistant.info, id: assistant.info.id + "empty" }, parts: [] });
+            }
+        });`,
+        );
+        plugins.unshift(`file://${fixture}`);
+    }
     const opencodeConfig = {
         $schema: "https://opencode.ai/config.json",
-        plugin: args.plugin === "none" ? [] : [`file://${resolve(args.plugin)}`],
+        plugin: plugins,
         autoupdate: false,
         share: "disabled",
         compaction: { auto: false, prune: false },
         permission: { bash: "allow", edit: "allow", read: "allow", task: "allow" },
         provider: {
             "mock-anthropic": {
-                npm: "@ai-sdk/anthropic",
+                npm: args.google ? "@ai-sdk/google" : "@ai-sdk/anthropic",
                 name: "Mock Anthropic",
                 env: [],
                 options: { apiKey: "test-key-not-real", baseURL },
@@ -248,7 +403,10 @@ async function main(): Promise<void> {
         embedding: { provider: "off" },
     };
     mkdirSync(join(dirs.config, "cortexkit"), { recursive: true });
-    writeFileSync(join(dirs.config, "cortexkit", "magic-context.jsonc"), JSON.stringify(mcConfig, null, 2));
+    writeFileSync(
+        join(dirs.config, "cortexkit", "magic-context.jsonc"),
+        JSON.stringify(mcConfig, null, 2),
+    );
 
     const env: Record<string, string> = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -267,11 +425,15 @@ async function main(): Promise<void> {
     mkdirSync(env.TMPDIR, { recursive: true });
 
     const port = 20000 + Math.floor(Math.random() * 20000);
-    const child = spawn(args.opencode, ["serve", "--port", String(port), "--hostname", "127.0.0.1"], {
-        cwd: dirs.work,
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = spawn(
+        args.opencode,
+        ["serve", "--port", String(port), "--hostname", "127.0.0.1"],
+        {
+            cwd: dirs.work,
+            env,
+            stdio: ["ignore", "pipe", "pipe"],
+        },
+    );
     let serverLog = "";
     child.stdout?.on("data", (chunk) => (serverLog += chunk));
     child.stderr?.on("data", (chunk) => (serverLog += chunk));
@@ -280,7 +442,9 @@ async function main(): Promise<void> {
     try {
         for (let i = 0; ; i += 1) {
             try {
-                const res = await fetch(`${url}/session`, { signal: AbortSignal.timeout(2000) });
+                const res = await fetch(`${url}/session`, {
+                    signal: AbortSignal.timeout(2000),
+                });
                 if (res.ok) break;
             } catch {}
             if (i > 300) throw new Error(`serve never came up:\n${serverLog}`);
@@ -288,7 +452,9 @@ async function main(): Promise<void> {
         }
         await Bun.sleep(1500);
         const lsof = Bun.spawnSync(["lsof", "-p", String(child.pid)]).stdout.toString();
-        const dbLines = lsof.split("\n").filter((l) => /\.db|context|cortexkit|opencode/.test(l) && /REG/.test(l));
+        const dbLines = lsof
+            .split("\n")
+            .filter((l) => /\.db|context|cortexkit|opencode/.test(l) && /REG/.test(l));
         writeFileSync(join(args.out, "lsof.txt"), dbLines.join("\n"));
 
         const created = (await (
@@ -299,45 +465,107 @@ async function main(): Promise<void> {
             })
         ).json()) as { id: string };
         summary.parent = created.id;
-        await fetch(`${url}/session/${created.id}/message?directory=${encodeURIComponent(dirs.work)}`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-                agent: "build",
-                parts: [{ type: "text", text: "PARENT_RUN delegate the reading to a subagent" }],
-            }),
-            signal: AbortSignal.timeout(15 * 60_000),
-        });
+        await fetch(
+            `${url}/session/${created.id}/message?directory=${encodeURIComponent(dirs.work)}`,
+            {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    agent: "build",
+                    parts: [
+                        {
+                            type: "text",
+                            text: "PARENT_RUN delegate the reading to a subagent",
+                        },
+                    ],
+                }),
+                signal: AbortSignal.timeout(15 * 60_000),
+            },
+        );
         const lsofAfter = Bun.spawnSync(["lsof", "-p", String(child.pid)]).stdout.toString();
         writeFileSync(
             join(args.out, "lsof-after.txt"),
-            lsofAfter.split("\n").filter((l) => /\.db/.test(l)).join("\n"),
+            lsofAfter
+                .split("\n")
+                .filter((l) => /\.db/.test(l))
+                .join("\n"),
         );
         const children = (await (
-            await fetch(`${url}/session/${created.id}/children?directory=${encodeURIComponent(dirs.work)}`)
+            await fetch(
+                `${url}/session/${created.id}/children?directory=${encodeURIComponent(dirs.work)}`,
+            )
         ).json()) as Array<{ id: string }>;
         summary.children = children.map((c) => c.id);
+        if (args.idleMs > 0 && children[0]) {
+            // Wait for the cache TTL to expire before resuming the sessions so
+            // the probe exercises cache expiration during normal execution.
+            await Bun.sleep(args.idleMs);
+            await fetch(
+                `${url}/session/${created.id}/message?directory=${encodeURIComponent(dirs.work)}`,
+                {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                        agent: "build",
+                        parts: [{ type: "text", text: "PARENT_RUN report completion again" }],
+                    }),
+                    signal: AbortSignal.timeout(15 * 60_000),
+                },
+            );
+            subStep = 0;
+            await fetch(
+                `${url}/session/${children[0].id}/message?directory=${encodeURIComponent(dirs.work)}`,
+                {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                        agent: args.agent,
+                        parts: [{ type: "text", text: "SUBAGENT_RUN read the files again" }],
+                    }),
+                    signal: AbortSignal.timeout(15 * 60_000),
+                },
+            );
+        }
         const errors: unknown[] = [];
         for (const id of [created.id, ...children.map((c) => c.id)]) {
             const msgs = (await (
-                await fetch(`${url}/session/${id}/message?directory=${encodeURIComponent(dirs.work)}`)
-            ).json()) as Array<{ info: { role: string; error?: { data?: { message?: string } } } }>;
-            for (const m of msgs) if (m.info.error) errors.push({ session: id, error: m.info.error });
+                await fetch(
+                    `${url}/session/${id}/message?directory=${encodeURIComponent(dirs.work)}`,
+                )
+            ).json()) as Array<{
+                info: { role: string; error?: { data?: { message?: string } } };
+            }>;
+            for (const m of msgs)
+                if (m.info.error) errors.push({ session: id, error: m.info.error });
             if (id !== created.id) summary.subagentMessages = msgs.length;
         }
         summary.assistantErrors = errors;
     } finally {
         child.kill("SIGTERM");
+        google?.stop(true);
         await mock.stop();
         writeFileSync(join(args.out, "serve.log"), serverLog);
     }
-    const records = readFileSync(requestLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const records = readFileSync(requestLog, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l));
+    const logPath = join(args.out, "magic-context.log");
+    if (args.plugin !== "none") {
+        summary.foldEvidence = readFileSync(logPath, "utf8")
+            .split("\n")
+            .filter((line) => /HARD fold decision|system prompt hash/.test(line));
+    }
     summary.requests = records.length;
     summary.subagentRequests = records.filter((r) => r.lane === "subagent").length;
     summary.prefillRejections = prefillHits;
-    summary.maxSubagentPct = Math.max(0, ...records.filter((r) => r.lane === "subagent").map((r) => r.pct));
+    summary.maxSubagentPct = Math.max(
+        0,
+        ...records.filter((r) => r.lane === "subagent").map((r) => r.pct),
+    );
     writeFileSync(join(args.out, "summary.json"), JSON.stringify(summary, null, 2));
     console.log(JSON.stringify(summary, null, 2));
 }
 
-await main();
+if (import.meta.main) await main();
