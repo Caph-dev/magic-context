@@ -54,6 +54,7 @@ test("worker A holds its default database write lock", async () => {
         lock.prepare("DELETE FROM schema_migrations WHERE version = ?").run(
             LATEST_SUPPORTED_VERSION,
         );
+        lock.exec("DROP TABLE single_store_state");
         lock.exec("BEGIN IMMEDIATE");
         record("worker-a.json");
         await waitForContender();

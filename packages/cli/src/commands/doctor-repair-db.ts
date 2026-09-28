@@ -11,7 +11,7 @@ import {
     statSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-authority";
+import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-store-uuid";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import {
     getPersistedSchemaVersion,
@@ -70,7 +70,7 @@ interface SalvageResult {
     schemaVersionAfter?: number;
 }
 
-function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
+export function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
     const rpc = inspectRpcServerDiscovery(storageDir);
     if (rpc.state === "unreadable") {
         const arm = rpc.unreadableArm === "parse" ? "could not be parsed" : "could not be read";

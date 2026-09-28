@@ -49,6 +49,7 @@ test("OpenCode 2 names a migration refused by an older live host, then recovers 
 	seeded
 		.prepare("DELETE FROM schema_migrations WHERE version = ?")
 		.run(LATEST_SUPPORTED_VERSION);
+	seeded.exec("DROP TABLE single_store_state");
 	seeded.close();
 	const persistedVersion = () => {
 		const db = new ContextDatabase(dbPath);

@@ -106,7 +106,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 91;
+export const LATEST_SUPPORTED_VERSION = 92;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -1499,6 +1499,16 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     INSERT OR IGNORE INTO message_time_backfill_state
       (id, cursor_session_id, cursor_ordinal, completed, updated_at)
     VALUES (1, '', 0, 0, 0);
+
+    CREATE TABLE IF NOT EXISTS single_store_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      state TEXT NOT NULL CHECK (state IN ('required', 'migrated')),
+      migrated_at INTEGER,
+      migrated_by TEXT,
+      backup_dir TEXT,
+      report_json TEXT
+    );
+    INSERT OR IGNORE INTO single_store_state(id, state) VALUES (1, 'required');
 
     -- Highest memory id another writer (the Rust module in single-store mode) put
     -- into memories for a project, and how far this host has embedded. Migration v91.

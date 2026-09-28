@@ -106,7 +106,6 @@ import {
     readStorageVersions,
 } from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
-import { reportAuthorityMarkers } from "./doctor-authority";
 import {
     compareCachedPluginFences,
     listCachedOpenCodePluginFences,
@@ -1036,16 +1035,15 @@ export async function runDoctor(
     try {
         authorityDb = openExistingContextDatabase(authorityDbPath, { readonly: true });
         if (authorityDb) {
-            await reportAuthorityMarkers({ db: authorityDb, info: log.info, warn });
             // Sessions whose OpenCode harness label the v87 repair could not verify
             // because no OpenCode store was readable when it ran.
             reportUnresolvedHarnessRelabel({ db: authorityDb, warn, detail: log.warn });
         } else {
-            log.info("Authority: no context database found");
+            log.info("Harness relabel: no context database found");
         }
     } catch (error) {
         warn(
-            `Authority check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            `Harness relabel check unavailable: ${error instanceof Error ? error.message : String(error)}`,
         );
     } finally {
         authorityDb?.close();

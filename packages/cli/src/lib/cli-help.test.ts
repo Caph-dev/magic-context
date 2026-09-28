@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
     DOCTOR_HELP,
-    DRAIN_AUTHORITY_HELP,
+    SINGLE_STORE_HELP,
     LIST_HIDDEN_SESSIONS_HELP,
     MERGE_IDENTITY_HELP,
     SETUP_HELP,
@@ -19,7 +19,7 @@ describe("subcommandHelp", () => {
             [["setup"], SETUP_HELP],
             [["doctor"], DOCTOR_HELP],
             [["doctor", "--fix"], DOCTOR_HELP],
-            [["doctor", "drain-authority"], DRAIN_AUTHORITY_HELP],
+            [["doctor", "single-store", "migrate"], SINGLE_STORE_HELP],
             [["doctor", "merge-identity", "--from", "a"], MERGE_IDENTITY_HELP],
             [["doctor", "list-hidden-sessions"], LIST_HIDDEN_SESSIONS_HELP],
         ];
@@ -77,7 +77,7 @@ describe("CLI --help per subcommand", () => {
     const commands: Array<[string[], string]> = [
         [["setup"], "Usage: magic-context setup"],
         [["doctor"], "Usage: magic-context doctor [options]"],
-        [["doctor", "drain-authority"], "Usage: magic-context doctor drain-authority"],
+        [["doctor", "single-store", "migrate"], "Usage: magic-context doctor single-store migrate"],
         [["doctor", "merge-identity"], "Usage: magic-context doctor merge-identity"],
         [["doctor", "list-hidden-sessions"], "Usage: magic-context doctor list-hidden-sessions"],
         [["doctor", "migrate"], "Magic Context doctor migrate"],

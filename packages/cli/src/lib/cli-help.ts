@@ -60,7 +60,7 @@ export const DOCTOR_HELP = [
     ...HARNESS_LINES,
     "",
     "  Subcommands (each accepts --help):",
-    "    drain-authority <project>   Drain module memory/note authority back to TypeScript",
+    "    single-store migrate        Move Rust domain rows into context.db offline",
     "    migrate                     Migrate an OpenCode session to Pi or OMP JSONL",
     "    migrate-session             Re-home an OpenCode session to another directory",
     "    merge-identity              Merge project rows between identities",
@@ -69,11 +69,17 @@ export const DOCTOR_HELP = [
     "",
 ].join("\n");
 
-export const DRAIN_AUTHORITY_HELP = [
+export const SINGLE_STORE_HELP = [
     "",
-    "  Usage: magic-context doctor drain-authority <project>",
+    "  Usage: magic-context doctor single-store migrate [options]",
     "",
-    "  Drain the module's memory and note authority for <project> back to TypeScript.",
+    "  Quit OpenCode, Pi and ck-mc (`ck stop magic-context`) before migrating every project.",
+    "  --ck-mc <path>          Override the installed engine executable",
+    "  --backup-root <dir>     Backup parent directory (default: <data>/backups)",
+    "  --dry-run              Verify, then roll back the engine transaction",
+    "  --skip-foreign         Leave foreign-context store rows only in the backup",
+    "  --prefer <project>=store|context  Resolve an ambiguous project (repeatable)",
+    "  --accept-id-change     Accept changed memory IDs in Claude Code sessions",
     "",
 ].join("\n");
 
@@ -111,7 +117,7 @@ export function subcommandHelp(argv: readonly string[]): string | null {
     if (command === "setup") return SETUP_HELP;
     if (command !== "doctor") return null;
     const subcommand = rest[0];
-    if (subcommand === "drain-authority") return DRAIN_AUTHORITY_HELP;
+    if (subcommand === "single-store") return SINGLE_STORE_HELP;
     if (subcommand === "merge-identity") return MERGE_IDENTITY_HELP;
     if (subcommand === "list-hidden-sessions") return LIST_HIDDEN_SESSIONS_HELP;
     if (subcommand !== undefined && DOCTOR_SUBCOMMANDS_WITH_OWN_HELP.has(subcommand)) return null;

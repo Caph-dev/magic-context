@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 import {
     ensureContextStoreUuid,
     getContextStoreUuid,
-} from "@magic-context/core/features/magic-context/context-authority";
+} from "@magic-context/core/features/magic-context/context-store-uuid";
 import {
     getPersistedSchemaVersion as getCorePersistedSchemaVersion,
     LATEST_SUPPORTED_VERSION,
