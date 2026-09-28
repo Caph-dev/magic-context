@@ -1,6 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { CANONICAL_DREAM_TASKS } from "../../features/magic-context/dreamer/task-registry";
+import { runMigrations } from "../../features/magic-context/migrations";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     __resetNotificationStateForTests,
     drainNotifications,
@@ -1414,6 +1417,10 @@ describe("createMagicContextCommandHandler", () => {
     });
     describe("ctx-dream", () => {
         it("runs all enabled tasks, sends summary, and throws the sentinel", async () => {
+            // A migrated store, so the backlog panels have real rows to count.
+            const dreamDb = new Database(":memory:");
+            initializeDatabase(dreamDb);
+            runMigrations(dreamDb);
             const sendNotification = mock(async () => {});
             const runManual = mock(async () => ({
                 ran: ["verify"],
@@ -1421,9 +1428,11 @@ describe("createMagicContextCommandHandler", () => {
                 skippedNoWork: [],
                 deferredBusy: [],
                 failed: [],
+                // The runner reports only the task it selected.
+                backlogAfter: { verify: { pending: 0, total: 0 } },
             }));
             const handler = createMagicContextCommandHandler({
-                db,
+                db: dreamDb,
                 sendNotification,
                 dreamer: {
                     // command handler only reads `config` for presence; runManual is the entry.
@@ -1455,7 +1464,21 @@ describe("createMagicContextCommandHandler", () => {
             expect(sendNotification.mock.calls[1]?.[1]).toContain(
                 "curate: 8 memory operations applied",
             );
-            expect(sendNotification.mock.calls[1]?.[1]).toContain("Backlog at run end:");
+            const before = String(sendNotification.mock.calls[0]?.[1]);
+            const after = String(sendNotification.mock.calls[1]?.[1]);
+            // The end panel appears once and lists exactly the tasks the start panel listed,
+            // even though the runner only reported the task it ran.
+            expect(after.split("Backlog at run end:").length - 1).toBe(1);
+            expect(after).not.toContain("Backlog at run start:");
+            const taskNames = (panel: string) =>
+                panel
+                    .split("\n")
+                    .map((line) => /^\s*[-*]?\s*([a-z-]+):/.exec(line)?.[1])
+                    .filter((name): name is string => CANONICAL_DREAM_TASKS.includes(name as never));
+            const beforeTasks = taskNames(before.split("Backlog before starting:")[1] ?? "");
+            const afterTasks = taskNames(after.split("Backlog at run end:")[1] ?? "");
+            expect(beforeTasks.length).toBe(CANONICAL_DREAM_TASKS.length);
+            expect(afterTasks).toEqual(beforeTasks);
         });
 
         it("samples toast duration once when a dream run starts", async () => {
