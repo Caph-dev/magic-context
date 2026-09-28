@@ -3,9 +3,10 @@
 //! After the single-store migration every memory, note, compartment and history row lives
 //! in `context.db`. [`ModuleContextDomain`] gives the store what it needs to reach them:
 //! one reader connection, whose reads run in a read transaction so revision heads agree
-//! with the rows they describe, and the fenced [`HostStore`] writer, whose writes each run
-//! in one `BEGIN IMMEDIATE` behind the per-table schema fence and the privileged-writer
-//! bracket.
+//! with the rows they describe, and the fenced [`HostStore`] writer. Each write runs in one
+//! `BEGIN IMMEDIATE`, after checking that every table it writes still has the schema this
+//! build was made against, with the host's guard triggers switched off for that
+//! transaction only.
 //!
 //! [`attach`] also decides whether the pair of files may be served at all: `store.db`
 //! carries the single-store marker (it is at migration 61) and `context.db` must record
