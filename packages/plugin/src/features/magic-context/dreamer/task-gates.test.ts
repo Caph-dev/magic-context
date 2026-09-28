@@ -177,6 +177,29 @@ describe("dream task backlog probes", () => {
         });
     });
 
+    test("uses persisted task watermarks unless an explicit value is supplied", () => {
+        db = freshDb();
+        const project = "/repo/watermarks";
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("old", "opencode", project, 100);
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("new", "opencode", project, 300);
+        db.prepare(
+            "INSERT INTO task_schedule_state (project_path, task, retrospective_watermark_ms, last_run_at) VALUES (?, ?, ?, ?)",
+        ).run(project, "retrospective", 200, null);
+        expect(getDreamTaskBacklog(db, project, "retrospective").pending).toBe(1);
+        expect(
+            getDreamTaskBacklog(db, project, "retrospective", { retrospectiveWatermarkMs: null })
+                .pending,
+        ).toBe(2);
+        expect(
+            getDreamTaskBacklog(db, project, "retrospective", { retrospectiveWatermarkMs: 200 })
+                .pending,
+        ).toBe(1);
+    });
+
     test("processed count is the start-to-end backlog reduction", () => {
         expect(processedDreamTaskItems(17, 5)).toBe(12);
         expect(processedDreamTaskItems(5, 7)).toBe(0);

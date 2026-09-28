@@ -1,3 +1,4 @@
+import { DREAM_TASK_PROMOTION_DEFAULTS } from "../../../config/schema/magic-context";
 import type { Database } from "../../../shared/sqlite";
 import { hasMemoryClassifiedAtColumn } from "../memory/storage-memory";
 import { hasMuralCueColumns } from "../mural/storage-mural-cues";
@@ -292,16 +293,20 @@ export function getDreamTaskBacklog(
             };
         }
         case "retrospective": {
-            const pending = countProjectSessionsSince(
-                db,
-                projectPath,
-                options.retrospectiveWatermarkMs ?? null,
-            );
+            const watermark =
+                options.retrospectiveWatermarkMs !== undefined
+                    ? options.retrospectiveWatermarkMs
+                    : getTaskScheduleState(db, projectPath, task)?.retrospectiveWatermarkMs;
+            const pending = countProjectSessionsSince(db, projectPath, watermark ?? null);
             return { pending, total: pending };
         }
         case "maintain-docs": {
             const total = countCompartmentsSince(db, projectPath, 0);
-            const pending = countCompartmentsSince(db, projectPath, options.lastRunAt ?? 0);
+            const lastRunAt =
+                options.lastRunAt !== undefined
+                    ? options.lastRunAt
+                    : getTaskScheduleState(db, projectPath, task)?.lastRunAt;
+            const pending = countCompartmentsSince(db, projectPath, lastRunAt ?? 0);
             return { pending, total };
         }
         case "evaluate-smart-notes": {
@@ -407,7 +412,10 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             return getUserMemoryCandidates(db).length >= ctx.promotionThreshold;
 
         case "promote-primers":
-            return countPrimerCandidatesForProject(db, project) >= (ctx.promotionThreshold ?? 2);
+            return (
+                countPrimerCandidatesForProject(db, project) >=
+                (ctx.promotionThreshold ?? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"])
+            );
 
         case "refresh-primers":
             return getActivePrimers(db, project).some(

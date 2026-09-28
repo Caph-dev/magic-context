@@ -647,7 +647,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseKey,
                     deadline,
                     leaseAcquisition,
-                    promotionThreshold: config.promotionThreshold ?? DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"],
+                    promotionThreshold:
+                        config.promotionThreshold ??
+                        DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"],
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
@@ -837,7 +839,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseKey,
                     deadline,
                     leaseAcquisition,
-                    promotionThreshold: config.promotionThreshold ?? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"],
+                    promotionThreshold:
+                        config.promotionThreshold ??
+                        DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"],
                     ensureProjectRegistered: deps.ensureProjectRegistered,
                 });
                 recordRun("completed", null);
