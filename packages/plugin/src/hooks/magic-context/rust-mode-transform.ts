@@ -28,6 +28,8 @@ import {
 import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
 import { getMuralIdentity } from "../../features/magic-context/mural/storage-mural";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
+import { parseCacheTtl } from "../../features/magic-context/scheduler";
+import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
@@ -2434,6 +2436,16 @@ export function createRustModeTransform(
         const modelKey = model
             ? canonicalModelIdentity(resolveModelKey(model.providerID, model.modelID) ?? "")
             : null;
+        try {
+            sessionMeta.cacheTtl = resolveSessionCacheTtl(
+                deps.db,
+                sessionId,
+                deps.cacheTtlConfig,
+                modelKey ?? undefined,
+            ).value;
+        } catch (error) {
+            preflightError ??= error;
+        }
         let resolvedContextLimit: number | undefined;
         let resolvedWindowGeometry: WindowGeometryResult | undefined;
         if (model) {
@@ -3106,7 +3118,12 @@ export function createRustModeTransform(
                 deps.clearReasoningAge,
                 deps.cavemanTextCompression,
             ]);
-            const idleBudgetMs = sessionMeta.cacheTtl === "1h" ? 3_600_000 : 300_000;
+            let idleBudgetMs = 300_000;
+            try {
+                idleBudgetMs = parseCacheTtl(sessionMeta.cacheTtl);
+            } catch {
+                // Invalid TTLs use the same five-minute fallback as the scheduler.
+            }
             // Synthetic todo bytes are re-decided only on a bust. Observe every
             // adapter-visible bust signal rather than polling host permissions on
             // an unchanged defer pass; unexpected module busts remain observable.

@@ -688,6 +688,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     registerLkgPersistence(createDbLkgPersistence(db));
 
     const transform = createTransform({
+        cacheTtlConfig: deps.config.cache_ttl,
         tagger: deps.tagger,
         scheduler: deps.scheduler,
         contextUsageMap,

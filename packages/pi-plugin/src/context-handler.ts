@@ -68,6 +68,7 @@ import {
 	parseCacheTtl,
 	type Scheduler,
 } from "@magic-context/core/features/magic-context/scheduler";
+import { resolveSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import {
 	HYGIENE_PROVIDER_UNITS_VERSION,
 	sessionDecisionCalibration,
@@ -1193,6 +1194,7 @@ export interface PiSchedulerOptions {
 }
 
 export interface PiContextHandlerOptions {
+	cacheTtlConfig?: import("@magic-context/core/shared/model-cache-ttl").CacheTtlConfig;
 	db: ContextDatabase;
 	/** Smart-drops (experimental, default off): also reclaim tool output that a
 	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
@@ -2683,6 +2685,13 @@ export function registerPiContextHandler(
 			}
 			const previousModelKey = liveModelBySession.get(sessionId);
 			const currentModelKey = resolvePiContextModelKey(ctx);
+			if (options.cacheTtlConfig !== undefined)
+				resolveSessionCacheTtl(
+					options.db,
+					sessionId,
+					options.cacheTtlConfig,
+					currentModelKey,
+				);
 			const modelChanged =
 				previousModelKey !== undefined &&
 				currentModelKey !== undefined &&

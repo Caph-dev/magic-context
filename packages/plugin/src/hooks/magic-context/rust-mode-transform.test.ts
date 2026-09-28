@@ -739,6 +739,41 @@ describe("Rust mode authority adapter", () => {
         });
     });
 
+    it("sends the frozen known-model TTL to the Rust module", async () => {
+        const sessionId = "rust-known-model-ttl";
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const ttls: unknown[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") ttls.push(body?.cache_ttl);
+                return method === "transform"
+                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.cacheTtlConfig = "5m";
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0].info.model = { providerID: "openai", modelID: "gpt-6" };
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: [...messages] },
+            makeMeta(db, sessionId),
+        );
+        deps.cacheTtlConfig = "1m";
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: [...messages] },
+            makeMeta(db, sessionId),
+        );
+        expect(ttls).toEqual(["30m", "30m"]);
+    });
+
     it("copies caveman settings onto the authority wire", () => {
         const body = __rustModeTransformTest.buildTransformBody({
             sessionId: "caveman-wire",

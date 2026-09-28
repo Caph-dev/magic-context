@@ -56,6 +56,7 @@ import {
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
+import { resolveSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -81,7 +82,6 @@ import {
 	resolveHistorianContextLimit,
 	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
-import { resolveCacheTtl } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
@@ -370,7 +370,12 @@ export function persistPiMessageEndModelMeta(args: {
 	}
 	const modelKey = canonicalPiModelKey(msg.provider, msg.model);
 	if (!recordPiLiveModel(args.sessionId, modelKey, msg.timestamp)) return;
-	const cacheTtl = resolveCacheTtl(args.cacheTtlConfig, modelKey);
+	const cacheTtl = resolveSessionCacheTtl(
+		args.db,
+		args.sessionId,
+		args.cacheTtlConfig,
+		modelKey,
+	).value;
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
 	updateSessionMeta(args.db, args.sessionId, {
 		...(currentMeta.cacheTtl === cacheTtl ? {} : { cacheTtl }),
@@ -1381,6 +1386,7 @@ async function startPiMagicContextRuntime(
 		auto: PiAutoSearchHandlerOptions,
 	): PiContextHandlerOptions => ({
 		db: database,
+		cacheTtlConfig: cfg.cache_ttl,
 		smartDrops: cfg.smart_drops === true,
 		protectedTokens: cfg.protected_tokens,
 		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},

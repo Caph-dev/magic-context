@@ -7,6 +7,9 @@ import {
 	setSystemTime,
 	spyOn,
 } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	getOrCreateSessionMeta,
 	getPendingOps,
@@ -59,13 +62,20 @@ function providerUsage(inputTokens: number) {
 	};
 }
 
-function setup(sessionId: string) {
+function setup(
+	sessionId: string,
+	model = MODEL,
+	cacheTtlConfig:
+		| string
+		| (Record<string, string> & { default: string }) = CACHE_TTL_CONFIG,
+) {
 	const logs: string[] = [];
 	spyOn(loggerModule, "sessionLog").mockImplementation(
 		(_session: string, ...parts: unknown[]) => {
 			logs.push(parts.map(String).join(" "));
 		},
 	);
+	const root = mkdtempSync(join(tmpdir(), "mc-idle-ttl-"));
 	const db = createTestDb();
 	const fake = createFakePi();
 	registerPiContextHandler(fake.pi as never, {
@@ -91,7 +101,7 @@ function setup(sessionId: string) {
 			db,
 			sessionId,
 			message,
-			cacheTtlConfig: CACHE_TTL_CONFIG,
+			cacheTtlConfig,
 		});
 		await persistPiPressureFromMessageEnd({
 			db,
@@ -99,7 +109,7 @@ function setup(sessionId: string) {
 			message,
 			piContextWindow: 100_000,
 			piContextWindowSource: "catalog",
-			piModel: MODEL,
+			piModel: model,
 		});
 	};
 
@@ -107,11 +117,11 @@ function setup(sessionId: string) {
 		await handler({ messages: messages as never[] }, {
 			...fakeContext(
 				sessionId,
-				process.cwd(),
+				root,
 				messages.map((_message, index) => `entry-${index}`),
 				messages,
 			),
-			model: { ...MODEL, contextWindow: 100_000 },
+			model: { ...model, contextWindow: 100_000 },
 			getContextUsage: () => ({
 				tokens: percent * 1_000,
 				percent,
@@ -124,6 +134,7 @@ function setup(sessionId: string) {
 		restoreObserver();
 		clearContextHandlerSession(sessionId);
 		closeQuietly(db);
+		rmSync(root, { recursive: true, force: true });
 	};
 	return { db, lines, logs, messageEnd, runPass, cleanup };
 }
@@ -171,6 +182,49 @@ describe("Pi idle past the cache TTL applies queued drops (issue 545)", () => {
 	afterEach(() => {
 		setSystemTime();
 		mock.restore();
+	});
+
+	it.each([
+		"gpt-6",
+		"unknown",
+	])("built-in TTL real transform: %s after ten idle minutes", async (id) => {
+		const model = { provider: "openai", id };
+		const sessionId = `ses-built-in-${id}`;
+		const ctx = setup(sessionId, model, "5m");
+		try {
+			setSystemTime(new Date(T0 - 5_000));
+			await ctx.runPass([user1], 20);
+			setSystemTime(new Date(T0));
+			const answer = assistantMessage("answer", 2, {
+				provider: model.provider,
+				model: id,
+				...providerUsage(20_000),
+			});
+			await ctx.messageEnd(answer);
+			const tag = getTagsBySession(ctx.db, sessionId).find(
+				(tag) => tag.status === "active",
+			);
+			if (!tag) throw new Error("first pass tagged nothing");
+			queuePendingOp(ctx.db, sessionId, tag.id, "drop");
+			ctx.lines.length = 0;
+			ctx.logs.length = 0;
+			setSystemTime(new Date(T0 + 10 * MINUTE));
+			await ctx.runPass([user1, answer, userMessage("continue", 3)], 20);
+			const known = id === "gpt-6";
+			expect(getPendingOps(ctx.db, sessionId)).toHaveLength(known ? 1 : 0);
+			expect(
+				ctx.logs.some((line) =>
+					line.startsWith("pi m[0] HARD fold decision: reason=ttl_idle "),
+				),
+			).toBe(!known);
+			expect(
+				ctx.lines.some((line) =>
+					line.includes(known ? "reason=scheduler_defer" : "scheduler=execute"),
+				),
+			).toBe(true);
+		} finally {
+			ctx.cleanup();
+		}
 	});
 
 	it("advances last_response_time only for an assistant message that carries provider usage", async () => {

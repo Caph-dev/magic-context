@@ -1154,6 +1154,7 @@ export async function registerContext(context: V2Context) {
                     ),
                 );
             transform ??= createTransform({
+                cacheTtlConfig: config.cache_ttl,
                 db,
                 tagger,
                 ...createV2ThresholdDeps(config),

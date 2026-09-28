@@ -37,6 +37,7 @@ import {
 	readEpochFloorSnapshot,
 } from "@magic-context/core/features/magic-context/protection-window";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
+import { readSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import {
@@ -143,7 +144,7 @@ export interface StatusDialogDetail {
 	historianLastFailureAt: number | null;
 	historianLastError: string | null;
 	cacheTtl: string;
-	cacheTtlSource: "config" | "session" | "default";
+	cacheTtlSource: import("@magic-context/core/shared/cache-ttl-display").CacheTtlDisplaySource;
 	cacheTtlModelKey?: string;
 	configParseFailures: ConfigParseFailure[];
 	lastResponseTime: number;
@@ -768,6 +769,7 @@ export function buildPiStatusDetail(
 		},
 	);
 	const cacheTtlDisplay = resolveCacheTtlDisplay({
+		frozen: readSessionCacheTtl(deps.db, sessionId),
 		configured: deps.cacheTtlConfig ?? "5m",
 		configuredExplicitly: deps.cacheTtlConfigured === true,
 		modelKey,

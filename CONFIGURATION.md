@@ -237,7 +237,7 @@ Magic Context uses the runtime's built-in SQLite: `bun:sqlite` under Bun (OpenCo
 
 LLM providers cache conversation prefixes server-side. The cache window depends on your provider and subscription tier — Claude Pro offers 5 minutes, Max offers 1 hour, and pricing for cached vs. uncached tokens differs between API and subscription usage.
 
-Magic Context defers all mutations until the cached prefix expires. `cache_ttl` is how long Magic Context *assumes* a provider's cached prefix stays valid — it is MC's own deferral gate, not a control over the provider's cache. It does not change the provider's actual cache lifetime. The default `"5m"` matches Anthropic's default TTL. You can tune it:
+Magic Context defers all mutations until the cached prefix expires. `cache_ttl` is how long Magic Context *assumes* a provider's cached prefix stays valid — it is MC's own deferral gate, not a control over the provider's cache. It does not change the provider's actual cache lifetime. The generic fallback is `"5m"`. GPT-5.6 and later (including every `gpt-6*` model) instead default to **30m**, including through `openai/`, `openai-codex/`, `openrouter/openai/`, and `azure/` prefixes. [OpenAI documents](https://developers.openai.com/api/docs/guides/prompt-caching) at least 30 minutes since the latest write or reuse (see “Cache lifetime” and “Summary of model differences”). Earlier models retain the generic fallback. You can tune it:
 
 ```jsonc
 {
@@ -258,6 +258,8 @@ Per-model overrides for mixed-model workflows:
 ```
 
 Keys are matched from most to least specific: the exact `provider/model`, the bare model ID, progressively shorter dash-prefixes of the model ID (`claude-opus-4-6` also matches a `claude-opus-4` entry), then the provider wildcard `provider/*`, then `default`. A more specific entry always wins over a wildcard, so the example above keeps `60m` for Opus 4.6 and applies `never` to every other Anthropic model. Harness provider aliases resolve to the canonical name first, so one entry covers the same model on OpenCode, Pi and OMP.
+
+Precedence: explicit per-model entry → built-in known-model lifetime → object `default` → `"5m"`. For the global string form, unset or `"5m"` means defaults (so GPT-6 gets 30m); any other string, such as `"10m"`, is an explicit policy and wins over built-ins. To force 5m on GPT-6, use a per-model entry. The policy is frozen per session and survives restarts; model switches resolve against the frozen policy rather than live config. `/ctx-status` shows the effective TTL and its source.
 
 Supported formats: `"30s"`, `"5m"`, `"1h"`.
 

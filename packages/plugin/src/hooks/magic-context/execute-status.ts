@@ -14,6 +14,7 @@ import {
 } from "../../features/magic-context/dreamer/task-registry";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
+import { readSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { getPendingOps } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getTagsBySession } from "../../features/magic-context/storage-tags";
@@ -143,6 +144,7 @@ export function executeStatus(
         const totalBytes = activeTags.reduce((sum, t) => sum + t.byteSize, 0);
 
         const ttlDisplay = resolveCacheTtlDisplay({
+            frozen: readSessionCacheTtl(db, sessionId),
             configured: display?.cacheTtlConfig ?? "5m",
             configuredExplicitly: display?.cacheTtlConfigured === true,
             modelKey: liveModelKey,

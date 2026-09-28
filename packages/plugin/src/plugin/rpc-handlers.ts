@@ -40,6 +40,7 @@ import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
 import { getProtectionWindowForSession } from "../features/magic-context/protection-window";
 import { parseCacheTtl } from "../features/magic-context/scheduler";
+import { readSessionCacheTtl } from "../features/magic-context/session-cache-ttl";
 import { getQuickJsNativeMemoryStats } from "../features/magic-context/smart-notes/sandbox-runner";
 import {
     type ContextDatabase as Database,
@@ -995,6 +996,7 @@ export function buildStatusDetail(
             }
 
             const ttlDisplay = resolveCacheTtlDisplay({
+                frozen: readSessionCacheTtl(db, sessionId),
                 configured: (config.cache_ttl ?? "5m") as MagicContextConfig["cache_ttl"],
                 configuredExplicitly: config.cacheTtlConfigured === true,
                 modelKey,

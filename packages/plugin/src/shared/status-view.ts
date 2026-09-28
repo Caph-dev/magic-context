@@ -124,7 +124,7 @@ export interface StatusViewSource {
     readonly protectedTagCount: number;
     readonly isSubagent: boolean;
     readonly cacheTtl: string;
-    readonly cacheTtlSource?: "config" | "session" | "default";
+    readonly cacheTtlSource?: import("./cache-ttl-display").CacheTtlDisplaySource;
     readonly cacheTtlModelKey?: string;
     readonly lastResponseTime: number;
     readonly cacheRemainingMs: number;
