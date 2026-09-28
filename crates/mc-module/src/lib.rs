@@ -3446,7 +3446,7 @@ impl NativeAttachmentCache {
             if let Some(session) = self.sessions.remove(&oldest) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
                 stats.evicted = stats.evicted.saturating_add(1);
-                tracing::debug!(
+                tracing::info!(
                     "native-attachment-cache evicted session={oldest} byte_charge={} retained_bytes={} total_budget={} reason=delta_core_admission",
                     session.retained_bytes, self.retained_bytes, self.max_retained_bytes,
                 );
@@ -5033,36 +5033,69 @@ impl McHandler {
     fn expand_transform_tail_delta(
         &self,
         parsed: &mut TransformRequest,
-    ) -> Option<NativeDeltaFrontier> {
-        let delta = parsed.tail_delta.as_ref().and_then(Value::as_object)?;
-        let after = delta.get("after").and_then(Value::as_str)?.to_string();
+    ) -> Result<NativeDeltaFrontier, &'static str> {
+        let delta = parsed
+            .tail_delta
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or("invalid_tail_delta")?;
+        let after = delta
+            .get("after")
+            .and_then(Value::as_str)
+            .ok_or("invalid_after")?
+            .to_string();
         let replace_from = delta
             .get("replace_from")
             .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())?;
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("invalid_replace_from")?;
         let native_replace_from = delta
             .get("native_replace_from")
             .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())?;
-        parsed.full_array_fingerprint.as_ref()?;
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("invalid_native_replace_from")?;
+        parsed
+            .full_array_fingerprint
+            .as_ref()
+            .ok_or("missing_full_array_fingerprint")?;
 
         // A store-side rewrite can advance the epoch without updating this process's request
         // snapshot. Load the persisted epoch first, then inspect the bounded projection and native
         // cores so stale process state cannot select an outdated entry.
         let current_revert_epoch = self
             .store
-            .get()?
+            .get()
+            .ok_or("store_unavailable")?
             .load(&parsed.session_id)
-            .ok()?
+            .map_err(|_| "store_load_failed")?
             .meta
             .revert_epoch;
-        let projection_cache = self.lookup_projection_cache(
-            parsed,
-            current_revert_epoch,
-            &after,
-            replace_from,
-            ProjectionCacheKeyMode::Normal,
-        );
+        let snapshot = self
+            .projections
+            .lock()
+            .expect("projection cache mutex")
+            .snapshot(&parsed.session_id, current_revert_epoch);
+        let projection_miss_reason = match snapshot.as_ref() {
+            None => "projection_cache_missing_or_reverted",
+            Some(snapshot)
+                if snapshot.full_array_fingerprint.as_deref() != Some(after.as_str()) =>
+            {
+                "projection_fingerprint_mismatch"
+            }
+            Some(snapshot) if projection_cache_context(parsed) != snapshot.context => {
+                "projection_context_mismatch"
+            }
+            Some(_) => "projection_prefix_unavailable",
+        };
+        let projection_cache = snapshot.as_ref().and_then(|snapshot| {
+            validated_projection_cache_input(
+                parsed,
+                snapshot,
+                &after,
+                replace_from,
+                ProjectionCacheKeyMode::Normal,
+            )
+        });
         let fallback_request = self
             .transform_snapshots
             .lock()
@@ -5077,16 +5110,32 @@ impl McHandler {
                 let request = fallback_request.as_ref()?;
                 (replace_from <= request.messages.len())
                     .then(|| request.messages[..replace_from].to_vec())
-            })?;
+            })
+            .ok_or(projection_miss_reason)?;
         let mut current_messages = std::mem::take(&mut parsed.messages);
         messages.append(&mut current_messages);
 
         let (native_prefix, native_prefix_retained_bytes) = if native_replace_from == 0 {
             (Vec::new(), Vec::new())
         } else {
-            self.native_attachments
+            let mut cache = self
+                .native_attachments
                 .lock()
-                .expect("native attachment cache mutex")
+                .expect("native attachment cache mutex");
+            let native_miss_reason = match cache.sessions.get(&parsed.session_id) {
+                None => "native_cache_missing",
+                Some(session) if session.revert_epoch != current_revert_epoch => {
+                    "native_revert_epoch_mismatch"
+                }
+                Some(session)
+                    if session.snapshot.full_array_fingerprint.as_deref()
+                        != Some(after.as_str()) =>
+                {
+                    "native_fingerprint_mismatch"
+                }
+                Some(_) => "native_prefix_unavailable",
+            };
+            cache
                 .delta_native_prefix(
                     &parsed.session_id,
                     current_revert_epoch,
@@ -5108,19 +5157,23 @@ impl McHandler {
                             .collect();
                         (prefix, retained_bytes)
                     })
-                })?
+                })
+                .ok_or(native_miss_reason)?
         };
         let mut native_messages = native_prefix
             .iter()
             .map(|message| message.as_ref().clone())
             .collect::<Vec<_>>();
-        let mut current_native = parsed.native_messages.take()?;
+        let mut current_native = parsed
+            .native_messages
+            .take()
+            .ok_or("missing_native_messages")?;
         native_messages.append(&mut current_native);
 
         parsed.messages = messages;
         parsed.native_messages = Some(native_messages);
         parsed.tail_delta = None;
-        Some(NativeDeltaFrontier {
+        Ok(NativeDeltaFrontier {
             after,
             native_replace_from,
             native_prefix,
@@ -10382,7 +10435,7 @@ impl McHandler {
             // existing producer sessions. Dreamer IDs instead require registration and route
             // validation before they may bypass the transform.
             if parsed.tail_delta.is_some() {
-                return need_full_sync_response(&parsed);
+                return need_full_sync_response(&parsed, "producer_requires_full_array");
             }
             ticket.accept();
             return passthrough_transform_response(&parsed);
@@ -10393,7 +10446,7 @@ impl McHandler {
             match self.resolve_binding(channel, &parsed.session_id) {
                 Ok(_) => {
                     if parsed.tail_delta.is_some() {
-                        return need_full_sync_response(&parsed);
+                        return need_full_sync_response(&parsed, "producer_requires_full_array");
                     }
                     ticket.accept();
                     return passthrough_transform_response(&parsed);
@@ -10495,8 +10548,9 @@ impl McHandler {
             let delta_expand_started_at = Instant::now();
             let expanded = self.expand_transform_tail_delta(&mut parsed);
             delta_expand_ms = delta_expand_started_at.elapsed().as_secs_f64() * 1_000.0;
-            let Some(frontier) = expanded else {
-                return need_full_sync_response(&parsed);
+            let frontier = match expanded {
+                Ok(frontier) => frontier,
+                Err(reason) => return need_full_sync_response(&parsed, reason),
             };
             Some(frontier)
         } else {
@@ -16013,11 +16067,23 @@ fn passthrough_transform_response(request: &TransformRequest) -> HandlerOutcome 
     respond_transform(request, response)
 }
 
-fn need_full_sync_response(request: &TransformRequest) -> HandlerOutcome {
-    respond_transform(
-        request,
-        transform::TransformResponse::need_full_sync(request.full_array_fingerprint.clone()),
-    )
+fn need_full_sync_response(request: &TransformRequest, reason: &str) -> HandlerOutcome {
+    tracing::info!(
+        "mc-module: need_full_sync session={} reason={} after={} fingerprint={}",
+        request.session_id,
+        reason,
+        request
+            .tail_delta
+            .as_ref()
+            .and_then(|delta| delta.get("after"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("none"),
+        request.full_array_fingerprint.as_deref().unwrap_or("none"),
+    );
+    let mut response =
+        transform::TransformResponse::need_full_sync(request.full_array_fingerprint.clone());
+    response.need_full_sync_reason = Some(reason.to_string());
+    respond_transform(request, response)
 }
 
 fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
@@ -16247,6 +16313,13 @@ fn respond_transform(
     let session_id = &request.session_id;
     let response_encode_started_at = Instant::now();
     let pass_timings = response.timings.clone();
+    let completion = format!(
+        "action={} row_version={} committed={} fingerprint={}",
+        response.action,
+        response.row_version,
+        response.committed,
+        response.full_array_fingerprint.as_deref().unwrap_or("none")
+    );
     let messages = response.ck_messages.take();
     let mut value = match serde_json::to_value(response) {
         Ok(value) => value,
@@ -16277,6 +16350,7 @@ fn respond_transform(
         let outcome = HandlerOutcome::Response(transform::encode_js_surrogate_markers(encoded));
         emit_pass_timing(
             session_id,
+            &completion,
             pass_timings.as_ref(),
             response_encode_started_at,
             response_meta_encode_ms,
@@ -16321,6 +16395,7 @@ fn respond_transform(
     let outcome = HandlerOutcome::Response(transform::encode_js_surrogate_markers(output));
     emit_pass_timing(
         session_id,
+        &completion,
         pass_timings.as_ref(),
         response_encode_started_at,
         response_meta_encode_ms,
@@ -16332,6 +16407,7 @@ fn respond_transform(
 
 fn emit_pass_timing(
     session_id: &str,
+    completion: &str,
     timings: Option<&transform::TransformTimings>,
     response_encode_started_at: Instant,
     response_meta_encode_ms: f64,
@@ -16343,14 +16419,14 @@ fn emit_pass_timing(
         timings.response_meta_encode = response_meta_encode_ms;
         timings.response_size_account = response_size_account_ms;
         timings.response_splice = response_splice_ms;
-        tracing::debug!(
-            "{}",
-            transform::format_pass_timing_line(
-                session_id,
-                &timings,
-                response_encode_started_at.elapsed().as_secs_f64() * 1_000.0,
-            )
-        );
+        let response_encode_ms = response_encode_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let line = transform::format_pass_timing_line(session_id, &timings, response_encode_ms);
+        // Emit before handing bytes to transport: a caller timeout must not hide a slow pass.
+        if timings.handler_total + response_encode_ms >= 1_000.0 {
+            tracing::info!(target: "perf", "{line} {completion}");
+        } else {
+            tracing::debug!("{line} {completion}");
+        }
     }
 }
 
@@ -33556,6 +33632,68 @@ mod tests {
         assert_eq!(store.load("ses").unwrap().row_version, before_unknown);
     }
 
+    /// Scratch-only socket adapter: isolates handler costs from daemon admission and framing.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "run with packages/plugin/scripts/cereb-full-sync-probe.ts and MC_SYNC_PROBE_SOCKET"]
+    async fn cereb_full_sync_socket_probe() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let socket = std::env::var("MC_SYNC_PROBE_SOCKET").expect("scratch socket path required");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        for pass in 0..3 {
+            if pass == 2 {
+                handler.projections.lock().unwrap().remove("ses");
+                handler.native_attachments.lock().unwrap().remove("ses");
+                handler.transform_snapshots.lock().unwrap().remove("ses");
+                handler.serialized_outputs.lock().unwrap().remove("ses");
+            }
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).unwrap();
+            let read_start = Instant::now();
+            let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut bytes).unwrap();
+            let read_ms = read_start.elapsed().as_secs_f64() * 1000.0;
+            let parse_start = Instant::now();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+            let handler_start = Instant::now();
+            let HandlerOutcome::Response(response) =
+                call_transform_outcome(&handler, request).await
+            else {
+                panic!("probe rejected")
+            };
+            let handler_ms = handler_start.elapsed().as_secs_f64() * 1000.0;
+            let decoded: Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(decoded["status"], "ok");
+            println!("scratch-pass pass={pass} request_bytes={} read_ms={read_ms:.3} parse_ms={parse_ms:.3} handler_ms={handler_ms:.3} response_bytes={} timings={}", bytes.len(), response.len(), decoded["timings"]);
+            let write_start = Instant::now();
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+            println!(
+                "scratch-reply pass={pass} write_ms={:.3}",
+                write_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        std::fs::remove_file(socket).unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn tail_delta_returns_need_full_sync_success_without_store_write() {
         let producer = Arc::new(ProducerState::default());
@@ -33569,6 +33707,7 @@ mod tests {
 
         assert_eq!(response["status"], "need_full_sync");
         assert_eq!(response["served_from"], "transform");
+        assert_eq!(response["need_full_sync_reason"], "invalid_replace_from");
         assert_eq!(response["full_array_fingerprint"], "fp-delta");
         assert_eq!(response["surface_state"], "inactive");
         assert!(response["row_version"].is_u64());
@@ -33577,6 +33716,44 @@ mod tests {
         // ambiguous state between "transformed to nothing" and "re-send".
         assert!(response.get("ck_messages").is_none());
         assert_eq!(store.load("ses").unwrap().row_version, before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn undelivered_transform_advances_delta_base_without_host_ack() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut first = request(vec![ck("m1", 1, "history")]);
+        first["full_array_fingerprint"] = json!("fp-first");
+        first["native_messages"] = json!([]);
+        assert_eq!(
+            call_transform_request(&handler, first).await["status"],
+            "ok"
+        );
+        let mut advanced = request(vec![ck("m1", 1, "history"), ck("m2", 2, "new tail")]);
+        advanced["full_array_fingerprint"] = json!("fp-advanced");
+        advanced["native_messages"] = json!([]);
+        // Simulate a completed pass whose response is lost. The module installs the
+        // advanced request as its sole ingress base before the host receives that response.
+        let undelivered = call_transform_request(&handler, advanced.clone()).await;
+        assert_eq!(undelivered["status"], "ok");
+        let before = store.load("ses").unwrap().row_version;
+        let mut stale = request(vec![ck("m2", 2, "new tail")]);
+        stale["full_array_fingerprint"] = json!("fp-advanced");
+        stale["native_messages"] = json!([]);
+        stale["tail_delta"] =
+            json!({"after": "fp-first", "replace_from": 1, "native_replace_from": 0});
+        let rejected = call_transform_request(&handler, stale).await;
+        assert_eq!(
+            rejected["need_full_sync_reason"],
+            "projection_fingerprint_mismatch"
+        );
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        let replay = call_transform_request(&handler, advanced).await;
+        assert_eq!(
+            serde_json::to_vec(&replay["ck_messages"]).unwrap(),
+            serde_json::to_vec(&undelivered["ck_messages"]).unwrap()
+        );
+        assert!(replay.get("need_full_sync_reason").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -33601,6 +33778,10 @@ mod tests {
         });
         let missing = call_transform_request(&handler, delta).await;
         assert_eq!(missing["status"], "need_full_sync");
+        assert_eq!(
+            missing["need_full_sync_reason"],
+            "projection_cache_missing_or_reverted"
+        );
         assert_eq!(store.load("ses").unwrap().row_version, before);
 
         let mut full = request(vec![ck("m1", 1, "cached history"), ck("m2", 2, "new tail")]);

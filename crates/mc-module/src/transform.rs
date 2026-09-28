@@ -1596,6 +1596,9 @@ pub struct TransformResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub native_reasoning_keep_mids: Vec<String>,
     pub status: TransformStatus,
+    /// Reason the request requires a full sync; omitted on success and by older modules.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub need_full_sync_reason: Option<String>,
     pub served_from: ServedFrom,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_array_fingerprint: Option<String>,
@@ -1697,6 +1700,7 @@ impl TransformResponse {
         Self {
             native_reasoning_keep_mids: Vec::new(),
             status: TransformStatus::NeedFullSync,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
             action: "NEED_FULL_SYNC".to_string(),
@@ -1736,6 +1740,7 @@ impl TransformResponse {
         Self {
             native_reasoning_keep_mids: Vec::new(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
             action: "PASSTHROUGH".to_string(),
@@ -3345,6 +3350,7 @@ fn apply_additive_only(
                 })
                 .collect(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: action.clone(),
@@ -6541,6 +6547,7 @@ fn apply_once(
                 })
                 .collect(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: result_action.clone(),

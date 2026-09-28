@@ -3496,7 +3496,14 @@ export function createRustModeTransform(
                     // rows, which the module's missing delta base says nothing about. Clearing
                     // it here made the retry (or the next pass) re-read every stored row of
                     // the session before dispatch, 57 s on a 124k-row session.
-                    sessionLog(sessionId, "need_full_sync retry=full ordinal_memo=kept");
+                    sessionLog(
+                        sessionId,
+                        `need_full_sync retry=full ordinal_memo=kept reason=${
+                            typeof response.need_full_sync_reason === "string"
+                                ? response.need_full_sync_reason
+                                : "unknown"
+                        }`,
+                    );
                 } else {
                     sessionLog(
                         sessionId,
