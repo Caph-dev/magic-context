@@ -2778,7 +2778,7 @@ fn load_broca_cache_sessions(limit: usize) -> Vec<CacheSessionListEntry> {
 // appended to the session's WAL. The Cache tab refetches a session's events
 // only when its listed activity moves, so a session dated by that stamp alone
 // stayed frozen at whatever its WAL held when it was first listed: a short
-// run (a sidekick gather) first seen just after `run_started` showed no steps
+// run (a gather research run) first seen just after `run_started` showed no steps
 // until it finished. With `wal_state_root`, a session with a running run is
 // dated by its live WAL's modification time as well, which moves on every
 // append. Such sessions are fetched past `limit` (there are only a few), so a

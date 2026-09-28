@@ -1162,7 +1162,7 @@ pub(crate) mod tests {
         assert_eq!(runs[0].steps[1].usage, StepUsage::default());
     }
 
-    /// WAL bytes shaped like a live sidekick gather session (`alfonso:gather-…`),
+    /// WAL bytes shaped like a live gather research session (`alfonso:gather-…`),
     /// synthesized from the record types and keys a real one holds, with no
     /// live content: one lineage frame, then bare records (no `ts_ms`/`record`
     /// envelope) written at fence 1. Each model step is followed by a tool
