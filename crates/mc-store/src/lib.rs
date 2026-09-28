@@ -3065,14 +3065,6 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE mc_historian_pending_run ADD COLUMN reported_at_ms INTEGER;
     ",
     },
-    Migration {
-        // The single-store move: the domain tables leave store.db for context.db, along with
-        // the mirror and authority machinery that kept the two copies in step. See
-        // `single_store_schema` for the statements and why they are shared with the offline
-        // engine. `McStore::open` applies this only to a store holding no domain rows.
-        version: 61,
-        statements: single_store_schema::MIGRATION_61_SQL,
-    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -3104,7 +3096,7 @@ pub const LATEST_MIGRATION_VERSION: u32 = {
 ///
 /// The change that adds those readers and writers flips this to `true`, which is what stops the
 /// refusal below from firing on builds that can actually cope.
-pub const SINGLE_STORE_CAPABLE: bool = true;
+pub const SINGLE_STORE_CAPABLE: bool = false;
 
 /// The migration that introduced the single-store marker columns. Named so the step-through test
 /// reads as one fact rather than two bare numbers.
@@ -5937,28 +5929,13 @@ pub enum McStoreError {
         session_id: String,
         stored: usize,
     },
-    /// The store still holds the rows the one-time single-store migration moves into
-    /// `context.db`, or `context.db` does not record that migration.
+    /// The store carries the single-store marker and this binary cannot serve that layout.
     ///
-    /// Terminal on purpose: this binary reads those rows only from `context.db`, so serving
-    /// this store would serve none of them. The fix is `magic-context doctor single-store
-    /// migrate`, which is what the sentence says.
-    SingleStoreMigrationRequired {
-        /// The store's recorded schema version.
-        db_version: u32,
-        /// The first moved table found holding a row, or what else made the pair unmigrated.
-        populated_table: String,
-    },
-    /// `store.db` and `context.db` disagree about the single-store migration: one records
-    /// it and the other does not, or their stamps differ.
-    SingleStoreStateSplit {
-        detail: String,
-    },
-    /// A read or write of the domain rows in `context.db` failed. `code` is the stable
-    /// name the module reports (busy, fence refusal, missing table, SQLite error).
-    ContextDomain {
-        code: String,
-        detail: String,
+    /// Terminal on purpose: retrying changes nothing, and opening anyway would serve rows that
+    /// are no longer the ones being written. The only fix is a build that can read the migrated
+    /// layout, which is what the message says.
+    SingleStoreMarkerUnsupported {
+        marker: SingleStoreMarker,
     },
     /// `store.db` records a schema version newer than the newest migration this binary carries.
     ///
@@ -6013,23 +5990,11 @@ impl std::fmt::Display for McStoreError {
                 f,
                 "note {id} CAS conflict: expected {expected_status}@{expected_version}, found {found_status}@{found_version}"
             ),
-            McStoreError::SingleStoreMigrationRequired {
-                db_version,
-                populated_table,
-            } => write!(
+            McStoreError::SingleStoreMarkerUnsupported { marker } => write!(
                 f,
-                "{}: store.db v{db_version} ({populated_table}): {}",
-                single_store_schema::SINGLE_STORE_MIGRATION_REQUIRED_REASON,
-                single_store_schema::SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE
+                "{SINGLE_STORE_MARKER_REFUSAL_REASON}: {}",
+                marker.remediation()
             ),
-            McStoreError::SingleStoreStateSplit { detail } => write!(
-                f,
-                "{}: {detail}; restore store.db and context.db together from the single-store backup",
-                single_store_schema::SINGLE_STORE_STATE_SPLIT_REASON
-            ),
-            McStoreError::ContextDomain { code, detail } => {
-                write!(f, "context.db {code}: {detail}")
-            }
             McStoreError::StoreAheadOfBinary {
                 db_version,
                 binary_max,
@@ -7835,6 +7800,25 @@ impl McStore {
     }
 
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
+        Self::open_with_single_store_capability(descriptor, SINGLE_STORE_CAPABLE)
+    }
+
+    /// `open`, with the single-store capability supplied instead of read from the build constant.
+    ///
+    /// Tests use this to exercise both sides of the refusal from one build; production always
+    /// goes through `open`, which passes [`SINGLE_STORE_CAPABLE`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_with_capability_for_test(
+        descriptor: &StorageDescriptor,
+        single_store_capable: bool,
+    ) -> Result<Self, McStoreError> {
+        Self::open_with_single_store_capability(descriptor, single_store_capable)
+    }
+
+    fn open_with_single_store_capability(
+        descriptor: &StorageDescriptor,
+        single_store_capable: bool,
+    ) -> Result<Self, McStoreError> {
         let inner = open_sqlite(descriptor)?;
         let note_caller_project = Arc::new(Mutex::new(None::<String>));
         let facade_authority_scope = Arc::new(Mutex::new(None::<FacadeAuthorityScope>));
@@ -7886,25 +7870,6 @@ impl McStore {
                 },
             )
         })?;
-        // Migration 61 drops the tables whose rows now live in context.db. A store that still
-        // holds such rows has not been through the offline migration, which copies them first,
-        // so it is refused here before any migration runs; the file stays exactly as it was.
-        let (recorded_before, populated) = inner.with_conn(|conn| {
-            Ok((
-                single_store_schema::recorded_store_version(conn)?,
-                single_store_schema::first_populated_moved_table(conn, "main")?,
-            ))
-        })?;
-        if recorded_before < single_store_schema::SINGLE_STORE_MIGRATION_VERSION {
-            if let Some(table) = populated {
-                let error = McStoreError::SingleStoreMigrationRequired {
-                    db_version: recorded_before,
-                    populated_table: table.to_string(),
-                };
-                tracing::error!("mc-store: refusing to open: {error}");
-                return Err(error);
-            }
-        }
         let migration = inner.migrate(NS, MIGRATIONS)?;
         // A store written by a longer chain than this binary carries is refused here, before the
         // repair below or anything else reads or writes a row. On such a store the migrator has
@@ -7924,28 +7889,26 @@ impl McStore {
             tracing::error!("mc-store: refusing to open: {error}");
             return Err(error);
         }
-        // An empty store just took migration 61 through the ordinary chain. Stamp its marker so
-        // the module can write the matching context.db flag; the suffix tells it this was a
-        // fresh install rather than a migrated store whose context.db flag went missing.
-        if recorded_before < single_store_schema::SINGLE_STORE_MIGRATION_VERSION
-            && migration.recorded >= single_store_schema::SINGLE_STORE_MIGRATION_VERSION
-        {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_millis() as i64)
-                .unwrap_or_default();
-            let build = format!(
-                "{}{}",
-                single_store_schema::build_identity(),
-                single_store_schema::FRESH_INSTALL_MARKER_SUFFIX
-            );
-            inner.with_conn(|conn| {
-                conn.execute(
-                    single_store_schema::SINGLE_STORE_MARKER_SQL,
-                    params![stamp, build],
-                )?;
-                Ok(())
-            })?;
+        // Older note updates could park session notes with conditions that no evaluator claims.
+        // Restore their session visibility without changing project-scoped smart notes.
+        inner.with_conn(|conn| {
+            conn.execute(
+                "UPDATE mc_notes SET status = 'active', surface_condition = NULL, status_version = status_version + 1
+                 WHERE type = 'session' AND status = 'pending' AND surface_condition IS NOT NULL",
+                [],
+            )?;
+            Ok(())
+        })?;
+        // After migrating, before anything reads or writes rows: a store whose project rows live
+        // elsewhere must not be served by a binary that would read the copies left behind here.
+        if !single_store_capable {
+            if let Some(marker) = inner.with_conn(read_single_store_marker)? {
+                tracing::warn!(
+                    "mc-store: refusing to open: {SINGLE_STORE_MARKER_REFUSAL_REASON}: {}",
+                    marker.remediation()
+                );
+                return Err(McStoreError::SingleStoreMarkerUnsupported { marker });
+            }
         }
         let store = McStore {
             inner: ScopedSqliteStore {
@@ -7978,6 +7941,7 @@ impl McStore {
             #[cfg(any(test, feature = "test-support"))]
             historian_side_channel_fail_once: Mutex::new(BTreeSet::new()),
         };
+        store.repair_migration_30_authority_routes()?;
         store.prune_transform_session_roots()?;
         Ok(store)
     }
@@ -24831,6 +24795,65 @@ mod tests {
         assert!(
             rejected.to_string().to_lowercase().contains("constraint"),
             "{rejected}"
+        );
+    }
+
+    /// A store carrying the marker is refused by this binary, by name, with a sentence naming the
+    /// build that moved it.
+    ///
+    /// The control in the same test is the capable open: the very same file opens when the
+    /// capability is present, which is what makes the refusal a statement about this binary
+    /// rather than about a damaged store.
+    #[test]
+    fn a_marked_store_is_refused_by_name_and_opens_for_a_capable_binary() {
+        // Checked at compile time: this build ships the refusal, not the readers it guards, and
+        // the refusal asserted below only happens while that capability is absent.
+        const { assert!(!SINGLE_STORE_CAPABLE) };
+        // Spelled out rather than compared against the constant: operators, log searches and the
+        // release note all quote this exact token, so a rename is a contract change and has to be
+        // made deliberately here rather than travelling silently through every assertion that
+        // reads the constant.
+        assert_eq!(SINGLE_STORE_MARKER_REFUSAL_REASON, "single_store_marker");
+        const SET_BY: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c";
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+
+        let unmarked = McStore::open(&descriptor).unwrap();
+        assert_eq!(unmarked.single_store_marker().unwrap(), None);
+        unmarked
+            .set_single_store_marker_for_test(1_758_000_000_000, SET_BY)
+            .unwrap();
+        drop(unmarked);
+
+        let Err(refusal) = McStore::open(&descriptor) else {
+            panic!("a marked store must not open for a binary without the readers for it");
+        };
+        let McStoreError::SingleStoreMarkerUnsupported { marker } = &refusal else {
+            panic!("expected the single-store refusal, got {refusal:?}");
+        };
+        assert_eq!(marker.set_at_ms, Some(1_758_000_000_000));
+        assert_eq!(marker.set_by, SET_BY);
+
+        let rendered = refusal.to_string();
+        assert!(
+            rendered.contains(SINGLE_STORE_MARKER_REFUSAL_REASON),
+            "the refusal must name itself so logs and health agree: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "this store was migrated to single-store mode by ck-mc {SET_BY}; \
+                 run that build or newer"
+            )),
+            "the refusal must say which build to run: {rendered}"
+        );
+
+        let capable = McStore::open_with_capability_for_test(&descriptor, true).unwrap();
+        assert_eq!(
+            capable.single_store_marker().unwrap(),
+            Some(SingleStoreMarker {
+                set_at_ms: Some(1_758_000_000_000),
+                set_by: SET_BY.to_string(),
+            })
         );
     }
 

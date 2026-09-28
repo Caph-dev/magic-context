@@ -2013,10 +2013,7 @@ struct LegacySource<'a>(&'a Connection);
 struct ContextSource<'a>(&'a Connection);
 
 fn store_error(error: rusqlite::Error) -> McStoreError {
-    McStoreError::ContextDomain {
-        code: "sqlite".to_string(),
-        detail: error.to_string(),
-    }
+    McStoreError::Store(cortexkit_store::StoreError::Backend(error.to_string()))
 }
 
 fn source_reads(

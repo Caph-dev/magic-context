@@ -64,7 +64,7 @@ pub const SINGLE_STORE_CAPABLE: bool = mc_store::SINGLE_STORE_CAPABLE;
 /// this binary was built; whether that migration changed anything these writers depend
 /// on is answered per table by the fingerprints, so a migration that touched only tables
 /// the module never writes does not stop the module writing.
-pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 92;
+pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 91;
 
 /// Versions at or above this number belong to downstream forks and are excluded when
 /// reading the persisted lane, matching the host's own fence arithmetic.
@@ -2708,8 +2708,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fixture_db(dir.path(), "context.db");
         mark_managed(&path, "git:fixture");
-        // The schema snapshot is lane 91, so a binary built at 90 sees it one lane ahead.
-        let mut store = HostStore::open_with_fence(&path, 90).unwrap();
+        let mut store = HostStore::open_with_fence(&path, BUILT_CONTEXT_FENCE_VERSION - 1).unwrap();
 
         assert!(store.fence().lane_ahead());
         assert_eq!(store.writable_tables(), DOMAIN_TABLES.to_vec());

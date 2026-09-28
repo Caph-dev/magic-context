@@ -688,3 +688,54 @@ async fn gate_restart_releases_a_parked_run_and_parks_its_queue_row() {
     );
     drop(dir);
 }
+
+/// B0 asserts the single-store refusal on `store_refusal()` because an unbound
+/// channel is refused before the store is consulted. Bind the channel and
+/// `session.status` reaches the store refusal for real, which is the seam the
+/// gate was asked to check.
+#[tokio::test]
+async fn gate_session_status_and_the_claim_lane_name_the_single_store_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_home = dir.path().join("data");
+    std::fs::create_dir_all(&data_home).unwrap();
+    let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+    let migrated = McStore::open(&descriptor).unwrap();
+    migrated
+        .set_single_store_marker_for_test(1_758_000_000_000, "a1b2c3d4")
+        .unwrap();
+    drop(migrated);
+
+    let handler = McHandler::new();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    handler.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+    handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handler.store_open.failure_snapshot().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("an open that cannot succeed must record its reason");
+
+    for request in [
+        json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        json!({ "method": "historian.pending", "v": 1 }),
+        json!({ "method": "historian.claim", "v": 1, "run_id": "r", "claimant_instance_id": "i" }),
+    ] {
+        let (code, message) = error_frame(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(code, "store_open_failed", "{request}");
+        assert!(
+            message.contains(&format!("reason_code={SINGLE_STORE_MARKER_REFUSAL_REASON}")),
+            "{request} -> {message}"
+        );
+        assert!(
+            message.contains("ck-mc a1b2c3d4"),
+            "the refusal has to say which build to run: {message}"
+        );
+        assert!(
+            message.contains("terminal"),
+            "a store this binary cannot read is not something a retry fixes: {message}"
+        );
+    }
+}

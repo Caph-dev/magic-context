@@ -71,10 +71,6 @@ use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use cortexkit_lease::LeaseError;
 use cortexkit_store::StoreError;
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use mc_store::single_store_schema::{
-    SINGLE_STORE_MIGRATION_REQUIRED_REASON, SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE,
-    SINGLE_STORE_STATE_SPLIT_REASON,
-};
 #[cfg(test)]
 use mc_store::TagNumberRow;
 use mc_store::{
@@ -89,7 +85,7 @@ use mc_store::{
     StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
     StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
     VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
-    STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
+    SINGLE_STORE_MARKER_REFUSAL_REASON, STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -344,8 +340,7 @@ const STORE_OPEN_FAILURE_REASON_GENERIC: &str = "open_error";
 /// the log line cannot drift into naming the same failure three different ways.
 fn store_open_failure_reason_code(error: &McStoreError) -> &'static str {
     match error {
-        McStoreError::SingleStoreMigrationRequired { .. } => SINGLE_STORE_MIGRATION_REQUIRED_REASON,
-        McStoreError::SingleStoreStateSplit { .. } => SINGLE_STORE_STATE_SPLIT_REASON,
+        McStoreError::SingleStoreMarkerUnsupported { .. } => SINGLE_STORE_MARKER_REFUSAL_REASON,
         McStoreError::StoreAheadOfBinary { .. } => STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
         _ => STORE_OPEN_FAILURE_REASON_GENERIC,
     }
@@ -446,25 +441,6 @@ enum StoreRefusal {
         origin: &'static str,
         descriptor: String,
     },
-    /// The store has not been through the one-time single-store migration, or it and
-    /// `context.db` disagree about it. Terminal: the fix is `magic-context doctor
-    /// single-store migrate` (or restoring both files from its backup), never a retry.
-    SingleStore {
-        code: &'static str,
-        reason: String,
-        origin: &'static str,
-        descriptor: String,
-    },
-}
-
-/// The single-store refusal code a failure reason names, if it is one.
-fn single_store_refusal_code(reason_code: &str) -> Option<&'static str> {
-    [
-        SINGLE_STORE_MIGRATION_REQUIRED_REASON,
-        SINGLE_STORE_STATE_SPLIT_REASON,
-    ]
-    .into_iter()
-    .find(|code| *code == reason_code)
 }
 
 impl StoreRefusal {
@@ -475,16 +451,12 @@ impl StoreRefusal {
             Self::LeaseWait { .. } => "store_lease_wait",
             Self::Failed { .. } => "store_open_failed",
             Self::StoreAhead { .. } => STORE_AHEAD_OF_BINARY_REFUSAL_REASON,
-            Self::SingleStore { code, .. } => code,
         }
     }
 
     /// Whether an identical request sent later can succeed without anyone intervening.
     fn retryable(&self) -> bool {
-        !matches!(
-            self,
-            Self::Failed { .. } | Self::StoreAhead { .. } | Self::SingleStore { .. }
-        )
+        !matches!(self, Self::Failed { .. } | Self::StoreAhead { .. })
     }
 
     fn message(&self) -> String {
@@ -525,30 +497,12 @@ impl StoreRefusal {
                 versions.binary_max,
                 mc_store::store_ahead_of_binary_remediation(versions.db_version, versions.binary_max)
             ),
-            Self::SingleStore {
-                code,
-                reason,
-                origin,
-                descriptor,
-            } => format!(
-                "storage open refused and is not retried before restart: reason_code={code} reason={reason} descriptor_origin={origin} descriptor={descriptor} ({disposition})"
-            ),
         }
     }
 
     /// The refusal as an error frame for an internal lane (transform, status, sync, authority),
     /// whose reader is an operator or a log.
     fn into_outcome(self) -> HandlerOutcome {
-        if let Self::SingleStore { code, .. } = &self {
-            return HandlerOutcome::ErrorWithDetail {
-                code: code.to_string(),
-                message: self.message(),
-                detail: json!({
-                    "reason_code": code,
-                    "user_message": SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE,
-                }),
-            };
-        }
         if let Self::StoreAhead { versions, .. } = &self {
             let detail = versions.detail();
             return HandlerOutcome::ErrorWithDetail {
@@ -569,13 +523,6 @@ impl StoreRefusal {
     /// logs. A store that is ahead of this binary gets its own sentence: "retry in a moment" would
     /// be wrong advice, because no retry fixes it.
     fn into_facade_outcome(self) -> HandlerOutcome {
-        if let Self::SingleStore { code, .. } = &self {
-            return HandlerOutcome::ErrorWithDetail {
-                code: code.to_string(),
-                message: SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE.to_string(),
-                detail: json!({ "reason_code": code }),
-            };
-        }
         if let Self::StoreAhead { versions, .. } = &self {
             return HandlerOutcome::ErrorWithDetail {
                 code: self.code().to_string(),
@@ -732,15 +679,6 @@ impl StoreOpenCoordinator {
                     origin,
                     descriptor,
                 },
-                Some(failure) if single_store_refusal_code(&failure.reason_code).is_some() => {
-                    StoreRefusal::SingleStore {
-                        code: single_store_refusal_code(&failure.reason_code)
-                            .expect("checked by the guard"),
-                        reason: failure.reason,
-                        origin: failure.origin,
-                        descriptor: failure.descriptor,
-                    }
-                }
                 Some(failure) => StoreRefusal::Failed {
                     reason_code: failure.reason_code,
                     reason: failure.reason,
@@ -766,22 +704,13 @@ impl StoreOpenCoordinator {
         }
     }
 
-    /// The refusal for a store that is ahead of this binary, or that still needs the
-    /// single-store migration, once the open has ended that way. `None` in every other state,
-    /// including while an open is still in flight.
+    /// The refusal for a store that is ahead of this binary, once the open has ended that way.
+    /// `None` in every other state, including while an open is still in flight.
     fn store_ahead_refusal(&self) -> Option<StoreRefusal> {
         if self.phase.load(Ordering::Acquire) != STORE_OPEN_IDLE {
             return None;
         }
         let failure = self.failure_snapshot()?;
-        if let Some(code) = single_store_refusal_code(&failure.reason_code) {
-            return Some(StoreRefusal::SingleStore {
-                code,
-                reason: failure.reason,
-                origin: failure.origin,
-                descriptor: failure.descriptor,
-            });
-        }
         let versions = failure.store_ahead?;
         Some(StoreRefusal::StoreAhead {
             versions,
@@ -838,24 +767,6 @@ impl StoreOpenCoordinator {
                     "storage_open_failure_reason": failure.reason,
                     "store_db_version": versions.db_version,
                     "binary_max_store_version": versions.binary_max,
-                    "storage_descriptor": failure.descriptor,
-                    "storage_descriptor_origin": failure.origin,
-                    "storage_open_failed_at_ms": failure.at_ms,
-                })),
-            });
-        }
-        if let Some(code) = single_store_refusal_code(&failure.reason_code) {
-            return Some(HealthReport {
-                status: HealthStatus::Failing,
-                detail: Some(format!(
-                    "storage open refused: {code}: {} (descriptor {} from {}); every request except echo refuses with {code} until the store is migrated and the module restarts",
-                    failure.reason, failure.descriptor, failure.origin
-                )),
-                metrics: Some(json!({
-                    "lane": TRANSFORM_HEALTH_LANE,
-                    "storage_state": "open_refused_unmigrated",
-                    "storage_open_failure_reason_code": failure.reason_code,
-                    "storage_open_failure_reason": failure.reason,
                     "storage_descriptor": failure.descriptor,
                     "storage_descriptor_origin": failure.origin,
                     "storage_open_failed_at_ms": failure.at_ms,
@@ -20717,34 +20628,26 @@ mod tests {
         );
     }
 
-    /// A store that still holds the rows the single-store migration moves is refused by name:
-    /// health reports it, and every lane except `echo` answers with it, so no lane half-works
-    /// on a store whose rows this binary no longer reads. The store keeps every row and its
-    /// version, because the refusal happens before any migration runs.
+    /// A store that has been migrated into single-store mode must stop this binary at the door,
+    /// and every surface that answers "why is there no store" must name that specific reason.
+    ///
+    /// The named token is what makes the refusal actionable: "storage open failed" sends an
+    /// operator looking for a broken file, while `single_store_marker` says the store is intact
+    /// and this binary is the wrong one. The health lane, the shared refusal seam behind
+    /// `session.status` and the transform lane are all asserted, because an operator may be
+    /// looking at any one of the three and a reason that reaches only one is a reason they will
+    /// not see.
     #[tokio::test]
-    async fn an_unmigrated_populated_store_is_refused_on_every_lane_except_echo() {
+    async fn a_single_store_marker_refusal_is_named_on_health_and_on_every_refusal_seam() {
         let dir = tempfile::tempdir().unwrap();
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let store_path = match &descriptor.backend {
-            cortexkit_store_types::StorageBackend::Sqlite { path } => PathBuf::from(path),
-            other => panic!("unexpected backend {other:?}"),
-        };
-        mc_store::migrate_store_to_pre_single_store(&store_path).unwrap();
-        let rows_before = {
-            let conn = rusqlite::Connection::open(&store_path).unwrap();
-            conn.execute(
-                "INSERT INTO mc_memories(project_path, category, content, normalized_hash)
-                 VALUES ('git:p', 'CONSTRAINTS', 'kept', 'h')",
-                [],
-            )
+        let migrated = McStore::open(&descriptor).unwrap();
+        migrated
+            .set_single_store_marker_for_test(1_758_000_000_000, "a1b2c3d4")
             .unwrap();
-            conn.query_row("SELECT COUNT(*) FROM mc_memories", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap()
-        };
+        drop(migrated);
 
         let handler = McHandler::new();
         handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
@@ -20755,70 +20658,50 @@ mod tests {
         })
         .await
         .expect("an open that cannot succeed must record its reason");
-        assert!(handler.store.get().is_none(), "no store handle may exist");
 
         let report = <McHandler as ModuleHandler>::health(&handler).await;
         assert_eq!(report.status, HealthStatus::Failing);
         let metrics = report
             .metrics
-            .expect("a refused open must carry health metrics");
-        assert_eq!(metrics["storage_state"], "open_refused_unmigrated");
+            .expect("a failed open must carry health metrics");
+        assert_eq!(metrics["storage_state"], "open_failed");
         assert_eq!(
             metrics["storage_open_failure_reason_code"],
-            SINGLE_STORE_MIGRATION_REQUIRED_REASON
+            SINGLE_STORE_MARKER_REFUSAL_REASON
+        );
+        let detail = report
+            .detail
+            .expect("a failed open must carry a health detail");
+        assert!(
+            detail.contains(SINGLE_STORE_MARKER_REFUSAL_REASON),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("run that build or newer"),
+            "health must carry the remediation, not only the diagnosis: {detail}"
         );
 
-        let (code, _, detail) = detailed_error_frame(handler.store_refusal());
-        assert_eq!(code, SINGLE_STORE_MIGRATION_REQUIRED_REASON);
-        assert_eq!(
-            detail["reason_code"],
-            SINGLE_STORE_MIGRATION_REQUIRED_REASON
+        // `session.status` and the other management lanes answer "there is no store" by calling
+        // exactly this method, so asserting it here covers all of them.
+        let (code, message) = error_frame(handler.store_refusal());
+        assert_eq!(code, "store_open_failed");
+        assert!(
+            message.contains(&format!("reason_code={SINGLE_STORE_MARKER_REFUSAL_REASON}")),
+            "{message}"
         );
-        let (transform_code, _, _) =
-            detailed_error_frame(call_transform_outcome(&handler, request(big_messages())).await);
-        assert_eq!(transform_code, SINGLE_STORE_MIGRATION_REQUIRED_REASON);
-        for method in [
-            "historian.pending",
-            "session.status",
-            "memory.set_classification",
-        ] {
-            let (lane_code, _, _) = detailed_error_frame(
-                handler
-                    .dispatch_value(7, json!({ "method": method, "v": 1 }))
-                    .await,
-            );
-            assert_eq!(
-                lane_code, SINGLE_STORE_MIGRATION_REQUIRED_REASON,
-                "{method}"
-            );
-        }
-        let (tool_code, tool_message, _) = detailed_error_frame(
-            call_facade(&handler, "ctx_memory", json!({ "action": "list" })).await,
+        assert!(message.contains("ck-mc a1b2c3d4"), "{message}");
+        assert!(
+            message.contains("terminal"),
+            "a store this binary cannot read is not something a retry fixes: {message}"
         );
-        assert_eq!(tool_code, SINGLE_STORE_MIGRATION_REQUIRED_REASON);
-        assert_eq!(tool_message, SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE);
-        match handler
-            .dispatch_value(7, json!({ "kind": "echo", "probe": 1 }))
-            .await
-        {
-            HandlerOutcome::Response(body) => {
-                let body: Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(body["echo"]["probe"], 1);
-            }
-            other => panic!("echo must still answer, got {other:?}"),
-        }
 
-        let conn = rusqlite::Connection::open(&store_path).unwrap();
-        let rows_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM mc_memories", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            rows_after, rows_before,
-            "the refusal must not drop the store's rows"
-        );
-        assert_eq!(
-            mc_store::single_store_schema::recorded_store_version(&conn).unwrap(),
-            60
+        let (transform_code, transform_message) =
+            error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        assert_eq!(transform_code, "store_open_failed");
+        assert!(
+            transform_message
+                .contains(&format!("reason_code={SINGLE_STORE_MARKER_REFUSAL_REASON}")),
+            "{transform_message}"
         );
     }
 
