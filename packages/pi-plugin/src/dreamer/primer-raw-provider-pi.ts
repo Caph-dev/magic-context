@@ -1,10 +1,10 @@
-import { closeSync, opendirSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { PRIMER_SEED_CAP_TOKENS } from "@magic-context/core/features/magic-context/dreamer/primer-seed";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { RAW_SUMMARY_TEXT_MAX_CHARS } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import { convertEntriesToRawMessagePage } from "../read-session-pi";
+import { findSession, lines } from "./bounded-session-reader";
 import { resolvePiCodingAgentModule } from "./pi-session-api";
 
 export interface PiPrimerRawProviderDeps {
@@ -12,9 +12,6 @@ export interface PiPrimerRawProviderDeps {
 	sessionDir?: string;
 }
 
-// A malformed or unusually large entry must not defeat the seed's memory bound.
-// Refuse it rather than skipping it and silently shifting persisted ordinals.
-const MAX_ENTRY_BYTES = 1024 * 1024;
 const MAX_PARTS = 256;
 const TOOL_KEYS = [
 	"description",
@@ -26,35 +23,6 @@ const TOOL_KEYS = [
 	"module",
 	"action",
 ];
-
-function* lines(path: string): Generator<string> {
-	const fd = openSync(path, "r");
-	const buffer = Buffer.alloc(64 * 1024);
-	let pending = Buffer.alloc(0);
-	try {
-		while (true) {
-			const bytes = readSync(fd, buffer, 0, buffer.length, null);
-			if (bytes === 0) break;
-			let start = 0;
-			for (let i = 0; i < bytes; i++) {
-				if (buffer[i] !== 10) continue;
-				if (pending.length + i - start > MAX_ENTRY_BYTES)
-					throw new Error("Pi primer entry exceeds bounded reader capacity");
-				yield Buffer.concat([pending, buffer.subarray(start, i)]).toString(
-					"utf8",
-				);
-				pending = Buffer.alloc(0);
-				start = i + 1;
-			}
-			if (pending.length + bytes - start > MAX_ENTRY_BYTES)
-				throw new Error("Pi primer entry exceeds bounded reader capacity");
-			pending = Buffer.concat([pending, buffer.subarray(start, bytes)]);
-		}
-		if (pending.length) yield pending.toString("utf8");
-	} finally {
-		closeSync(fd);
-	}
-}
 
 function record(value: unknown): Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -137,46 +105,6 @@ function* summaryEntries(path: string): Generator<unknown> {
 		}
 		yield entry;
 	}
-}
-
-function* sessionFiles(directory: string, nested: boolean): Generator<string> {
-	let dir: ReturnType<typeof opendirSync>;
-	try {
-		dir = opendirSync(directory);
-	} catch {
-		return;
-	}
-	try {
-		while (true) {
-			const entry = dir.readSync();
-			if (!entry) break;
-			const path = join(directory, entry.name);
-			if (entry.isFile() && entry.name.endsWith(".jsonl")) yield path;
-			else if (nested && entry.isDirectory()) yield* sessionFiles(path, false);
-		}
-	} finally {
-		dir.closeSync();
-	}
-}
-
-/** Discovery reads only one bounded header per file, never listAll's transcript previews. */
-function findSession(
-	directory: string,
-	nested: boolean,
-	sessionId: string,
-): string | null {
-	for (const path of sessionFiles(directory, nested)) {
-		try {
-			for (const line of lines(path)) {
-				const header = record(JSON.parse(line));
-				if (header.type === "session" && header.id === sessionId) return path;
-				break;
-			}
-		} catch {
-			/* Unreadable or malformed headers are not candidates. */
-		}
-	}
-	return null;
 }
 
 export function createPiPrimerRawProviderFactory(
