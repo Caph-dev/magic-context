@@ -408,10 +408,23 @@ describe("LKG transform replay", () => {
         expect(validateAnthropicReasoningRuns([first, second])).toBe(false);
     });
 
-    test("declines thinking introduced by a second merged assistant even without earlier thinking", () => {
+    test("accepts leading thinking after an assistant that holds only step markers", () => {
+        // Step markers never reach the provider, so the second message's thinking
+        // still leads the merged run on the wire.
         expect(
             validateAnthropicReasoningRuns([
                 assistant("a-empty", 1, [{ type: "step-start" }]),
+                assistant("a-thinking", 2, [
+                    { type: "thinking", thinking: "trace", signature: "synthetic-sig" },
+                ]),
+            ]),
+        ).toBe(true);
+    });
+
+    test("declines thinking from a second merged assistant after text in the first", () => {
+        expect(
+            validateAnthropicReasoningRuns([
+                assistant("a-text", 1, [{ type: "text", text: "preface" }]),
                 assistant("a-thinking", 2, [
                     { type: "thinking", thinking: "trace", signature: "synthetic-sig" },
                 ]),

@@ -412,10 +412,12 @@ export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean
             index += 1;
             continue;
         }
+        // The run's first message is the first one that contributes provider content;
+        // an assistant holding only step markers does not reach the wire, so it cannot
+        // make a later message's leading thinking count as merged.
         let firstMessageInRun: number | null = null;
         let sawOtherContent = false;
         while (index < messages.length && messageRole(messages[index]) === "assistant") {
-            if (firstMessageInRun === null) firstMessageInRun = index;
             for (const part of messageParts(messages[index])) {
                 if (partEndsAnthropicAssistantRun(part)) {
                     firstMessageInRun = null;
