@@ -238,7 +238,13 @@ none of those raw databases or logs are committed.
   only `rejects Gemini-invalid model turns and empty content`; the valid tool
   round test stayed green. Staged live state first; diff was one insertion
   during mutation and empty after restoration. Restored tests passed.
-- Pure replay and comment-review results are recorded in the delivery record.
+- `bun packages/e2e-tests/scripts/pure-replay-differential.ts --ts-only origin/master HEAD`:
+  **RESULT IDENTICAL**, all four defer passes. Baseline
+  `1b8de24431ae5f8f829dc217be0384f2950813f2`; byte counts 588, 754, 920,
+  1,088, with matching message, system and tool hashes.
+- Comment review completed; clarified the new empty-row and TTL comments.
+  AFT scoped inspect timed out after 16 phases; strict TypeScript checking above
+  is the authoritative changed-file check.
 
 ## Next evidence needed from the failing production request
 
