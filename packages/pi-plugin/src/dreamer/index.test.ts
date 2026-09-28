@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
@@ -23,6 +23,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
+import * as logger from "@magic-context/core/shared/logger";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { __setPiHarnessKindForTesting } from "../pi-harness-kind";
@@ -33,6 +34,7 @@ import {
 	registerPiDreamerProject,
 	runPiDreamForProject,
 	unregisterPiDreamerProject,
+	validatePiDreamerModels,
 } from ".";
 
 let db: Database | null = null;
@@ -154,6 +156,98 @@ afterEach(() => {
 });
 
 describe("Pi dreamer wiring", () => {
+	test("drops an unknown fallback with a warning while the valid primary runs", async () => {
+		db = createDb();
+		const identity = "git:pi-model-validation";
+		const attempted: string[] = [];
+		const warning = spyOn(logger, "log");
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async (args: { model: string }) => {
+						attempted.push(args.model);
+						return { ok: true, assistantText: "curation complete" };
+					}),
+				}) as never,
+		);
+		const registry = {
+			find: (provider: string, model: string) =>
+				provider === "test" && model === "model" ? {} : undefined,
+		};
+		const opts = dreamerOptions({
+			database: db,
+			projectIdentity: identity,
+			projectDir: process.cwd(),
+			config: {
+				...DreamerConfigSchema.parse({
+					tasks: { curate: { schedule: "0 4 * * *" } },
+				}),
+				pi: {
+					model: "test/model",
+					fallback_models: ["ollama-cloud/unknown-dreamer"],
+				},
+			} as never,
+		});
+		insertMemory(db, {
+			projectPath: identity,
+			category: "PROJECT_RULES",
+			content: "Keep valid primary.",
+		});
+		try {
+			registerPiDreamerProject({ ...opts, modelRegistry: registry });
+			const result = await runPiDreamForProject(
+				identity,
+				"curate",
+				opts.registrationOwner,
+			);
+			expect(result.failed).toEqual([]);
+			expect(attempted).toEqual(["test/model"]);
+			expect(
+				warning.mock.calls.some(([message]) =>
+					String(message).includes(
+						"dropping Pi model not found: ollama-cloud/unknown-dreamer",
+					),
+				),
+			).toBe(true);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	test("marks a chain with no Pi-resolvable models unavailable", () => {
+		const tasks = validatePiDreamerModels(
+			[
+				{
+					task: "classify-memories",
+					schedule: "0 4 * * *",
+					timeoutMinutes: 20,
+					model: "ollama-cloud/unknown-dreamer",
+				},
+			],
+			{ find: () => undefined },
+		);
+		expect(tasks[0].model).toBeUndefined();
+		expect(tasks[0].modelChainUnavailable).toBe(true);
+	});
+
+	test("does not register the filesystem root or home for dreaming", () => {
+		db = createDb();
+		let starts = 0;
+		__test.setStartDreamScheduleTimerFactory(async () => {
+			starts++;
+			return () => {};
+		});
+		for (const dir of ["/", homedir()])
+			registerPiDreamerProject(
+				dreamerOptions({
+					database: db,
+					projectIdentity: `dir:${dir}`,
+					projectDir: dir,
+				}),
+			);
+		expect(starts).toBe(0);
+	});
 	test("classifies a provider refusal surfaced by a Pi child runner", async () => {
 		db = createDb();
 		const projectIdentity = "git:pi-dreamer-provider-refusal";

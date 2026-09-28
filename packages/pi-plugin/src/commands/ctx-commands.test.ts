@@ -225,6 +225,21 @@ describe("Pi Magic Context commands", () => {
 		expect(customCalls[0]?.options).toMatchObject({ overlay: true });
 	});
 
+	it("reports an empty Pi model chain loudly in /ctx-status", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		registerCtxStatusCommand(pi as never, {
+			db,
+			projectIdentity: "/tmp/project",
+			modelChainWarning:
+				"Pi model chain empty (no model found): classify-memories, historian",
+		});
+		await handlers.get("ctx-status")?.("", createCtx());
+		expect(sent[0]?.data.text).toContain(
+			"WARNING: Pi model chain empty (no model found): classify-memories, historian",
+		);
+	});
+
 	it("appends a model-invisible status entry without UI", async () => {
 		const db = createDb();
 		const { pi, handlers, sent } = createMockPi();

@@ -37,6 +37,7 @@ export interface RegisterCtxStatusDeps {
 		[modelKey: string]: number | undefined;
 	};
 	dreamer?: { runnable?: boolean; scheduleSummary?: string };
+	modelChainWarning?: string;
 	/** User-owned profile selected for the project, after config resolution. */
 	activeProfile?: string;
 	configGeneration?: number;
@@ -117,6 +118,8 @@ export function registerCtxStatusCommand(
 
 			try {
 				if (ctx.hasUI) {
+					if (currentDeps.modelChainWarning)
+						ctx.ui.notify(currentDeps.modelChainWarning, "error");
 					await showStatusDialog(pi, ctx, currentDeps);
 					return;
 				}
@@ -127,7 +130,7 @@ export function registerCtxStatusCommand(
 					currentDeps,
 					sessionId,
 				);
-				const statusText = formatPiStatusSummary(statusDetail);
+				const statusText = `${formatPiStatusSummary(statusDetail)}${currentDeps.modelChainWarning ? `\nWARNING: ${currentDeps.modelChainWarning}` : ""}`;
 				const details = buildStatusDetails(currentDeps, statusDetail);
 				sendStatus(
 					{

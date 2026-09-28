@@ -1,6 +1,17 @@
+import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { type AuthorityModuleClient, getContextStoreUuid } from "../context-authority";
 import type { ClassifyModuleClient } from "./classify";
+
+const loggedNotOwnerProjects = new Set<string>();
+
+export function logDreamerNotOwnerOnce(projectIdentity: string): void {
+    if (loggedNotOwnerProjects.has(projectIdentity)) return;
+    loggedNotOwnerProjects.add(projectIdentity);
+    log(
+        `[dreamer] ${projectIdentity}: module-managed project; skipping TS writes without an owner route`,
+    );
+}
 
 export class DreamerModuleBusyError extends Error {
     readonly transient = true;

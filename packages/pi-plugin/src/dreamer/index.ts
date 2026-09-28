@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { parse, resolve } from "node:path";
+
 import type {
 	DreamerConfig,
 	EmbeddingConfig,
@@ -9,12 +12,14 @@ import {
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "@magic-context/core/features/magic-context/dreamer/task-executor";
 import type { DreamTaskName } from "@magic-context/core/features/magic-context/dreamer/task-registry";
+import type { DreamTaskRuntimeConfig } from "@magic-context/core/features/magic-context/dreamer/task-scheduler";
 import {
 	type ManualRunResult,
 	runManualDream,
 } from "@magic-context/core/features/magic-context/dreamer/task-scheduler";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
+import { log } from "@magic-context/core/shared/logger";
 import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
 import type { CompletedSubagentToolCall } from "@magic-context/core/shared/subagent-runner";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
@@ -30,6 +35,7 @@ export interface PiDreamerOptions {
 	registrationOwner: object;
 	/** Resolved runnable DreamerConfig from loadPiConfig(). When disable=true, the caller does not register. */
 	config: DreamerConfig;
+	modelRegistry?: { find(provider: string, modelId: string): unknown };
 	sampleDreamRun?: () => {
 		dreamerConfig?: DreamerConfig;
 		mural?: { enabled: boolean; model?: string };
@@ -113,9 +119,57 @@ interface ProjectRegistration {
 	 *  switch and rebuild against the new checkout + its config instead of
 	 *  silently reusing the first one. */
 	projectDir: string;
+	modelRegistry?: PiDreamerOptions["modelRegistry"];
 }
 
 type PiSubagentRunnerFactory = () => PiSubagentRunner;
+
+const warnedUnknownModels = new Set<string>();
+const modelAvailability = new WeakMap<object, Map<string, boolean>>();
+
+export function validatePiDreamerModels(
+	tasks: DreamTaskRuntimeConfig[],
+	registry: NonNullable<PiDreamerOptions["modelRegistry"]>,
+): DreamTaskRuntimeConfig[] {
+	let resolved = modelAvailability.get(registry);
+	if (!resolved) {
+		resolved = new Map();
+		modelAvailability.set(registry, resolved);
+	}
+	return tasks.map((task) => {
+		const entries = [task.model, ...(task.fallbackModels ?? [])].filter(
+			(entry): entry is NonNullable<typeof entry> => entry !== undefined,
+		);
+		const valid = entries.filter((entry) => {
+			const model = typeof entry === "string" ? entry : entry.model;
+			let available = resolved.get(model);
+			if (available === undefined) {
+				const separator = model.indexOf("/");
+				available =
+					separator > 0 &&
+					Boolean(
+						registry.find(
+							model.slice(0, separator),
+							model.slice(separator + 1),
+						),
+					);
+				resolved.set(model, available);
+			}
+			if (available) return true;
+			if (!warnedUnknownModels.has(model)) {
+				log(`[dreamer] WARNING: dropping Pi model not found: ${model}`);
+				warnedUnknownModels.add(model);
+			}
+			return false;
+		});
+		return {
+			...task,
+			model: valid[0],
+			fallbackModels: valid.slice(1),
+			modelChainUnavailable: entries.length > 0 && valid.length === 0,
+		};
+	});
+}
 
 interface PiDreamerSession {
 	id: string;
@@ -161,7 +215,12 @@ let startDreamScheduleTimerFn: typeof defaultStartDreamScheduleTimer =
 /** Initialize the Pi-side dreamer integration: register this project with
  *  the singleton timer, ensure PiSubagentRunner is the active runner. */
 export function registerPiDreamerProject(opts: PiDreamerOptions): void {
-	if (opts.config.disable === true) {
+	const directory = resolve(opts.projectDir);
+	if (
+		opts.config.disable === true ||
+		directory === parse(directory).root ||
+		directory === homedir()
+	) {
 		return;
 	}
 
@@ -180,7 +239,11 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 	if (existing) {
 		// Same identity and directory genuinely reuses the timer. Registrations
 		// retained by an older module have no generation and must rebuild once.
-		if (existing.generation && existing.projectDir === opts.projectDir) {
+		if (
+			existing.generation &&
+			existing.projectDir === opts.projectDir &&
+			(!opts.modelRegistry || existing.modelRegistry)
+		) {
 			return;
 		}
 		// A different checkout or legacy registration has a timer + client closure
@@ -208,12 +271,16 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 
 	let cleanup: (() => void) | undefined;
 	let cancelled = false;
+	const modelRegistry = opts.modelRegistry;
 	void startDreamScheduleTimerFn({
 		directory: opts.projectDir,
 		projectIdentity: opts.projectIdentity,
 		harness: opts.harness,
 		client,
 		dreamerConfig: opts.config,
+		validateTaskModels: modelRegistry
+			? (tasks) => validatePiDreamerModels(tasks, modelRegistry)
+			: undefined,
 		sampleDreamRun: opts.sampleDreamRun,
 		language: opts.language,
 		gitCommitIndexing: opts.gitCommitIndexing,
@@ -277,12 +344,22 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		const manualRun = runManualDream({
 			db: manualOpts.db,
 			projectIdentity: manualOpts.projectIdentity,
-			tasks: buildDreamTaskRuntimeConfigs(
-				dreamerConfig,
-				manualOpts.harness,
-				manualOpts.language,
-				mural?.model,
-			),
+			tasks: manualOpts.modelRegistry
+				? validatePiDreamerModels(
+						buildDreamTaskRuntimeConfigs(
+							dreamerConfig,
+							manualOpts.harness,
+							manualOpts.language,
+							mural?.model,
+						),
+						manualOpts.modelRegistry,
+					)
+				: buildDreamTaskRuntimeConfigs(
+						dreamerConfig,
+						manualOpts.harness,
+						manualOpts.language,
+						mural?.model,
+					),
 			executor: createDreamTaskExecutor({
 				client: manualClient as never,
 				sessionDirectory: manualOpts.projectDir,
@@ -319,6 +396,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		},
 		runManual,
 		projectDir: opts.projectDir,
+		modelRegistry: opts.modelRegistry,
 	});
 }
 

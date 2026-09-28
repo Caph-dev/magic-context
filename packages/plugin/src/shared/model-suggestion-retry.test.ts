@@ -553,7 +553,7 @@ describe("promptSyncWithValidatedOutputRetry", () => {
         });
     });
 
-    test("all empty outputs surface the original validation failure", async () => {
+    test("all empty outputs surface the last validation failure and every attempted model", async () => {
         const prompt = mock(async () => ({}));
         const messages = mock(async () => "");
         const client = createClient(prompt, undefined, messages);
@@ -569,7 +569,9 @@ describe("promptSyncWithValidatedOutputRetry", () => {
                     return output.trim();
                 },
             }),
-        ).rejects.toThrow("empty output from primary");
+        ).rejects.toThrow(
+            /All models exhausted \(primary, anthropic\/claude-sonnet-4-6\): empty output from anthropic\/claude-sonnet-4-6/,
+        );
 
         expect(prompt).toHaveBeenCalledTimes(2);
         expect(messages).toHaveBeenCalledTimes(2);

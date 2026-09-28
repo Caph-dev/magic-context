@@ -75,6 +75,31 @@ describe("Pi config resolvers", () => {
 		expect(resolveDreamerFromConfig(empty)).toBeUndefined();
 	});
 
+	it("promotes the first Pi-resolvable historian fallback and disables an empty chain", () => {
+		const config = MagicContextConfigSchema.parse({
+			historian: {
+				pi: {
+					model: "ollama-cloud/unknown",
+					fallback_models: [
+						{ model: "anthropic/valid", thinking_level: "low" },
+					],
+				},
+			},
+		});
+		const registry = {
+			find: (provider: string, model: string) =>
+				provider === "anthropic" && model === "valid" ? {} : undefined,
+		};
+		expect(resolveHistorianFromConfig(config, "pi", registry)).toMatchObject({
+			model: "anthropic/valid",
+			thinkingLevel: "low",
+			fallbackModels: [],
+		});
+		expect(
+			resolveHistorianFromConfig(config, "pi", { find: () => undefined }),
+		).toBeUndefined();
+	});
+
 	it("returns undefined for historian and dreamer when disabled", () => {
 		const config = MagicContextConfigSchema.parse({
 			historian: { disable: true, model: "test/historian" },
