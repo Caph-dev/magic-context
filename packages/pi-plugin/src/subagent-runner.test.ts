@@ -606,7 +606,7 @@ describe("subagent-runner pure helpers", () => {
 		]);
 	});
 
-	it("loads the provider calibration extension only for historian requests", () => {
+	it("loads the calibration and provenance extension for historian and dreamer requests", () => {
 		const historian = buildArgsForTest(
 			{ ...baseOptions, agent: "magic-context-historian" },
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
@@ -618,7 +618,7 @@ describe("subagent-runner pure helpers", () => {
 			{ ...baseOptions, agent: "dreamer" },
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
 		);
-		expect(dreamer).not.toContain("/tmp/historian-calibration.js");
+		expect(dreamer).toContain("/tmp/historian-calibration.js");
 	});
 
 	it("passes the active entry thinking level through Pi's --thinking flag", () => {
@@ -3314,4 +3314,157 @@ describe("Pi subagent schema-fence probe", () => {
 			rmSync(dataHome, { recursive: true, force: true });
 		}
 	});
+});
+
+describe("child observability", () => {
+	it("warns once for replaced prompts and never for identical prompts", async () => {
+		const { createHash } = await import("node:crypto");
+		const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+		try {
+			for (const changed of [false, true]) {
+				log.mockClear();
+				const child = createMockChild();
+				const { runner } = runnerWith(child);
+				const run = runner.run(baseOptions);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				const text = changed ? "another persona" : baseOptions.systemPrompt;
+				const event = {
+					type: "mc_system_prompt",
+					bytes: Buffer.byteLength(text),
+					sha256: createHash("sha256").update(text).digest("hex"),
+					containsIntended: !changed,
+				};
+				child.writeStdoutLine(event);
+				child.writeStdoutLine(event);
+				child.writeStdoutLine({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "text", text: "done" }],
+					},
+				});
+				child.emitClose();
+				await run;
+				const warnings = log.mock.calls.filter((args) =>
+					String(args[1]).startsWith("subagent_system_prompt_replaced "),
+				);
+				expect(warnings.length).toBe(changed ? 1 : 0);
+			}
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it("logs exact step, tool output byte and prompt token counts without terminal duplication", async () => {
+		const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+		try {
+			const child = createMockChild();
+			const { runner } = runnerWith(child);
+			const run = runner.run(baseOptions);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			const messages = [
+				{
+					role: "assistant",
+					stopReason: "toolUse",
+					usage: { input: 10, cacheRead: 20, cacheWrite: 5 },
+					content: [
+						{ type: "toolCall", id: "a", name: "read" },
+						{ type: "toolCall", id: "b", name: "read" },
+					],
+				},
+				{
+					role: "assistant",
+					stopReason: "stop",
+					usage: { input: 7, cacheRead: 40 },
+					content: [{ type: "text", text: "done" }],
+				},
+			];
+			child.writeStdoutLine({ type: "message_end", message: messages[0] });
+			for (const id of ["a", "b"])
+				child.writeStdoutLine({
+					type: "tool_execution_end",
+					toolCallId: id,
+					toolName: "read",
+					result: { content: [{ type: "text", text: "é" }] },
+				});
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "a",
+					content: [{ type: "text", text: "é" }],
+				},
+			});
+			child.writeStdoutLine({ type: "message_end", message: messages[1] });
+			child.writeStdoutLine({ type: "agent_end", messages });
+			child.emitClose();
+			await run;
+			const lines = log.mock.calls.filter((args) =>
+				String(args[1]).startsWith("subagent_telemetry "),
+			);
+			expect(lines).toHaveLength(1);
+			const summary = JSON.parse(
+				String(lines[0]?.[1]).slice("subagent_telemetry ".length),
+			);
+			expect(summary.steps).toBe(2);
+			expect(summary.tools).toEqual({ read: { calls: 2, outputBytes: 4 } });
+			expect(summary.promptTokens).toEqual({ first: 35, last: 47, max: 47 });
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it("aborts over-cap streams with step_limit", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const run = runner.run({ ...baseOptions, agent: "dreamer-classifier" });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		for (let n = 0; n < 5; n++)
+			child.writeStdoutLine({
+				type: "message_end",
+				message: { role: "assistant", stopReason: "toolUse", content: [] },
+			});
+		const killed = child.killed;
+		child.emitClose();
+		const result = await run;
+		expect(result.ok).toBe(false);
+		expect(!result.ok && result.reason).toBe("step_limit");
+		expect(killed).toBe(true);
+	});
+});
+
+it("accepts provenance redirected to chunked stderr by Pi's output guard", async () => {
+	const { promptFingerprint } = await import("./subagent-telemetry");
+	const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+	try {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const run = runner.run(baseOptions);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const line = `${JSON.stringify({
+			type: "mc_system_prompt",
+			...promptFingerprint("replacement"),
+			containsIntended: false,
+		})}\n`;
+		child.writeStderr(line.slice(0, 10));
+		child.writeStderr(line.slice(10));
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "text", text: "done" }],
+			},
+		});
+		child.emitClose();
+		await run;
+		expect(
+			log.mock.calls.filter((args) =>
+				String(args[1]).startsWith("subagent_system_prompt_replaced "),
+			),
+		).toHaveLength(1);
+	} finally {
+		log.mockRestore();
+	}
 });

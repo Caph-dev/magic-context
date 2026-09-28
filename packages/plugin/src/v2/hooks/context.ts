@@ -16,7 +16,7 @@ import {
     formatFailClosedBlockingSummary,
     isFailClosedBlockingError,
 } from "../../features/magic-context/fail-closed-block";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { detectOverflow } from "../../features/magic-context/overflow-detection";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import {
@@ -627,7 +627,8 @@ export async function registerContext(context: V2Context) {
             },
             {
                 db: database,
-                projectIdentity: resolveProjectIdentity(directory) ?? directory,
+                projectIdentity:
+                    resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
                 hook: hiddenChildHook,
                 keepSubagents: config.keep_subagents === true,
                 ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
@@ -640,7 +641,9 @@ export async function registerContext(context: V2Context) {
         );
     const dreamerAtBoot = config.dreamer;
     const startDreamer = (executor: HiddenCompletionExecutor) =>
-        dreamerAtBoot && !dreamerAtBoot.disable
+        resolveProjectIdentityForSession(directory, config.allow_home_project) &&
+        dreamerAtBoot &&
+        !dreamerAtBoot.disable
             ? startDreamTrigger(context, {
                   config: dreamerAtBoot,
                   sample: () => {
@@ -652,14 +655,19 @@ export async function registerContext(context: V2Context) {
                       config,
                       () => liveConfigReader.poll().effective,
                   ),
-                  projectIdentity: () => resolveProjectIdentity(directory) ?? directory,
+                  projectIdentity: () =>
+                      resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
                   language: config.language,
                   mural: config.mural,
               })
             : undefined;
     // Both stay undefined after a refused start until recoverHiddenWork wires them.
     let hiddenCompletionExecutor: HiddenCompletionExecutor | undefined =
-        db && isDatabasePersisted(db) ? await createHiddenExecutor(db) : undefined;
+        db &&
+        isDatabasePersisted(db) &&
+        resolveProjectIdentityForSession(directory, config.allow_home_project)
+            ? await createHiddenExecutor(db)
+            : undefined;
     let dreamTrigger = hiddenCompletionExecutor
         ? startDreamer(hiddenCompletionExecutor)
         : undefined;
@@ -674,19 +682,21 @@ export async function registerContext(context: V2Context) {
      * so unlike tools they can start mid-session. Returns whether they are wired.
      */
     const recoverHiddenWork = (database: NonNullable<typeof db>): Promise<boolean> =>
-        (hiddenWorkRecovery ??= (async () => {
-            try {
-                hiddenCompletionExecutor ??= await createHiddenExecutor(database);
-                dreamTrigger ??= startDreamer(hiddenCompletionExecutor);
-                return true;
-            } catch (error) {
-                log(
-                    "[magic-context] v2 historian and dreamer could not start after recovery:",
-                    error,
-                );
-                return false;
-            }
-        })());
+        !resolveProjectIdentityForSession(directory, config.allow_home_project)
+            ? Promise.resolve(false)
+            : (hiddenWorkRecovery ??= (async () => {
+                  try {
+                      hiddenCompletionExecutor ??= await createHiddenExecutor(database);
+                      dreamTrigger ??= startDreamer(hiddenCompletionExecutor);
+                      return true;
+                  } catch (error) {
+                      log(
+                          "[magic-context] v2 historian and dreamer could not start after recovery:",
+                          error,
+                      );
+                      return false;
+                  }
+              })());
     const sampleHistorian = () => {
         const fresh = historianRunConfig(config, liveConfigReader.poll().effective);
         const models = resolveHistorianModel(fresh, "opencode");
@@ -930,9 +940,12 @@ export async function registerContext(context: V2Context) {
             db,
             sessionId: draft.sessionID,
             state,
-            projectPath: resolveProjectIdentity(directory) ?? directory,
+            projectPath:
+                resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
             projectDirectory: directory,
-            memoryEnabled: config.memory.enabled,
+            memoryEnabled:
+                config.memory.enabled &&
+                !!resolveProjectIdentityForSession(directory, config.allow_home_project),
             memoryInjectionBudgetTokens: config.memory.injection_budget_tokens,
             hardSignals: {
                 systemHash: foldDigest(JSON.stringify(draft.system)),
@@ -1120,7 +1133,9 @@ export async function registerContext(context: V2Context) {
             systemPrompt ??= createSystemPromptHashHandler({
                 db,
                 dreamerEnabled: config.dreamer !== undefined && !config.dreamer.disable,
-                memoryEnabled: config.memory.enabled,
+                memoryEnabled:
+                    config.memory.enabled &&
+                    !!resolveProjectIdentityForSession(directory, config.allow_home_project),
                 language: config.language,
                 promptSurface: config.prompt_surface,
                 promptSurfaceRuntime,
@@ -1528,7 +1543,8 @@ export async function registerContext(context: V2Context) {
         void runManualDreamNow({
             db: runDb,
             dreamer: manualDreamer,
-            projectIdentity: resolveProjectIdentity(directory) ?? directory,
+            projectIdentity:
+                resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
             directory,
             language: config.language,
             mural: config.mural,
