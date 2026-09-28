@@ -258,6 +258,40 @@ describe("Pi dreamer wiring", () => {
 		}
 	});
 
+	test("defers OMP primary and fallback role validation to the host only", () => {
+		const find = mock((provider: string, model: string) =>
+			provider === "mock" && model === "known" ? {} : undefined,
+		);
+		const registry = { find };
+		const task = {
+			task: "classify-memories" as const,
+			schedule: "",
+			timeoutMinutes: 20,
+			model: "@dreamer",
+			fallbackModels: [
+				{ model: "@cheap", qualifier: "low" },
+				"mock/missing",
+				"mock/known",
+			],
+		};
+		expect(validatePiDreamerModels([task], registry, "omp")[0]).toMatchObject({
+			model: "@dreamer",
+			fallbackModels: [{ model: "@cheap", qualifier: "low" }, "mock/known"],
+			modelChainUnavailable: false,
+		});
+		expect(find.mock.calls).toEqual([
+			["mock", "missing"],
+			["mock", "known"],
+		]);
+		expect(validatePiDreamerModels([task], registry, "pi")[0]).toMatchObject({
+			model: "mock/known",
+			fallbackModels: [],
+		});
+		expect(validatePiDreamerModels([task], registry, "omp")[0].model).toBe(
+			"@dreamer",
+		);
+	});
+
 	test("marks a chain with no Pi-resolvable models unavailable", () => {
 		const tasks = validatePiDreamerModels(
 			[
