@@ -414,7 +414,7 @@ async function runDomainGroup(
                         projectIdentity,
                         due.config.task,
                     ),
-                    promotionThreshold: due.config.promotionThreshold ?? 3,
+                    promotionThreshold: due.config.promotionThreshold,
                 });
                 if (!gatePass) {
                     advanceAfterRun(db, projectIdentity, due, Date.now(), "skipped", null);
@@ -561,7 +561,7 @@ export async function runManualDream(
                 deps.projectIdentity,
                 d.config.task,
             ),
-            promotionThreshold: d.config.promotionThreshold ?? 3,
+            promotionThreshold: d.config.promotionThreshold,
         });
         if (pass) gated.push(d);
         else result.skippedNoWork.push(d.config.task);
@@ -636,7 +636,7 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
                 deps.projectIdentity,
                 d.config.task,
             ),
-            promotionThreshold: d.config.promotionThreshold ?? 3,
+            promotionThreshold: d.config.promotionThreshold,
         });
         if (pass) {
             gated.push(d);

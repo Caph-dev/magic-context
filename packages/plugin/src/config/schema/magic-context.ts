@@ -487,11 +487,16 @@ const DreamTaskBaseConfigSchema = z
     })
     .strict();
 
+export const DREAM_TASK_PROMOTION_DEFAULTS = {
+    "review-user-memories": 3,
+    "promote-primers": 2,
+} as const;
+
 const PromotionThresholdSchema = z
     .number()
     .min(2)
     .max(20)
-    .optional()
+    .default(DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"])
     .describe(
         "review-user-memories: min candidate observations before promotion is considered (default: 3)",
     );
@@ -499,7 +504,7 @@ const PrimerPromotionThresholdSchema = z
     .number()
     .min(2)
     .max(20)
-    .optional()
+    .default(DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"])
     .describe(
         "promote-primers: min recurring source days before promotion is considered (default: 2)",
     );
@@ -548,8 +553,10 @@ const DEFAULT_TASK_SCHEDULES: Record<DreamTaskName, string> = {
 
 function defaultTaskConfig(task: DreamTaskName): z.input<typeof DreamTaskConfigSchema> {
     const base: z.input<typeof DreamTaskConfigSchema> = { schedule: DEFAULT_TASK_SCHEDULES[task] };
-    if (task === "review-user-memories") base.promotion_threshold = 3;
-    if (task === "promote-primers") base.promotion_threshold = 2;
+    if (task === "review-user-memories")
+        base.promotion_threshold = DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"];
+    if (task === "promote-primers")
+        base.promotion_threshold = DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"];
     return base;
 }
 

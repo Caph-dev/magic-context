@@ -7,7 +7,10 @@ import {
     DREAMER_RETROSPECTIVE_AGENT,
 } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
-import type { DreamingTask } from "../../../config/schema/magic-context";
+import {
+    DREAM_TASK_PROMOTION_DEFAULTS,
+    type DreamingTask,
+} from "../../../config/schema/magic-context";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import {
     type HiddenCompletionExecutor,
@@ -644,7 +647,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseKey,
                     deadline,
                     leaseAcquisition,
-                    promotionThreshold: config.promotionThreshold ?? 3,
+                    promotionThreshold: config.promotionThreshold ?? DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"],
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
@@ -834,7 +837,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseKey,
                     deadline,
                     leaseAcquisition,
-                    promotionThreshold: config.promotionThreshold ?? 2,
+                    promotionThreshold: config.promotionThreshold ?? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"],
                     ensureProjectRegistered: deps.ensureProjectRegistered,
                 });
                 recordRun("completed", null);
