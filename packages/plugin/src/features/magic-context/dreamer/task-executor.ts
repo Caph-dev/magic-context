@@ -722,13 +722,18 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                         });
                         return { status: "completed" };
                     }
-                    const error = incompleteMessage(result.remaining);
+                    const batchTimedOut = result.stopReason === "batch-timeout";
+                    const error = batchTimedOut
+                        ? `${config.task}: a batch timed out within its time slice; ${result.remaining} remain`
+                        : incompleteMessage(result.remaining);
                     recordRun("failed", error, {
                         progress: verificationProgress,
                         memoryChanges: computeMemoryDelta(memoryBefore),
                         backlogAfter,
                     });
-                    return { status: "failed", transient: true, error };
+                    // A hot retry would split the deadline the same way and time out
+                    // again, so a batch timeout waits for the next scheduled run.
+                    return { status: "failed", transient: !batchTimedOut, error };
                 }
                 recordRun("completed", null, {
                     progress: verificationProgress,

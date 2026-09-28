@@ -390,6 +390,9 @@ async function mapOneBatch(
                 },
             },
             {
+                // Send without holding a request open for the whole batch, so the
+                // slice below is the only timer (see prompt-async-transport.ts).
+                transport: shared.createPromptAsyncTransport(client, agentSessionId),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,

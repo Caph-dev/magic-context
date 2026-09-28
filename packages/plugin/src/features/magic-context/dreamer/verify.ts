@@ -78,6 +78,25 @@ const VERIFY_BATCH_SIZE = 50;
 // the same outage, so leave the remaining memories for the scheduler retry.
 const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
 
+/**
+ * Minimum wall-clock budget for one 50-memory verify batch. Verify reads deeper
+ * than map, whose 80-memory batch already gets this floor, so an even split of
+ * the task deadline across many batches (120 s for ten batches in 20 minutes)
+ * cannot finish one tool loop. A batch below the floor is not started; its
+ * memories keep their old verified_at and a later run picks them up.
+ */
+export const VERIFY_BATCH_FLOOR_MS = 240_000;
+
+/** Evenly split the remaining deadline, but never below the batch floor. The
+ * caller checks that the remaining budget covers the floor before starting a
+ * batch, so the result always fits the deadline. */
+export function computeVerifyBatchSliceMs(remainingMs: number, batchesRemaining: number): number {
+    return Math.min(
+        remainingMs,
+        Math.max(VERIFY_BATCH_FLOOR_MS, Math.floor(remainingMs / batchesRemaining)),
+    );
+}
+
 export interface VerifyVerdictCounts {
     verified: number;
     updated: number;
@@ -88,6 +107,8 @@ export interface VerifyVerdictCounts {
 
 interface VerifyBatchResult extends VerifyVerdictCounts {
     providerFailure?: DreamerProviderOutputFailureError;
+    /** The batch's prompt ran out of time (our slice or a host request timer). */
+    timedOut?: boolean;
 }
 
 export interface VerifyArgs {
@@ -118,6 +139,13 @@ export interface VerifyResult extends VerifyVerdictCounts {
     mode: string;
     /** The open broad-cycle watermark, when this run used verify-broad. */
     broadCycleStartAt?: number;
+    /**
+     * Why a run stopped before draining its scope. "deadline": the remaining
+     * budget could not give the next batch its floor. "batch-timeout": a batch
+     * ran out of time, so the next batch would meet the same budget; earlier
+     * batches stay banked.
+     */
+    stopReason?: "deadline" | "batch-timeout";
 }
 
 function closeBroadCycle(args: VerifyArgs, cycleStartAt: number | undefined): void {
@@ -195,9 +223,14 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
     try {
         for (let i = 0; i < batches.length; i += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
-            if (remainingMs <= 0) break;
-            const batchesRemaining = batches.length - i;
-            const sliceMs = Math.max(1, Math.floor(remainingMs / batchesRemaining));
+            if (remainingMs < VERIFY_BATCH_FLOOR_MS) {
+                result.stopReason = "deadline";
+                log(
+                    `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: stopping before batch ${i + 1}/${batches.length} — remaining budget ${remainingMs}ms is below the ${VERIFY_BATCH_FLOOR_MS}ms batch floor`,
+                );
+                break;
+            }
+            const sliceMs = computeVerifyBatchSliceMs(remainingMs, batches.length - i);
 
             const counts = await verifyOneBatch(args, batches[i], sliceMs, abortController.signal);
             result.verified += counts.verified;
@@ -221,6 +254,17 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
                     result.refused,
                 result.refused,
             );
+
+            if (counts.timedOut) {
+                // Every later batch gets the same or a smaller share of the deadline,
+                // so starting one would repeat this timeout. Keep what earlier
+                // batches committed and stop.
+                result.stopReason = "batch-timeout";
+                log(
+                    `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: batch ${i + 1}/${batches.length} timed out after its ${sliceMs}ms slice; stopping with ${result.remaining} remaining`,
+                );
+                break;
+            }
 
             if (counts.providerFailure) {
                 lastProviderFailure = counts.providerFailure;
@@ -327,6 +371,9 @@ async function verifyOneBatch(
                 },
             },
             {
+                // Send without holding a request open for the whole batch, so the
+                // slice below is the only timer (see prompt-async-transport.ts).
+                transport: shared.createPromptAsyncTransport(client, agentSessionId),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,
@@ -372,12 +419,23 @@ async function verifyOneBatch(
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
         recordInvocation(args, startedAt, { status: failedInvocationStatus(error), error });
+        if (error instanceof DreamerModuleFailureError || signal.aborted) throw error;
+        // A timeout is a budget verdict, not a failure of this run: report it so the
+        // run can stop cleanly with its earlier batches banked.
+        if (promptFailure?.failureClass === "provider_timeout" || shared.isPromptTimeoutError(error)) {
+            return {
+                verified: 0,
+                updated: 0,
+                archived: 0,
+                skipped: 0,
+                refused: 0,
+                timedOut: true,
+            };
+        }
         if (
-            error instanceof DreamerModuleFailureError ||
-            signal.aborted ||
-            (promptFailure !== null &&
-                promptFailure.failureClass !== "parse_failed" &&
-                !providerFailure)
+            promptFailure !== null &&
+            promptFailure.failureClass !== "parse_failed" &&
+            !providerFailure
         )
             throw error;
         return {
