@@ -126,14 +126,18 @@ function successfulMapClient(onPrompt?: () => void) {
 }
 
 /** The exact timeout-class error from the shared prompt helper. */
-function timeoutMapClient(onPrompt?: () => void) {
+function timeoutMapClient(
+    onPrompt?: () => void,
+    timeoutError: () => unknown = () => new Error("prompt timed out after 99997ms"),
+) {
     return {
         session: {
             create: async () => ({ data: { id: "map-child" } }),
             prompt: async () => {
                 onPrompt?.();
-                throw new Error("prompt timed out after 99997ms");
+                throw timeoutError();
             },
+            abort: async () => ({}),
             messages: async () => ({ data: [] }),
             delete: async () => ({}),
         },
@@ -499,6 +503,40 @@ describe("mapMemories disposition", () => {
                 complete: false,
                 stopReason: "timeout-circuit-breaker",
             });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("two consecutive host request timeouts also trip the starvation circuit breaker", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-host-timeout-breaker";
+            const dir = tempProject();
+            for (let index = 0; index < 241; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Host timeout mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            let promptCalls = 0;
+            // Bun's fetch rejects with this DOMException when the host client's own
+            // request timer fires on a long synchronous prompt.
+            args.client = timeoutMapClient(
+                () => {
+                    promptCalls += 1;
+                },
+                () => new DOMException("The operation timed out.", "TimeoutError"),
+            ) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(2);
+            expect(result.stopReason).toBe("timeout-circuit-breaker");
+            expect(result.complete).toBe(false);
         } finally {
             closeQuietly(db);
         }

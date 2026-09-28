@@ -142,10 +142,10 @@ export function computeMapBatchSliceMs(remainingMs: number, batchesRemaining: nu
     );
 }
 
-/** The shared prompt helper uses this exact error shape for a deadline expiry.
- * Validation and provider failures remain ordinary per-batch retries. */
+/** Our own slice expiry and the host client's request timer both count as
+ * timeouts. Validation and provider failures remain ordinary per-batch retries. */
 function isTimeoutClassError(error: unknown): boolean {
-    return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
+    return shared.isPromptTimeoutError(error);
 }
 
 /** Re-queue predicate: a file-independent mapping (sentinel, no real files)
