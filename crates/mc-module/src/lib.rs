@@ -19978,7 +19978,7 @@ mod tests {
                 kind: "text".to_string(),
                 token_count: 37,
                 created_at_ms: 1,
-                source_bytes: bytes.clone(),
+                source_bytes: bytes.clone().into(),
             }],
         );
         let mut snapshot = cache.snapshot("session");

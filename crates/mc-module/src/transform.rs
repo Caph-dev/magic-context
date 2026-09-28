@@ -7459,7 +7459,7 @@ fn new_caveman_units(
             {
                 return None;
             }
-            let source = String::from_utf8(row.source_bytes.clone()).ok()?;
+            let source = std::str::from_utf8(&row.source_bytes).ok()?.to_owned();
             (!source.is_empty()).then_some((tag_number, block.id.clone(), source))
         })
         .collect::<Vec<_>>();
@@ -9444,6 +9444,20 @@ fn tag_mint_frontier_cache() -> &'static Mutex<TagMintFrontierCache> {
     })
 }
 
+/// Append this pass's mints to the shared tag rows and return the index of the first mint.
+/// A pass with nothing to mint leaves the rows untouched: they are usually shared with the
+/// retained tag baseline, and requesting mutable access would copy every row to append nothing.
+fn append_minted_tag_rows(
+    tag_rows: &mut Arc<Vec<McTagRow>>,
+    tag_mints: Vec<TagMintInput>,
+    created_at_ms: i64,
+) -> usize {
+    if tag_mints.is_empty() {
+        return tag_rows.len();
+    }
+    append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mints, created_at_ms)
+}
+
 fn append_tag_mint_rows(
     tag_rows: &mut Vec<McTagRow>,
     tag_mints: Vec<TagMintInput>,
@@ -9461,7 +9475,7 @@ fn append_tag_mint_rows(
                 kind: input.kind,
                 token_count: input.token_count.max(0),
                 created_at_ms,
-                source_bytes: input.source_bytes,
+                source_bytes: input.source_bytes.into(),
             }),
     );
     start
@@ -10200,8 +10214,7 @@ fn compute_active_overlay_decisions(
     let tag_mint_candidates = tag_mint_work.candidate_count;
     let tag_mint_tokenized_bytes = tag_mint_work.tokenized_bytes;
     let tag_mint_count = tag_mint_work.inputs.len();
-    let tag_mint_start =
-        append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mint_work.inputs, ctx.now_ms);
+    let tag_mint_start = append_minted_tag_rows(tag_rows, tag_mint_work.inputs, ctx.now_ms);
     let tag_mint_ms = elapsed_ms(tag_mint_started_at);
     let temporal_started_at = Instant::now();
 
@@ -10999,13 +11012,22 @@ fn tag_rows_for_hygiene(
         .iter()
         .map(|block| block.id.as_str())
         .collect::<HashSet<_>>();
+    // Hygiene reads tag identities (number, block, kind, token count), never the stored source
+    // payload, so the retained rows are copied without it.
     let mut rows = stored_rows
         .iter()
         .filter(|row| {
             !projected_ids.contains(row.block_id.as_str())
                 || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
         })
-        .cloned()
+        .map(|row| McTagRow {
+            tag_number: row.tag_number,
+            block_id: row.block_id.clone(),
+            kind: row.kind.clone(),
+            token_count: row.token_count,
+            created_at_ms: row.created_at_ms,
+            source_bytes: Default::default(),
+        })
         .collect::<Vec<_>>();
     let existing_ids = rows
         .iter()
@@ -11027,7 +11049,7 @@ fn tag_rows_for_hygiene(
             kind: kind.as_store_kind().to_string(),
             token_count: 0,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         });
     }
     if rows.is_empty() && derive_when_empty {
@@ -11046,7 +11068,7 @@ fn tag_rows_for_hygiene(
                     .to_string(),
                 token_count: 0,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
     }
@@ -16910,6 +16932,131 @@ pub(crate) mod tests {
         }
     }
 
+    fn payload_tag(number: i64, block_id: &str, payload: &str) -> McTagRow {
+        McTagRow {
+            tag_number: number,
+            block_id: block_id.to_string(),
+            kind: "message".to_string(),
+            token_count: number * 3,
+            created_at_ms: number * 1_000,
+            source_bytes: payload.as_bytes().into(),
+        }
+    }
+
+    /// A pass that mints nothing must leave the tag rows shared with the retained baseline, and
+    /// a pass that mints must produce exactly the rows and start index the copying append did
+    /// while sharing every earlier row's stored payload instead of copying it.
+    #[test]
+    fn tag_mint_append_shares_rows_and_payloads() {
+        let baseline = Arc::new(vec![
+            payload_tag(4, "a#0", "alpha payload"),
+            payload_tag(9, "b#0", "beta payload"),
+            payload_tag(7, "c#0", "gamma payload"),
+        ]);
+        let mut rows = Arc::clone(&baseline);
+        assert_eq!(append_minted_tag_rows(&mut rows, Vec::new(), 5), 3);
+        assert!(
+            Arc::ptr_eq(&rows, &baseline),
+            "a no-mint pass copied the rows"
+        );
+
+        let mint = || {
+            vec![TagMintInput {
+                block_id: "d#0".to_string(),
+                kind: "tool_result".to_string(),
+                token_count: -2,
+                source_bytes: b"delta".to_vec(),
+            }]
+        };
+        let start = append_minted_tag_rows(&mut rows, mint(), 5);
+        let mut copying = (*baseline).clone();
+        let copying_start = append_tag_mint_rows(&mut copying, mint(), 5);
+        assert_eq!(
+            (start, rows.as_slice()),
+            (copying_start, copying.as_slice())
+        );
+        assert_eq!(rows[3].tag_number, 10);
+        assert_eq!(baseline.len(), 3, "the retained baseline is not mutated");
+        for (row, original) in rows.iter().zip(baseline.iter()) {
+            assert!(Arc::ptr_eq(&row.source_bytes, &original.source_bytes));
+        }
+    }
+
+    /// Hygiene preparation keeps exactly the rows, order and identities the cloning version
+    /// kept, but none of their stored payload bytes.
+    #[test]
+    fn hygiene_rows_are_identity_only_and_match_cloned_rows() {
+        let projection = project_messages(&[
+            item("live-a", 1, "first"),
+            item("live-b", 2, "second"),
+            item("live-c", 3, "third"),
+        ])
+        .unwrap();
+        let stored = vec![
+            payload_tag(1, "gone#0", &"historical ".repeat(500)),
+            payload_tag(2, "live-a#0", "first"),
+            payload_tag(3, "live-b#0", "second"),
+        ];
+        let overlay = TagOverlayState {
+            // live-a keeps its stored number, live-b was renumbered, live-c is a new mint.
+            tag_by_block_id: BTreeMap::from([
+                ("live-a#0".to_string(), 2),
+                ("live-b#0".to_string(), 30),
+                ("live-c#0".to_string(), 4),
+            ]),
+            ..Default::default()
+        };
+        for derive_when_empty in [false, true] {
+            let view = tag_rows_for_hygiene(&projection, &stored, &overlay, derive_when_empty);
+            assert!(view.iter().all(|row| row.source_bytes.is_empty()));
+            let identities = |rows: &[McTagRow]| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.tag_number,
+                            row.block_id.clone(),
+                            row.kind.clone(),
+                            row.token_count,
+                            row.created_at_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            // The cloning version: surviving stored rows copied whole, then the same additions.
+            let projected = projection
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<HashSet<_>>();
+            let mut cloned = stored
+                .iter()
+                .filter(|row| {
+                    !projected.contains(row.block_id.as_str())
+                        || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            cloned.push(McTagRow {
+                tag_number: 4,
+                block_id: "live-c#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            });
+            cloned.push(McTagRow {
+                tag_number: 30,
+                block_id: "live-b#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            });
+            cloned.sort_by_key(|row| row.tag_number);
+            assert_eq!(identities(&view), identities(&cloned));
+        }
+    }
+
     /// A timestamped conversation for the temporal differential: users with one or two text
     /// blocks, assistants with and without completion times, gaps from seconds to days, and
     /// one user repeated under the same id.
@@ -19896,7 +20043,7 @@ pub(crate) mod tests {
                 kind: kind.clone(),
                 token_count: *tokens,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
         // Coalesce assistant text and its following call under the same CC message id.
@@ -20014,7 +20161,7 @@ pub(crate) mod tests {
                 kind: "tool_result".into(),
                 token_count: 10_000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
         ctx.tag_window_protected_block_ids =
@@ -33674,7 +33821,7 @@ pub(crate) mod tests {
                     .find(|block| block.id == row.block_id)
                     .unwrap();
                 let (_, source) = taggable_source(block).expect("minted tags must be overlayable");
-                assert_eq!(row.source_bytes, source.as_bytes());
+                assert_eq!(&*row.source_bytes, source.as_bytes());
             }
             assert_eq!(tail_bytes(&response, "m1"), "§1§   user §7§");
             assert_eq!(tail_bytes(&response, "text"), "§2§   text output");
@@ -33985,7 +34132,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let cached = load_cached_tags(&store, session).unwrap();
-        assert_eq!(cached[0].source_bytes, b"old");
+        assert_eq!(&*cached[0].source_bytes, b"old");
         let before = store.tag_cache_summary(session).unwrap();
 
         // This bypasses transform commits, so only the SQLite mutation trigger can invalidate
@@ -34002,7 +34149,7 @@ pub(crate) mod tests {
         assert_ne!(after.generation, before.generation);
 
         let refilled = load_cached_tags(&store, session).unwrap();
-        assert_eq!(refilled[0].source_bytes, b"poisoned");
+        assert_eq!(&*refilled[0].source_bytes, b"poisoned");
     }
 
     #[test]
@@ -34023,9 +34170,9 @@ pub(crate) mod tests {
         let b = load_cached_tags(&store, "tag-cache-b").unwrap();
         let a_second = load_cached_tags(&store, "tag-cache-a").unwrap();
         assert_eq!(a_first[0].block_id, "a#0");
-        assert_eq!(a_second[0].source_bytes, b"A");
+        assert_eq!(&*a_second[0].source_bytes, b"A");
         assert_eq!(b[0].block_id, "b#0");
-        assert_eq!(b[0].source_bytes, b"B");
+        assert_eq!(&*b[0].source_bytes, b"B");
     }
 
     #[test]
@@ -35421,7 +35568,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 1_500,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -35441,7 +35588,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 1_000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let applying_window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -35668,7 +35815,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 4_000,
                 created_at_ms: 0,
-                source_bytes: b"old source".to_vec(),
+                source_bytes: b"old source".to_vec().into(),
             },
             McTagRow {
                 tag_number: 8,
@@ -35676,7 +35823,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 4_000,
                 created_at_ms: 0,
-                source_bytes: b"new source".to_vec(),
+                source_bytes: b"new source".to_vec().into(),
             },
         ];
         let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -37280,7 +37427,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         }];
         let no_units = new_caveman_units(
             &CoreState::default(),
@@ -37499,7 +37646,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         }];
         let units = new_caveman_units(
             &core,
@@ -37541,7 +37688,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         };
         assert!(new_caveman_units(
             &CoreState::default(),

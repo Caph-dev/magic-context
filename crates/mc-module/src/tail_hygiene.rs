@@ -1172,7 +1172,7 @@ mod tests {
             kind: "message".to_string(),
             token_count: 0,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
     }
 
@@ -2124,7 +2124,7 @@ mod tests {
             kind: input.kind.clone(),
             token_count: input.token_count,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
     }
 
