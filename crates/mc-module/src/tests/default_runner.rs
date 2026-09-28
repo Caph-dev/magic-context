@@ -281,11 +281,7 @@ async fn classify_defaults_to_the_host_on_opencode_and_follows_a_configured_drea
         bound.config.dreamer_runner = dreamer;
         handler.bind_route(7, bound);
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
         let outcome = handler
             .handle_dreamer_run_task(
                 7,

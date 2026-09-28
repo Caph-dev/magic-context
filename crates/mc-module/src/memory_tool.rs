@@ -882,7 +882,7 @@ mod tests {
     }
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&descriptor(dir)).unwrap()
+        McStore::open_for_test(&descriptor(dir)).unwrap()
     }
 
     fn input<'a>(

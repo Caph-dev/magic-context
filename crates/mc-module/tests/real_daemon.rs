@@ -376,7 +376,7 @@ async fn mc_transform_spine_through_real_daemon() {
 fn seed_store(data_home: &Path) {
     use mc_store::{McStore, StoredCompartment};
     let descriptor = mc_module::dev_descriptor_at(&data_home.to_string_lossy());
-    let store = McStore::open(&descriptor).expect("open store to seed");
+    let store = McStore::open_for_test(&descriptor).expect("open store to seed");
     let c = |seq: i64, start: i64, end: i64, end_id: &str, p1: &str| StoredCompartment {
         sequence: seq,
         start_message: start,

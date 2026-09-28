@@ -142,7 +142,7 @@ async fn a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform() {
     // checkpoints the WAL into the main file before the module starts.
     let descriptor = mc_module::dev_descriptor_at(&isolation.data_home.to_string_lossy());
     let ahead = LATEST_MIGRATION_VERSION + 1;
-    let newer = McStore::open(&descriptor).expect("create the store");
+    let newer = McStore::open_for_test(&descriptor).expect("create the store");
     newer
         .stamp_schema_version_for_test(ahead)
         .expect("stamp the store one version ahead");

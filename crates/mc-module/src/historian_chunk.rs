@@ -2316,7 +2316,7 @@ mod tests {
         use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
         let dir = tempfile::tempdir().unwrap();
-        let store = mc_store::McStore::open(&StorageDescriptor {
+        let store = mc_store::McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,
@@ -2374,7 +2374,7 @@ mod tests {
         use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
         let dir = tempfile::tempdir().unwrap();
-        let store = mc_store::McStore::open(&StorageDescriptor {
+        let store = mc_store::McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,

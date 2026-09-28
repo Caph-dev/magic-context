@@ -5089,6 +5089,8 @@ pub struct M1RevisionSnapshot {
     pub project_memory_epoch: i64,
     /// The session's highest `m0_mutation_log` id, 0 when it has none.
     pub m0_mutation_head: i64,
+    /// The global user-profile version (`project_state['__global__']`), 0 when unset.
+    pub user_profile_version: u64,
 }
 
 /// A project memory row projected for rendering into the prompt.
@@ -7011,6 +7013,9 @@ pub struct McStore {
     state_load_query_count: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     historian_side_channel_fail_once: Mutex<BTreeSet<String>>,
+    /// Route roots a test keyed by a project identity; see `set_route_identity_for_test`.
+    #[cfg(any(test, feature = "test-support"))]
+    route_identities_for_test: Mutex<HashMap<String, String>>,
 }
 
 fn valid_drop_seed_block_id(block_id: &str) -> bool {
@@ -7406,6 +7411,64 @@ impl McStore {
         self.context_write(&[], operation)
     }
 
+    /// Key `route_root` by `identity` for the module's route resolution in tests, where
+    /// production reads the session's recorded project instead.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_route_identity_for_test(&self, route_root: &str, identity: &str) {
+        self.route_identities_for_test
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(route_root.to_string(), identity.to_string());
+    }
+
+    /// The identity a test keyed `route_root` by, if any.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route_identity_for_test(&self, route_root: &str) -> Option<String> {
+        self.route_identities_for_test
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(route_root)
+            .cloned()
+    }
+
+    /// Replace the host's user profile in `context.db` with `lines` (active, promoted in
+    /// order) and set the global profile version, as the host's dreamer does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn seed_user_profile_for_test(&self, lines: &[String], version: u64) -> Result<(), McStoreError> {
+        self.with_context_conn_for_test(|tx| {
+            tx.execute("DELETE FROM user_memories", [])?;
+            for (index, line) in lines.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO user_memories (content, status, promoted_at, created_at, updated_at)
+                     VALUES (?1, 'active', ?2, 0, 0)",
+                    params![line, index as i64],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO project_state (project_path, project_memory_epoch, project_user_profile_version, updated_at)
+                 VALUES ('__global__', 0, ?1, 0)
+                 ON CONFLICT(project_path) DO UPDATE SET project_user_profile_version = excluded.project_user_profile_version",
+                params![version as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Set a project's `project_memory_epoch` in `context.db`, as the host's identity and
+    /// workspace writers do.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_project_memory_epoch_for_test(&self, project_path: &str, epoch: i64) -> Result<(), McStoreError> {
+        self.with_context_conn_for_test(|tx| {
+            tx.execute(
+                "INSERT INTO project_state (project_path, project_memory_epoch, project_user_profile_version, updated_at)
+                 VALUES (?1, ?2, 0, 0)
+                 ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = excluded.project_memory_epoch",
+                params![project_path, epoch],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Open a store for a test, with a `context.db` beside it (created from the schema
     /// snapshot when missing) installed as its domain.
     #[cfg(any(test, feature = "test-support"))]
@@ -7508,6 +7571,8 @@ impl McStore {
             state_load_query_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             historian_side_channel_fail_once: Mutex::new(BTreeSet::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            route_identities_for_test: Mutex::new(HashMap::new()),
         };
         store.prune_transform_session_roots()?;
         Ok(store)
@@ -8034,10 +8099,20 @@ impl McStore {
             }
         })?;
 
+        // The user-profile version is the host's, kept in context.db; the cached meta only
+        // remembers which version m1 last rendered (`m1_user_profile_version`).
+        let user_profile_version = if self.has_context_domain() {
+            self.user_profile_version()?
+        } else {
+            0
+        };
         match row {
             None => Ok(LoadedState {
                 core: CoreState::default(),
-                meta: ModuleMeta::default(),
+                meta: ModuleMeta {
+                    user_profile_version,
+                    ..ModuleMeta::default()
+                },
                 row_version: None,
             }),
             Some((rv, core_json, meta_json, identities, served)) => {
@@ -8045,6 +8120,7 @@ impl McStore {
                     .map_err(|e| McStoreError::Serde(e.to_string()))?;
                 meta.block_identity_by_mid = identities;
                 meta.served_output_fingerprint = served;
+                meta.user_profile_version = user_profile_version;
                 Ok(LoadedState {
                     core: serde_json::from_str(&core_json)
                         .map_err(|e| McStoreError::Serde(e.to_string()))?,
@@ -11795,6 +11871,21 @@ impl McStore {
         })
     }
 
+    /// The global user-profile version the host records in `context.db`
+    /// (`project_state['__global__'].project_user_profile_version`), 0 when unset.
+    pub fn user_profile_version(&self) -> Result<u64, McStoreError> {
+        let version: Option<i64> = self.context_read(|conn| {
+            conn.query_row(
+                "SELECT project_user_profile_version FROM project_state
+                  WHERE project_path = '__global__'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+        })?;
+        Ok(version.unwrap_or(0).max(0) as u64)
+    }
+
     /// Read the membership and all m1 revision watermarks from one `context.db` read
     /// transaction. The memory-id watermark uses the same visible render-pool predicate as
     /// m0 and m1 additions at `now_ms`; note and compartment watermarks retain their
@@ -11877,6 +11968,17 @@ impl McStore {
                 params![session_id],
                 |row| row.get(0),
             )?;
+            // The user profile is global: the host bumps the `__global__` row's version
+            // whenever a profile line changes.
+            let user_profile_version = transaction
+                .query_row(
+                    "SELECT project_user_profile_version FROM project_state
+                      WHERE project_path = '__global__'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
             Ok(M1RevisionSnapshot {
                 membership,
                 max_memory_id,
@@ -11885,6 +11987,7 @@ impl McStore {
                 note_status_version,
                 project_memory_epoch,
                 m0_mutation_head,
+                user_profile_version: user_profile_version.max(0) as u64,
             })
         })
     }
@@ -20569,18 +20672,6 @@ mod tests {
                 .len(),
             "two migrations must never claim the same version"
         );
-    }
-
-    fn privilege_state_columns(store: &SqliteStore) -> Vec<String> {
-        store
-            .with_conn(|conn| {
-                let mut statement = conn.prepare("PRAGMA table_info(mc_privilege_state)")?;
-                let rows = statement
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .unwrap()
     }
 
     /// The marker column rejects anything that is neither set nor unset, so no writer can leave a

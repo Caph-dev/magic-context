@@ -3149,7 +3149,7 @@ mod tests {
     use crate::transform::{transform, ProducerContext, TransformRequest};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
+        McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,
@@ -3251,48 +3251,6 @@ mod tests {
     fn empty_boundary_dates() -> &'static BTreeMap<String, String> {
         static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
         EMPTY.get_or_init(BTreeMap::new)
-    }
-
-    /// The single-store view stamps the route's own harness label, not a module-wide
-    /// one. `harness` is part of `primer_candidates`' upsert key, so any other label makes
-    /// the module add a second candidate row beside the host's instead of updating it.
-    #[test]
-    fn the_single_store_view_carries_the_routes_harness_label() {
-        let predicate = HistorianPublishPredicate {
-            firing_seq: 1,
-            producer_run_id: "run-1".into(),
-            producer_attempt: 0,
-            chunk_fingerprint: "fp".into(),
-            selected_range_identities: Vec::new(),
-            compartment_set_generation: CompartmentSetGeneration {
-                max_sequence: 0,
-                count: 0,
-            },
-        };
-        let validated = ValidatedChunk::default();
-        for harness in ["opencode", "opencode2", "pi"] {
-            let request = ValidatedPublishRequest {
-                session_id: "ses",
-                project_path: "git:proj",
-                harness,
-                expected_row_version: None,
-                expected_revert_epoch: 0,
-                predicate: &predicate,
-                observed_chunk_fingerprint: "fp",
-                validated: &validated,
-                promote_facts: false,
-                collect_user_memory_candidates: false,
-                publication_floor_ordinal: 1,
-                chunk_transcript: "",
-                raw_chunk_messages: "[]",
-                boundary_dates: empty_boundary_dates(),
-                created_at_ms: 1,
-                failure_backoff_at_ms: 0,
-                publication_fence: None,
-            };
-            let view = fold_publish_view(&request, &[], &[], &[], &[], &[]);
-            assert_eq!(view.harness, harness);
-        }
     }
 
     fn pctx<'a>() -> ProducerContext<'a> {

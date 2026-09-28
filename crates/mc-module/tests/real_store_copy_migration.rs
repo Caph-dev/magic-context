@@ -59,7 +59,7 @@ fn a_copy_of_a_real_store_migrates_to_this_build_and_passes_quick_check() {
 
     let before = recorded_versions(&working);
     let started = Instant::now();
-    let store = McStore::open(&descriptor(&working)).unwrap();
+    let store = McStore::open_for_test(&descriptor(&working)).unwrap();
     let elapsed = started.elapsed();
     drop(store);
     let after = recorded_versions(&working);
@@ -102,7 +102,7 @@ fn a_copy_of_a_real_store_migrates_to_this_build_and_passes_quick_check() {
     );
     // A second open is a no-op on an already-migrated store.
     let started = Instant::now();
-    drop(McStore::open(&descriptor(&working)).unwrap());
+    drop(McStore::open_for_test(&descriptor(&working)).unwrap());
     eprintln!(
         "real store copy: reopen elapsed_ms={}",
         started.elapsed().as_millis()

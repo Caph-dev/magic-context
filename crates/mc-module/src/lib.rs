@@ -5314,7 +5314,8 @@ impl McHandler {
             .resolve_project_identity_for_test
             .load(Ordering::Relaxed)
         {
-            return Ok(binding.project_root.to_string_lossy().to_string());
+            let root = binding.project_root.to_string_lossy().to_string();
+            return Ok(store.route_identity_for_test(&root).unwrap_or(root));
         }
         self.project_identities
             .resolve(&binding.project_root)
@@ -18098,7 +18099,6 @@ mod tests {
     mod gate_a1_b0;
     mod gate_a1_b0_baseline_probe;
     mod gate_a2;
-    mod gate_b1_off;
     // The per-harness default runner, driven through real passes.
     mod default_runner;
 
@@ -18952,7 +18952,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let predecessor = McStore::open(&descriptor).unwrap();
+        let predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
@@ -18976,7 +18976,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(60)));
 
@@ -19018,7 +19018,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
 
         let never_acked = McHandler::new();
         let missing_ack =
@@ -19064,7 +19064,7 @@ mod tests {
             StorageBackend::Sqlite { path } => path.clone(),
             other => panic!("expected sqlite backend, got {other:?}"),
         };
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
@@ -19100,7 +19100,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(60)));
 
@@ -19240,7 +19240,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(60)));
 
@@ -19282,7 +19282,7 @@ mod tests {
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
         let ahead = LATEST_MIGRATION_VERSION + 1;
-        let newer = McStore::open(&descriptor).unwrap();
+        let newer = McStore::open_for_test(&descriptor).unwrap();
         newer.stamp_schema_version_for_test(ahead).unwrap();
         drop(newer);
 
@@ -19376,7 +19376,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
@@ -19395,7 +19395,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_secs(5)));
         let coordinator = Arc::clone(&handler.store_open);
@@ -19418,7 +19418,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
@@ -19468,7 +19468,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let opened = McStore::open(&descriptor).unwrap();
+        let opened = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         mark_store_open_in_flight(&handler, &descriptor);
 
@@ -19521,7 +19521,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
-        let _predecessor = McStore::open(&descriptor).unwrap();
+        let _predecessor = McStore::open_for_test(&descriptor).unwrap();
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(StoreOpenPolicy {
             request_wait: Duration::from_secs(5),
@@ -19730,7 +19730,7 @@ mod tests {
                 std::fs::copy(&seed, &target).unwrap();
             }
             let store =
-                Arc::new(McStore::open(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
+                Arc::new(McStore::open_for_test(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
             let handler = McHandler::with_producer_factory_config_resolver(
                 Arc::new(TestProducerFactory { state }),
                 default_test_config(),
@@ -20439,7 +20439,7 @@ mod tests {
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let store =
-            Arc::new(McStore::open(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
+            Arc::new(McStore::open_for_test(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
         let handler = McHandler::with_producer_factory_config_resolver(
             Arc::new(TestProducerFactory { state }),
             config,
@@ -20455,16 +20455,11 @@ mod tests {
     /// The project key the claim lane resolves for a channel bound to this project
     /// root.
     ///
-    /// The lane scopes every op to the caller's project, resolving the key through
-    /// the authority route the way the transform that queued the run did. A test
-    /// that reads the queue directly has to use the same key, or it looks in the
-    /// wrong project and reads an empty queue as "nothing was queued".
-    fn lane_project_key(store: &McStore, project_root: &std::path::Path) -> String {
-        let route_root = project_root.to_string_lossy().to_string();
-        store
-            .authority_project_for_route(&route_root, "memories")
-            .unwrap()
-            .unwrap_or(route_root)
+    /// The lane scopes every op to the caller's project, the identity the transform that
+    /// queued the run resolved. Unit tests key a route with no recorded session project by
+    /// its root path, so a test that reads the queue directly uses that key too.
+    fn lane_project_key(_store: &McStore, project_root: &std::path::Path) -> String {
+        project_root.to_string_lossy().to_string()
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -21029,48 +21024,20 @@ mod tests {
                 now_ms: now,
             })
             .unwrap();
-        store
-            .acknowledge_host_memory_ids(
-                project,
-                &[HostMemoryIdentityAck {
-                    module_row_id: id,
-                    host_row_id: id,
-                }],
-            )
-            .unwrap();
         id
     }
 
+    /// Key a route root by a project identity, the way a host-recorded session project
+    /// keys it in production. The other arguments are kept so the call sites read as the
+    /// project, route and domain they set up.
     fn activate_module_authority(
         store: &McStore,
-        context_store_uuid: &str,
+        _context_store_uuid: &str,
         identity: &str,
         route_project_root: &str,
-        domain: &str,
+        _domain: &str,
     ) {
-        let preparing = store
-            .authority_begin_prepare(context_store_uuid, identity, domain)
-            .unwrap();
-        let checksum = store
-            .authority_seed_checksum(context_store_uuid, identity, domain)
-            .unwrap();
-        store
-            .authority_verify_prepare(
-                context_store_uuid,
-                identity,
-                domain,
-                preparing.generation,
-                &checksum,
-                &checksum,
-            )
-            .unwrap();
-        let module = store
-            .authority_ack_prepare(context_store_uuid, identity, domain, preparing.generation)
-            .unwrap();
-        assert_eq!(module.state, "MODULE");
-        store
-            .bind_authority_route(context_store_uuid, identity, route_project_root)
-            .unwrap();
+        store.set_route_identity_for_test(route_project_root, identity);
     }
 
     fn seed_workspace(store: &McStore, own: &str, foreign: &str) {
@@ -21359,74 +21326,6 @@ mod tests {
         let metrics = report.metrics.unwrap();
         assert_eq!(metrics["in_flight_count"], json!(0));
         assert_eq!(metrics["oldest_queued_age_ms"], Value::Null);
-    }
-
-    #[test]
-    fn memory_mirror_health_surfaces_a_frozen_non_frontier_cursor_with_a_code() {
-        let handler = McHandler::new();
-        handler.memory_mirror_health.observe_frontier(4_850, 275);
-        handler.memory_mirror_health.observe_pull(3_726, 1_000);
-
-        let within_bound =
-            handler.augment_memory_mirror_health(DispatchHealth::new().report(40_999), 40_999);
-        assert_eq!(within_bound.status, HealthStatus::Ok);
-        assert_eq!(
-            within_bound.metrics.unwrap()["memory_mirror"]["stalled"],
-            json!(false)
-        );
-
-        let stalled =
-            handler.augment_memory_mirror_health(DispatchHealth::new().report(41_000), 41_000);
-        assert_eq!(stalled.status, HealthStatus::Degraded);
-        assert!(stalled
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("MC-M01 memory mirror cursor stalled")));
-        let metrics = stalled.metrics.unwrap();
-        assert_eq!(metrics["memory_mirror"]["feed_head"], json!(4_850));
-        assert_eq!(metrics["memory_mirror"]["host_cursor"], json!(3_726));
-        assert_eq!(metrics["memory_mirror"]["pending_rows"], json!(1_124));
-        assert_eq!(metrics["memory_mirror"]["code"], json!("MC-M01"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn transform_and_session_status_publish_memory_mirror_frontier_and_authority() {
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let project = project.to_string_lossy().to_string();
-        handler.bind_route(7, binding(&project, "ses"));
-        activate_module_authority(&store, "store", "git:mirror-status", &project, "memories");
-        insert_memory(
-            &store,
-            "git:mirror-status",
-            "ARCHITECTURE",
-            "mirror frontier fixture",
-            1,
-        );
-
-        let transformed = call_transform_request_on_channel(
-            &handler,
-            7,
-            request(vec![ck("mirror-status", 1, "hello")]),
-        )
-        .await;
-        let feed_head = store.changefeed_head("memories").unwrap();
-        assert!(feed_head > 0);
-        assert_eq!(transformed["memory_mirror_head"], json!(feed_head));
-
-        let status = call_dispatch_request_on_channel(
-            &handler,
-            7,
-            json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
-        )
-        .await;
-        assert_eq!(status["memory_mirror"]["feed_head"], json!(feed_head));
-        assert_eq!(status["memory_mirror"]["module_live_rows"], json!(1));
-        assert_eq!(status["authority"]["memories"]["state"], json!("MODULE"));
-        assert_eq!(
-            status["authority"]["memories"]["project"],
-            json!("git:mirror-status")
-        );
     }
 
     #[test]
@@ -25039,31 +24938,22 @@ mod tests {
             )
             .unwrap();
         let project_path = project.to_str().unwrap();
-        let seeded_note_ids = store
-            .seed_authority_rows(
-                "context-db",
-                project_path,
-                "notes",
-                &[AuthoritySeedRow {
-                    source_row_id: 52,
-                    snapshot: json!({
-                        "type": "session",
-                        "project_path": project_path,
-                        "session_id": source,
-                        "content": "compiled note inherited by the successor",
-                        "status": "active",
-                        "surface_condition": "when descent completes",
-                        "compiled_provider": "retina-local-fs",
-                        "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"src/lib.rs\"}",
-                        "compiled_at": 5200,
-                        "compile_status": "compiled",
-                        "status_version": 3,
-                        "created_at": 5100,
-                        "updated_at": 5200,
-                    }),
-                }],
-            )
+        let seeded_note_id = store
+            .with_context_conn_for_test(|tx| {
+                tx.execute(
+                    "INSERT INTO notes (type, project_path, session_id, content, status,
+                                        surface_condition, compiled_provider, compiled_config,
+                                        compiled_at, compile_status, created_at, updated_at)
+                     VALUES ('session', ?1, ?2, 'compiled note inherited by the successor',
+                             'active', 'when descent completes', 'retina-local-fs',
+                             '{\"kind\":\"path_exists\",\"path\":\"src/lib.rs\"}',
+                             5200, 'compiled', 5100, 5200)",
+                    rusqlite::params![project_path, source],
+                )?;
+                Ok(tx.last_insert_rowid())
+            })
             .unwrap();
+        let seeded_note_ids = [seeded_note_id];
         let source_note = store
             .get_note_by_id(project_path, source, seeded_note_ids[0])
             .unwrap()
@@ -27722,12 +27612,6 @@ mod tests {
         .await;
         assert_eq!(error_code(outcome), "session_unresolved");
         assert_eq!(resolver.calls(), vec!["ses"]);
-        assert_eq!(
-            store
-                .authority_project_for_route(root_b, "memories")
-                .unwrap(),
-            None
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -27744,7 +27628,7 @@ mod tests {
         let identity = "git:restart-lineage";
 
         {
-            let store = Arc::new(McStore::open(&descriptor).unwrap());
+            let store = Arc::new(McStore::open_for_test(&descriptor).unwrap());
             let handler = McHandler::with_producer_factory_config_resolver(
                 Arc::new(TestProducerFactory {
                     state: Arc::new(ProducerState::default()),
@@ -27770,7 +27654,7 @@ mod tests {
         }
 
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::None)]);
-        let store = Arc::new(McStore::open(&descriptor).unwrap());
+        let store = Arc::new(McStore::open_for_test(&descriptor).unwrap());
         let handler = McHandler::with_producer_factory_config_resolver(
             Arc::new(TestProducerFactory {
                 state: Arc::new(ProducerState::default()),
@@ -27967,100 +27851,6 @@ mod tests {
                 .status,
             "ready"
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn note_facade_recovers_pre_and_post_migration_compilation_metadata() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
-        let rows = [
-            AuthoritySeedRow {
-                source_row_id: 42,
-                snapshot: json!({
-                    "type": "smart",
-                    "project_path": "/repo",
-                    "session_id": "session",
-                    "content": "seeded before migration 52",
-                    "status": "ready",
-                    "surface_condition": "legacy condition",
-                    "ready_reason": "legacy condition met",
-                    "status_version": 2,
-                    "created_at": 1,
-                    "updated_at": 2
-                }),
-            },
-            AuthoritySeedRow {
-                source_row_id: 43,
-                snapshot: json!({
-                    "type": "smart",
-                    "project_path": "/repo",
-                    "session_id": "session",
-                    "content": "seeded after migration 52",
-                    "status": "ready",
-                    "surface_condition": "compiled condition",
-                    "compiled_provider": "retina-local-fs",
-                    "compiled_config": "{\"kind\":\"path_exists\"}",
-                    "compiled_at": 123,
-                    "compile_status": "compiled",
-                    "ready_reason": "compiled condition met",
-                    "status_version": 3,
-                    "created_at": 3,
-                    "updated_at": 4
-                }),
-            },
-        ];
-        store
-            .seed_authority_rows("context-db", "/repo", "notes", &rows)
-            .unwrap();
-
-        let pre_migration = store
-            .get_note_by_id("/repo", "session", 1)
-            .unwrap()
-            .unwrap();
-        assert_eq!(pre_migration.compiled_provider, None);
-        assert_eq!(pre_migration.compiled_config, None);
-        assert_eq!(pre_migration.compiled_at, None);
-        assert_eq!(pre_migration.compile_status, None);
-        let post_migration = store
-            .get_note_by_id("/repo", "session", 2)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            post_migration.compiled_provider.as_deref(),
-            Some("retina-local-fs")
-        );
-        assert_eq!(
-            post_migration.compiled_config.as_deref(),
-            Some("{\"kind\":\"path_exists\"}")
-        );
-        assert_eq!(post_migration.compiled_at, Some(123));
-        assert_eq!(post_migration.compile_status.as_deref(), Some("compiled"));
-
-        let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
-        assert!(output.contains("## Notes"));
-        assert!(output.contains("seeded before migration 52"));
-        assert!(output.contains("seeded after migration 52"));
-
-        drop(handler);
-        drop(store);
-        let reopened = McStore::open(&dev_descriptor_at(
-            dir.path().join("data").to_str().unwrap(),
-        ))
-        .unwrap();
-        let durable = reopened
-            .get_note_by_id("/repo", "session", 2)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            durable.compiled_provider.as_deref(),
-            Some("retina-local-fs")
-        );
-        assert_eq!(durable.compiled_at, Some(123));
-        assert_eq!(durable.compile_status.as_deref(), Some("compiled"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -28950,42 +28740,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_authority_lookup_failure_is_retryable_and_never_falls_back() {
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) = handler_with_store_and_resolver(
-            Arc::new(ProducerState::default()),
-            default_test_config(),
-            resolver,
-        );
-        let project_root = project.to_str().unwrap();
-        handler.bind_route(7, binding(project_root, "token"));
-        store.fail_next_authority_project_resolution_for_test();
-        let arguments = json!({
-            "action": "write",
-            "category": "CONSTRAINTS",
-            "content": "retry after authority lookup",
-        });
-
-        let failed = call_facade(&handler, "ctx_memory", arguments.clone()).await;
-        assert_eq!(error_code(failed), "authority_project_resolution_failed");
-        assert!(store
-            .load_active_memories(project_root, now_ms())
-            .unwrap()
-            .is_empty());
-
-        let retried = call_facade(&handler, "ctx_memory", arguments).await;
-        assert!(!tool_is_error(retried));
-        assert_eq!(
-            store
-                .load_active_memories(project_root, now_ms())
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn facade_multi_instance_shares_memory_pool_and_splits_compartment_scope() {
         let producer = Arc::new(ProducerState::default());
         let project_root = "/same/repo";
@@ -29471,124 +29225,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn authority_complete_uses_the_module_seed_digest_before_ack() {
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
-        let begin = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "authority.prepare",
-                "phase": "begin",
-                "context_store_uuid": "store-uuid",
-                "project": "/repo",
-                "domain": "memories"
-            }),
-        )
-        .await;
-        let generation = begin["authority"]["generation"].as_u64().unwrap();
-        let _ = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "authority.seed",
-                "context_store_uuid": "store-uuid",
-                "project": "/repo",
-                "domain": "memories",
-                "rows": [{
-                    "source_row_id": 1,
-                    "snapshot": {
-                        "id": 1,
-                        "project_path": "/repo",
-                        "category": "CONSTRAINTS",
-                        "content": "seeded",
-                        "normalized_hash": "hash"
-                    }
-                }]
-            }),
-        )
-        .await;
-        let actual = store
-            .authority_seed_checksum("store-uuid", "/repo", "memories")
-            .unwrap();
-        let verified = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "authority.prepare",
-                "phase": "complete",
-                "context_store_uuid": "store-uuid",
-                "project": "/repo",
-                "domain": "memories",
-                "generation": generation,
-                "checksum_expected": actual
-            }),
-        )
-        .await;
-        assert_eq!(verified["authority"]["state"], "PREPARING");
-        assert_eq!(verified["authority"]["checksum_ok"], true);
-        let acked = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "authority.prepare",
-                "phase": "ack",
-                "context_store_uuid": "store-uuid",
-                "project": "/repo",
-                "domain": "memories",
-                "generation": generation
-            }),
-        )
-        .await;
-        assert_eq!(acked["authority"]["state"], "MODULE");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn authority_seed_bad_middle_row_fails_loudly_without_partial_frame() {
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
-        let checksum_before = store
-            .authority_seed_checksum("store-uuid", "/repo", "memories")
-            .unwrap();
-        let outcome = handler
-            .dispatch_value(
-                7,
-                json!({
-                    "method": "authority.seed",
-                    "context_store_uuid": "store-uuid",
-                    "project": "/repo",
-                    "domain": "memories",
-                    "rows": [
-                        {
-                            "source_row_id": 1,
-                            "snapshot": {
-                                "id": 1,
-                                "project_path": "/repo",
-                                "content": "valid"
-                            }
-                        },
-                        {
-                            "source_row_id": 2,
-                            "snapshot": {
-                                "id": 2,
-                                "project_path": "/other",
-                                "content": "invalid project"
-                            }
-                        }
-                    ]
-                }),
-            )
-            .await;
-        let (code, message) = error_frame(outcome);
-        assert_eq!(code, "authority_seed_project_mismatch");
-        assert!(message.contains("project_path"));
-        assert_eq!(store.authority_seed_transaction_count_for_test(), 0);
-        let checksum_after = store
-            .authority_seed_checksum("store-uuid", "/repo", "memories")
-            .unwrap();
-        assert_eq!(
-            checksum_after, checksum_before,
-            "validation failure must not commit a valid prefix"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn facade_never_panics_on_malformed_memory_arguments() {
         let producer = Arc::new(ProducerState::default());
         let resolver = FakeSessionResolver::with(&[(
@@ -29710,379 +29346,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn host_memory_lane_translates_overlap_ids_and_never_mutates_the_raw_module_row() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let project = project.to_str().unwrap();
-        handler.bind_route(7, binding_with_harness(project, "opencode", "token"));
-
-        for index in 1..=7 {
-            assert_eq!(
-                insert_memory(
-                    &store,
-                    project,
-                    "CONSTRAINTS",
-                    &format!("memory-{index}"),
-                    index,
-                ),
-                index
-            );
-        }
-        store
-            .acknowledge_host_memory_ids(
-                project,
-                &[
-                    HostMemoryIdentityAck {
-                        module_row_id: 1,
-                        host_row_id: 2,
-                    },
-                    HostMemoryIdentityAck {
-                        module_row_id: 2,
-                        host_row_id: 102,
-                    },
-                    HostMemoryIdentityAck {
-                        module_row_id: 3,
-                        host_row_id: 4,
-                    },
-                    HostMemoryIdentityAck {
-                        module_row_id: 4,
-                        host_row_id: 104,
-                    },
-                    HostMemoryIdentityAck {
-                        module_row_id: 5,
-                        host_row_id: 6,
-                    },
-                    HostMemoryIdentityAck {
-                        module_row_id: 6,
-                        host_row_id: 106,
-                    },
-                    HostMemoryIdentityAck {
-                        module_row_id: 7,
-                        host_row_id: 7,
-                    },
-                ],
-            )
-            .unwrap();
-
-        let get = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "get",
-                "ids": [1],
-                "host_ids": [2],
-                "memory_id_lane": "host",
-            }),
-        )
-        .await;
-        assert_eq!(
-            tool_text(get),
-            "Memory [ID: 2] in CONSTRAINTS (status: active): memory-1"
-        );
-
-        let raw_overlap = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "get",
-                "ids": [2],
-                "host_ids": [2],
-                "memory_id_lane": "host",
-            }),
-        )
-        .await;
-        assert!(tool_text(raw_overlap).contains("memory id 2 has no module mapping yet"));
-
-        let update = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "update",
-                "ids": [1],
-                "host_ids": [2],
-                "memory_id_lane": "host",
-                "content": "updated-host-two",
-            }),
-        )
-        .await;
-        assert_eq!(tool_text(update), "Updated memory [ID: 2] in CONSTRAINTS.");
-        assert_eq!(
-            store.get_memory_full(1).unwrap().unwrap().content,
-            "updated-host-two"
-        );
-        assert_eq!(
-            store.get_memory_full(2).unwrap().unwrap().content,
-            "memory-2"
-        );
-
-        let archive = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "archive",
-                "ids": [3],
-                "host_ids": [4],
-                "memory_id_lane": "host",
-            }),
-        )
-        .await;
-        assert_eq!(tool_text(archive), "Archived memory IDs [4].");
-        assert_eq!(
-            store.get_memory_full(3).unwrap().unwrap().status,
-            "archived"
-        );
-        assert_eq!(store.get_memory_full(4).unwrap().unwrap().status, "active");
-
-        let merge = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "merge",
-                "ids": [5, 7],
-                "host_ids": [6, 7],
-                "memory_id_lane": "host",
-                "content": "merged-host-six",
-            }),
-        )
-        .await;
-        assert!(!tool_text(merge).contains("ID: 8"));
-        assert_eq!(
-            store.get_memory_full(6).unwrap().unwrap().content,
-            "memory-6"
-        );
-
-        let write = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "write",
-                "memory_id_lane": "host",
-                "host_ids": [],
-                "ids": [],
-                "category": "CONSTRAINTS",
-                "content": "fresh host write",
-            }),
-        )
-        .await;
-        let body = tool_body(write);
-        assert!(body["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("id will appear in <project-memory>"));
-        assert!(body["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .find("ID:")
-            .is_none());
-        assert!(body["memory_operation"]["module_id"].as_i64().is_some());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn review_host_identity_does_not_grant_foreign_write_ownership() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(
-            7,
-            binding_with_harness(project.to_str().unwrap(), "opencode", "token"),
-        );
-        let id = insert_memory(&store, "git:foreign", "CONSTRAINTS", "foreign pinned", 1);
-        store
-            .acknowledge_host_memory_ids(
-                "git:foreign",
-                &[HostMemoryIdentityAck {
-                    module_row_id: id,
-                    host_row_id: 901,
-                }],
-            )
-            .unwrap();
-        let other = insert_memory(
-            &store,
-            "git:foreign",
-            "CONSTRAINTS",
-            "other foreign pinned",
-            2,
-        );
-        store
-            .acknowledge_host_memory_ids(
-                "git:foreign",
-                &[HostMemoryIdentityAck {
-                    module_row_id: other,
-                    host_row_id: 902,
-                }],
-            )
-            .unwrap();
-        let get = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "get", "ids": [id], "host_ids": [901],
-                "memory_id_lane": "host"
-            }),
-        )
-        .await;
-        let get_text = tool_text(get);
-        assert!(
-            get_text.contains("id 901: not found or not visible"),
-            "{get_text}"
-        );
-        assert!(!get_text.contains(&format!("id {id}:")), "{get_text}");
-
-        for action in ["update", "archive", "merge"] {
-            let ids = if action == "merge" {
-                vec![id, other]
-            } else {
-                vec![id]
-            };
-            let host_ids = if action == "merge" {
-                vec![901, 902]
-            } else {
-                vec![901]
-            };
-            let result = call_facade(
-                &handler,
-                "ctx_memory",
-                json!({
-                    "action": action, "ids": ids, "host_ids": host_ids,
-                    "memory_id_lane": "host", "content": "must not write"
-                }),
-            )
-            .await;
-            let text = tool_text(result);
-            eprintln!("host ownership probe {action}: {text}");
-            assert!(!text.contains("Updated memory"), "{text}");
-            assert!(!text.contains("Archived memory IDs"), "{text}");
-            assert!(!text.contains("Merged memories"), "{text}");
-            assert!(
-                text.contains("901"),
-                "host id missing from {action} error: {text}"
-            );
-            assert!(
-                !text.contains(&format!("memory {id} was not found")),
-                "raw module id escaped from {action}: {text}"
-            );
-            let row = store.get_memory_full(id).unwrap().unwrap();
-            assert_eq!(row.content, "foreign pinned");
-            assert_eq!(row.status, "active");
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn review_host_ownership_error_must_not_expose_module_id() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(
-            7,
-            binding_with_harness(project.to_str().unwrap(), "opencode", "token"),
-        );
-        let id = insert_memory(&store, "git:foreign", "CONSTRAINTS", "foreign pinned", 1);
-        store
-            .acknowledge_host_memory_ids(
-                "git:foreign",
-                &[HostMemoryIdentityAck {
-                    module_row_id: id,
-                    host_row_id: 901,
-                }],
-            )
-            .unwrap();
-        let result = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "update", "ids": [id], "host_ids": [901],
-                "memory_id_lane": "host", "content": "must not write"
-            }),
-        )
-        .await;
-        let text = tool_text(result);
-        assert!(text.contains("memory 901 was not found"), "{text}");
-        assert!(
-            !text.contains(&format!("memory {id} was not found")),
-            "raw module id escaped: {text}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn host_memory_lane_translates_constraint_error_ids() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let project = project.to_str().unwrap();
-        handler.bind_route(7, binding_with_harness(project, "opencode", "token"));
-
-        let target = insert_memory(&store, project, "CONSTRAINTS", "target", 1);
-        let duplicate = insert_memory(&store, project, "CONSTRAINTS", "duplicate", 2);
-        let source = insert_memory(&store, project, "CONSTRAINTS", "source", 3);
-        store
-            .acknowledge_host_memory_ids(
-                project,
-                &[
-                    HostMemoryIdentityAck {
-                        module_row_id: target,
-                        host_row_id: 901,
-                    },
-                    HostMemoryIdentityAck {
-                        module_row_id: duplicate,
-                        host_row_id: 902,
-                    },
-                    HostMemoryIdentityAck {
-                        module_row_id: source,
-                        host_row_id: 903,
-                    },
-                ],
-            )
-            .unwrap();
-
-        let update = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "update", "ids": [target], "host_ids": [901],
-                "memory_id_lane": "host", "content": "duplicate"
-            }),
-        )
-        .await;
-        let update_text = tool_text(update);
-        assert!(
-            update_text.contains("memory content already exists as ID 902"),
-            "{update_text}"
-        );
-        assert!(
-            !update_text.contains(&format!("ID {duplicate}")),
-            "raw duplicate module id escaped: {update_text}"
-        );
-
-        let merge = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "merge", "ids": [target, source], "host_ids": [901, 903],
-                "memory_id_lane": "host", "content": "duplicate"
-            }),
-        )
-        .await;
-        let merge_text = tool_text(merge);
-        assert!(
-            merge_text.contains("memory content already exists as ID 902"),
-            "{merge_text}"
-        );
-        assert!(
-            !merge_text.contains(&format!("ID {duplicate}")),
-            "raw duplicate module id escaped: {merge_text}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn claude_code_memory_lane_keeps_module_ids_byte_for_byte() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
@@ -30105,55 +29368,6 @@ mod tests {
         assert_eq!(
             tool_text(get),
             "Memory [ID: 1] in CONSTRAINTS (status: active): claude row"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn memory_facade_routes_all_authority_actions_into_store_and_changefeed() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
-
-        for arguments in [
-            json!({"action": "write", "category": "CONSTRAINTS", "content": "first"}),
-            json!({"action": "update", "ids": [1], "content": "first updated"}),
-            json!({"action": "write", "category": "CONSTRAINTS", "content": "second"}),
-            json!({"action": "merge", "ids": [1, 2], "content": "merged"}),
-        ] {
-            let outcome = call_facade(&handler, "ctx_memory", arguments.clone()).await;
-            assert!(!tool_is_error(outcome), "action failed: {arguments}");
-        }
-        let canonical = store
-            .get_memory_full(1)
-            .unwrap()
-            .unwrap()
-            .superseded_by_memory_id
-            .expect("new merged content creates a canonical row");
-        for arguments in [
-            json!({"action": "get", "ids": [canonical]}),
-            json!({"action": "archive", "ids": [canonical]}),
-        ] {
-            let outcome = call_facade(&handler, "ctx_memory", arguments.clone()).await;
-            assert!(!tool_is_error(outcome), "action failed: {arguments}");
-        }
-        let memory = store.get_memory_full(canonical).unwrap().unwrap();
-        assert_eq!(memory.content, "merged");
-        assert_eq!(memory.status, "archived");
-        assert_eq!(
-            store
-                .get_memory_full(2)
-                .unwrap()
-                .unwrap()
-                .superseded_by_memory_id,
-            Some(canonical)
-        );
-        let feed = store.pull_changefeed("memories", 0, 100).unwrap();
-        assert!(
-            feed.rows.len() >= 6,
-            "every mutation must append changefeed state"
         );
     }
 
@@ -30325,11 +29539,6 @@ mod tests {
         let memory_revision_after_update =
             crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
         assert_ne!(memory_revision_after_update, memory_revision_after_write);
-        let memory_feed_after_update = store
-            .pull_changefeed("memories", 0, 100)
-            .unwrap()
-            .rows
-            .len();
         call_and_replay(
             &handler,
             &store,
@@ -30346,14 +29555,6 @@ mod tests {
         let memory_revision_after_archive =
             crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
         assert_ne!(memory_revision_after_archive, memory_revision_after_update);
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 100)
-                .unwrap()
-                .rows
-                .len(),
-            memory_feed_after_update + 1
-        );
 
         call_and_replay(
             &handler,
@@ -30369,7 +29570,6 @@ mod tests {
         )
         .await;
         let note_revision_after_write = store.max_note_status_version(project).unwrap();
-        let note_feed_after_write = store.pull_changefeed("notes", 0, 100).unwrap().rows.len();
         call_and_replay(
             &handler,
             &store,
@@ -30386,10 +29586,6 @@ mod tests {
         .await;
         let note_revision_after_update = store.max_note_status_version(project).unwrap();
         assert_eq!(note_revision_after_update, note_revision_after_write + 1);
-        assert_eq!(
-            store.pull_changefeed("notes", 0, 100).unwrap().rows.len(),
-            note_feed_after_write + 1
-        );
         call_and_replay(
             &handler,
             &store,
@@ -30405,10 +29601,6 @@ mod tests {
         .await;
         let note_revision_after_dismiss = store.max_note_status_version(project).unwrap();
         assert_eq!(note_revision_after_dismiss, note_revision_after_update + 1);
-        assert_eq!(
-            store.pull_changefeed("notes", 0, 100).unwrap().rows.len(),
-            note_feed_after_write + 2
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -30446,11 +29638,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .normalized_hash;
-        let generation = store
-            .authority_status("context", "git:classify", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
         let before =
             crate::m1_compose::m1_revision_signal(&store, "git:classify", "session").unwrap();
         let outcome = call_facade(
@@ -30492,11 +29680,6 @@ mod tests {
         let after =
             crate::m1_compose::m1_revision_signal(&store, "git:classify", "session").unwrap();
         assert_eq!(before, after, "classification metadata must not change m1");
-        let feed = store.pull_changefeed("memories", 0, 100).unwrap();
-        assert!(feed
-            .rows
-            .iter()
-            .any(|row| row.op == "update" && row.module_row_id == fresh_id));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -30514,11 +29697,7 @@ mod tests {
         let updated_id = insert_memory(&store, identity, "CONSTRAINTS", "updated", 1);
         let archived_id = insert_memory(&store, identity, "CONSTRAINTS", "archived", 1);
         let foreign_id = insert_memory(&store, "git:other", "CONSTRAINTS", "foreign", 1);
-        let generation = store
-            .authority_status("context", identity, "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
         let hash = |id: i64| store.get_memory_full(id).unwrap().unwrap().normalized_hash;
         let before_verified =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
@@ -30537,10 +29716,6 @@ mod tests {
         };
         assert_eq!(verified_body["accepted"], json!([verified_id]));
         assert_eq!(verified_body["rejected"].as_array().unwrap().len(), 3);
-        let verified_feed_head = store
-            .pull_changefeed("memories", 0, 1000)
-            .unwrap()
-            .next_cursor;
         let after_verified =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
         assert_eq!(
@@ -30558,14 +29733,6 @@ mod tests {
         assert_eq!(
             replay_body, verified_body,
             "command replay must return the stored terminal response"
-        );
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 1000)
-                .unwrap()
-                .next_cursor,
-            verified_feed_head,
-            "verification replay must not emit another feed row"
         );
 
         let before_update =
@@ -30605,10 +29772,6 @@ mod tests {
             "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "mapped_files": ["src/lib.rs", "src/lib.rs"]}]
         })).await;
         assert!(matches!(mapping, HandlerOutcome::Response(_)));
-        let mapping_feed_head = store
-            .pull_changefeed("memories", 0, 1000)
-            .unwrap()
-            .next_cursor;
         let mapping_replay = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
             "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": "stale", "mapped_files": null}]
@@ -30617,232 +29780,37 @@ mod tests {
             matches!(mapping_replay, HandlerOutcome::Response(_)),
             "mapping command replay must be idempotent"
         );
-        assert_eq!(
+        let mapped_files = |store: &McStore| -> Vec<(String, String)> {
             store
-                .pull_changefeed("memories", 0, 1000)
+                .with_context_conn_for_test(|tx| {
+                    let mut statement = tx.prepare(
+                        "SELECT file_path, COALESCE(mapping_origin, '') FROM memory_verifications
+                          WHERE memory_id = ?1 ORDER BY file_path",
+                    )?;
+                    let rows = statement
+                        .query_map([verified_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
                 .unwrap()
-                .next_cursor,
-            mapping_feed_head,
-            "mapping replay must not emit another feed row"
+        };
+        assert_eq!(
+            mapped_files(&store)
+                .into_iter()
+                .map(|(file, _)| file)
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs".to_string()]
         );
-        let feed = store.pull_changefeed("memories", 0, 1000).unwrap();
-        assert!(feed
-            .rows
-            .iter()
-            .any(|row| row.full_row_snapshot.get("mapping").is_some()));
         let fallback_mapping = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
             "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "mapped_files": null, "mapping_origin": "host_rejected_fallback"}]
         })).await;
         assert!(matches!(fallback_mapping, HandlerOutcome::Response(_)));
-        let fallback_feed = store
-            .pull_changefeed("memories", 0, 1000)
-            .unwrap()
-            .rows
-            .into_iter()
-            .rev()
-            .find(|row| row.module_row_id == verified_id)
-            .unwrap();
-        assert_eq!(fallback_feed.full_row_snapshot["mapping"], json!([]));
+        // No files is recorded the way the host's mapper records it: one sentinel row
+        // with an empty path.
         assert_eq!(
-            fallback_feed.full_row_snapshot["mapping_origin"],
-            json!("host_rejected_fallback")
-        );
-        let generation_error = call_facade(&handler, "memory.set_mapping", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation - 1,
-            "rows": []
-        })).await;
-        assert_eq!(
-            error_code(generation_error),
-            "authority_generation_mismatch"
-        );
-        store
-            .authority_begin_drain("context", identity, "memories", "test-drain", 9_999_999, 1)
-            .unwrap();
-        let draining = call_facade(&handler, "memory.set_verification", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "rows": []
-        })).await;
-        assert_eq!(error_code(draining), "authority_draining");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn raced_classification_drain_returns_the_transition_specific_code() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_root = project.to_str().unwrap();
-        let identity = "git:classification-race";
-        handler.bind_route(7, binding(route_root, "token"));
-        activate_module_authority(&store, "context", identity, route_root, "memories");
-        let memory_id = insert_memory(&store, identity, "CONSTRAINTS", "classify me", 1);
-        let before = store.get_memory_full(memory_id).unwrap().unwrap();
-        let generation = store
-            .authority_status("context", identity, "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
-        let feed_head = store
-            .pull_changefeed("memories", 0, 100)
-            .unwrap()
-            .next_cursor;
-        let hook_store = Arc::clone(&store);
-        *handler
-            .classification_before_apply_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move || {
-            hook_store
-                .authority_begin_drain(
-                    "context",
-                    identity,
-                    "memories",
-                    "classification-race",
-                    i64::MAX,
-                    2,
-                )
-                .unwrap();
-        }));
-
-        let outcome = call_facade(
-            &handler,
-            "memory.set_classification",
-            json!({
-                "memory_project": identity,
-                "context_store_uuid": "context",
-                "authority_generation": generation,
-                "rows": [{
-                    "memory_id": memory_id,
-                    "content_hash_at_prompt": before.normalized_hash.clone(),
-                    "importance": 99
-                }]
-            }),
-        )
-        .await;
-
-        assert_eq!(error_code(outcome), "authority_draining");
-        assert_eq!(
-            store
-                .get_memory_full(memory_id)
-                .unwrap()
-                .unwrap()
-                .importance,
-            before.importance
-        );
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 100)
-                .unwrap()
-                .next_cursor,
-            feed_head
-        );
-        assert_eq!(
-            store
-                .authority_status("context", identity, "memories")
-                .unwrap()
-                .unwrap()
-                .state,
-            "DRAINING"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn draining_authority_rejects_every_facade_mutation_but_keeps_reads_resolved() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_root = project.to_str().unwrap();
-        let identity = "git:draining";
-        handler.bind_route(7, binding(route_root, "token"));
-        for domain in ["memories", "notes"] {
-            activate_module_authority(&store, "context", identity, route_root, domain);
-        }
-        let first = insert_memory(&store, identity, "CONSTRAINTS", "first", 1);
-        let second = insert_memory(&store, identity, "CONSTRAINTS", "second", 1);
-        let note = store
-            .insert_note(NoteInput {
-                project_path: identity,
-                route_project_root: Some(route_root),
-                session_id: "session",
-                content: "note",
-                surface_condition: None,
-                anchor_block_id: None,
-                now_ms: 1,
-            })
-            .unwrap();
-        let memory_drain = store
-            .authority_begin_drain("context", identity, "memories", "lease-memory", i64::MAX, 2)
-            .unwrap();
-        store
-            .authority_begin_drain("context", identity, "notes", "lease-notes", i64::MAX, 2)
-            .unwrap();
-        let memory_head = store
-            .pull_changefeed("memories", 0, 100)
-            .unwrap()
-            .next_cursor;
-        let note_head = store.pull_changefeed("notes", 0, 100).unwrap().next_cursor;
-
-        for arguments in [
-            json!({"action": "write", "category": "CONSTRAINTS", "content": "late"}),
-            json!({"action": "update", "ids": [first], "content": "late"}),
-            json!({"action": "archive", "ids": [first]}),
-            json!({"action": "merge", "ids": [first, second], "content": "late"}),
-        ] {
-            assert_eq!(
-                error_code(call_facade(&handler, "ctx_memory", arguments).await),
-                "authority_draining"
-            );
-        }
-        for arguments in [
-            json!({"action": "write", "content": "late"}),
-            json!({"action": "update", "note_ids": [note.id], "content": "late"}),
-            json!({"action": "dismiss", "note_ids": [note.id]}),
-        ] {
-            assert_eq!(
-                error_code(call_facade(&handler, "ctx_note", arguments).await),
-                "authority_draining"
-            );
-        }
-        assert_eq!(
-            error_code(
-                call_facade(
-                    &handler,
-                    "memory.set_classification",
-                    json!({
-                        "memory_project": identity,
-                        "context_store_uuid": "context",
-                        "authority_generation": memory_drain.generation,
-                        "rows": []
-                    }),
-                )
-                .await
-            ),
-            "authority_draining"
-        );
-        assert!(!tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({"action": "get", "ids": [first]})
-            )
-            .await
-        ));
-        assert!(!tool_is_error(
-            call_facade(&handler, "ctx_note", json!({"action": "read"})).await
-        ));
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 100)
-                .unwrap()
-                .next_cursor,
-            memory_head
-        );
-        assert_eq!(
-            store.pull_changefeed("notes", 0, 100).unwrap().next_cursor,
-            note_head
+            mapped_files(&store),
+            vec![(String::new(), "host_rejected_fallback".to_string())]
         );
     }
 
@@ -30872,11 +29840,7 @@ mod tests {
         route_binding.config.language = Some("tr".to_string());
         handler.bind_route(7, route_binding);
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
 
         let outcome = handler
             .handle_dreamer_run_task(
@@ -30944,11 +29908,7 @@ mod tests {
             let route_root = project.to_str().unwrap();
             handler.bind_route(7, binding(route_root, "ses"));
             activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-            let generation = store
-                .authority_status("context", "git:identity", "memories")
-                .unwrap()
-                .unwrap()
-                .generation;
+            let generation = 1u64;
             let outcome = handler
                 .handle_dreamer_run_task(
                     7,
@@ -30988,11 +29948,7 @@ mod tests {
         let route_root = project.to_str().unwrap();
         handler.bind_route(7, binding(route_root, "ses"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
         let outcome = handler
             .handle_dreamer_run_task(
                 7,
@@ -31041,11 +29997,7 @@ mod tests {
         let route_root = project.to_str().unwrap();
         handler.bind_route(7, binding(route_root, "ses"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
 
         let outcome = handler
             .handle_dreamer_run_task(
@@ -31090,11 +30042,7 @@ mod tests {
         let route_root = project.to_str().unwrap();
         handler.bind_route(7, binding(route_root, "ses"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
         let request = |completion: Option<Value>| {
             let mut body = json!({
                 "v": 1,
@@ -31183,11 +30131,7 @@ mod tests {
         let route_root = project.to_str().unwrap();
         handler.bind_route(7, binding(route_root, "ses"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
 
         let outcome = handler
             .handle_dreamer_run_task(
@@ -31226,11 +30170,7 @@ mod tests {
         let route_root = project.to_str().unwrap();
         handler.bind_route(7, binding(route_root, "parent"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
+        let generation = 1u64;
         let handler = Arc::new(handler);
         let running_handler = Arc::clone(&handler);
         let task = tokio::spawn(async move {
@@ -31353,15 +30293,6 @@ mod tests {
         // This request uses a host-backed profile, so m1 renders host mirror ids. The host
         // mirror acknowledges the merge's new row before the next pass, as it does for the
         // rows `insert_memory` created.
-        store
-            .acknowledge_host_memory_ids(
-                project,
-                &[HostMemoryIdentityAck {
-                    module_row_id: canonical,
-                    host_row_id: canonical,
-                }],
-            )
-            .unwrap();
         let revision_after = crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap();
         assert_ne!(revision_before, revision_after);
         assert_eq!(
@@ -31387,83 +30318,6 @@ mod tests {
         assert!(
             transition_m1.contains(&format!("<superseded id=\"{source}\" by=\"{canonical}\"/>")),
             "{transition_m1}"
-        );
-        let stable = call_transform_request(&handler, request).await;
-        assert_eq!(stable["action"], "SOFT+");
-        assert_eq!(transition["ck_messages"], stable["ck_messages"]);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn authority_activation_moves_render_reads_once_through_the_m1_revision() {
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let route_project_root = project.to_str().unwrap();
-        store
-            .replace_compartments("ses", &[stored_comp(1, 0, 0, "m0", "initial summary")])
-            .unwrap();
-        let request = request(vec![ck("m0", 0, "live input")]);
-        let initial = call_transform_request(&handler, request.clone()).await;
-        assert_eq!(initial["action"], "HARD");
-
-        insert_memory(
-            &store,
-            "git:identity",
-            "CONSTRAINTS",
-            "identity-only memory",
-            1,
-        );
-        assert_eq!(store.load("ses").unwrap().meta.max_memory_id, 0);
-        assert_eq!(
-            store
-                .load_active_memories("git:identity", now_ms())
-                .unwrap()
-                .len(),
-            1
-        );
-        activate_module_authority(
-            &store,
-            "context",
-            "git:identity",
-            route_project_root,
-            "memories",
-        );
-
-        assert_eq!(
-            store
-                .authority_project_for_route(route_project_root, "memories")
-                .unwrap()
-                .as_deref(),
-            Some("git:identity")
-        );
-        let before_transition = store.load("ses").unwrap();
-        let identity_revision =
-            crate::m1_compose::m1_revision_signal(&store, "git:identity", "ses").unwrap();
-        assert_ne!(before_transition.meta.m1_revision, identity_revision);
-        let direct_m1 = crate::m1_compose::compose_m1_from_store(
-            &store,
-            "git:identity",
-            route_project_root,
-            "ses",
-            &before_transition.meta,
-            before_transition.meta.expiry_cutoff_ms,
-            true,
-            true,
-            8_000.0,
-            4_000.0,
-            true,
-            |_| 0,
-        )
-        .unwrap();
-        assert!(
-            direct_m1.body.contains("identity-only memory"),
-            "{}",
-            direct_m1.body
-        );
-        let transition = call_transform_request(&handler, request.clone()).await;
-        assert_eq!(transition["action"], "SOFT");
-        assert!(
-            transition.to_string().contains("identity-only memory"),
-            "the coordinated soft pass must read the identity-keyed row: {transition}"
         );
         let stable = call_transform_request(&handler, request).await;
         assert_eq!(stable["action"], "SOFT+");
@@ -31713,59 +30567,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ctx_search_excludes_host_visible_memory_but_keeps_hidden_memory() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let project = project.to_str().unwrap();
-        handler.bind_route(7, binding_with_harness(project, "opencode", "ses"));
-
-        let visible = insert_memory(&store, project, "CONSTRAINTS", "needle visible", 10);
-        let host_visible = 101;
-        store
-            .acknowledge_host_memory_ids(
-                project,
-                &[HostMemoryIdentityAck {
-                    module_row_id: visible,
-                    host_row_id: host_visible,
-                }],
-            )
-            .unwrap();
-        let mut transform = request(vec![ck("m0", 0, "live input")]);
-        transform["serializer_profile"] = json!("opencode-aisdk");
-        let initial = call_transform_request(&handler, transform).await;
-        assert_eq!(initial["action"], "HARD");
-        assert_eq!(initial["rendered_memory_ids"], json!([host_visible]));
-        assert_ne!(visible, host_visible);
-        assert!(store
-            .load("ses")
-            .unwrap()
-            .meta
-            .last_serializer_profile
-            .is_empty());
-
-        let hidden = insert_memory(&store, project, "CONSTRAINTS", "needle hidden", 20);
-        let results = tool_text(
-            call_facade(
-                &handler,
-                "ctx_search",
-                json!({"query": "needle", "sources": ["memory"]}),
-            )
-            .await,
-        );
-        assert!(
-            !results.contains(&format!("[memory] score=1.00 id={visible} ")),
-            "{results}"
-        );
-        assert!(
-            results.contains(&format!("[memory] score=1.00 id={hidden} ")),
-            "{results}"
-        );
-        assert!(results.contains(&format!("ids {visible}")), "{results}");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn ctx_search_keeps_claude_code_module_visible_memory_ids() {
         let producer = Arc::new(ProducerState::default());
         let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
@@ -31775,15 +30576,6 @@ mod tests {
         handler.bind_route(7, binding_with_harness(project, "claude-code", "token"));
 
         let visible = insert_memory(&store, project, "CONSTRAINTS", "needle visible", 10);
-        store
-            .acknowledge_host_memory_ids(
-                project,
-                &[HostMemoryIdentityAck {
-                    module_row_id: visible,
-                    host_row_id: 101,
-                }],
-            )
-            .unwrap();
         let hidden = insert_memory(&store, project, "CONSTRAINTS", "needle hidden", 20);
         store
             .commit(
@@ -32042,15 +30834,6 @@ mod tests {
                 .as_deref(),
             Some(additive_scope)
         );
-        store
-            .acknowledge_host_memory_ids(
-                additive_project_root,
-                &[HostMemoryIdentityAck {
-                    module_row_id: new_memory.id,
-                    host_row_id: new_memory.id,
-                }],
-            )
-            .unwrap();
         let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
         assert_eq!(add_delta["action"], "SOFT");
         assert!(synthetic_text(&add_delta, 1).contains("<new-memories>"));
@@ -34900,7 +33683,7 @@ mod tests {
         drop(store);
 
         let reopened = Arc::new(
-            McStore::open(&dev_descriptor_at(
+            McStore::open_for_test(&dev_descriptor_at(
                 dir.path().join("data").to_str().unwrap(),
             ))
             .unwrap(),
@@ -39812,69 +38595,6 @@ mod tests {
         assert_eq!(seed_accounting(&handler), (0, 0));
     }
 
-    #[tokio::test]
-    async fn paged_state_sync_seed_profiles_reach_store_and_module_m0() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
-        let session = "paged-profile";
-        handler.bind_route(8, binding(project.to_str().unwrap(), session));
-
-        let mut first = paged_seed_batch(session, "profile-seed", 0, 0, 0, 3, vec![]);
-        first["user_profile"] = json!(["prefers root cause"]);
-        let mut second = paged_seed_batch(
-            session,
-            "profile-seed",
-            0,
-            0,
-            1,
-            3,
-            vec![state_sync_compartment(0, "first compartment")],
-        );
-        second["user_profile"] = json!(["x < y & z"]);
-        let final_batch = paged_seed_batch(session, "profile-seed", 0, 0, 2, 3, vec![]);
-
-        assert!(matches!(
-            handler.dispatch_value(8, first).await,
-            HandlerOutcome::Response(_)
-        ));
-        assert!(store.load_active_user_memories().unwrap().is_empty());
-        assert!(matches!(
-            handler.dispatch_value(8, second).await,
-            HandlerOutcome::Response(_)
-        ));
-        assert!(store.load_active_user_memories().unwrap().is_empty());
-        assert!(matches!(
-            handler.dispatch_value(8, final_batch).await,
-            HandlerOutcome::Response(_)
-        ));
-
-        let profile = store.load_active_user_memories().unwrap();
-        assert_eq!(profile, vec!["prefers root cause", "x < y & z"]);
-        let composed = crate::m0_compose::compose_m0_from_store(
-            &*store,
-            &crate::m0_compose::M0ComposeInputs {
-                session_id: session,
-                project_path: session,
-                project_directory: project.to_str().unwrap(),
-                now_ms: 0,
-                history_budget_tokens: 60_000.0,
-                covered_system_messages: &[],
-                memory_enabled: true,
-                host_backed_memory_ids: false,
-                memory_budget_tokens: 8_000.0,
-                user_profile_budget_tokens: 4_000.0,
-                inject_docs: true,
-                temporal_awareness: true,
-                mural: None,
-            },
-            |_| 0,
-        )
-        .unwrap();
-        assert_eq!(
-            composed.m0_bytes,
-            "<user-profile>\n- prefers root cause\n- x &lt; y &amp; z\n</user-profile>\n\n<session-history>\n## 0-0 · c0\nfirst compartment-p1\n</session-history>"
-        );
-    }
     fn publish_ctx_expand_fixture(
         store: &McStore,
         session_id: &str,

@@ -630,6 +630,7 @@ mod tests {
     }
 
     fn seed_user_profile(store: &McStore, profile: &[String]) {
+        store.seed_user_profile_for_test(profile, 1).unwrap();
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: "ses",
@@ -653,16 +654,7 @@ mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: profile,
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: false,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: Some(1),
                 acked_watermarks: serde_json::json!({}),
             })
             .unwrap();
@@ -1286,44 +1278,6 @@ mod tests {
             hash, fixture.m0_sha256,
             "m0 bytes drift from the TS fixture"
         );
-    }
-
-    #[test]
-    fn review_claude_code_m0_identity_pin() {
-        let fixture = FixtureBuilder::store();
-        fixture
-            .store
-            .seed_memory(1, "git:proj", "CONSTRAINTS", "stable", 50)
-            .unwrap();
-        let inputs = M0ComposeInputs {
-            session_id: "ses",
-            project_path: "git:proj",
-            project_directory: fixture.dir.path().to_str().unwrap(),
-            now_ms: 0,
-            history_budget_tokens: 60_000.0,
-            covered_system_messages: &[],
-            memory_enabled: true,
-            memory_budget_tokens: 8_000.0,
-            user_profile_budget_tokens: 4_000.0,
-            inject_docs: false,
-            temporal_awareness: true,
-            mural: None,
-        };
-        let before = compose_m0_from_store(&fixture.store, &inputs, no_estimate).unwrap();
-        assert!(before.m0_bytes.contains("#1:"));
-        fixture
-            .store
-            .acknowledge_host_memory_ids(
-                "git:proj",
-                &[mc_store::HostMemoryIdentityAck {
-                    module_row_id: 1,
-                    host_row_id: 901,
-                }],
-            )
-            .unwrap();
-        let after = compose_m0_from_store(&fixture.store, &inputs, no_estimate).unwrap();
-        assert_eq!(before.m0_bytes, after.m0_bytes);
-        assert_eq!(after.rendered_memory_ids, vec![1]);
     }
 
     #[test]

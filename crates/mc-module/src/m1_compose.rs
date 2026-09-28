@@ -126,9 +126,9 @@ fn digest_in_session_inputs(
 /// * `revision` is the IN-SESSION lane. Memory inserts/updates, the mutation log,
 ///   profile-version lines, and ordinary compartment publication all become pending work.
 ///   Note status changes do not: m1 renders nothing about notes. A mismatch is intentionally deferred until an independent render.
-/// * `external_revision` is the EXTERNAL lane. Workspace membership/visibility changes
-///   remain eager-HARD because they change the m0 memory universe; project memory epochs
-///   are carried by state-sync and arm the same HARD path in durable metadata.
+/// * `external_revision` is the EXTERNAL lane. Workspace membership/visibility changes,
+///   the project memory epoch and the session's m0 mutation-log head all remain
+///   eager-HARD because they change the m0 baseline.
 ///
 /// This table is the ordering contract for the module's bust opportunity gate:
 ///
@@ -274,8 +274,14 @@ pub fn m1_revision_signal_parts_for_pass_timed(
     let workspace_fingerprint =
         store.workspace_fingerprint_for_membership(snapshot.membership.as_ref());
     let mut external = DefaultHasher::new();
-    "mc-m1-external-v1".hash(&mut external);
+    "mc-m1-external-v2".hash(&mut external);
     workspace_fingerprint.hash(&mut external);
+    // Both are baseline changes a host makes in context.db: an identity or workspace move
+    // bumps the project's memory epoch, and an in-place compartment rewrite (a recomp, a
+    // revert) appends to the session's m0 mutation log. Either one needs the next pass to
+    // rebuild m0, which is what a changed external revision asks for.
+    snapshot.project_memory_epoch.hash(&mut external);
+    snapshot.m0_mutation_head.hash(&mut external);
 
     Ok(M1RevisionSignal {
         revision,
@@ -598,6 +604,7 @@ mod tests {
     }
 
     fn seed_user_profile(store: &McStore, profile: &[String]) {
+        store.seed_user_profile_for_test(profile, 2).unwrap();
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: "ses",
@@ -621,16 +628,7 @@ mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: profile,
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: false,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: Some(2),
                 acked_watermarks: serde_json::json!({}),
             })
             .unwrap();
@@ -723,7 +721,7 @@ mod tests {
     #[test]
     fn profile_delta_uses_the_quarter_budget_boundary() {
         let exact_dir = tempfile::tempdir().unwrap();
-        let exact_store = McStore::open(&descriptor(exact_dir.path())).unwrap();
+        let exact_store = McStore::open_for_test(&descriptor(exact_dir.path())).unwrap();
         seed_user_profile(&exact_store, &["exact-quarter".to_string()]);
         let exact = compose_m1_from_store(
             &exact_store,
@@ -733,18 +731,16 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
-            false,
             8_000.0,
             100.0,
             true,
-            |_| 21,
-        )
+            |_| 21,)
         .unwrap();
         assert!(exact.body.contains("- exact-quarter"), "{}", exact.body);
         assert!(exact.profile_rendered);
 
         let over_dir = tempfile::tempdir().unwrap();
-        let over_store = McStore::open(&descriptor(over_dir.path())).unwrap();
+        let over_store = McStore::open_for_test(&descriptor(over_dir.path())).unwrap();
         seed_user_profile(&over_store, &["one-token-over".to_string()]);
         let over = compose_m1_from_store(
             &over_store,
@@ -754,18 +750,16 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
-            false,
             8_000.0,
             100.0,
             true,
-            |_| 22,
-        )
+            |_| 22,)
         .unwrap();
         assert_eq!(over.body, M1_PLACEHOLDER);
         assert!(!over.profile_rendered);
 
         let empty_dir = tempfile::tempdir().unwrap();
-        let empty_store = McStore::open(&descriptor(empty_dir.path())).unwrap();
+        let empty_store = McStore::open_for_test(&descriptor(empty_dir.path())).unwrap();
         seed_user_profile(&empty_store, &["too-large".to_string()]);
         let empty = compose_m1_from_store(
             &empty_store,
@@ -775,12 +769,10 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
-            false,
             8_000.0,
             1.0,
             true,
-            |_| 1,
-        )
+            |_| 1,)
         .unwrap();
         assert_eq!(empty.body, M1_PLACEHOLDER);
         assert!(!empty.profile_rendered);
@@ -881,12 +873,10 @@ mod tests {
             &meta,
             0,
             false,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
 
         assert_eq!(m1.body, M1_PLACEHOLDER);
@@ -911,12 +901,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert_eq!(m1.body, M1_PLACEHOLDER, "no delta → the placeholder body");
         assert_eq!(m1.new_coverage, None);
@@ -939,12 +927,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
 
         // C2 rides m1 at P1, and coverage extends 10 → 20 (the SOFT advances the anchor)
@@ -975,12 +961,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
 
         assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
@@ -1070,12 +1054,10 @@ mod tests {
             &meta,
             1,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
 
         let late_source = store
@@ -1104,12 +1086,10 @@ mod tests {
             &meta,
             1,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         let reconciled = crate::m0_compose::compose_m0_from_store(
             store,
@@ -1145,12 +1125,10 @@ mod tests {
             &reconciled_meta,
             30,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
 
         let expected: serde_json::Value =
@@ -1184,7 +1162,7 @@ mod tests {
 
         for case in ["update", "archive", "merge"] {
             let dir = tempfile::tempdir().unwrap();
-            let store = McStore::open(&descriptor(dir.path())).unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
             store
                 .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
                 .unwrap();
@@ -1239,12 +1217,10 @@ mod tests {
                 &meta,
                 0,
                 true,
-                false,
                 8_000.0,
                 4_000.0,
                 true,
-                no_estimate,
-            )
+                no_estimate,)
             .unwrap();
             assert!(m1.body.contains("<memory-updates>"), "{case}: {}", m1.body);
             assert_eq!(
@@ -1294,12 +1270,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         let replay = compose_m1_from_store(
             store,
@@ -1309,12 +1283,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
 
         assert!(
@@ -1363,12 +1335,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert_eq!(
             m1.body.matches("deduplicated correction").count(),
@@ -1422,12 +1392,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(m1.body.contains("own workspace correction"), "{}", m1.body);
         assert!(
@@ -1498,12 +1466,10 @@ mod tests {
             &meta_after_hard(0, None, terminal, cursor, vec![source]),
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(
             m1.body
@@ -1546,12 +1512,10 @@ mod tests {
             &meta_after_hard(0, None, terminal, folded_cursor, vec![source]),
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(
             chain
@@ -1564,7 +1528,7 @@ mod tests {
         assert!(!chain.body.contains("middle merged"), "{}", chain.body);
 
         let cycle_dir = tempfile::tempdir().unwrap();
-        let cycle_store = McStore::open(&descriptor(cycle_dir.path())).unwrap();
+        let cycle_store = McStore::open_for_test(&descriptor(cycle_dir.path())).unwrap();
         let cycle_source = cycle_store
             .insert_memory(insert_input(project, "CONSTRAINTS", "cycle source", 1))
             .unwrap();
@@ -1585,12 +1549,10 @@ mod tests {
             &meta_after_hard(0, None, cycle_target, 0, vec![cycle_source]),
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(
             cycle
@@ -1628,12 +1590,10 @@ mod tests {
             &meta_after_hard(0, None, target, cursor, vec![source]),
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(
             m1.body.contains(&format!("<removed id=\"{source}\"/>")),
@@ -1661,9 +1621,6 @@ mod tests {
         let own_id = store
             .insert_memory(insert_input(own, "ARCHITECTURE", "own high watermark", 1))
             .unwrap();
-        store
-            .seed_module_memory_authority_for_test("store-uuid", foreign, 5)
-            .unwrap();
         let membership = store.resolve_workspace_membership(own).unwrap().unwrap();
         let baseline = store
             .load_memory_render_snapshot(own, Some(&membership), 100)
@@ -1683,10 +1640,7 @@ mod tests {
             .unwrap()
             .normalized_hash;
         store
-            .set_memory_classification(
-                "store-uuid",
-                foreign,
-                5,
+            .set_memory_classification(foreign,
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash.clone(),
@@ -1708,21 +1662,16 @@ mod tests {
             &meta_after_hard(0, None, own_id, 0, vec![own_id]),
             100,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(grant.body.contains("foreign below max"), "{}", grant.body);
         assert_eq!(grant.body.matches("foreign below max").count(), 1);
 
         store
-            .set_memory_classification(
-                "store-uuid",
-                foreign,
-                5,
+            .set_memory_classification(foreign,
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash,
@@ -1741,12 +1690,10 @@ mod tests {
             &meta_after_hard(0, None, own_id, grant_cursor, vec![foreign_id, own_id]),
             100,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(
             revoke
@@ -1796,12 +1743,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
         assert!(m1.body.contains("brand new"), "{}", m1.body);
@@ -1842,12 +1787,10 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
-            no_estimate,
-        )
+            no_estimate,)
         .unwrap();
         assert!(
             m1.body.contains("own arch rule"),
@@ -1858,7 +1801,7 @@ mod tests {
         // the digest detects it too (MAX(id) over the union, no visibility filter), so the
         // body now AGREES with what the digest moved on — no silent stale m1.
         let before = {
-            let s = McStore::open(&descriptor(&fixture.dir.path().join("probe"))).unwrap();
+            let s = McStore::open_for_test(&descriptor(&fixture.dir.path().join("probe"))).unwrap();
             s.seed_workspace_member("ws", own, "[\"CONSTRAINTS\"]")
                 .unwrap();
             s.seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
