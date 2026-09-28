@@ -107,7 +107,7 @@ import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
 import { runV2SessionProjectBackfill } from "./session-project-backfill";
-import { createV2StorageGate } from "./storage-gate";
+import { createV2StorageGate, probeV2StorageAtBoot } from "./storage-gate";
 import {
     dropStorageNotices,
     formatStorageRecoveryNotice,
@@ -490,10 +490,7 @@ export async function registerContext(context: V2Context) {
     });
     // Storage recovery must not hold the host's setup promise. Healthy local
     // stores usually open immediately; slow discovery continues behind the gate.
-    let db: ReturnType<typeof openDatabase> | undefined = await Promise.race([
-        storage.probe(),
-        new Promise<undefined>((resolve) => setTimeout(resolve, 100)),
-    ]);
+    let db: ReturnType<typeof openDatabase> | undefined = await probeV2StorageAtBoot(storage);
     const storageOpenedAtBoot = db !== undefined;
     let storageRecoveryAnnounced = false;
     const storageNoticeBySession = new Map<string, string>();

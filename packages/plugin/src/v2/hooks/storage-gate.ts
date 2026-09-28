@@ -119,3 +119,20 @@ export function createV2StorageGate(options: V2StorageGateOptions = {}): V2Stora
         },
     };
 }
+
+/** Allow a healthy open to finish without waiting for storage recovery at setup. */
+export async function probeV2StorageAtBoot(
+    storage: V2StorageGate,
+): Promise<ContextDatabase | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            storage.probe(),
+            new Promise<undefined>((resolve) => {
+                timer = setTimeout(() => resolve(undefined), 100);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}

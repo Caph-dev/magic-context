@@ -8,7 +8,7 @@ import {
     getMigrationOnOpenRefusal,
     openDatabaseAsync,
 } from "../features/magic-context/storage-db";
-import { createV2StorageGate } from "../v2/hooks/storage-gate";
+import { createV2StorageGate, probeV2StorageAtBoot } from "../v2/hooks/storage-gate";
 import {
     __resetRpcIdentityTestHooks,
     __setAsyncProcessProbeForTests,
@@ -90,14 +90,14 @@ test("async Windows inspection bounds CIM and tasklist fallback and caches failu
     ]);
 });
 
-test("async storage guard refuses a v90 store without entering a synchronous Windows probe", async () => {
+test("boot grace stays responsive with a locked v90 store and slow Windows probes", async () => {
     const root = mkdtempSync(join(tmpdir(), "async-storage-guard-"));
     const dbPath = join(root, "context.db");
     const seeded = new Database(dbPath);
     seeded.exec(
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES(90)",
     );
-    seeded.close();
+    seeded.exec("BEGIN IMMEDIATE");
     mkdirSync(join(root, "rpc", "blocker"), { recursive: true });
     writeFileSync(
         join(root, "rpc", "blocker", "port-12345.json"),
@@ -130,6 +130,8 @@ test("async storage guard refuses a v90 store without entering a synchronous Win
         const gate = createV2StorageGate({
             open: () => openDatabaseAsync({ dbPath, busyTimeoutMs: 0 }),
         });
+        const started = performance.now();
+        const boot = probeV2StorageAtBoot(gate);
         const opening = gate.probe();
         expect(
             await Promise.race([
@@ -137,6 +139,9 @@ test("async storage guard refuses a v90 store without entering a synchronous Win
                 new Promise<string>((resolve) => setTimeout(() => resolve("responsive"), 10)),
             ]),
         ).toBe("responsive");
+        expect(await boot).toBeUndefined();
+        expect(performance.now() - started).toBeLessThan(300);
+        expect(gate.current()).toBeUndefined();
         release(
             JSON.stringify([
                 {
@@ -157,6 +162,7 @@ test("async storage guard refuses a v90 store without entering a synchronous Win
         ).toEqual({ version: 90 });
         checked.close();
     } finally {
+        seeded.close();
         rmSync(root, { recursive: true, force: true });
     }
 });

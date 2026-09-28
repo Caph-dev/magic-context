@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { OpenCode } from "@opencode/client";
 import {
+	CLI,
 	isolation,
 	spawnOpencode2,
 	waitForPluginActive,
@@ -25,6 +26,11 @@ test("OpenCode 2 serves HTTP while Windows migration probes are slow and storage
 	const fixture = isolation();
 	if (previousTmp === undefined) delete process.env.TMPDIR;
 	else process.env.TMPDIR = previousTmp;
+	const cliVersion = execFileSync(CLI, ["--version"], {
+		env: fixture.env,
+		encoding: "utf8",
+	}).trim();
+	console.log(`OpenCode CLI: ${CLI}; version: ${cliVersion}`);
 	const storage = fixture.env.MAGIC_CONTEXT_STORAGE_DIR!;
 	mkdirSync(join(storage, "rpc", "older-host"), { recursive: true });
 	const dbPath = join(storage, "context.db");
@@ -32,7 +38,7 @@ test("OpenCode 2 serves HTTP while Windows migration probes are slow and storage
 	db.exec(
 		"CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES (90)",
 	);
-	db.close();
+	db.exec("BEGIN IMMEDIATE");
 	const blockerPid = process.pid;
 	writeFileSync(
 		join(storage, "rpc", "older-host", `port-${blockerPid}.json`),
@@ -73,7 +79,7 @@ const mark = (text) => appendFileSync(${JSON.stringify(trace)}, text + "\\n");
 probes.__setRpcIdentityTestHooks({ platform: "win32", execFileSync: (file) => file === "powershell" ? facts : '"opencode.exe","${blockerPid}"', processListExecFileSync: () => { mark("sync-start"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000); mark("sync-end"); return facts; } });
 const asyncHook = probes["__setAsyncProcessProbeForTests"];
 if (asyncHook) asyncHook(async () => { mark("async-start"); await new Promise(resolve => setTimeout(resolve, 5000)); mark("async-end"); return facts; });
-export default { id: "opencode-magic-context", async setup(context) { mark("setup-start " + Date.now()); const dispose = await setup(context); mark("setup-end " + Date.now()); return dispose; } };
+export default { id: "opencode-magic-context", async setup(context) { mark("setup-start " + Date.now()); let lastBeat = Date.now(); let maxGap = 0; const beat = () => { const now = Date.now(); maxGap = Math.max(maxGap, now - lastBeat); lastBeat = now; }; const heartbeat = setInterval(beat, 10); try { const dispose = await setup(context); mark("setup-end " + Date.now()); return dispose; } finally { beat(); clearInterval(heartbeat); mark("heartbeat-max " + maxGap); } } };
 `,
 	);
 	const built = await Bun.build({
@@ -104,6 +110,7 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 		authorization: `Basic ${btoa(`opencode:${host.password}`)}`,
 	};
 	const client = OpenCode.make({ baseUrl: host.url, headers });
+	let releaseLock: ReturnType<typeof setTimeout> | undefined;
 	try {
 		// Activation is lazy on this host; drive it while sampling HTTP from outside
 		// the host process, so a blocked host event loop cannot delay our timeout.
@@ -126,6 +133,9 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 			Date.now() < setupDeadline
 		)
 			await Bun.sleep(10);
+		// Hold an actual SQLite writer lock through the five-second discovery probe.
+		// The advertised live server must still block migration after the lock is released.
+		releaseLock = setTimeout(() => db.exec("ROLLBACK"), 5000);
 		const latencies: number[] = [];
 		const failures: string[] = [];
 		for (let index = 0; index < 30; index++) {
@@ -143,6 +153,8 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 			await Bun.sleep(200);
 		}
 		await activation;
+		clearTimeout(releaseLock);
+		if (db.inTransaction) db.exec("ROLLBACK");
 		const openFiles = execFileSync("lsof", ["-p", String(host.pid), "-Fn"], {
 			encoding: "utf8",
 		});
@@ -157,6 +169,8 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 		const probeLog = readFileSync(trace, "utf8");
 		const evidence = {
 			root: fixture.root,
+			cliVersion,
+			pid: host.pid,
 			source,
 			probeLog,
 			activationMs,
@@ -177,7 +191,8 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 		const setupMs =
 			Number(/setup-end (\d+)/.exec(probeLog)?.[1]) -
 			Number(/setup-start (\d+)/.exec(probeLog)?.[1]);
-		expect(setupMs).toBeLessThan(2000);
+		console.log(`Setup duration: ${setupMs} ms`);
+		expect(Number(/heartbeat-max (\d+)/.exec(probeLog)?.[1])).toBeLessThan(1000);
 		expect(failures).toEqual([]);
 		expect(Math.max(...latencies)).toBeLessThan(2000);
 		const checked = new Database(dbPath, { readonly: true });
@@ -192,6 +207,8 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 		console.error(`Host diagnostics: ${fixture.root}`);
 		throw error;
 	} finally {
+		clearTimeout(releaseLock);
+		db.close();
 		await host.stop();
 	}
 }, 120_000);
