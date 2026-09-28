@@ -809,7 +809,7 @@ impl WalCache {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
@@ -1160,6 +1160,107 @@ mod tests {
             }
         );
         assert_eq!(runs[0].steps[1].usage, StepUsage::default());
+    }
+
+    /// WAL bytes shaped like a live sidekick gather session (`alfonso:gather-…`),
+    /// synthesized from the record types and keys a real one holds, with no
+    /// live content: one lineage frame, then bare records (no `ts_ms`/`record`
+    /// envelope) written at fence 1. Each model step is followed by a tool
+    /// batch and `turn_finished`; only `run_started` and
+    /// `model_attempt_finished` carry a time; usage omits `cache_write_tokens`
+    /// and adds `reasoning_tokens`; a `budget_fired` record comes late in the
+    /// run. `steps` is `(attempt time, input, cached input)` per step. When
+    /// `finished` is false the run is still going: its last frame is a
+    /// `step_started` with no finished step after it.
+    pub(crate) fn gather_wal(
+        run_id: &str,
+        started_ms: u64,
+        steps: &[(u64, u64, u64)],
+        finished: bool,
+    ) -> Vec<u8> {
+        let mut bytes = lineage();
+        let mut seq = 0;
+        let mut push = |record: Value| {
+            seq += 1;
+            bytes.extend(frame(1, seq, 1, record.to_string().as_bytes()));
+        };
+        push(
+            json!({"type": "run_started", "run_id": run_id, "ts_ms": started_ms,
+                    "session": {"project_root": "/work", "harness": "broca",
+                                "session": "alfonso:gather-test"},
+                    "project_id": "p", "origin": {"kind": "fresh"}, "input": [],
+                    "config": {"model": {"provider_module_id": "openai",
+                                          "model_id": "gpt-test"}}}),
+        );
+        for (index, &(attempt_ms, input, cached)) in steps.iter().enumerate() {
+            let step = index as u64 + 1;
+            let batch = format!("b{step}");
+            push(json!({"type": "step_started", "step_id": step}));
+            push(
+                json!({"type": "model_attempt_finished", "step_id": step, "attempt": 0,
+                        "request_body_len": 1, "request_body_sha256": "00",
+                        "http_status": 200, "response_body_len": 1,
+                        "response_body_sha256": "00", "outcome": "completed",
+                        "ts_ms": attempt_ms}),
+            );
+            push(json!({"type": "model_step_finished", "step_id": step,
+                        "assistant_message": {"message_id": "m", "content": []},
+                        "usage": {"input_tokens": input, "cached_input_tokens": cached,
+                                  "output_tokens": 200, "reasoning_tokens": 40},
+                        "finish_reason": "stop", "retries_used": 0,
+                        "service_tier_used": "default"}));
+            push(
+                json!({"type": "tool_batch_started", "batch_id": batch, "step_id": step,
+                        "planned_calls": ["c1"]}),
+            );
+            push(json!({"type": "tool_dispatch_intent", "batch_id": batch,
+                        "tool_call_id": "c1", "tool_name": "read",
+                        "args": {"filePath": "a.rs"}}));
+            push(json!({"type": "tool_result", "batch_id": batch,
+                        "result": {"tool_call_id": "c1",
+                                   "output": {"kind": "text", "text": "x"},
+                                   "is_error": false},
+                        "outcome": "completed"}));
+            push(json!({"type": "tool_batch_finished", "batch_id": batch}));
+            push(json!({"type": "turn_finished", "step_id": step}));
+        }
+        push(
+            json!({"type": "budget_fired", "run_id": run_id, "kind": "steps",
+                    "threshold": 10, "ordinal": 1, "caller_text": "wrap up"}),
+        );
+        if finished {
+            push(json!({"type": "run_finished", "reason": "completed"}));
+        } else {
+            push(json!({"type": "step_started", "step_id": steps.len() as u64 + 1}));
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_gather_run_decodes_every_model_step() {
+        let steps = [
+            (1_010, 6_026, 0),
+            (1_020, 930, 5_632),
+            (1_030, 4_042, 5_632),
+        ];
+        let runs = decode(&gather_wal("g1", 1_000, &steps, false)).unwrap();
+        assert_eq!(
+            step_ids(&runs),
+            [("g1".into(), 1), ("g1".into(), 2), ("g1".into(), 3)]
+        );
+        let step = &runs[0].steps[1];
+        assert_eq!(step.ts_ms, Some(1_020));
+        assert_eq!(step.model.as_deref(), Some("gpt-test"));
+        assert_eq!(
+            step.usage,
+            StepUsage {
+                input_tokens: Some(930),
+                cached_input_tokens: Some(5_632),
+                cache_write_tokens: None,
+                output_tokens: Some(200),
+            }
+        );
+        assert!(!runs[0].finished);
     }
 
     /// Counts the bytes a reader hands out, to prove a poll reads only what
