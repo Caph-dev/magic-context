@@ -141,12 +141,6 @@ pub struct McModuleConfig {
     /// Per-model TTL overrides from the object config shape. Resolution uses the
     /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
-    /// Whether the module writes the host's context.db domain tables directly.
-    ///
-    /// User-tier only for the same reason the model chain is: it decides which database
-    /// file this process writes, and a cloned repository must not be able to redirect
-    /// that. `off` leaves the existing mirror as the only path.
-    pub single_store: crate::host_store::SingleStoreMode,
 }
 
 impl Default for McModuleConfig {
@@ -178,7 +172,6 @@ impl Default for McModuleConfig {
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_by_model: std::collections::BTreeMap::new(),
-            single_store: crate::host_store::SingleStoreMode::Off,
         }
     }
 }
@@ -582,16 +575,6 @@ fn merge_tiers_with_warnings(
                 }
             }
         }
-        if let Some(raw) = user.pointer("/single_store").and_then(Value::as_str) {
-            match crate::host_store::SingleStoreMode::parse(raw) {
-                Some(mode) => cfg.single_store = mode,
-                // A typo must not read as "off": that is the value a user would get
-                // silently, and it looks exactly like the feature simply not working.
-                None => warnings.push(format!(
-                    "ignoring single_store value {raw:?}; expected \"off\", \"shadow\", or \"on\""
-                )),
-            }
-        }
         if let Some(language) = user
             .pointer("/language")
             .and_then(Value::as_str)
@@ -728,7 +711,6 @@ fn merge_tiers_with_warnings(
         {
             cfg.temporal_awareness = enabled;
         }
-        warn_ignored_project_key(project, "/single_store", &mut warnings);
         warn_ignored_project_key(
             project,
             "/prompt_surface/guidance_override_text",
@@ -1492,39 +1474,6 @@ mod tests {
             AutoSearchConfig::default()
         );
         assert_eq!(merge_tiers(None, None).caveman, CavemanConfig::default());
-    }
-
-    #[test]
-    fn single_store_is_user_tier_only_and_defaults_off() {
-        use crate::host_store::SingleStoreMode;
-
-        assert_eq!(merge_tiers(None, None).single_store, SingleStoreMode::Off);
-
-        let user = serde_json::json!({ "single_store": "shadow" });
-        let project = serde_json::json!({ "single_store": "on" });
-        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), Some(&project));
-        assert_eq!(cfg.single_store, SingleStoreMode::Shadow);
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("/single_store")),
-            "a project tier attempt must warn, not take effect: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn an_unrecognized_single_store_value_warns_instead_of_reading_as_off() {
-        use crate::host_store::SingleStoreMode;
-
-        let user = serde_json::json!({ "single_store": "enabled" });
-        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), None);
-        assert_eq!(cfg.single_store, SingleStoreMode::Off);
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("single_store") && warning.contains("enabled")),
-            "{warnings:?}"
-        );
     }
 
     #[test]

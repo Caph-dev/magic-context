@@ -830,6 +830,27 @@ fn claude_code_ids_refuse_until_accepted() {
     assert_eq!(run(&options, &mut NoHooks).unwrap().status, "migrated");
 }
 
+#[test]
+fn a_claude_code_id_that_now_names_another_projects_memory_does_not_refuse() {
+    let fixture = Fixture::new(Extras::default());
+    // Store memory 7 belongs to the context-wins project and moves to a new context id;
+    // context id 7 is a memory of the store-wins project. The session's lookups carry its
+    // own project, so id 7 reads as "not found" there, not as the wrong memory.
+    let meta = json!({"last_serializer_profile": CLAUDE_CODE_PROFILE, "rendered_memory_ids": [7]});
+    fixture
+        .store()
+        .execute(
+            "INSERT INTO mc_cache_state(session_id, row_version, core_state, meta, last_activity_at)
+             VALUES ('ses_cc', 1, '{}', ?1, 0)",
+            params![meta.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        run(&fixture.options("b"), &mut NoHooks).unwrap().status,
+        "migrated"
+    );
+}
+
 struct CorruptDate;
 impl EngineHooks for CorruptDate {
     fn after_copy(&mut self, conn: &Connection) -> Result<(), EngineError> {
@@ -963,4 +984,26 @@ fn renders_differing_in_one_compartment_date_segment_fail() {
     let after = render(&HISTORY.replace("2026-01-01", "2026-01-02"), "");
     let error = compare_renders(&before, &after).unwrap_err();
     assert!(error.contains("2026-01-01"), "{error}");
+}
+
+#[test]
+fn an_unknown_column_is_named_with_the_statement_that_drops_it() {
+    // An old development build added `memories.content_version`; no release knows it.
+    let fixture = Fixture::new(Extras::default());
+    fixture
+        .context()
+        .execute_batch("ALTER TABLE memories ADD COLUMN content_version INTEGER;")
+        .unwrap();
+    let refusal = assert_refused_unchanged(
+        &fixture,
+        fixture.options("b"),
+        &mut NoHooks,
+        FINGERPRINT_MISMATCH,
+    );
+    let message = refusal.to_value().to_string();
+    assert!(message.contains("content_version"), "{message}");
+    assert!(
+        message.contains("ALTER TABLE memories DROP COLUMN content_version;"),
+        "{message}"
+    );
 }

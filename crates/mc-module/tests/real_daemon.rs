@@ -376,7 +376,7 @@ async fn mc_transform_spine_through_real_daemon() {
 fn seed_store(data_home: &Path) {
     use mc_store::{McStore, StoredCompartment};
     let descriptor = mc_module::dev_descriptor_at(&data_home.to_string_lossy());
-    let store = McStore::open(&descriptor).expect("open store to seed");
+    let store = McStore::open_for_test(&descriptor).expect("open store to seed");
     let c = |seq: i64, start: i64, end: i64, end_id: &str, p1: &str| StoredCompartment {
         sequence: seq,
         start_message: start,
@@ -401,6 +401,18 @@ fn seed_store(data_home: &Path) {
     let proj = project_root_for("soft");
     store
         .seed_memory(5, &proj, "ARCHITECTURE", "a durable rule", 70)
+        .unwrap();
+    // The host records each session's project in context.db; the module keys the
+    // session's memories by that record.
+    store
+        .with_context_conn_for_test(|tx| {
+            tx.execute(
+                "INSERT INTO session_projects (session_id, harness, project_path, updated_at)
+                 VALUES ('soft', 'opencode', ?1, 1)",
+                [&proj],
+            )?;
+            Ok(())
+        })
         .unwrap();
     // drop `store` here → release the single-writer lease before the module spawns
 }

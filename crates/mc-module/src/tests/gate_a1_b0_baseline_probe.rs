@@ -41,7 +41,10 @@ const BASELINE_SERVED_DIGEST: &str =
 /// both bases, so they were left as recorded.
 const BASELINE_META_DIGEST: &str =
     "6d9f28bd0253565e8175ad3d26a4f7e490b01d577f188c8299b0321ee502caeb";
-const BASELINE_META_BYTES: usize = 22_403;
+// One byte more than the base tree's 22_403: the single-store move folds two more
+// inputs into `m1_external_revision`, and the hash it stores here is one decimal digit
+// longer. Nothing about the attempt field changed.
+const BASELINE_META_BYTES: usize = 22_404;
 const ATTEMPT_FIELD: &str = ",\"producer_attempt\":0";
 
 fn digest(parts: &[&str]) -> String {

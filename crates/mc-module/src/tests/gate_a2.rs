@@ -114,7 +114,8 @@ fn a2_module_on(
     data_home: &std::path::Path,
     project: &std::path::Path,
 ) -> (McHandler, Arc<McStore>) {
-    let store = Arc::new(McStore::open(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
+    let store =
+        Arc::new(McStore::open_for_test(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
     let handler = McHandler::with_producer_factory_config_resolver(
         Arc::new(TestProducerFactory { state }),
         config,

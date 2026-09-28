@@ -126,9 +126,9 @@ fn digest_in_session_inputs(
 /// * `revision` is the IN-SESSION lane. Memory inserts/updates, the mutation log,
 ///   profile-version lines, and ordinary compartment publication all become pending work.
 ///   Note status changes do not: m1 renders nothing about notes. A mismatch is intentionally deferred until an independent render.
-/// * `external_revision` is the EXTERNAL lane. Workspace membership/visibility changes
-///   remain eager-HARD because they change the m0 memory universe; project memory epochs
-///   are carried by state-sync and arm the same HARD path in durable metadata.
+/// * `external_revision` is the EXTERNAL lane. Workspace membership/visibility changes,
+///   the project memory epoch and the session's m0 mutation-log head all remain
+///   eager-HARD because they change the m0 baseline.
 ///
 /// This table is the ordering contract for the module's bust opportunity gate:
 ///
@@ -274,8 +274,14 @@ pub fn m1_revision_signal_parts_for_pass_timed(
     let workspace_fingerprint =
         store.workspace_fingerprint_for_membership(snapshot.membership.as_ref());
     let mut external = DefaultHasher::new();
-    "mc-m1-external-v1".hash(&mut external);
+    "mc-m1-external-v2".hash(&mut external);
     workspace_fingerprint.hash(&mut external);
+    // Both are baseline changes a host makes in context.db: an identity or workspace move
+    // bumps the project's memory epoch, and an in-place compartment rewrite (a recomp, a
+    // revert) appends to the session's m0 mutation log. Either one needs the next pass to
+    // rebuild m0, which is what a changed external revision asks for.
+    snapshot.project_memory_epoch.hash(&mut external);
+    snapshot.m0_mutation_head.hash(&mut external);
 
     Ok(M1RevisionSignal {
         revision,
@@ -312,9 +318,8 @@ pub struct M1Composition {
 /// compose). Reads compartments + memories; never call on a defer. `_note_project_path`
 /// is accepted for call-site stability only: ready smart notes are not rendered into m1.
 ///
-/// `host_backed_memory_ids` must be the same choice the m0 render made for this request's
-/// serializer profile: true for every harness except Claude Code. It selects which id space
-/// m1 renders, and which id space `meta.rendered_memory_ids` (written by m0) is in.
+/// Every id m1 renders, and every id in `meta.rendered_memory_ids`, is a `context.db`
+/// memory id, whatever the harness.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_m1_from_store(
     store: &McStore,
@@ -324,7 +329,6 @@ pub fn compose_m1_from_store(
     meta: &ModuleMeta,
     now_ms: i64,
     memory_enabled: bool,
-    host_backed_memory_ids: bool,
     memory_budget_tokens: f64,
     user_profile_budget_tokens: f64,
     temporal_awareness: bool,
@@ -378,15 +382,8 @@ pub fn compose_m1_from_store(
             .map(|workspace| workspace.union_identities.clone())
             .unwrap_or_else(|| vec![project_path.to_string()]);
 
-        let baseline_module_ids = if host_backed_memory_ids {
-            let mapped = store.module_memory_ids_for_host_ids(&paths, &meta.rendered_memory_ids)?;
-            meta.rendered_memory_ids
-                .iter()
-                .filter_map(|id| mapped.get(id).copied())
-                .collect::<Vec<_>>()
-        } else {
-            meta.rendered_memory_ids.clone()
-        };
+        // Rendered ids are context.db ids, the same ids the mutation log targets.
+        let baseline_module_ids = meta.rendered_memory_ids.clone();
 
         // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
         // The store also returns visibility-transition markers for rows omitted from m0 and
@@ -481,61 +478,9 @@ pub fn compose_m1_from_store(
                 Some(mutation)
             })
             .collect::<Vec<_>>();
-        let (
-            rendered_mutations,
-            rendered_resolvable_ids,
-            rendered_delta_memories,
-            rendered_sources,
-        ) = if host_backed_memory_ids {
-            let mutation_ids = mutations
-                .iter()
-                .flat_map(|mutation| [Some(mutation.target_memory_id), mutation.superseded_by_id])
-                .flatten()
-                .chain(delta_memories.iter().map(|memory| memory.id))
-                .collect::<Vec<_>>();
-            let host_ids = store.host_memory_ids_for_module_ids(&mutation_ids)?;
-            let rendered_mutations = mutations
-                .iter()
-                .filter_map(|mutation| {
-                    let target_memory_id = *host_ids.get(&mutation.target_memory_id)?;
-                    let mut rendered = mutation.clone();
-                    rendered.target_memory_id = target_memory_id;
-                    rendered.superseded_by_id = mutation
-                        .superseded_by_id
-                        .and_then(|id| host_ids.get(&id).copied());
-                    Some(rendered)
-                })
-                .collect::<Vec<_>>();
-            let rendered_resolvable_ids = resolvable_ids
-                .iter()
-                .filter_map(|id| host_ids.get(id).copied())
-                .collect::<HashSet<_>>();
-            let mut rendered_delta_memories = delta_memories.clone();
-            for memory in &mut rendered_delta_memories {
-                memory.id = memory.host_row_id.unwrap_or(0);
-            }
-            let rendered_sources = membership
-                .as_ref()
-                .map(|workspace| workspace_source_names(&rendered_delta_memories, workspace))
-                .unwrap_or_default();
-            (
-                rendered_mutations,
-                rendered_resolvable_ids,
-                rendered_delta_memories,
-                rendered_sources,
-            )
-        } else {
-            (
-                mutations.clone(),
-                resolvable_ids,
-                delta_memories,
-                source_name_by_id,
-            )
-        };
-        let memory_updates_block =
-            render_memory_updates(&rendered_mutations, &rendered_resolvable_ids);
+        let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
         let new_memories_block =
-            render_memory_block(&rendered_delta_memories, "new-memories", &rendered_sources);
+            render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
         (mutations, memory_updates_block, new_memories_block)
     } else {
         (Vec::new(), String::new(), String::new())
@@ -659,6 +604,7 @@ mod tests {
     }
 
     fn seed_user_profile(store: &McStore, profile: &[String]) {
+        store.seed_user_profile_for_test(profile, 2).unwrap();
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: "ses",
@@ -682,16 +628,7 @@ mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: profile,
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: false,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: Some(2),
                 acked_watermarks: serde_json::json!({}),
             })
             .unwrap();
@@ -784,7 +721,7 @@ mod tests {
     #[test]
     fn profile_delta_uses_the_quarter_budget_boundary() {
         let exact_dir = tempfile::tempdir().unwrap();
-        let exact_store = McStore::open(&descriptor(exact_dir.path())).unwrap();
+        let exact_store = McStore::open_for_test(&descriptor(exact_dir.path())).unwrap();
         seed_user_profile(&exact_store, &["exact-quarter".to_string()]);
         let exact = compose_m1_from_store(
             &exact_store,
@@ -794,7 +731,6 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
-            false,
             8_000.0,
             100.0,
             true,
@@ -805,7 +741,7 @@ mod tests {
         assert!(exact.profile_rendered);
 
         let over_dir = tempfile::tempdir().unwrap();
-        let over_store = McStore::open(&descriptor(over_dir.path())).unwrap();
+        let over_store = McStore::open_for_test(&descriptor(over_dir.path())).unwrap();
         seed_user_profile(&over_store, &["one-token-over".to_string()]);
         let over = compose_m1_from_store(
             &over_store,
@@ -815,7 +751,6 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
-            false,
             8_000.0,
             100.0,
             true,
@@ -826,7 +761,7 @@ mod tests {
         assert!(!over.profile_rendered);
 
         let empty_dir = tempfile::tempdir().unwrap();
-        let empty_store = McStore::open(&descriptor(empty_dir.path())).unwrap();
+        let empty_store = McStore::open_for_test(&descriptor(empty_dir.path())).unwrap();
         seed_user_profile(&empty_store, &["too-large".to_string()]);
         let empty = compose_m1_from_store(
             &empty_store,
@@ -836,7 +771,6 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
-            false,
             8_000.0,
             1.0,
             true,
@@ -942,7 +876,6 @@ mod tests {
             &meta,
             0,
             false,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -972,7 +905,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1000,7 +932,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1036,7 +967,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1093,7 +1023,6 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
-                host_backed_memory_ids: false,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: false,
@@ -1132,7 +1061,6 @@ mod tests {
             &meta,
             1,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1166,7 +1094,6 @@ mod tests {
             &meta,
             1,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1183,7 +1110,6 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
-                host_backed_memory_ids: false,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: false,
@@ -1208,7 +1134,6 @@ mod tests {
             &reconciled_meta,
             30,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1247,7 +1172,7 @@ mod tests {
 
         for case in ["update", "archive", "merge"] {
             let dir = tempfile::tempdir().unwrap();
-            let store = McStore::open(&descriptor(dir.path())).unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
             store
                 .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
                 .unwrap();
@@ -1302,7 +1227,6 @@ mod tests {
                 &meta,
                 0,
                 true,
-                false,
                 8_000.0,
                 4_000.0,
                 true,
@@ -1357,7 +1281,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1372,7 +1295,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1426,7 +1348,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1485,7 +1406,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1561,7 +1481,6 @@ mod tests {
             &meta_after_hard(0, None, terminal, cursor, vec![source]),
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1609,7 +1528,6 @@ mod tests {
             &meta_after_hard(0, None, terminal, folded_cursor, vec![source]),
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1627,7 +1545,7 @@ mod tests {
         assert!(!chain.body.contains("middle merged"), "{}", chain.body);
 
         let cycle_dir = tempfile::tempdir().unwrap();
-        let cycle_store = McStore::open(&descriptor(cycle_dir.path())).unwrap();
+        let cycle_store = McStore::open_for_test(&descriptor(cycle_dir.path())).unwrap();
         let cycle_source = cycle_store
             .insert_memory(insert_input(project, "CONSTRAINTS", "cycle source", 1))
             .unwrap();
@@ -1648,7 +1566,6 @@ mod tests {
             &meta_after_hard(0, None, cycle_target, 0, vec![cycle_source]),
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1691,7 +1608,6 @@ mod tests {
             &meta_after_hard(0, None, target, cursor, vec![source]),
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1724,9 +1640,6 @@ mod tests {
         let own_id = store
             .insert_memory(insert_input(own, "ARCHITECTURE", "own high watermark", 1))
             .unwrap();
-        store
-            .seed_module_memory_authority_for_test("store-uuid", foreign, 5)
-            .unwrap();
         let membership = store.resolve_workspace_membership(own).unwrap().unwrap();
         let baseline = store
             .load_memory_render_snapshot(own, Some(&membership), 100)
@@ -1747,9 +1660,7 @@ mod tests {
             .normalized_hash;
         store
             .set_memory_classification(
-                "store-uuid",
                 foreign,
-                5,
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash.clone(),
@@ -1771,7 +1682,6 @@ mod tests {
             &meta_after_hard(0, None, own_id, 0, vec![own_id]),
             100,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1783,9 +1693,7 @@ mod tests {
 
         store
             .set_memory_classification(
-                "store-uuid",
                 foreign,
-                5,
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash,
@@ -1804,7 +1712,6 @@ mod tests {
             &meta_after_hard(0, None, own_id, grant_cursor, vec![foreign_id, own_id]),
             100,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1859,7 +1766,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1905,7 +1811,6 @@ mod tests {
             &meta,
             0,
             true,
-            false,
             8_000.0,
             4_000.0,
             true,
@@ -1921,7 +1826,7 @@ mod tests {
         // the digest detects it too (MAX(id) over the union, no visibility filter), so the
         // body now AGREES with what the digest moved on — no silent stale m1.
         let before = {
-            let s = McStore::open(&descriptor(&fixture.dir.path().join("probe"))).unwrap();
+            let s = McStore::open_for_test(&descriptor(&fixture.dir.path().join("probe"))).unwrap();
             s.seed_workspace_member("ws", own, "[\"CONSTRAINTS\"]")
                 .unwrap();
             s.seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")

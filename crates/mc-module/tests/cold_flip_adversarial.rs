@@ -81,7 +81,7 @@ fn quiet(store: &McStore, request: &TransformRequest, expected: &[u8]) {
 fn dormant_flip_readd_and_restart_are_single_hard() {
     for profile in ["opencode-aisdk", "claude-code-anthropic"] {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = McStore::open(&descriptor(dir.path())).unwrap();
+        let mut store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
         let mut request = request(profile);
         let dormant = run(&store, &request);
         assert_eq!(dormant.action, "HARD");
@@ -90,7 +90,7 @@ fn dormant_flip_readd_and_restart_are_single_hard() {
         for restart in [false, true] {
             if restart {
                 drop(store);
-                store = McStore::open(&descriptor(dir.path())).unwrap();
+                store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
             }
             let before = store.load("review").unwrap();
             assert!(!before.meta.tagging_surface_active);
@@ -113,7 +113,7 @@ fn dormant_flip_readd_and_restart_are_single_hard() {
             assert!(after.meta.tagging_surface_active);
             quiet(&store, &request, &bytes(&transition));
             drop(store);
-            store = McStore::open(&descriptor(dir.path())).unwrap();
+            store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
             quiet(&store, &request, &bytes(&transition));
             request.tool_present = false;
             let disabled = run(&store, &request);
@@ -126,7 +126,7 @@ fn dormant_flip_readd_and_restart_are_single_hard() {
 #[test]
 fn subagent_flip_defers_served_tags_and_tags_new_tail_on_first_sight() {
     let dir = tempfile::tempdir().unwrap();
-    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
     let mut request = request("opencode-aisdk");
     request.is_subagent = true;
     let before = run(&store, &request);
@@ -159,7 +159,7 @@ fn subagent_flip_defers_served_tags_and_tags_new_tail_on_first_sight() {
 #[test]
 fn temporal_quiet_active_session_does_not_invent_transition() {
     let dir = tempfile::tempdir().unwrap();
-    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
     let mut request = request("opencode-aisdk");
     request.tool_present = true;
     let first = run(&store, &request);
@@ -174,7 +174,7 @@ fn temporal_quiet_active_session_does_not_invent_transition() {
 #[test]
 fn lifecycle_cas_advances_do_not_repeat_surface_transition() {
     let dir = tempfile::tempdir().unwrap();
-    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
     let mut request = request("opencode-aisdk");
     run(&store, &request);
     request.tool_present = true;
@@ -200,7 +200,7 @@ fn lifecycle_cas_advances_do_not_repeat_surface_transition() {
 fn identity_fold_without_temporal_parity_tags_on_the_same_hard() {
     for profile in ["opencode-aisdk", "claude-code-anthropic"] {
         let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
         let mut request = request(profile);
         for message in &mut request.messages {
             message.ck.meta.created_at_ms = None;

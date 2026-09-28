@@ -213,106 +213,6 @@ fn to_stored_compartment(
 /// Project a validated fact candidate onto the store's promotion input. Historian facts
 /// have no importance or expiry at publish time, but retain the source session so later
 /// maintenance can relate them to the publication that created them.
-/// Project one validated publish onto the shape the single-store writers take.
-///
-/// Built from the rows that are already on their way into the module's own store, so the
-/// two writers are handed the same publish rather than two independently derived ones.
-///
-/// The harness label is the route's own, carried on the request, so a module-written row
-/// and a host-written row for the same session carry the same label.
-fn fold_publish_view(
-    request: &ValidatedPublishRequest<'_>,
-    compartments: &[StoredCompartment],
-    facts: &[FactCandidate],
-    events: &[HistorianEventCandidate],
-    primer_candidates: &[HistorianPrimerCandidate],
-    user_memory_candidates: &[HistorianUserMemoryCandidate],
-) -> crate::host_store::FoldPublish {
-    use crate::host_store as single_store;
-
-    single_store::FoldPublish {
-        session_id: request.session_id.to_string(),
-        project_path: request.project_path.to_string(),
-        harness: request.harness.to_string(),
-        now_ms: request.created_at_ms,
-        compartments: compartments
-            .iter()
-            .map(|compartment| single_store::HostCompartment {
-                sequence: compartment.sequence,
-                start_message: compartment.start_message,
-                end_message: compartment.end_message,
-                start_message_id: compartment.start_message_id.clone(),
-                end_message_id: compartment.end_message_id.clone(),
-                title: compartment.title.clone(),
-                content: compartment.content.clone(),
-                p1: compartment.p1.clone(),
-                p2: compartment.p2.clone(),
-                p3: compartment.p3.clone(),
-                p4: compartment.p4.clone(),
-                importance: Some(i64::from(compartment.importance)),
-                episode_type: compartment.episode_type.clone(),
-                created_at: compartment.created_at,
-            })
-            .collect(),
-        facts: facts
-            .iter()
-            .map(|fact| single_store::HostSessionFact {
-                category: fact.category.clone(),
-                content: fact.content.clone(),
-            })
-            .collect(),
-        events: events
-            .iter()
-            .map(|event| single_store::HostCompartmentEvent {
-                kind: event.kind.clone(),
-                at_compartment: event.at_compartment.map(|value| value as i64),
-                fields_json: event.fields_json.clone(),
-            })
-            .collect(),
-        memories: facts
-            .iter()
-            .map(|fact| single_store::HostMemory {
-                category: fact.category.clone(),
-                content: fact.content.clone(),
-                importance: fact.importance.map(i64::from),
-                source_session_id: fact.source_session_id.clone(),
-                expires_at: fact.expires_at,
-                metadata_json: None,
-            })
-            .collect(),
-        notes: Vec::new(),
-        primer_candidates: primer_candidates
-            .iter()
-            .map(|candidate| single_store::HostPrimerCandidate {
-                question: candidate.question.clone(),
-                source_compartment_start: candidate
-                    .source_compartment_start
-                    .map(|value| value as i64),
-                source_compartment_end: candidate.source_compartment_end.map(|value| value as i64),
-                source_start_message_id: candidate.source_start_message_id.clone(),
-                source_end_message_id: candidate.source_end_message_id.clone(),
-                source_message_time: candidate.source_message_time,
-                created_at: candidate.created_at,
-            })
-            .collect(),
-        user_observations: user_memory_candidates
-            .iter()
-            .map(|candidate| single_store::HostUserObservation {
-                content: candidate.content.clone(),
-                source_compartment_start: candidate
-                    .source_compartment_start
-                    .map(|value| value as i64),
-                source_compartment_end: candidate.source_compartment_end.map(|value| value as i64),
-                created_at: candidate.created_at,
-            })
-            .collect(),
-        user_memories: Vec::new(),
-        // The module has already applied the privacy gate: an empty candidate list means
-        // collection is off, and re-deriving the gate here could disagree with it.
-        user_memory_collection_enabled: !user_memory_candidates.is_empty(),
-    }
-}
-
 fn to_store_fact(
     f: &crate::historian_validate::FactCandidate,
     source_session_id: &str,
@@ -984,6 +884,7 @@ pub fn publish_validated_chunk(
         };
 
     let publish_request = HistorianPublishRequest {
+        harness: Some(request.harness),
         session_id: request.session_id,
         expected_row_version: request.expected_row_version,
         expected_revert_epoch: request.expected_revert_epoch,
@@ -1019,24 +920,6 @@ pub fn publish_validated_chunk(
                     "[magic-context] could not record publish duration for {}: {error}",
                     request.session_id
                 );
-            }
-            // The single-store writers, when configured. Off by default: one atomic load
-            // and nothing else, not even building the view.
-            if crate::host_store::mode() != crate::host_store::SingleStoreMode::Off {
-                if let Some(crate::host_store::ModePublish::Shadow(report)) =
-                    crate::host_store::apply_publish_for_mode(&fold_publish_view(
-                        &request,
-                        &compartments,
-                        &facts,
-                        &events,
-                        &primer_candidates,
-                        &user_memory_candidates,
-                    ))
-                {
-                    if !report.divergences.is_empty() {
-                        eprintln!("[magic-context] {}", report.summary());
-                    }
-                }
             }
             Ok(result)
         }
@@ -3266,7 +3149,7 @@ mod tests {
     use crate::transform::{transform, ProducerContext, TransformRequest};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
+        McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,
@@ -3368,48 +3251,6 @@ mod tests {
     fn empty_boundary_dates() -> &'static BTreeMap<String, String> {
         static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
         EMPTY.get_or_init(BTreeMap::new)
-    }
-
-    /// The single-store view stamps the route's own harness label, not a module-wide
-    /// one. `harness` is part of `primer_candidates`' upsert key, so any other label makes
-    /// the module add a second candidate row beside the host's instead of updating it.
-    #[test]
-    fn the_single_store_view_carries_the_routes_harness_label() {
-        let predicate = HistorianPublishPredicate {
-            firing_seq: 1,
-            producer_run_id: "run-1".into(),
-            producer_attempt: 0,
-            chunk_fingerprint: "fp".into(),
-            selected_range_identities: Vec::new(),
-            compartment_set_generation: CompartmentSetGeneration {
-                max_sequence: 0,
-                count: 0,
-            },
-        };
-        let validated = ValidatedChunk::default();
-        for harness in ["opencode", "opencode2", "pi"] {
-            let request = ValidatedPublishRequest {
-                session_id: "ses",
-                project_path: "git:proj",
-                harness,
-                expected_row_version: None,
-                expected_revert_epoch: 0,
-                predicate: &predicate,
-                observed_chunk_fingerprint: "fp",
-                validated: &validated,
-                promote_facts: false,
-                collect_user_memory_candidates: false,
-                publication_floor_ordinal: 1,
-                chunk_transcript: "",
-                raw_chunk_messages: "[]",
-                boundary_dates: empty_boundary_dates(),
-                created_at_ms: 1,
-                failure_backoff_at_ms: 0,
-                publication_fence: None,
-            };
-            let view = fold_publish_view(&request, &[], &[], &[], &[], &[]);
-            assert_eq!(view.harness, harness);
-        }
     }
 
     fn pctx<'a>() -> ProducerContext<'a> {
@@ -6920,6 +6761,7 @@ mod tests {
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: loaded.row_version,
                 expected_revert_epoch: 0,
@@ -7043,6 +6885,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: Some(row_version),
                 expected_revert_epoch: 0,

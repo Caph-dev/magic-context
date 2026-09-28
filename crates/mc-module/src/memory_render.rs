@@ -128,12 +128,6 @@ pub fn render_memory_block(
 
     let mut lines = Vec::with_capacity(memories.len() * 2 + 3);
     lines.push(format!("<{wrapper}>"));
-    if memories.iter().any(|memory| memory.id <= 0) {
-        lines.push(
-            "<!-- One or more memory ids are waiting for the host mirror; retry after the next pass. -->"
-                .to_string(),
-        );
-    }
     let mut open_category: Option<&str> = None;
     for memory in ordered {
         if open_category != Some(memory.category.as_str()) {

@@ -2270,7 +2270,6 @@ fn render_check(
             // Only where the store's memories won can the two memory blocks be expected to
             // agree: where context.db wins, its differing twins are kept on purpose.
             memory_enabled: store_wins.contains(&project) && !sample.memory_disabled,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 1e15,
             user_profile_budget_tokens: 0.0,
             inject_docs: false,
@@ -2466,8 +2465,19 @@ fn context_version(conn: &Connection) -> rusqlite::Result<i64> {
     )
 }
 
+/// Print how long one step of the migration took, on stderr beside the other progress
+/// lines. A run on a large pair takes minutes, and the operator should see it moving.
+fn log_step(step: &str, started: Instant) {
+    eprintln!("{step}: {:.1}s", started.elapsed().as_secs_f64());
+}
+
 /// Copy both files into `backup_dir` with a consistent snapshot of each, check each copy,
 /// and write `MANIFEST.tsv` (name, source path, schema version, sha256).
+///
+/// Checking a copy means reading it in full twice: once for `PRAGMA quick_check` and once
+/// for its sha256. On a multi-gigabyte `context.db` those two reads, not the copy, are
+/// most of the migration's wall time, so they run side by side rather than one after the
+/// other.
 fn backup(options: &EngineOptions) -> Result<(), EngineError> {
     std::fs::create_dir_all(&options.backup_dir)?;
     let mut manifest = String::from("name\tsource\tschema_version\tsha256\n");
@@ -2476,30 +2486,48 @@ fn backup(options: &EngineOptions) -> Result<(), EngineError> {
         ("store.db", &options.store_db),
     ] {
         let target = options.backup_dir.join(name);
+        eprintln!(
+            "backing up {name} ({:.1} GB)...",
+            file_len(source) as f64 / 1e9
+        );
         let conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::from_millis(u64::from(
             CONTEXT_BUSY_TIMEOUT_MS,
         )))?;
+        let step = Instant::now();
         conn.execute("VACUUM INTO ?1", params![target.to_string_lossy()])?;
         drop(conn);
-        let copy = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let check: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        log_step(&format!("backup {name}: copy"), step);
+        let step = Instant::now();
+        let (check, digest) = std::thread::scope(|scope| {
+            let digest = scope.spawn(|| sha256_file(&target));
+            let check = (|| -> rusqlite::Result<(String, i64)> {
+                let copy = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                let check: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+                let version = if name == "context.db" {
+                    context_version(&copy)?
+                } else {
+                    i64::from(schema::recorded_store_version(&copy)?)
+                };
+                Ok((check, version))
+            })();
+            let digest = digest
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the sha256 thread panicked")));
+            (check, digest)
+        });
+        let (check, version) = check?;
+        let digest = digest?;
+        log_step(&format!("backup {name}: quick_check and sha256"), step);
         if check != "ok" {
             return Err(EngineError::Internal(format!(
                 "backup {} failed quick_check: {check}",
                 target.display()
             )));
         }
-        let version = if name == "context.db" {
-            context_version(&copy)?
-        } else {
-            i64::from(schema::recorded_store_version(&copy)?)
-        };
-        drop(copy);
         manifest.push_str(&format!(
-            "{name}\t{}\t{version}\t{}\n",
+            "{name}\t{}\t{version}\t{digest}\n",
             source.display(),
-            sha256_file(&target)?
         ));
     }
     std::fs::write(options.backup_dir.join("MANIFEST.tsv"), manifest)?;
@@ -2647,9 +2675,13 @@ pub fn run(options: &EngineOptions, hooks: &mut dyn EngineHooks) -> Result<Repor
     )
     .map_err(|error| EngineError::Internal(error.to_string()))?;
     for table in WRITTEN_CONTEXT_TABLES {
-        fence
-            .check_table(table)
-            .map_err(|error| Refusal::new(FINGERPRINT_MISMATCH, error.to_string()))?;
+        fence.check_table(table).map_err(|error| {
+            let message = match column_drift(&context_conn, table) {
+                Some(drift) => format!("{error}. {drift}"),
+                None => error.to_string(),
+            };
+            Refusal::new(FINGERPRINT_MISMATCH, message)
+        })?;
     }
     let context_state = read_context_state(&context_conn)?;
 
@@ -2838,6 +2870,7 @@ fn migrate_in_transaction(
     hooks: &mut dyn EngineHooks,
 ) -> Result<Report, EngineError> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
+    let step = Instant::now();
     conn.execute_batch(schema::MIGRATION_61_CREATE_SQL)?;
     let file_uuid: String = conn
         .query_row(
@@ -2863,6 +2896,8 @@ fn migrate_in_transaction(
         }
     }
     let decided = classify_projects(conn, &projects, &file_uuid, options)?;
+    log_step("read and classify", step);
+    let step = Instant::now();
     let skipped_projects: BTreeSet<&String> = decided
         .iter()
         .filter(|(_, decision)| **decision == Classification::Skipped)
@@ -2954,7 +2989,11 @@ fn migrate_in_transaction(
             .map_err(|error| EngineError::Internal(error.to_string()))?;
     }
 
-    check_claude_code_ids(conn, &copier, options)?;
+    log_step("copy", step);
+    let step = Instant::now();
+    check_claude_code_ids(conn, &copier, &sessions, options)?;
+    log_step("claude code id check", step);
+    let step = Instant::now();
 
     let sessions_reset = schema::reset_cache_state_for_single_store(conn)?;
     for project in &copier.changed_projects {
@@ -2978,9 +3017,14 @@ fn migrate_in_transaction(
         )?;
     }
 
+    log_step("cache reset and flags", step);
     hooks.after_copy(conn)?;
+    let step = Instant::now();
     verify(conn, &copier, &source, &decided, &copied_sessions)?;
+    log_step("verify", step);
+    let step = Instant::now();
     let render_check = render_check(conn, &sessions, &skipped_sessions, &store_wins, options)?;
+    log_step("render check", step);
 
     let mut projects_report: Vec<ProjectReport> = Vec::new();
     for (project, decision) in &decided {
@@ -3041,9 +3085,68 @@ fn migrate_in_transaction(
 
 /// A Claude Code session rendered store memory ids. Where one of those ids now names a
 /// different `context.db` memory, an agent acting on it would touch the wrong memory.
+/// The `context.db` schema this build was made against, as the host creates it.
+const BUILT_CONTEXT_SCHEMA: &str = include_str!("../tests/fixtures/context-db-schema.sql");
+
+/// Name the columns of `table` that `context.db` has and this build does not know, and
+/// say how to drop them. A column an old development build added (and no release ever
+/// shipped) is the usual cause, and the operator can see and fix it straight away.
+/// `None` when the columns match, so the refusal is about something else (an index, a
+/// trigger, a constraint).
+fn column_drift(conn: &Connection, table: &str) -> Option<String> {
+    let columns = |conn: &Connection, schema: &str| -> Option<Vec<String>> {
+        let mut statement = conn
+            .prepare(&format!("PRAGMA {schema}.table_info(\"{table}\")"))
+            .ok()?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .ok()?
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        Some(names)
+    };
+    let built = Connection::open_in_memory().ok()?;
+    built.execute_batch(BUILT_CONTEXT_SCHEMA).ok()?;
+    let known = columns(&built, "main")?;
+    let live = columns(conn, "main")?;
+    let unknown: Vec<&String> = live.iter().filter(|name| !known.contains(name)).collect();
+    let missing: Vec<&String> = known.iter().filter(|name| !live.contains(name)).collect();
+    if unknown.is_empty() && missing.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !unknown.is_empty() {
+        let names = unknown
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let drops = unknown
+            .iter()
+            .map(|name| format!("ALTER TABLE {table} DROP COLUMN {name};"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        parts.push(format!(
+            "{table} has column(s) this build does not know: {names}. If no release of Magic Context created them (a development build did), stop every Magic Context process and drop them with sqlite3 on context.db: {drops} Then run the migration again"
+        ));
+    }
+    if !missing.is_empty() {
+        let names = missing
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "{table} lacks column(s) this build expects: {names}; start the matching Magic Context plugin once so it migrates context.db"
+        ));
+    }
+    Some(parts.join(". "))
+}
+
 fn check_claude_code_ids(
     conn: &Connection,
     copier: &Copier<'_>,
+    sessions: &Sessions,
     options: &EngineOptions,
 ) -> Result<(), EngineError> {
     if options.accept_id_change {
@@ -3072,13 +3175,32 @@ fn check_claude_code_ids(
             if copier.memory_ids.get(&id) == Some(&id) {
                 continue;
             }
+            // After the move the session's lookups carry its own project
+            // (`WHERE id = ? AND project_path = ?`), so an old id that now names a memory of
+            // another project reads as "not found", which the agent already handles. Only a
+            // memory of the session's own project would be read as the wrong memory. The
+            // session's project is the one its host recorded, or else the project of the
+            // memory it rendered under that id, which is the project it was reading.
+            let project = match sessions.project.get(&session) {
+                Some(project) => Some(project.clone()),
+                None => conn
+                    .query_row(
+                        "SELECT project_path FROM main.mc_memories WHERE id = ?1",
+                        params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?,
+            };
+            let Some(project) = project else {
+                continue;
+            };
             let taken: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM ctx.memories WHERE id = ?1)",
-                params![id],
+                "SELECT EXISTS(SELECT 1 FROM ctx.memories WHERE id = ?1 AND project_path = ?2)",
+                params![id, project],
                 |row| row.get(0),
             )?;
             if taken {
-                affected.push(json!({"session": session, "rendered_id": id}));
+                affected.push(json!({"session": session, "project": project, "rendered_id": id}));
                 break;
             }
         }
@@ -3089,7 +3211,7 @@ fn check_claude_code_ids(
     Err(Refusal::new(
         CLAUDE_CODE_IDS,
         format!(
-            "{} Claude Code session(s) rendered memory ids that name different memories after the move; re-run with --accept-id-change to accept that",
+            "{} Claude Code session(s) rendered memory ids that name a different memory of the same project after the move; re-run with --accept-id-change to accept that",
             affected.len()
         ),
     )

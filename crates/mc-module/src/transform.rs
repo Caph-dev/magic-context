@@ -1637,10 +1637,6 @@ pub struct TransformResponse {
     /// filter search results, using the module manifest rather than its TypeScript render cache.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rendered_memory_ids: Option<Vec<i64>>,
-    /// Newest memories changefeed sequence observed while producing this response. The host
-    /// folds it into its mirror projection key so unrendered memory changes still schedule a pull.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub memory_mirror_head: Option<i64>,
     /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
     /// subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1715,7 +1711,6 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -1754,7 +1749,6 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -2775,13 +2769,7 @@ fn compose_additive_m0(
         ctx.memory_budget_tokens,
         estimate_tokens,
     );
-    let host_backed_memory_ids = serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
-    let mut rendered_memories = selected_memories;
-    if host_backed_memory_ids {
-        for memory in &mut rendered_memories {
-            memory.id = memory.host_row_id.unwrap_or(0);
-        }
-    }
+    let rendered_memories = selected_memories;
     let source_name_by_id = membership
         .as_ref()
         .map(|value| workspace_source_names(&rendered_memories, value))
@@ -3145,7 +3133,6 @@ fn apply_additive_only(
                 &additive_meta,
                 meta.expiry_cutoff_ms,
                 ctx.memory_enabled,
-                serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic),
                 ctx.memory_budget_tokens,
                 ctx.user_profile_budget_tokens,
                 ctx.temporal_awareness,
@@ -3368,7 +3355,6 @@ fn apply_additive_only(
             committed: commit_required,
             coverage_ordinal: None,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -4739,6 +4725,7 @@ fn apply_once(
         legacy_baseline: is_legacy_baseline(&loaded.core),
         render_config_changed,
         profile_transition,
+        project_memory_epoch_due: external_revision_changed || project_memory_epoch_hard_due,
         first_fold_due,
         ttl_expired: scheduler_outcome.idle_ttl_fired,
         coverage_fold_due: system_absorb_hard_due,
@@ -5060,8 +5047,6 @@ fn apply_once(
                         ),
                         covered_system_messages: &covered_system_messages,
                         memory_enabled: ctx.memory_enabled,
-                        host_backed_memory_ids: serializer_profile
-                            != Some(SerializerProfile::ClaudeCodeAnthropic),
                         memory_budget_tokens: ctx.memory_budget_tokens,
                         user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                         inject_docs: ctx.inject_docs,
@@ -5168,8 +5153,6 @@ fn apply_once(
                                         ),
                                     covered_system_messages: &recut_covered_system_messages,
                                     memory_enabled: ctx.memory_enabled,
-                                    host_backed_memory_ids: serializer_profile
-                                        != Some(SerializerProfile::ClaudeCodeAnthropic),
                                     memory_budget_tokens: ctx.memory_budget_tokens,
                                     user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                                     inject_docs: ctx.inject_docs,
@@ -5381,7 +5364,6 @@ fn apply_once(
                     &meta,
                     meta.expiry_cutoff_ms,
                     ctx.memory_enabled,
-                    serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic),
                     ctx.memory_budget_tokens,
                     ctx.user_profile_budget_tokens,
                     ctx.temporal_awareness,
@@ -5429,8 +5411,6 @@ fn apply_once(
                             ),
                             covered_system_messages: &covered_system_messages,
                             memory_enabled: ctx.memory_enabled,
-                            host_backed_memory_ids: serializer_profile
-                                != Some(SerializerProfile::ClaudeCodeAnthropic),
                             memory_budget_tokens: ctx.memory_budget_tokens,
                             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                             inject_docs: ctx.inject_docs,
@@ -6564,7 +6544,6 @@ fn apply_once(
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
-            memory_mirror_head: None,
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
             lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
             cache_ttl: None,
@@ -8370,8 +8349,6 @@ fn compose_hard_fold_m0(
             ),
             covered_system_messages: &covered_system_messages,
             memory_enabled: ctx.memory_enabled,
-            host_backed_memory_ids: serializer_profile
-                != Some(SerializerProfile::ClaudeCodeAnthropic),
             memory_budget_tokens: ctx.memory_budget_tokens,
             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
             inject_docs: ctx.inject_docs,
@@ -15193,6 +15170,9 @@ struct MaterializeReasonInputs {
     legacy_baseline: bool,
     render_config_changed: bool,
     profile_transition: bool,
+    /// The external revision moved (workspace, project memory epoch, or an in-place
+    /// compartment rewrite by another writer), or a pending epoch was armed.
+    project_memory_epoch_due: bool,
     first_fold_due: bool,
     ttl_expired: bool,
     coverage_fold_due: bool,
@@ -15210,6 +15190,7 @@ fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String>
         legacy_baseline,
         render_config_changed,
         profile_transition,
+        project_memory_epoch_due,
         first_fold_due,
         ttl_expired,
         coverage_fold_due,
@@ -15229,6 +15210,8 @@ fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String>
                 "profile_transition"
             } else if render_config_changed {
                 "epoch_change"
+            } else if project_memory_epoch_due {
+                "project_memory_epoch"
             } else if coverage_fold_due || first_fold_due {
                 "coverage_fold"
             } else if ttl_expired {
@@ -15727,7 +15710,7 @@ pub(crate) mod tests {
     use serde_json::{json, Value};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
+        McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,
@@ -16945,18 +16928,6 @@ pub(crate) mod tests {
             .commit(&request.session_id, loaded.row_version, &core, &meta)
             .unwrap();
         request
-    }
-
-    fn acknowledge_test_host_memory(store: &McStore, project_path: &str, id: i64) {
-        store
-            .acknowledge_host_memory_ids(
-                project_path,
-                &[mc_store::HostMemoryIdentityAck {
-                    module_row_id: id,
-                    host_row_id: id,
-                }],
-            )
-            .unwrap();
     }
 
     fn memory_input<'a>(
@@ -21554,7 +21525,6 @@ pub(crate) mod tests {
         let memory_id = s
             .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", memory_id);
         let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
         let boot = run(&s, &execute_req, &spine());
         assert_eq!(boot.action, "HARD");
@@ -21581,111 +21551,144 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn review_late_host_ack_preserves_m0_across_restart() {
+    fn in_session_memory_mutations_ride_the_next_bust_and_defers_replay_them() {
+        // An update, an archive and a merge each append to context.db's
+        // memory_mutation_log and change no memory id. The mutation-log head is the only
+        // revision input that moves, so it alone must open the next execute-band pass as a
+        // SOFT carrying <memory-updates>; the defers after it replay those bytes exactly.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let first = s
-            .insert_memory(memory_input("git:proj", "CONSTRAINTS", "acknowledged", 0))
+        let updated = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule one", 0))
             .unwrap();
-        let pending = s
-            .insert_memory(memory_input("git:proj", "CONSTRAINTS", "pending", 0))
+        let archived = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule two", 0))
             .unwrap();
-        s.acknowledge_host_memory_ids(
-            "git:proj",
-            &[mc_store::HostMemoryIdentityAck {
-                module_row_id: first,
-                host_row_id: 901,
-            }],
-        )
-        .unwrap();
-        let mut request = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
-        request.serializer_profile = "opencode".into();
+        let merge_target = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule three", 0))
+            .unwrap();
+        let merge_source = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule four", 0))
+            .unwrap();
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let boot = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(boot.action, "HARD");
-        let frozen = m0_bytes(&boot).to_string();
-        assert!(frozen.contains("#901:"));
-        assert!(!frozen.contains(&format!("#{pending}:")));
-        let second = transform(&s, &request, &ctx).unwrap();
-        assert_ne!(second.action, "HARD");
-        assert_eq!(m0_bytes(&second), frozen);
-        s.acknowledge_host_memory_ids(
-            "git:proj",
-            &[mc_store::HostMemoryIdentityAck {
-                module_row_id: pending,
-                host_row_id: 902,
-            }],
-        )
-        .unwrap();
-        for _ in 0..3 {
-            let pass = transform(&s, &request, &ctx).unwrap();
-            assert_ne!(pass.action, "HARD", "late identity ack must not bust m0");
-            assert_eq!(m0_bytes(&pass), frozen);
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let defer_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 10, 100);
+        assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "HARD");
+        // With nothing pending, an execute-band pass does not bust.
+        assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "SOFT+");
+
+        let archived_marker = format!("id=\"{archived}\"");
+        type Mutation<'a> = (&'a str, Box<dyn Fn(&McStore)>);
+        let mutations: [Mutation<'_>; 3] = [
+            (
+                "rule one corrected",
+                Box::new(move |s: &McStore| {
+                    s.update_memory_content("git:proj", updated, "rule one corrected", None, 1)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                archived_marker.as_str(),
+                Box::new(move |s: &McStore| {
+                    s.archive_memories("git:proj", &[archived], None, 2)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                "rules three and four",
+                Box::new(move |s: &McStore| {
+                    s.merge_memories(
+                        "git:proj",
+                        merge_target,
+                        &[merge_source],
+                        "rules three and four",
+                        3,
+                    )
+                    .unwrap()
+                    .unwrap();
+                }),
+            ),
+        ];
+        for (marker, mutate) in mutations {
+            mutate(&s);
+            let soft = transform(&s, &execute_req, &ctx).unwrap();
+            assert_eq!(soft.action, "SOFT", "{marker}");
+            let m1 = m1_bytes(&soft);
+            assert!(m1.contains("<memory-updates>"), "{marker}: {m1}");
+            assert!(m1.contains(marker), "{marker}: {m1}");
+            let served = serde_json::to_vec(&soft.ck_messages).unwrap();
+            for _ in 0..3 {
+                let deferred = transform(&s, &defer_req, &ctx).unwrap();
+                assert_eq!(deferred.action, "SOFT+", "{marker}");
+                assert_eq!(
+                    serde_json::to_vec(&deferred.ck_messages).unwrap(),
+                    served,
+                    "{marker}: a defer replays the served bytes"
+                );
+            }
         }
-        drop(s);
-        let reopened = store(dir.path());
-        assert_eq!(
-            reopened
-                .get_memory_full(pending)
-                .unwrap()
-                .unwrap()
-                .host_row_id,
-            Some(902)
-        );
-        let pass = transform(&reopened, &request, &ctx).unwrap();
-        assert_ne!(pass.action, "HARD");
-        assert_eq!(m0_bytes(&pass), frozen);
     }
 
     #[test]
-    fn project_memory_epoch_from_state_sync_is_an_eager_hard_input() {
+    fn project_memory_epoch_in_context_db_is_an_eager_hard_input() {
+        // An identity or workspace writer bumps project_state.project_memory_epoch in
+        // context.db. The next pass must rebuild m0 (a HARD naming the epoch), and the pass
+        // after it must not repeat the HARD.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
         let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
         assert_eq!(run(&s, &request, &spine()).action, "HARD");
-        let loaded = s.load("ses").unwrap();
-        s.apply_authority_state_sync(ModuleStateSyncRequest {
-            session_id: "ses",
-            project_path: "git:proj",
-            shadow_generation: loaded.meta.shadow_generation,
-            expected_shadow_seq: loaded.meta.shadow_seq,
-            seed_boundary_id: None,
-            drop_seeds: &[],
-            drop_seed_skipped: 0,
-            strip_seeds: &[],
-            strip_seed_skipped: 0,
-            reasoning_cleared_through_tag: None,
-            compartments: &[],
-            memories: &[],
-            memory_mutations: &[],
-            user_profile: &[],
-            user_profile_present: true,
-            workspace: None,
-            workspace_present: true,
-            last_todo_state: None,
-            project_memory_epoch: Some(7),
-            user_profile_version: None,
-            pending_agent_drops: &[],
-            pending_agent_drops_skipped: 0,
-            user_hint_seeds: &[],
-            auto_search_hint_skipped: 0,
-            note_nudge_anchors: None,
-            todo_synthetic_anchor: None,
-            todo_synthetic_anchor_present: false,
-            emergency_latches: None,
-            pending_compaction_marker: None,
-            deferred_execute_state: None,
-            channel2_nudge_state: None,
-            acked_watermarks: serde_json::Value::Null,
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+
+        s.set_project_memory_epoch_for_test("git:proj", 7).unwrap();
+        let after_epoch = run(&s, &request, &spine());
+        assert_eq!(after_epoch.action, "HARD");
+        assert_eq!(
+            after_epoch.materialize_reason.as_deref(),
+            Some("project_memory_epoch")
+        );
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+    }
+
+    #[test]
+    fn an_in_place_compartment_rewrite_by_another_writer_is_an_eager_hard_input() {
+        // A TypeScript recomp rewrites a session's compartments in place and appends an
+        // m0_mutation_log row; the highest compartment sequence does not move. The next
+        // module pass must still rebuild m0.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        assert_eq!(run(&s, &request, &spine()).action, "HARD");
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+
+        s.with_context_conn_for_test(|tx| {
+            tx.execute(
+                "UPDATE compartments SET content = 'REWRITTEN', p1 = 'REWRITTEN'
+                  WHERE session_id = 'ses'",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO m0_mutation_log (session_id, mutation_type, target_id, queued_at)
+                 VALUES ('ses', 'recomp_boundary_change', NULL, 1)",
+                [],
+            )?;
+            Ok(())
         })
         .unwrap();
-        assert!(s.load("ses").unwrap().meta.project_memory_epoch_pending);
-        assert_eq!(run(&s, &request, &spine()).action, "HARD");
-        assert!(!s.load("ses").unwrap().meta.project_memory_epoch_pending);
+        let after_rewrite = run(&s, &request, &spine());
+        assert_eq!(after_rewrite.action, "HARD");
+        assert_eq!(
+            after_rewrite.materialize_reason.as_deref(),
+            Some("project_memory_epoch")
+        );
     }
 
     #[test]
@@ -22102,16 +22105,7 @@ pub(crate) mod tests {
             strip_seeds: &[],
             strip_seed_skipped: 0,
             reasoning_cleared_through_tag: None,
-            compartments: &[],
-            memories: &[],
-            memory_mutations: &[],
-            user_profile: &[],
-            user_profile_present: false,
-            workspace: None,
-            workspace_present: false,
             last_todo_state: Some(state_json.to_string()),
-            project_memory_epoch: None,
-            user_profile_version: None,
             pending_agent_drops: &[],
             pending_agent_drops_skipped: 0,
             user_hint_seeds: &[],
@@ -27598,6 +27592,7 @@ pub(crate) mod tests {
             if !interleaved.replace(true) {
                 store
                     .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                        harness: None,
                         session_id: "astro-publish-race",
                         expected_row_version: Some(publish_row_version),
                         expected_revert_epoch: loaded.meta.revert_epoch,
@@ -27704,6 +27699,7 @@ pub(crate) mod tests {
             hook_ran_for_publish.store(true, Ordering::SeqCst);
             store
                 .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                    harness: None,
                     session_id: "astro-torn-read",
                     expected_row_version: Some(publish_row_version),
                     expected_revert_epoch,
@@ -28554,75 +28550,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stale_full_state_sync_cannot_rewind_a_committed_divergence_recut() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let request = seed_astro_divergence(&store, "astro-stale-state-sync", 2_402);
-        let recut = run(&store, &request, &spine());
-        assert_eq!(recut.action, "HARD");
-        let recut_bytes = serde_json::to_vec(&recut.ck_messages).unwrap();
-        let after_recut = store.load("astro-stale-state-sync").unwrap();
-        let compartments_after_recut = store.load_compartments("astro-stale-state-sync").unwrap();
-        let mut stale_compartments = astro_compartments()[..2].to_vec();
-        for compartment in &mut stale_compartments {
-            compartment.content = format!("STALE-TS-{}", compartment.sequence);
-            compartment.p1 = Some(compartment.content.clone());
-        }
-
-        store
-            .apply_authority_state_sync(ModuleStateSyncRequest {
-                session_id: "astro-stale-state-sync",
-                project_path: "git:proj",
-                shadow_generation: after_recut.meta.shadow_generation,
-                expected_shadow_seq: after_recut.meta.shadow_seq,
-                seed_boundary_id: Some("m425#0"),
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &stale_compartments,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                acked_watermarks: Value::Null,
-            })
-            .unwrap();
-
-        let after_sync = store.load("astro-stale-state-sync").unwrap();
-        assert_eq!(after_sync.meta.coverage_ordinal, Some(2_400));
-        assert_eq!(after_sync.meta.folded_compartment_seq, 47);
-        assert_eq!(after_sync.core.boundary_id, "m2400#0");
-        assert_eq!(
-            store.load_compartments("astro-stale-state-sync").unwrap(),
-            compartments_after_recut
-        );
-        let deferred = run(&store, &request, &spine());
-        assert_eq!(deferred.action, "SOFT+");
-        assert_eq!(
-            serde_json::to_vec(&deferred.ck_messages).unwrap(),
-            recut_bytes
-        );
-    }
-
-    #[test]
     fn fired_divergence_with_absent_new_anchor_fails_loud_without_commit() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -28827,7 +28754,6 @@ pub(crate) mod tests {
         let memory_id = s
             .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", memory_id);
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
             .unwrap();
         let before = run(
@@ -28893,74 +28819,6 @@ pub(crate) mod tests {
             "{}",
             m1_bytes(&soft)
         );
-    }
-
-    /// Boot a session on `profile`, then insert a memory whose host mirror id differs from its
-    /// module id. Returns the boot response, the defer that follows the insert, and the SOFT
-    /// that an explicit refresh opens afterwards.
-    fn new_memory_passes_with_distinct_host_id(
-        profile: SerializerProfile,
-    ) -> (TransformResponse, TransformResponse, TransformResponse) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        let request = profile_req(profile, "ses", "cfg0", vec![item("m1msg", 1, "raw")]);
-        let boot = run(&s, &request, &spine());
-        assert_eq!(boot.action, "HARD");
-
-        let module_id = s
-            .insert_memory(memory_input(
-                "git:proj",
-                "ARCHITECTURE",
-                "a durable rule",
-                1,
-            ))
-            .unwrap();
-        assert_eq!(module_id, 1);
-        s.acknowledge_host_memory_ids(
-            "git:proj",
-            &[mc_store::HostMemoryIdentityAck {
-                module_row_id: module_id,
-                host_row_id: 901,
-            }],
-        )
-        .unwrap();
-
-        let deferred = run(&s, &request, &spine());
-        s.arm_soft_refresh("ses").unwrap();
-        let soft = run(&s, &request, &spine());
-        (boot, deferred, soft)
-    }
-
-    #[test]
-    fn host_backed_m1_new_memories_render_host_ids_and_ride_the_next_bust() {
-        let (boot, deferred, soft) =
-            new_memory_passes_with_distinct_host_id(SerializerProfile::OpencodeAiSdk);
-        // A pending memory changes nothing on its own: the defer replays the frozen bytes.
-        assert_eq!(deferred.action, "SOFT+");
-        assert_eq!(
-            serde_json::to_string(deferred.messages()).unwrap(),
-            serde_json::to_string(boot.messages()).unwrap()
-        );
-        assert_eq!(soft.action, "SOFT");
-        let m1 = m1_bytes(&soft);
-        assert!(m1.contains("<new-memories>"), "{m1}");
-        assert!(
-            m1.contains("#901: a durable rule"),
-            "OpenCode m1 must render the host id, as m0 does: {m1}"
-        );
-        assert!(!m1.contains("#1: a durable rule"), "{m1}");
-    }
-
-    #[test]
-    fn claude_code_m1_new_memories_keep_module_ids() {
-        let (_, _, soft) =
-            new_memory_passes_with_distinct_host_id(SerializerProfile::ClaudeCodeAnthropic);
-        assert_eq!(soft.action, "SOFT");
-        let m1 = m1_bytes(&soft);
-        assert!(m1.contains("#1: a durable rule"), "{m1}");
-        assert!(!m1.contains("#901"), "{m1}");
     }
 
     #[test]
@@ -29096,7 +28954,6 @@ pub(crate) mod tests {
         // a memory is in the m0 baseline (seeded before bootstrap → in the manifest)
         s.seed_memory(5, "git:proj", "ARCHITECTURE", "original", 70)
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", 5);
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
             .unwrap();
         let before = run(
@@ -30446,7 +30303,6 @@ pub(crate) mod tests {
                     70,
                 )
                 .unwrap();
-                acknowledge_test_host_memory(s, "git:proj", id);
             })
             .collect()
     }
@@ -35508,6 +35364,89 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_ready_note_is_never_injected_and_defers_replay_while_it_stays_ready() {
+        // The module renders nothing for ready smart notes: not in m1, not in the tail,
+        // not as a reminder. The host's note nudger owns surfacing them. So a ready note
+        // must not appear in any served byte, a bust with the note ready must not change
+        // anything about it, and defers must replay the served bytes exactly while it
+        // stays ready.
+        const NOTE_TEXT: &str = "ready note the module must not inject";
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let boot = transform(&s, &execute_req, &ctx).unwrap();
+        assert_eq!(boot.action, "HARD");
+
+        let note = s
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("ses"),
+                content: NOTE_TEXT,
+                surface_condition: Some("condition true"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            s.write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: note.status_version,
+                verdict: true,
+                compiled_check: None,
+                manifest_json: None,
+                check_hash: None,
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap(),
+            NoteCasOutcome::Applied(note) if note.status == "ready"
+        ));
+        let ready = s
+            .get_note_by_id("git:proj", "ses", note.id)
+            .unwrap()
+            .unwrap();
+
+        // A bust (explicit refresh) and a HARD (a new render config) with the note ready.
+        s.arm_soft_refresh("ses").unwrap();
+        let soft = transform(&s, &execute_req, &ctx).unwrap();
+        assert_eq!(soft.action, "SOFT");
+        let hard_req = with_usage(req("ses", "cfg1", vec![item("a", 1, "raw")]), 70, 100);
+        let hard = transform(&s, &hard_req, &ctx).unwrap();
+        assert_eq!(hard.action, "HARD");
+        let served = serde_json::to_vec(&hard.ck_messages).unwrap();
+        for response in [&boot, &soft, &hard] {
+            let bytes = serde_json::to_string(&response.ck_messages).unwrap();
+            assert!(!bytes.contains(NOTE_TEXT), "{}", response.action);
+        }
+
+        let defer_req = with_usage(req("ses", "cfg1", vec![item("a", 1, "raw")]), 10, 100);
+        for _ in 0..3 {
+            let deferred = transform(&s, &defer_req, &ctx).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
+            assert_eq!(serde_json::to_vec(&deferred.ck_messages).unwrap(), served);
+        }
+        let after = s
+            .get_note_by_id("git:proj", "ses", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status, "ready",
+            "serving passes must not consume the note"
+        );
+        assert_eq!(after.status_version, ready.status_version);
+    }
+
+    #[test]
     fn pressure_refold_keeps_ready_notes_out_of_m1_and_ready() {
         // Ready smart notes reach the agent through the host's deferred-notes reminder
         // and `ctx_note read`, never through m1. A pressure refold with a ready note in
@@ -36476,16 +36415,7 @@ pub(crate) mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
                 pending_agent_drops: &[],
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
@@ -37187,6 +37117,10 @@ pub(crate) mod tests {
             importance: 50,
             ..Default::default()
         }];
+        // The seeded compartments are the host's rows in context.db.
+        store
+            .replace_compartments("seeded-trim", &compartments)
+            .unwrap();
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: "seeded-trim",
@@ -37199,16 +37133,7 @@ pub(crate) mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &compartments,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
                 pending_agent_drops: &[],
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
@@ -38051,7 +37976,6 @@ pub(crate) mod tests {
         // keeps its real arguments, large is removed.
         s.seed_memory(1, "git:proj", "ARCHITECTURE", "a new architecture rule", 70)
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", 1);
         force_hard(&s);
         let hard = run(&s, &request, &spine());
         assert_eq!(hard.action, "HARD");
