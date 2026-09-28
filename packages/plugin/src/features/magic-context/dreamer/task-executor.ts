@@ -911,6 +911,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 });
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
+                    backlogAfter:
+                        retro.retrospectiveWatermarkMs == null
+                            ? undefined
+                            : getDreamTaskBacklog(db, projectIdentity, "retrospective", {
+                                  retrospectiveWatermarkMs: retro.retrospectiveWatermarkMs,
+                              }),
                 });
                 // Advance the content watermark on completion (incl. clean "n"
                 // runs) so the next run only scans newer messages.

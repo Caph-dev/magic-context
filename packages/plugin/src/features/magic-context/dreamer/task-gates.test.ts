@@ -198,6 +198,27 @@ describe("dream task backlog probes", () => {
             getDreamTaskBacklog(db, project, "retrospective", { retrospectiveWatermarkMs: 200 })
                 .pending,
         ).toBe(1);
+        db.prepare(
+            "UPDATE task_schedule_state SET retrospective_watermark_ms = ? WHERE project_path = ? AND task = ?",
+        ).run(300, project, "retrospective");
+        expect(getDreamTaskBacklog(db, project, "retrospective").pending).toBe(0);
+
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("docs-session", "opencode", project, 500);
+        db.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, title, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ).run("docs-session", 1, 0, 1, "old doc", "old", 100);
+        db.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, title, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ).run("docs-session", 2, 2, 3, "new doc", "new", 300);
+        db.prepare(
+            "INSERT INTO task_schedule_state (project_path, task, last_run_at) VALUES (?, ?, ?)",
+        ).run(project, "maintain-docs", 200);
+        expect(getDreamTaskBacklog(db, project, "maintain-docs").pending).toBe(1);
+        expect(getDreamTaskBacklog(db, project, "maintain-docs", { lastRunAt: null }).pending).toBe(
+            2,
+        );
     });
 
     test("processed count is the start-to-end backlog reduction", () => {

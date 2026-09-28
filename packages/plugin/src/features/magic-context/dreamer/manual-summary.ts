@@ -35,7 +35,8 @@ export function summarizeManualDream(summary: ManualRunResult): string {
         );
     }
     if (Object.keys(summary.backlogAfter ?? {}).length > 0) {
-        lines.push("", "Backlog at run end:", formatDreamTaskBacklogs(summary.backlogAfter ?? {}));
+        const backlogAfter = { ...(summary.backlogBefore ?? {}), ...(summary.backlogAfter ?? {}) };
+        lines.push("", "Backlog at run end:", formatDreamTaskBacklogs(backlogAfter));
     }
     if (
         summary.ran.length === 0 &&
