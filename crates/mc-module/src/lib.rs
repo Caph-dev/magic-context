@@ -21016,7 +21016,10 @@ mod tests {
     #[test]
     fn supported_fences_report_plugin_and_store_ceilings() {
         let line = supported_fences_line();
-        assert_eq!(line, format!("context.db=91 store.db={LATEST_MIGRATION_VERSION}"));
+        assert_eq!(
+            line,
+            format!("context.db=91 store.db={LATEST_MIGRATION_VERSION}")
+        );
     }
 
     #[test]

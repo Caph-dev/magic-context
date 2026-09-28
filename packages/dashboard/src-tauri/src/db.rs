@@ -2550,11 +2550,7 @@ fn build_db_cache_events_with_attribution(
                 // Snapshot prev values out before mutating chronological[i].
                 let (prev_read, prev_write, prev_input) = {
                     let prev = &chronological[prev_idx];
-                    (
-                        prev.cache_read,
-                        prev.cache_write,
-                        prev.input_tokens,
-                    )
+                    (prev.cache_read, prev.cache_write, prev.input_tokens)
                 };
                 if prev_read == 0 {
                     // No cache was established on the prior step (cold / still
@@ -10820,7 +10816,10 @@ mod cache_turn_tests {
             .collect();
         let events = build_db_cache_events(rows, false);
         assert_eq!(
-            events.iter().map(|event| event.severity.as_str()).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.severity.as_str())
+                .collect::<Vec<_>>(),
             ["stable", "stable", "warning", "warning", "warning", "stable", "stable", "stable"]
         );
     }
