@@ -10,9 +10,9 @@
 //!    ATTACHed databases atomically across all of them only when none is in WAL mode, so
 //!    this is what makes the copy, the flags and the cache reset land together or not at
 //!    all. WAL mode is restored afterwards, on success and on failure.
-//! 3. `store.db` is the main database and `context.db` is attached, so every statement
-//!    below names `context.db` tables by their plain names (no `store.db` table shares a
-//!    name with one) and `store.db` tables by their `mc_` names.
+//! 3. `store.db` is the main database and `context.db` is attached as `ctx`, so statements
+//!    name `context.db` tables as `ctx.<table>` and `store.db` tables as `main.<table>`
+//!    or by their `mc_` names.
 //! 4. Inside one `BEGIN IMMEDIATE`: the cache tables of store migration 61 are created,
 //!    projects are classified and copied, the module cache is reset, the `context.db`
 //!    mirror and authority rows are cleared, everything is verified (including a render
@@ -2792,7 +2792,9 @@ fn restore_both_wal(options: &EngineOptions) {
     }
 }
 
-/// Write `single_store_state = migrated` for a store `McStore::open` migrated fresh.
+/// Write `single_store_state = migrated` for an empty store that `McStore::open` took
+/// straight to migration 61 (a fresh install), clearing the mirror rows in the same
+/// transaction. Nothing needs moving, so no backup is recorded.
 pub fn write_fresh_context_flag(
     conn: &Connection,
     stamp: i64,

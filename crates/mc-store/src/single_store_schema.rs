@@ -1,10 +1,13 @@
 //! Store migration 61: the schema half of moving the module's domain rows into `context.db`.
 //!
-//! Migration 61 is applied in two places, and both must run exactly the same statements:
+//! Migration 61 is meant to be applied in two places, and both must run exactly the same
+//! statements:
 //!
-//! - `McStore::open` applies it through the ordinary migration chain, but only to a store
-//!   that holds no domain rows (a fresh install). A populated store is refused instead, so
-//!   its rows are never dropped before they were copied.
+//! - `McStore::open`, through the ordinary migration chain, but only to a store that holds
+//!   no domain rows (a fresh install), refusing a populated one so its rows are never
+//!   dropped before they were copied. This is not wired yet: 61 joins `MIGRATIONS` together
+//!   with the runtime that reads the moved rows from `context.db`, because until then
+//!   every store the module opens still needs those tables.
 //! - The offline migration engine (`ck-mc single-store-migrate`) applies it inside its one
 //!   transaction, after the rows were copied into `context.db` and verified, and records the
 //!   version row itself.
@@ -164,9 +167,10 @@ pub const SINGLE_STORE_MARKER_SQL: &str = "UPDATE mc_privilege_state
     SET single_store = 1, single_store_set_at_ms = ?1, single_store_set_by = ?2
   WHERE id = 1";
 
-/// Suffix of the build identity recorded when `McStore::open` applied migration 61 to an
-/// empty store. The module sees it and knows the `context.db` flag still has to be written
-/// for a fresh install, rather than treating the pair as split.
+/// Suffix of the build identity to record when `McStore::open` applies migration 61 to an
+/// empty store (once 61 is in `MIGRATIONS`). The module and the engine read it to know the
+/// `context.db` flag still has to be written for a fresh install, rather than treating the
+/// pair as split.
 pub const FRESH_INSTALL_MARKER_SUFFIX: &str = "+fresh";
 
 /// The build identity recorded in the markers: the release SHA, or the crate version for
