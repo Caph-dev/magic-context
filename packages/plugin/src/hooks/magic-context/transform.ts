@@ -135,7 +135,10 @@ import {
     recordHighPressureNoEligibleHead,
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
-import { truncateUnreachableCompartmentHistory } from "./reachable-compartment-history";
+import {
+    consumePendingCoveredCut,
+    truncateUnreachableCompartmentHistory,
+} from "./reachable-compartment-history";
 import { readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
@@ -1131,17 +1134,19 @@ export function createTransform(deps: TransformDeps) {
             );
         }
 
-        // If an earlier stored message ID is present but a later compartment's
-        // start or end ID is absent, delete that obsolete range before rendering
-        // its summary or trimming messages at its boundary. Host compaction can
-        // hide earlier messages without deleting them, so skip that window.
-        if (!hostCompaction && deps.transformMode !== "rust") {
+        // A lease-busy removal is retried before rendering; wire omissions
+        // additionally need a by-ID host-store deletion check. A native
+        // compaction head hides earlier messages without deleting them.
+        if (deps.transformMode !== "rust") {
+            const pendingCut = consumePendingCoveredCut(db, sessionId);
             const reachable = new Set(
                 messages
                     .map((message) => message.info.id)
                     .filter((id): id is string => typeof id === "string" && id.length > 0),
             );
-            if (truncateUnreachableCompartmentHistory(db, sessionId, reachable)) {
+            const wireCut =
+                !hostCompaction && truncateUnreachableCompartmentHistory(db, sessionId, reachable);
+            if (pendingCut || wireCut) {
                 clearInjectionCache(sessionId);
                 resetPrefixTrimFallbackState(sessionId);
                 dropSlot(sessionId, "covered-history-revert");

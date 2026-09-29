@@ -240,6 +240,10 @@ it(
             }
         }
         const beforeCompaction = readBaseline(sessionId);
+        const compartmentsBefore = h.contextDb()
+            .prepare("SELECT sequence, start_message_id, end_message_id FROM compartments WHERE session_id = ? ORDER BY sequence")
+            .all(sessionId);
+        expect(compartmentsBefore.length).toBeGreaterThan(0);
         expect(beforeCompaction.hasM0).toBe(true);
         expect(beforeCompaction.boundary).not.toBeNull();
         expect(mainRequestBodies().at(-1)).toContain(HISTORY_SENTINEL);
@@ -284,6 +288,9 @@ it(
         // and the host summary row is still left off the wire.
         expect(first).toContain(HISTORY_SENTINEL);
         expect(first).not.toContain(HOST_SUMMARY_SENTINEL);
+        expect(h.contextDb().prepare("SELECT sequence, start_message_id, end_message_id FROM compartments WHERE session_id = ? ORDER BY sequence").all(sessionId))
+            .toEqual(compartmentsBefore);
+        expect(pluginLog().slice(logOffsetBeforeCompaction)).not.toContain("truncated unreachable compartment history");
         // The real turn's system prompt is handled as usual: it still carries Magic
         // Context's guidance, so recognising the compaction request did not swallow
         // the next system-prompt hook call.
@@ -296,6 +303,8 @@ it(
 
         // Exactly one fold after the compaction: the next pass replays it.
         await h.sendPrompt(sessionId, "second prompt after the native compaction");
+        expect(h.contextDb().prepare("SELECT sequence, start_message_id, end_message_id FROM compartments WHERE session_id = ? ORDER BY sequence").all(sessionId))
+            .toEqual(compartmentsBefore);
         const lines = pluginLog().split("\n");
         const compactedAt = lines.findIndex((line) => line.includes("compaction-marker: removed on session cleanup"));
         expect(compactedAt).toBeGreaterThan(-1);

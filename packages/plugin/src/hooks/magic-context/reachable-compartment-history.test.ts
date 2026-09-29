@@ -6,7 +6,7 @@ import {
     acquireCompartmentLease,
     releaseCompartmentLease,
 } from "../../features/magic-context/compartment-lease";
-import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
+import { clearSession, closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import { getPendingOps, queuePendingOp } from "../../features/magic-context/storage-ops";
 import * as logger from "../../shared/logger";
 import {
@@ -120,6 +120,65 @@ describe("covered branch ancestry", () => {
         ).toEqual([{ sequence: 1 }]);
     });
 
+    test("lease-busy interior cut survives restart and session deletion clears its marker", () => {
+        const db = seed();
+        for (const [id, ordinal] of [
+            ["old-3", 3],
+            ["middle", 4],
+            ["old-4", 5],
+        ] as const) {
+            db.prepare(`INSERT INTO message_history_source
+                (session_id, message_id, message_ordinal, source_version, normalized_content_hash, role, updated_at)
+                VALUES ('ses-revert', ?, ?, 'v1', 'h', 'user', 1)`).run(id, ordinal);
+        }
+        db.prepare(
+            "UPDATE session_meta SET deferred_execute_state = ? WHERE session_id = 'ses-revert'",
+        ).run(JSON.stringify({ magicContextTokenizerCalibration: { hygieneUnitsVersion: 2 } }));
+        acquireCompartmentLease(db, "ses-revert", "historian");
+        expect(() => truncateRemovedCompartmentAnchor(db, "ses-revert", "middle")).toThrow(
+            "compartment_truncation_lease_busy",
+        );
+        releaseCompartmentLease(db, "ses-revert", "historian");
+        const marker = db
+            .prepare(
+                "SELECT deferred_execute_state FROM session_meta WHERE session_id = 'ses-revert'",
+            )
+            .get() as { deferred_execute_state: string };
+        expect(
+            JSON.parse(marker.deferred_execute_state).magicContextCoveredHistoryPendingCuts,
+        ).toEqual(["middle"]);
+        closeDatabase();
+        const reopened = openDatabase();
+        expect(
+            truncateUnreachableCompartmentHistory(
+                reopened,
+                "ses-revert",
+                new Set(["old-1", "old-2", "old-3", "old-4", "tail-1"]),
+            ),
+        ).toBe(false);
+        expect(
+            reopened
+                .prepare("SELECT sequence FROM compartments WHERE session_id = 'ses-revert'")
+                .all(),
+        ).toEqual([{ sequence: 1 }]);
+        const after = reopened
+            .prepare(
+                "SELECT deferred_execute_state FROM session_meta WHERE session_id = 'ses-revert'",
+            )
+            .get() as { deferred_execute_state: string };
+        expect(JSON.parse(after.deferred_execute_state)).toEqual({
+            magicContextTokenizerCalibration: { hygieneUnitsVersion: 2 },
+        });
+        clearSession(reopened, "ses-revert");
+        expect(
+            reopened
+                .prepare(
+                    "SELECT deferred_execute_state FROM session_meta WHERE session_id = 'ses-revert'",
+                )
+                .get(),
+        ).toBeNull();
+    });
+
     test("pending drops from the previous branch cannot run after truncation", () => {
         const db = seed();
         db.prepare(
@@ -155,11 +214,32 @@ describe("covered branch ancestry", () => {
                 db,
                 "ses-revert",
                 new Set(["old-1", "old-2", "new-1"]),
+                // The host confirms the omitted endpoints were deleted, rather
+                // than merely hidden by a filtered request window.
+                (id) => id !== "old-3" && id !== "old-4",
             ),
         ).toBe(true);
         expect(
             db.prepare("SELECT sequence FROM compartments WHERE session_id = 'ses-revert'").all(),
         ).toEqual([{ sequence: 1 }]);
+    });
+
+    test("a wire-absent but store-present covered endpoint leaves frozen caches intact", () => {
+        const db = seed();
+        const ids = new Set(["old-1", "old-2", "old-4", "new-1"]);
+        expect(truncateUnreachableCompartmentHistory(db, "ses-revert", ids, () => true)).toBe(
+            false,
+        );
+        expect(
+            db
+                .prepare("SELECT count(*) AS n FROM compartments WHERE session_id = 'ses-revert'")
+                .get(),
+        ).toEqual({ n: 3 });
+        expect(
+            db
+                .prepare("SELECT cached_m0_bytes FROM session_meta WHERE session_id = 'ses-revert'")
+                .get(),
+        ).not.toEqual({ cached_m0_bytes: null });
     });
 
     test("a short visible window ending at an old anchor is not a branch cut", () => {

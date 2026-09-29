@@ -8,17 +8,81 @@ import {
     type Compartment,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
+import { clearIndexedMessagesInTransaction } from "../../features/magic-context/message-index";
 import { clearPendingOps } from "../../features/magic-context/storage-ops";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { canVerifyRawSessionMessageById, hasRawSessionMessageById } from "./read-session-chunk";
 
-/**
- * Find the first compartment whose start or end message ID is no longer on
- * this branch. A host may hide an entire prefix after compaction, so require
- * at least one stored endpoint ID to still occur in the visible messages.
- */
 const ambiguousAncestryLogged = new BoundedSessionMap<boolean>(100);
+const PENDING_CUT_KEY = "magicContextCoveredHistoryPendingCuts";
+
+function readPendingCutRoot(db: Database, sessionId: string): Record<string, unknown> {
+    const row = db
+        .prepare("SELECT deferred_execute_state FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { deferred_execute_state: string | null } | null;
+    if (!row?.deferred_execute_state) return {};
+    try {
+        const parsed: unknown = JSON.parse(row.deferred_execute_state);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : {};
+    } catch {
+        return {};
+    }
+}
+
+function pendingCutIds(root: Record<string, unknown>): string[] {
+    const value = root[PENDING_CUT_KEY];
+    return Array.isArray(value)
+        ? value.filter((id): id is string => typeof id === "string" && id.length > 0)
+        : [];
+}
+
+function recordPendingCoveredCut(db: Database, sessionId: string, messageId: string): void {
+    db.transaction(() => {
+        const root = readPendingCutRoot(db, sessionId);
+        root[PENDING_CUT_KEY] = [...new Set([...pendingCutIds(root), messageId])];
+        db.prepare("UPDATE session_meta SET deferred_execute_state = ? WHERE session_id = ?").run(
+            JSON.stringify(root),
+            sessionId,
+        );
+    }).immediate();
+}
+
+export function consumePendingCoveredCut(db: Database, sessionId: string): boolean {
+    const pending = pendingCutIds(readPendingCutRoot(db, sessionId));
+    if (!pending.length) return false;
+    // A recorded removal is durable evidence; where the raw store is available,
+    // wait until its indexed by-ID lookup confirms that removal was committed.
+    if (
+        canVerifyRawSessionMessageById(sessionId) &&
+        pending.some((id) => hasRawSessionMessageById(sessionId, id))
+    ) {
+        return false;
+    }
+    return truncateWithLease(
+        db,
+        sessionId,
+        (rows) => {
+            const candidates = pending
+                .map((id) => firstRemovedCompartmentAnchor(db, sessionId, id, rows))
+                .filter((sequence): sequence is number => sequence !== null);
+            if (!candidates.length)
+                throw new Error("covered_history_pending_cut_unresolved: source anchor missing");
+            return Math.min(...candidates);
+        },
+        () => {
+            const root = readPendingCutRoot(db, sessionId);
+            delete root[PENDING_CUT_KEY];
+            db.prepare(
+                "UPDATE session_meta SET deferred_execute_state = ? WHERE session_id = ?",
+            ).run(JSON.stringify(root), sessionId);
+            clearIndexedMessagesInTransaction(db, sessionId);
+        },
+    );
+}
 
 function logAmbiguousAncestryOnce(sessionId: string, reason: string): void {
     if (ambiguousAncestryLogged.has(sessionId)) return;
@@ -44,6 +108,11 @@ function hasDivergentSuffix(
     return lastAnchor >= 0 && ids.slice(lastAnchor + 1).some((id) => !storedEndpoints.has(id));
 }
 
+/**
+ * Find the first compartment whose start or end message ID is no longer on
+ * this branch. A host may hide an entire prefix after compaction, so require
+ * at least one stored endpoint ID to still occur in the visible messages.
+ */
 export function firstUnreachableCompartment(
     compartments: readonly { startMessageId: string; endMessageId: string }[],
     reachable: ReadonlySet<string>,
@@ -105,6 +174,7 @@ function truncateWithLease(
     db: Database,
     sessionId: string,
     chooseFirst: (rows: Compartment[]) => number | null,
+    onCut?: () => void,
 ): boolean {
     // A historian holds this session's lease while generating compartments.
     // Once acquired, BEGIN IMMEDIATE re-reads the current rows and deletes them
@@ -122,6 +192,7 @@ function truncateWithLease(
                 const firstSequence = chooseFirst(getCompartments(db, sessionId));
                 if (firstSequence === null) return false;
                 deleteCompartmentSuffixInTransaction(db, sessionId, firstSequence);
+                onCut?.();
                 return true;
             })
             .immediate();
@@ -181,14 +252,24 @@ export function truncateRemovedCompartmentAnchor(
     const chooseFirst = (rows: Compartment[]) =>
         firstRemovedCompartmentAnchor(db, sessionId, removedMessageId, rows);
     if (chooseFirst(getCompartments(db, sessionId)) === null) return false;
-    return truncateWithLease(db, sessionId, chooseFirst);
+    try {
+        return truncateWithLease(db, sessionId, chooseFirst);
+    } catch (error) {
+        if (error instanceof CompartmentTruncationLeaseBusyError) {
+            recordPendingCoveredCut(db, sessionId, removedMessageId);
+        }
+        throw error;
+    }
 }
 
 export function truncateUnreachableCompartmentHistory(
     db: Database,
     sessionId: string,
     reachable: ReadonlySet<string>,
+    hostMessageExists: (id: string) => boolean | null = (id) =>
+        canVerifyRawSessionMessageById(sessionId) ? hasRawSessionMessageById(sessionId, id) : null,
 ): boolean {
+    if (consumePendingCoveredCut(db, sessionId)) return false;
     const rows = getCompartments(db, sessionId);
     if (!rows.length || rows.some((row) => !row.startMessageId || !row.endMessageId)) return false;
     const first = firstUnreachableCompartment(rows, reachable);
@@ -213,10 +294,27 @@ export function truncateUnreachableCompartmentHistory(
         );
         return false;
     }
-    return truncateWithLease(db, sessionId, (currentRows) => {
+    const chooseDeletedRange = (currentRows: Compartment[]): number | null => {
         const current = firstUnreachableCompartment(currentRows, reachable);
-        return current === null || !hasDivergentSuffix(currentRows, reachable)
-            ? null
-            : currentRows[current].sequence;
-    });
+        if (current === null || !hasDivergentSuffix(currentRows, reachable)) return null;
+        const compartment = currentRows[current];
+        // An array omission alone cannot prove undo: filtered and compacted
+        // windows hide messages that remain in the host's authoritative store.
+        const absentEndpoints = [compartment.startMessageId, compartment.endMessageId].filter(
+            (id) => !reachable.has(id),
+        );
+        const existence = absentEndpoints.map(hostMessageExists);
+        if (!existence.includes(false)) {
+            logAmbiguousAncestryOnce(
+                sessionId,
+                existence.includes(true)
+                    ? "an endpoint is absent on the wire but present in the host store"
+                    : "an endpoint is absent on the wire but the host store cannot verify deletion",
+            );
+            return null;
+        }
+        return compartment.sequence;
+    };
+    if (chooseDeletedRange(rows) === null) return false;
+    return truncateWithLease(db, sessionId, chooseDeletedRange);
 }

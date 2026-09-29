@@ -9,6 +9,7 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
+import { setRawMessageProvider } from "./read-session-chunk";
 import { createTransform } from "./transform";
 
 type WireMessage = {
@@ -24,6 +25,7 @@ type WireMessage = {
 };
 const SID = "ses-covered-fold";
 let priorHome: string | undefined;
+let releaseHostStore: (() => void) | undefined;
 let home: string;
 beforeEach(() => {
     priorHome = process.env.XDG_DATA_HOME;
@@ -33,6 +35,8 @@ beforeEach(() => {
     closeDatabase();
 });
 afterEach(() => {
+    releaseHostStore?.();
+    releaseHostStore = undefined;
     closeDatabase();
     if (priorHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = priorHome;
@@ -55,6 +59,10 @@ for (const model of ["claude-opus-5-5", "claude-fable-5-1"]) {
     describe(`covered history first hard fold on ${model}`, () => {
         test("rebuilds both prefix messages, strips signed thinking, and replays the shared prefix after append", async () => {
             const db = openDatabase();
+            releaseHostStore = setRawMessageProvider(SID, {
+                readMessages: () => [],
+                hasMessageById: (id) => id !== "old-4" && id !== "old-5",
+            });
             for (const [sequence, start, end, content] of [
                 [1, "old-1", "old-2", "REACHABLE-OLD-01"],
                 [2, "old-4", "old-5", "UNDONE-OLD-02"],
