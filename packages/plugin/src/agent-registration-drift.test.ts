@@ -278,7 +278,7 @@ describe("hidden-agent registration drift guard", () => {
 
     test("base dreamer (curate) is memory-tool-only and locked", () => {
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual([...DREAMER_CURATE_ALLOWED_TOOLS]);
-        expect(byId(DREAMER_AGENT)?.allowedTools).toEqual(["ctx_memory", "ctx_memory_list"]);
+        expect(byId(DREAMER_AGENT)?.allowedTools).toEqual(["ctx_memory"]);
         expect(byId(DREAMER_AGENT)?.lockPermissions).toBe(true);
         expect(byId(DREAMER_AGENT)?.maxSteps).toBe(150);
     });

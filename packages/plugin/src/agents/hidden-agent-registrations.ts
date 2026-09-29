@@ -102,15 +102,15 @@ export function buildHiddenAgentRegistrations(args: {
             hidden: true,
             description: HIDDEN_AGENT_DESCRIPTION,
             prompt: args.dreamerPrompt,
-            // CURATE-ONLY now. Curate edits through ctx_memory and enumerates through
-            // ctx_memory_list; it never reads code because a separate verify task
+            // Curate receives its category snapshot in the first message and edits
+            // through ctx_memory; it never reads code because a separate verify task
             // owns memory-vs-code correctness. No former bash/write/edit/read/aft/
             // ctx_search/ctx_note surface remains. maintain-docs
             // and review-user-memories moved to their own scoped agents below.
             // (Inline literal — kept byte-identical to DREAMER_CURATE_ALLOWED_TOOLS
             // by agent-registration-drift.test.ts; see the module header for why
             // these are not const imports.)
-            allowedTools: ["ctx_memory", "ctx_memory_list"],
+            allowedTools: ["ctx_memory"],
             // Curate is a genuine multi-step whole-pool hygiene loop, so it keeps a
             // high cap.
             maxSteps: 150,

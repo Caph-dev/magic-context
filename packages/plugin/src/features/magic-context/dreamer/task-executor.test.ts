@@ -70,6 +70,7 @@ function curateToolMessages(
     calls: Array<{
         action: string;
         status: "completed" | "pending" | "error";
+        output?: string;
     }>,
     text?: string,
     finish = "stop",
@@ -85,7 +86,20 @@ function curateToolMessages(
                     state: {
                         status: call.status,
                         input: { action: call.action },
-                        ...(call.status === "completed" ? { output: "memory updated" } : {}),
+                        ...(call.status === "completed"
+                            ? {
+                                  output:
+                                      call.output ??
+                                      (
+                                          {
+                                              merge: "Merged memories [1, 2]",
+                                              archive: "Archived memory [ID: 1]",
+                                              update: "Updated memory [ID: 1]",
+                                          } as Record<string, string>
+                                      )[call.action] ??
+                                      "read memory",
+                              }
+                            : {}),
                         ...(call.status === "error" ? { error: "tool failed" } : {}),
                     },
                 })),
@@ -117,6 +131,53 @@ arguments:
 {"action":"archive","reason":"与全局用户画像重复","ids":[6]}`;
 
 describe("createDreamTaskExecutor — curate", () => {
+    test("drives separate children for category snapshot chunks", async () => {
+        db = freshDb();
+        const project = "/repo/chunked-curate";
+        for (let i = 0; i < 3; i++)
+            insertMemory(db, {
+                projectPath: project,
+                category: "PROJECT_RULES",
+                content: `Rule ${i}: ${"meaningful context ".repeat(170)}`,
+            });
+        const prompts: string[] = [];
+        let children = 0;
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: `child-${++children}` } })),
+                prompt: mock(async (args: { body: { parts: Array<{ text: string }> } }) => {
+                    prompts.push(args.body.parts[0].text);
+                    return {};
+                }),
+                messages: mock(async () => ({
+                    data: assistantMessages("No duplicates in this snapshot."),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            resolveRetrospectiveUsableInputTokens: () => 2000,
+        });
+        const result = await executor(
+            { task: "curate", schedule: "0 4 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-chunk",
+                leaseKey: leaseKeyFor("curate", project),
+            },
+        );
+        expect(result.status).toBe("completed");
+        expect(children).toBe(3);
+        expect(prompts).toHaveLength(3);
+        expect(prompts.every((prompt) => (prompt.match(/Content: Rule/g) ?? []).length === 1)).toBe(
+            true,
+        );
+    });
     test("archives an unsettled child through a detached final-part write, then the age gate sweeps it", async () => {
         db = freshDb();
         const project = "/repo/detached-writer";
@@ -517,6 +578,9 @@ describe("createDreamTaskExecutor — curate", () => {
                     data: curateToolMessages([
                         { action: "merge", status: "completed" },
                         { action: "archive", status: "completed" },
+                        { action: "get", status: "completed" },
+                        { action: "list", status: "completed" },
+                        { action: "update", status: "completed", output: "Error: unsafe" },
                     ]),
                 })),
                 delete: mock(async () => ({})),
