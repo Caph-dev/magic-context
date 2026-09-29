@@ -103,6 +103,46 @@ describe("ensureProjectRegisteredFromOpenCodeDirectory", () => {
         expect(snapshot?.runtimeFingerprint).not.toStartWith("observation:");
     });
 
+    it("keeps repeated registration read-only and observes a changed config file", async () => {
+        const projectDir = tempDir("mc-registration-read-");
+        process.env.HOME = tempDir("mc-registration-home-");
+        const configHome = tempDir("mc-registration-config-");
+        process.env.XDG_CONFIG_HOME = configHome;
+        process.env.XDG_DATA_HOME = tempDir("mc-registration-data-");
+        writeUserConfig(configHome, {
+            embedding: {
+                provider: "openai-compatible",
+                model: "first",
+                endpoint: "http://127.0.0.1:9/v1",
+            },
+        });
+        const db = openDatabase();
+        const identity = resolveProjectIdentity(projectDir);
+        await ensureProjectRegisteredFromOpenCodeDirectory(projectDir, db);
+        const first = getProjectEmbeddingSnapshot(identity);
+        const changes = (db.prepare("SELECT total_changes() AS count").get() as { count: number })
+            .count;
+        for (let i = 0; i < 4; i++)
+            await ensureProjectRegisteredFromOpenCodeDirectory(projectDir, db);
+        expect(
+            (db.prepare("SELECT total_changes() AS count").get() as { count: number }).count,
+        ).toBe(changes);
+        expect(getProjectEmbeddingSnapshot(identity)?.runtimeFingerprint).toBe(
+            first?.runtimeFingerprint,
+        );
+        writeUserConfig(configHome, {
+            embedding: {
+                provider: "openai-compatible",
+                model: "second-longer",
+                endpoint: "http://127.0.0.1:9/v1",
+            },
+        });
+        await ensureProjectRegisteredFromOpenCodeDirectory(projectDir, db);
+        expect(getProjectEmbeddingSnapshot(identity)?.runtimeFingerprint).not.toBe(
+            first?.runtimeFingerprint,
+        );
+    });
+
     it("retires a disabled shadow without removing the primary lane", async () => {
         const projectDir = tempDir("mc-shadow-disable-");
         process.env.HOME = tempDir("mc-shadow-disable-home-");

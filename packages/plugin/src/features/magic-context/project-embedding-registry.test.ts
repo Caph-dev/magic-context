@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -56,7 +56,12 @@ import {
     TestProviderFactoryRequiredError,
     unregisterProjectShadowEmbedding,
 } from "./project-embedding-registry";
-import { recordSessionProjectIdentity } from "./session-project-storage";
+import {
+    hasMisScopedCompartmentChunkEmbeddingsForProject,
+    MIS_SCOPED_PROJECT_CHUNK_IDS_SQL,
+    recordSessionProjectIdentity,
+    repairMisScopedCompartmentChunkEmbeddingsForProject,
+} from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
 import { beginSynapseBatchLedger } from "./storage-embedding-measurements";
 
@@ -1485,6 +1490,51 @@ describe("project embedding registry", () => {
                 currentChunkModelId("git:project-a"),
             ),
         ).toHaveLength(0);
+    });
+
+    it("registers a current identity by reading and probes repairs through project indexes", () => {
+        const db = useTempDb();
+        const identity = "git:repair-read";
+        const config = localConfig("test-model");
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const prepare = spyOn(db, "prepare");
+        registerProjectEmbedding(db, identity, config, features, "/tmp/repair-read");
+        expect(
+            prepare.mock.calls.filter(([sql]) =>
+                String(sql).startsWith("UPDATE compartment_chunk_embeddings"),
+            ),
+        ).toHaveLength(0);
+        prepare.mockRestore();
+        const before = (db.prepare("SELECT total_changes() AS count").get() as { count: number })
+            .count;
+        for (let i = 0; i < 4; i++)
+            registerProjectEmbedding(db, identity, config, features, "/tmp/repair-read");
+        expect(
+            (db.prepare("SELECT total_changes() AS count").get() as { count: number }).count,
+        ).toBe(before);
+        expect(hasMisScopedCompartmentChunkEmbeddingsForProject(db, identity)).toBe(false);
+        expect(repairMisScopedCompartmentChunkEmbeddingsForProject(db, identity)).toBe(0);
+        const plan = db
+            .prepare(
+                `EXPLAIN QUERY PLAN SELECT 1 FROM (${MIS_SCOPED_PROJECT_CHUNK_IDS_SQL}) LIMIT 1`,
+            )
+            .all(identity, identity) as Array<{ detail: string }>;
+        expect(plan.some((row) => row.detail.includes("idx_cce_project_model"))).toBe(true);
+        expect(plan.some((row) => row.detail.includes("idx_session_projects_project"))).toBe(true);
+        expect(plan.some((row) => row.detail.includes("SCAN compartment_chunk_embeddings"))).toBe(
+            false,
+        );
+        const oldPlan = db
+            .prepare(`EXPLAIN QUERY PLAN SELECT id FROM compartment_chunk_embeddings
+            WHERE EXISTS (SELECT 1 FROM session_projects sp
+                WHERE sp.session_id = compartment_chunk_embeddings.session_id
+                AND sp.harness = compartment_chunk_embeddings.harness
+                AND sp.project_path <> compartment_chunk_embeddings.project_path
+                AND (sp.project_path = ? OR compartment_chunk_embeddings.project_path = ?))`)
+            .all(identity, identity) as Array<{ detail: string }>;
+        expect(
+            oldPlan.some((row) => row.detail.includes("SCAN compartment_chunk_embeddings")),
+        ).toBe(true);
     });
 
     it("repairs chunk rows stamped with a different project than their session owner", async () => {
