@@ -44,9 +44,13 @@ export function createDreamerOutputCapSampler<T extends MagicContextConfig>(
             input: { sessionID: string; agent: string },
             output: { maxOutputTokens: number | undefined },
         ) {
+            // An unset cap must leave the host's own output limit in place. Writing
+            // `undefined` over it removes the limit OpenCode computed from the model,
+            // and some providers then send no usable max_tokens (a local Anthropic-
+            // compatible server answered every historian run with zero output).
             if (input.agent.startsWith("historian")) {
                 const historian = historianCaps.get(input.sessionID);
-                if (historian) output.maxOutputTokens = historian.value;
+                if (historian?.value !== undefined) output.maxOutputTokens = historian.value;
                 return;
             }
             if (
@@ -60,7 +64,7 @@ export function createDreamerOutputCapSampler<T extends MagicContextConfig>(
                 cap = { value: dreamerRunConfig(boot, fresh()).dreamer?.maxTokens };
                 caps.set(input.sessionID, cap);
             }
-            output.maxOutputTokens = cap.value;
+            if (cap.value !== undefined) output.maxOutputTokens = cap.value;
         },
         delete(sessionId: string) {
             caps.delete(sessionId);

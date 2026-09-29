@@ -73,3 +73,29 @@ test("OpenCode 1 historian keeps the sampled reserve and child output cap", () =
     sampler.delete("hist-a");
     sampler.delete("hist-b");
 });
+
+test("an unset cap leaves the host's own output limit untouched", () => {
+    // OpenCode computes maxOutputTokens from the model before chat.params runs.
+    // With no historian.maxTokens or dreamer.maxTokens configured, the hook must
+    // not overwrite that value with undefined.
+    const config = MagicContextConfigSchema.parse({});
+    const sampler = createDreamerOutputCapSampler(config, () => config);
+
+    const historianOutput = { maxOutputTokens: 32_000 as number | undefined };
+    rememberHistorianOutputCap("hist-unset", config.historian?.maxTokens);
+    sampler.apply({ sessionID: "hist-unset", agent: "historian" }, historianOutput);
+    expect(historianOutput.maxOutputTokens).toBe(32_000);
+
+    const editorOutput = { maxOutputTokens: 32_000 as number | undefined };
+    rememberHistorianOutputCap("editor-unset", undefined);
+    sampler.apply({ sessionID: "editor-unset", agent: "historian-editor" }, editorOutput);
+    expect(editorOutput.maxOutputTokens).toBe(32_000);
+
+    const dreamerOutput = { maxOutputTokens: 16_000 as number | undefined };
+    sampler.apply({ sessionID: "dream-unset", agent: "dreamer-classifier" }, dreamerOutput);
+    expect(dreamerOutput.maxOutputTokens).toBe(16_000);
+
+    sampler.delete("hist-unset");
+    sampler.delete("editor-unset");
+    sampler.delete("dream-unset");
+});
