@@ -109,6 +109,8 @@ const samples: {
 const turns: { index: number; phase: string; ms: number; result: string }[] =
 	[];
 const dbPath = join(storage, "context.db");
+// A fresh store has every migration pending; host startup creates it without prewarming.
+const toolCalls: { index: number; issued: boolean; outcome: string }[] = [];
 let lock: Database | undefined;
 let paused = false;
 const version = execFileSync(process.env.MC_E2E_OPENCODE2_CLI!, ["--version"], {
@@ -137,6 +139,35 @@ try {
 				memory: { enabled: false },
 			},
 		});
+		if (index < 7) {
+			const call = { index, issued: false, outcome: "not started" };
+			toolCalls.push(call);
+			host.mock.addMatcher((body) => {
+				const wire = JSON.stringify(body);
+				if (
+					call.issued ||
+					!wire.includes("write a note for issue 554 locked") ||
+					!wire.includes('"name":"ctx_note"')
+				)
+					return null;
+				call.issued = true;
+				return {
+					openaiOutput: [
+						{
+							type: "function_call",
+							id: `fc_554_${index}`,
+							call_id: `call_554_${index}`,
+							name: "ctx_note",
+							arguments: JSON.stringify({
+								action: "write",
+								content: `Issue 554 note ${index}`,
+							}),
+						},
+					],
+					usage: { input_tokens: 100, output_tokens: 10 },
+				};
+			});
+		}
 		hosts.push(host);
 	}
 	const auth = (host: (typeof hosts)[number]) => ({
@@ -163,7 +194,10 @@ try {
 				try {
 					await client.session.prompt({
 						sessionID: sessions[i],
-						text: `issue 554 ${phase} ${Date.now()}`,
+						text:
+							phase === "locked"
+								? `write a note for issue 554 locked ${Date.now()}`
+								: `issue 554 ${phase} ${Date.now()}`,
 					});
 					turns.push({
 						index: i,
@@ -218,10 +252,10 @@ try {
 	const steadyTurn = drive("steady");
 	await poll("steady", 10);
 	await steadyTurn;
-	hosts.forEach((host) => process.kill(host.pid!, "SIGSTOP"));
+	hosts.forEach((host) => { process.kill(host.pid!, "SIGSTOP"); });
 	paused = true;
 	await poll("stopped", 30);
-	hosts.forEach((host) => process.kill(host.pid!, "SIGCONT"));
+	hosts.forEach((host) => { process.kill(host.pid!, "SIGCONT"); });
 	paused = false;
 	const wakeTurn = drive("wake");
 	await poll("wake", 10);
@@ -235,6 +269,19 @@ try {
 	lock = undefined;
 	await poll("released", 7);
 	await Promise.race([lockTurn, Bun.sleep(12000)]);
+	await Promise.all(
+		toolCalls.map(async (call) => {
+			try {
+				await clients[call.index].session.wait(
+					{ sessionID: sessions[call.index] },
+					{ signal: AbortSignal.timeout(30000) },
+				);
+				call.outcome = call.issued ? "completed" : "not issued";
+			} catch (error) {
+				call.outcome = String(error);
+			}
+		}),
+	);
 	const openPaths = hosts.map((host) => ({
 		pid: host.pid,
 		dbs: execFileSync("lsof", ["-p", String(host.pid), "-Fn"], {
@@ -282,6 +329,27 @@ try {
 				.filter(Boolean)
 				.map((line) => JSON.parse(line))
 		: [];
+	const migrationReader = new Database(dbPath, { readonly: true });
+	const startupMigration = migrationReader
+		.prepare("SELECT MAX(version) AS version FROM schema_migrations")
+		.get();
+	for (const call of toolCalls) {
+		if (call.outcome === "completed") {
+			const row = migrationReader
+				.prepare("SELECT COUNT(*) AS count FROM notes WHERE content = ?")
+				.get(`Issue 554 note ${call.index}`) as { count: number };
+			call.outcome = row.count === 1 ? "persisted" : "missing write";
+		}
+	}
+	migrationReader.close();
+	const lockedTurnOutcomes = hosts.map((_, index) => ({
+		index,
+		outcome: hostLogs[index].stderr.includes("lkg_replay_served")
+			? "LKG"
+			: hostLogs[index].stderr.includes("refuseIfUnsafe")
+				? "refused"
+				: "normal",
+	}));
 	const evidence = {
 		root,
 		version,
@@ -290,6 +358,9 @@ try {
 		hostPids: hosts.map((host) => host.pid),
 		phases,
 		turns,
+		toolCalls,
+		lockedTurnOutcomes,
+		startupMigration,
 		openPaths,
 		samples,
 		hostLogs,
@@ -306,6 +377,9 @@ try {
 			version,
 			phases,
 			turns,
+			toolCalls,
+			lockedTurnOutcomes,
+			startupMigration: evidence.startupMigration,
 			heartbeat: evidence.heartbeat.length,
 			openPaths,
 		}),

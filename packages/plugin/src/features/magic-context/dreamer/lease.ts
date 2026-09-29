@@ -1,4 +1,4 @@
-import type { Database } from "../../../shared/sqlite";
+import { type Database, withSqliteBackgroundWriter } from "../../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../../shared/write-transaction-timing";
 import { deleteDreamState, getDreamState, setDreamState } from "./storage-dream-state";
 
@@ -314,7 +314,9 @@ export function startLeaseHeartbeat(
     // same lease key.
     beat();
 
-    const timer = lost ? undefined : setInterval(beat, intervalMs);
+    const timer = lost
+        ? undefined
+        : setInterval(() => withSqliteBackgroundWriter(beat), intervalMs);
     return {
         stop: () => {
             if (timer) clearInterval(timer);

@@ -60,7 +60,7 @@ import * as logger from "../../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { createPromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
-import { Database, withPrivilegedWriter } from "../../shared/sqlite";
+import { Database, withAsyncPrivilegedWriter, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
@@ -6778,7 +6778,7 @@ describe("Rust stalled transform probe", () => {
             });
         });
 
-    it("direct Rust entry grants acquisition retries to the awaited pass", async () => {
+    it("direct Rust entry yields during async writer acquisition before invoking the callback", async () => {
         const sessionId = `rust-foreground-scope-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -6792,13 +6792,12 @@ describe("Rust stalled transform probe", () => {
                 throw Object.assign(new Error("busy"), { code: "SQLITE_BUSY" });
             return exec(sql);
         });
-        const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) => {
                 if (method !== "transform") return { ok: true };
                 injecting = true;
                 try {
-                    withPrivilegedWriter(db, () => {
+                    await withAsyncPrivilegedWriter(db, () => {
                         callbacks++;
                     });
                 } finally {
@@ -6826,7 +6825,6 @@ describe("Rust stalled transform probe", () => {
             expect(JSON.stringify(output.messages)).toContain("scoped result");
         } finally {
             intercepted.mockRestore();
-            wait.mockRestore();
         }
     });
 
