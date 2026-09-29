@@ -1,8 +1,14 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+    acquireCompartmentLease,
+    releaseCompartmentLease,
+} from "../../features/magic-context/compartment-lease";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
+import { getPendingOps, queuePendingOp } from "../../features/magic-context/storage-ops";
+import * as logger from "../../shared/logger";
 import {
     firstUnreachableCompartment,
     truncateRemovedCompartmentAnchor,
@@ -96,6 +102,35 @@ describe("covered branch ancestry", () => {
         ).toEqual({ cached_m0_bytes: null, cached_m1_bytes: null });
     });
 
+    test("truncation refuses an active historian lease and preserves all rows until retry", () => {
+        const db = seed();
+        expect(acquireCompartmentLease(db, "ses-revert", "historian-holder")).not.toBeNull();
+        expect(() => truncateRemovedCompartmentAnchor(db, "ses-revert", "old-3")).toThrow(
+            "compartment_truncation_lease_busy",
+        );
+        expect(
+            db
+                .prepare("SELECT count(*) AS n FROM compartments WHERE session_id = 'ses-revert'")
+                .get(),
+        ).toEqual({ n: 3 });
+        releaseCompartmentLease(db, "ses-revert", "historian-holder");
+        expect(truncateRemovedCompartmentAnchor(db, "ses-revert", "old-3")).toBe(true);
+        expect(
+            db.prepare("SELECT sequence FROM compartments WHERE session_id = 'ses-revert'").all(),
+        ).toEqual([{ sequence: 1 }]);
+    });
+
+    test("pending drops from the previous branch cannot run after truncation", () => {
+        const db = seed();
+        db.prepare(
+            "INSERT INTO tags (session_id, message_id, type, tag_number) VALUES ('ses-revert', 'old-3', 'text', 42)",
+        ).run();
+        queuePendingOp(db, "ses-revert", 42, "drop");
+        expect(getPendingOps(db, "ses-revert")).toHaveLength(1);
+        expect(truncateRemovedCompartmentAnchor(db, "ses-revert", "old-3")).toBe(true);
+        expect(getPendingOps(db, "ses-revert")).toEqual([]);
+    });
+
     test("removing an indexed interior ID uses anchored lineage, not ordinal alone", () => {
         const db = seed();
         for (const [id, ordinal] of [
@@ -146,6 +181,26 @@ describe("covered branch ancestry", () => {
                 .prepare("SELECT cached_m0_bytes FROM session_meta WHERE session_id = 'ses-revert'")
                 .get(),
         ).not.toEqual({ cached_m0_bytes: null });
+    });
+
+    test("missing ancestry logs once per session without deleting stored history", () => {
+        const db = seed();
+        db.prepare(
+            "UPDATE compartments SET session_id = 'ses-no-anchor' WHERE session_id = 'ses-revert'",
+        ).run();
+        const log = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const visible = new Set(["compaction-summary", "new-1"]);
+            expect(truncateUnreachableCompartmentHistory(db, "ses-no-anchor", visible)).toBe(false);
+            expect(truncateUnreachableCompartmentHistory(db, "ses-no-anchor", visible)).toBe(false);
+            expect(
+                log.mock.calls.filter(([, text]) =>
+                    String(text).includes("covered history ancestry unknown"),
+                ),
+            ).toHaveLength(1);
+        } finally {
+            log.mockRestore();
+        }
     });
 
     test("ordinary tail removal does not truncate or bust the frozen baseline", () => {

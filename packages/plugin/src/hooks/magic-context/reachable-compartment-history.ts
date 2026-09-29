@@ -1,4 +1,16 @@
-import { getCompartments } from "../../features/magic-context/compartment-storage";
+import { randomUUID } from "node:crypto";
+import {
+    acquireCompartmentLease,
+    isCompartmentLeaseHeld,
+    releaseCompartmentLeaseBestEffort,
+} from "../../features/magic-context/compartment-lease";
+import {
+    type Compartment,
+    getCompartments,
+} from "../../features/magic-context/compartment-storage";
+import { clearPendingOps } from "../../features/magic-context/storage-ops";
+import { BoundedSessionMap } from "../../shared/bounded-session-map";
+import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 
 /**
@@ -6,6 +18,8 @@ import type { Database } from "../../shared/sqlite";
  * this branch. A host may hide an entire prefix after compaction, so require
  * at least one stored endpoint ID to still occur in the visible messages.
  */
+const noCommonAnchorLogged = new BoundedSessionMap<boolean>(100);
+
 export function firstUnreachableCompartment(
     compartments: readonly { startMessageId: string; endMessageId: string }[],
     reachable: ReadonlySet<string>,
@@ -27,42 +41,77 @@ export function firstUnreachableCompartment(
  * transaction so readers never see a partial deletion. Project-wide memories
  * previously extracted from these compartments remain untouched.
  */
-export function truncateCompartmentHistory(
+function deleteCompartmentSuffixInTransaction(
     db: Database,
     sessionId: string,
     firstSequence: number,
 ): void {
-    db.transaction(() => {
-        const first = db
-            .prepare("SELECT id FROM compartments WHERE session_id = ? AND sequence >= ? LIMIT 1")
-            .get(sessionId, firstSequence);
-        if (!first) return;
-        db.prepare(
-            "DELETE FROM compartment_events WHERE session_id = ? AND (compartment_id IN (SELECT id FROM compartments WHERE session_id = ? AND sequence >= ?) OR at_compartment >= ?)",
-        ).run(sessionId, sessionId, firstSequence, firstSequence);
-        db.prepare(
-            "DELETE FROM compartment_chunk_embeddings WHERE session_id = ? AND compartment_id IN (SELECT id FROM compartments WHERE session_id = ? AND sequence >= ?)",
-        ).run(sessionId, sessionId, firstSequence);
-        db.prepare("DELETE FROM compartments WHERE session_id = ? AND sequence >= ?").run(
-            sessionId,
-            firstSequence,
-        );
-        db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
-        db.prepare(`UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL,
+    db.prepare(
+        "DELETE FROM compartment_events WHERE session_id = ? AND (compartment_id IN (SELECT id FROM compartments WHERE session_id = ? AND sequence >= ?) OR at_compartment >= ?)",
+    ).run(sessionId, sessionId, firstSequence, firstSequence);
+    db.prepare(
+        "DELETE FROM compartment_chunk_embeddings WHERE session_id = ? AND compartment_id IN (SELECT id FROM compartments WHERE session_id = ? AND sequence >= ?)",
+    ).run(sessionId, sessionId, firstSequence);
+    db.prepare("DELETE FROM compartments WHERE session_id = ? AND sequence >= ?").run(
+        sessionId,
+        firstSequence,
+    );
+    db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
+    // Pending drops name numbered tags on messages from the old conversation.
+    // Their targets cannot be trusted after those messages are removed.
+    clearPendingOps(db, sessionId);
+    db.prepare(`UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL,
             cached_m0_last_baseline_end_message_id = NULL, memory_block_cache = '',
             cached_m0_max_compartment_seq = NULL, prior_boundary_ordinal = 1,
             compaction_marker_state = '', compaction_marker_target_end_message_id = NULL,
             pending_compaction_marker_state = NULL, compartment_in_progress = 0
             WHERE session_id = ?`).run(sessionId);
-    }).immediate();
 }
 
-export function truncateRemovedCompartmentAnchor(
+export class CompartmentTruncationLeaseBusyError extends Error {
+    constructor() {
+        super(
+            "compartment_truncation_lease_busy: historian publication must finish before history is cut",
+        );
+        this.name = "CompartmentTruncationLeaseBusyError";
+    }
+}
+
+function truncateWithLease(
+    db: Database,
+    sessionId: string,
+    chooseFirst: (rows: Compartment[]) => number | null,
+): boolean {
+    // A historian holds this session's lease while generating compartments.
+    // Once acquired, BEGIN IMMEDIATE re-reads the current rows and deletes them
+    // under one write lock, so a second connection cannot publish between them.
+    const holderId = randomUUID();
+    if (!acquireCompartmentLease(db, sessionId, holderId)) {
+        throw new CompartmentTruncationLeaseBusyError();
+    }
+    try {
+        return db
+            .transaction(() => {
+                if (!isCompartmentLeaseHeld(db, sessionId, holderId)) {
+                    throw new CompartmentTruncationLeaseBusyError();
+                }
+                const firstSequence = chooseFirst(getCompartments(db, sessionId));
+                if (firstSequence === null) return false;
+                deleteCompartmentSuffixInTransaction(db, sessionId, firstSequence);
+                return true;
+            })
+            .immediate();
+    } finally {
+        releaseCompartmentLeaseBestEffort(db, sessionId, holderId);
+    }
+}
+
+function firstRemovedCompartmentAnchor(
     db: Database,
     sessionId: string,
     removedMessageId: string,
-): boolean {
-    const rows = getCompartments(db, sessionId);
+    rows: Compartment[],
+): number | null {
     const endpoint = rows.find(
         (row) => row.startMessageId === removedMessageId || row.endMessageId === removedMessageId,
     );
@@ -97,9 +146,18 @@ export function truncateRemovedCompartmentAnchor(
                   );
               })
             : undefined);
-    if (!first) return false;
-    truncateCompartmentHistory(db, sessionId, first.sequence);
-    return true;
+    return first?.sequence ?? null;
+}
+
+export function truncateRemovedCompartmentAnchor(
+    db: Database,
+    sessionId: string,
+    removedMessageId: string,
+): boolean {
+    const chooseFirst = (rows: Compartment[]) =>
+        firstRemovedCompartmentAnchor(db, sessionId, removedMessageId, rows);
+    if (chooseFirst(getCompartments(db, sessionId)) === null) return false;
+    return truncateWithLease(db, sessionId, chooseFirst);
 }
 
 export function truncateUnreachableCompartmentHistory(
@@ -111,11 +169,23 @@ export function truncateUnreachableCompartmentHistory(
     if (!rows.length || rows.some((row) => !row.startMessageId || !row.endMessageId)) return false;
     const first = firstUnreachableCompartment(rows, reachable);
     if (first === null) {
-        // Compaction or a pending summary may hide every stored endpoint from
-        // this array without deleting its messages. There is no shared ID to
-        // establish which stored range was removed.
+        if (
+            reachable.size > 0 &&
+            !rows.some(
+                (row) => reachable.has(row.startMessageId) || reachable.has(row.endMessageId),
+            ) &&
+            !noCommonAnchorLogged.has(sessionId)
+        ) {
+            noCommonAnchorLogged.set(sessionId, true);
+            sessionLog(
+                sessionId,
+                "covered history ancestry unknown: no stored endpoint ID on visible branch; compaction or a pending summary may hide the prefix, leaving compartments unchanged",
+            );
+        }
         return false;
     }
-    truncateCompartmentHistory(db, sessionId, rows[first].sequence);
-    return true;
+    return truncateWithLease(db, sessionId, (currentRows) => {
+        const current = firstUnreachableCompartment(currentRows, reachable);
+        return current === null ? null : currentRows[current].sequence;
+    });
 }
