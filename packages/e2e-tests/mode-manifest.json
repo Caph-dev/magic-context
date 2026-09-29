@@ -2415,6 +2415,21 @@
             ]
         },
         {
+            "path": "tests/dreamer-token-budget-oc1.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "the dreamer token budget on a real OpenCode 1.18.30 host: aborting at the soft limit keeps the tools array byte-identical, the finalize turn banks its manifest, a later tool call is refused, and the hard stop records token_budget (MC-D11); opt-in with MC_E2E_OC1_BUDGET_PROBE=1, so it runs by hand outside the mode lanes",
+            "contract_refs": [
+                "DREAMER-TIMEOUTS"
+            ],
+            "hosts": [
+                "opencode"
+            ]
+        },
+        {
             "path": "tests/dreamer-verify-slice-authority.test.ts",
             "tier": "excluded",
             "invocation": {
