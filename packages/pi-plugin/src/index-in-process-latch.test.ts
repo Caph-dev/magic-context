@@ -419,7 +419,7 @@ describe("Pi in-process child guard (#247)", () => {
 					const child = spawn(
 						process.execPath,
 						["-e", "setInterval(() => {}, 1000)"],
-						{ stdio: "ignore" },
+						{ stdio: "ignore", windowsHide: true },
 					);
 					children.add(child);
 					childPid = child.pid ?? 0;
@@ -517,7 +517,9 @@ describe("Pi in-process child guard (#247)", () => {
 			);
 			await awaitInFlightHistorians(sessionId);
 			expect(() =>
-				execFileSync("ps", ["-p", String(pid), "-o", "pid="]),
+				execFileSync("ps", ["-p", String(pid), "-o", "pid="], {
+					windowsHide: true,
+				}),
 			).toThrow();
 			expect(
 				acquireCompartmentLease(db, sessionId, "next-process"),

@@ -7,7 +7,12 @@ import { isSentinel, makeSentinel, makeWholeMessageSentinel } from "./sentinel";
 import { stripWellFormedLeadingTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 
-const DROPPED_PLACEHOLDER_PATTERN = /^\[dropped §\d+§\]$/;
+const MARKER_ONLY_PATTERN = /^(?:(?:§\d+§|\[dropped(?: §\d+§)?\]|\[cleared\])\s*)+$/;
+
+export function isMarkerOnlyText(text: string): boolean {
+    const trimmed = text.trim();
+    return trimmed.length > 0 && MARKER_ONLY_PATTERN.test(trimmed);
+}
 const TAG_PREFIX_PATTERN = /^§\d+§\s*/;
 
 // Patterns that identify system-injected messages (notifications, reminders, etc.)
@@ -186,7 +191,10 @@ export function stripDroppedPlaceholderMessages(
         let hasNonDroppedContent = false;
 
         for (const part of msg.parts) {
-            if (!isRecord(part)) continue;
+            if (!isRecord(part)) {
+                hasNonDroppedContent = true;
+                break;
+            }
             const partType = part.type as string;
 
             // Skip metadata parts — they don't reach the model
@@ -198,40 +206,15 @@ export function stripDroppedPlaceholderMessages(
                 break;
             }
 
-            // Text parts: check if they're only dropped placeholders
-            if (partType === "text" && typeof part.text === "string") {
+            // Blank parts and complete markers both qualify; the sentinel below uses
+            // empty text only for Anthropic and [dropped] for other providers.
+            if (
+                (partType === "text" || partType === "reasoning") &&
+                typeof part.text === "string"
+            ) {
                 hasContentPart = true;
-                const trimmed = part.text.trim();
-                if (trimmed.length === 0) continue;
-                if (!trimmed.includes("[dropped §")) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                const allSegmentsDropped = trimmed
-                    .split(/(?=\[dropped §)/)
-                    .filter((s) => s.trim().length > 0)
-                    .every((segment) => DROPPED_PLACEHOLDER_PATTERN.test(segment.trim()));
-                if (!allSegmentsDropped) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                continue;
-            }
-
-            // Reasoning parts: check similarly
-            if (partType === "reasoning" && typeof part.text === "string") {
-                hasContentPart = true;
-                const trimmed = part.text.trim();
-                if (trimmed.length === 0) continue;
-                if (!trimmed.includes("[dropped §")) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                const allSegmentsDropped = trimmed
-                    .split(/(?=\[dropped §)/)
-                    .filter((s) => s.trim().length > 0)
-                    .every((segment) => DROPPED_PLACEHOLDER_PATTERN.test(segment.trim()));
-                if (!allSegmentsDropped) {
+                if (part.text.trim().length === 0) continue;
+                if (!isMarkerOnlyText(part.text)) {
                     hasNonDroppedContent = true;
                     break;
                 }

@@ -19,6 +19,10 @@ type KnownSlot = {
  * a negative cache cannot quietly become permanent.
  */
 const KNOWN_SLOTS: Record<string, KnownSlot> = {
+    "packages/pi-plugin/src/index.ts:databaseExitHookRegistered": {
+        classification: "PUBLICATION",
+        reason: "Correct: records that the one process-exit handler closing the shared database is installed, so /reload doesn't register a second one; it holds no failure or absence verdict.",
+    },
     "packages/plugin/src/features/magic-context/compaction-marker.ts:cachedSchemaCompatible": {
         classification: "VERDICT",
         reason: "DEFECT: a transient PRAGMA/read failure is cached as incompatible until the writable DB is closed.",

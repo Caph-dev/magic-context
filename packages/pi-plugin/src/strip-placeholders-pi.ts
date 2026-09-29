@@ -23,19 +23,12 @@ import {
 import { sessionLog } from "@magic-context/core/shared/logger";
 import { resolvePiStableId } from "./read-session-pi";
 
-const DROPPED_SEGMENT_PATTERN = /^\[dropped(?: §[^§]+§)?\]$/;
+const MARKER_ONLY_PATTERN =
+	/^(?:(?:§\d+§|\[dropped(?: §\d+§)?\]|\[cleared\])\s*)+$/;
 
-function isDroppedOnlyText(text: string): boolean {
+export function isPiMarkerOnlyText(text: string): boolean {
 	const trimmed = text.trim();
-	if (trimmed.length === 0) return true;
-	const segments = trimmed
-		.split(/(?=\[dropped(?: §[^§]+§)?\])/)
-		.map((segment) => segment.trim())
-		.filter((segment) => segment.length > 0);
-	return (
-		segments.length > 0 &&
-		segments.every((s) => DROPPED_SEGMENT_PATTERN.test(s))
-	);
+	return trimmed.length > 0 && MARKER_ONLY_PATTERN.test(trimmed);
 }
 
 function messageIsPlaceholderOnly(message: unknown): boolean {
@@ -51,18 +44,20 @@ function messageIsPlaceholderOnly(message: unknown): boolean {
 	// entries here — never all-[dropped] — making this a safe parity guard.
 	if (msg.role !== "assistant") return false;
 
-	if (typeof msg.content === "string") return isDroppedOnlyText(msg.content);
+	if (typeof msg.content === "string")
+		return msg.content.trim().length === 0 || isPiMarkerOnlyText(msg.content);
 	if (!Array.isArray(msg.content)) return false;
 	if (msg.content.length === 0) return false;
 
 	let sawVisibleContent = false;
 	for (const part of msg.content) {
 		if (!part || typeof part !== "object") return false;
-		const p = part as { type?: unknown; text?: unknown };
-		if (p.type !== "text") return false;
-		if (typeof p.text !== "string") return false;
+		const p = part as { type?: unknown; text?: unknown; thinking?: unknown };
+		const text =
+			p.type === "text" ? p.text : p.type === "thinking" ? p.thinking : null;
+		if (typeof text !== "string") return false;
 		sawVisibleContent = true;
-		if (!isDroppedOnlyText(p.text)) return false;
+		if (text.trim().length > 0 && !isPiMarkerOnlyText(text)) return false;
 	}
 	return sawVisibleContent;
 }
