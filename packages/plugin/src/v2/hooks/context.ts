@@ -92,8 +92,8 @@ import { pushNotification } from "../../shared/rpc-notifications";
 import { MagicContextRpcServer } from "../../shared/rpc-server";
 import {
     isTransientSqliteError,
+    withAsyncPrivilegedWriter,
     withoutSqliteTransformPass,
-    withPrivilegedWriter,
     withSqliteTransformPass,
 } from "../../shared/sqlite";
 import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
@@ -1123,7 +1123,8 @@ export async function registerContext(context: V2Context) {
             // Check writer admission before best-effort setup writers can each spend
             // their own busy timeout. No transform callback runs in this transaction.
             const admissionDb = db ?? storage.current();
-            if (!compactionOff && admissionDb) withPrivilegedWriter(admissionDb, () => undefined);
+            if (!compactionOff && admissionDb)
+                await withAsyncPrivilegedWriter(admissionDb, () => undefined);
             // Measure only after admission and after per-model descriptions are final.
             recordV2ToolDefinitions(draft);
             // Only a failure to read or record usage refuses here. A high reading is

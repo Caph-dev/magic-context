@@ -224,7 +224,7 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
         writable: true,
         value: (sql: string) => {
             if (/^\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
-                retryAcquisition(() => nativeExec(sql), sql.trim());
+                acquireShort(db, () => nativeExec(sql), sql.trim());
                 return db;
             }
             return nativeExec(sql);
@@ -530,35 +530,74 @@ export class SqliteAcquisitionBusyError extends Error {
     readonly code = "SQLITE_BUSY";
     readonly stage: string;
     constructor(cause: unknown, stage = "BEGIN IMMEDIATE") {
-        super("SQLite writer acquisition remained busy after 3 attempts", { cause });
+        super("SQLite writer acquisition remained busy", { cause });
         this.name = "SqliteAcquisitionBusyError";
         this.stage = stage;
     }
 }
 
-/** Retry only acquisition: no privilege flag, callback or in-memory mutation has run yet. */
-function retryAcquisition(acquire: () => unknown, stage: string): void {
-    // Maintenance writers retry on their next tick. Multiplying their native
-    // busy timeout here would stall every session sharing the host event loop.
-    if (!transformPassScope.getStore()?.active) {
+const SHORT_BUSY_TIMEOUT_MS = 25;
+const FOREGROUND_ACQUISITION_BUDGET_MS = 16_500;
+
+/** The connection is never handed back to another caller with a shortened timeout. */
+function acquireShort(db: Database, acquire: () => unknown, site: string): void {
+    const started = performance.now();
+    const previous = pragmaNumber(db, "busy_timeout");
+    let acquired = false;
+    try {
+        db.exec(`PRAGMA busy_timeout=${SHORT_BUSY_TIMEOUT_MS}`);
         acquire();
-        return;
+        acquired = true;
+    } catch (error) {
+        if (transformPassScope.getStore()?.active && isTransientSqliteError(error))
+            throw new SqliteAcquisitionBusyError(error, site);
+        throw error;
+    } finally {
+        if (previous !== null) db.exec(`PRAGMA busy_timeout=${previous}`);
+        const elapsed = performance.now() - started;
+        if (elapsed >= 250)
+            console.warn(
+                `[magic-context] sqlite acquisition site=${site} lane=${transformPassScope.getStore()?.active ? "foreground" : "background"} elapsed=${Math.round(elapsed)}ms attempts=1 outcome=${acquired ? "acquired" : "busy"}`,
+            );
     }
-    const delays = [500, 1000];
-    for (let attempt = 0; ; attempt++) {
+}
+
+/** Retry admission before any turn work, yielding between short lock attempts. */
+export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () => T): Promise<T> {
+    const started = performance.now();
+    let attempts = 0;
+    for (;;) {
+        attempts++;
         try {
-            acquire();
-            return;
+            const result = withSqliteTransformPass(() => withPrivilegedWriter(db, operation));
+            const elapsed = performance.now() - started;
+            if (elapsed >= 250)
+                console.warn(
+                    `[magic-context] sqlite acquisition site=privileged_writer lane=foreground elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=acquired`,
+                );
+            return result;
         } catch (error) {
-            // Handles created by this module already retry inside exec. Do not
-            // apply the attempt budget twice; externally supplied handles still
-            // need the acquisition retry performed by withPrivilegedWriter.
-            if (error instanceof SqliteAcquisitionBusyError || !isTransientSqliteError(error))
-                throw error;
-            if (attempt === delays.length) throw new SqliteAcquisitionBusyError(error, stage);
-            // The database API is synchronous on both hosts. With busy_timeout=5000,
-            // three attempts plus these waits bound one acquisition to 16.5 seconds.
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delays[attempt]);
+            // A callback failure can occur after writes; only retry a failed BEGIN.
+            if (!(error instanceof SqliteAcquisitionBusyError)) throw error;
+            const elapsed = performance.now() - started;
+            if (elapsed >= FOREGROUND_ACQUISITION_BUDGET_MS) {
+                if (elapsed >= 250)
+                    console.warn(
+                        `[magic-context] sqlite acquisition site=privileged_writer lane=foreground elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=busy`,
+                    );
+                throw error instanceof SqliteAcquisitionBusyError
+                    ? error
+                    : new SqliteAcquisitionBusyError(error);
+            }
+            await new Promise<void>((resolve) =>
+                setTimeout(
+                    resolve,
+                    Math.min(
+                        attempts === 1 ? 500 : 1000,
+                        FOREGROUND_ACQUISITION_BUDGET_MS - elapsed,
+                    ),
+                ),
+            );
         }
     }
 }
@@ -587,7 +626,13 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
     if (nested) {
         db.exec(`SAVEPOINT ${savepoint}`);
     } else {
-        retryAcquisition(() => db.exec("BEGIN IMMEDIATE"), "BEGIN IMMEDIATE");
+        try {
+            db.exec("BEGIN IMMEDIATE");
+        } catch (error) {
+            if (transformPassScope.getStore()?.active && isTransientSqliteError(error))
+                throw new SqliteAcquisitionBusyError(error);
+            throw error;
+        }
     }
     privilegeDepth.set(db, previousDepth + 1);
     try {

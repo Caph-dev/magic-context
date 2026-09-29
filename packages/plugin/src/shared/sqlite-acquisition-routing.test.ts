@@ -1,8 +1,13 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database, withPrivilegedWriter, withSqliteTransformPass } from "./sqlite";
+import {
+    Database,
+    withAsyncPrivilegedWriter,
+    withPrivilegedWriter,
+    withSqliteTransformPass,
+} from "./sqlite";
 import { startSqliteWriteLocker } from "./sqlite-write-locker-test-support";
 
 for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
@@ -10,7 +15,9 @@ for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
         const dir = mkdtempSync(join(tmpdir(), "mc-routed-acquisition-"));
         const path = join(dir, "context.db");
         const db = new Database(path);
-        db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=50; CREATE TABLE result(value TEXT)");
+        db.exec(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=50; CREATE TABLE result(value TEXT); CREATE TABLE context_privilege_state(id INTEGER PRIMARY KEY, enabled INTEGER)",
+        );
         const locker = await startSqliteWriteLocker(path, 650);
         let calls = 0;
         const write = () => {
@@ -19,7 +26,8 @@ for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
             return "managed";
         };
         try {
-            withSqliteTransformPass(() => {
+            await withSqliteTransformPass(async () => {
+                await withAsyncPrivilegedWriter(db, () => undefined);
                 if (mode === "literal") {
                     db.exec("BEGIN IMMEDIATE");
                     write();
@@ -43,7 +51,9 @@ for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
 
 test("routed transactions preserve nesting, receiver, arguments and rollback without callback retries", () => {
     const db = new Database(":memory:");
-    db.exec("CREATE TABLE result(value TEXT)");
+    db.exec(
+        "CREATE TABLE result(value TEXT); CREATE TABLE context_privilege_state(id INTEGER PRIMARY KEY, enabled INTEGER)",
+    );
     let calls = 0;
     const transaction = db.transaction(function (this: { prefix: string }, value: string) {
         calls++;
@@ -69,23 +79,21 @@ test("exhausted routed acquisition never enters the callback or multiplies privi
     const path = join(dir, "context.db");
     const blocker = new Database(path);
     const db = new Database(path);
-    blocker.exec("PRAGMA journal_mode=WAL; CREATE TABLE result(value TEXT)");
+    blocker.exec(
+        "PRAGMA journal_mode=WAL; CREATE TABLE result(value TEXT); CREATE TABLE context_privilege_state(id INTEGER PRIMARY KEY, enabled INTEGER)",
+    );
     db.exec("PRAGMA busy_timeout=0");
     blocker.exec("BEGIN IMMEDIATE");
-    const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
     let callbacks = 0;
     try {
         for (const run of [
             () => db.transaction(() => callbacks++)(),
             () => withPrivilegedWriter(db, () => callbacks++),
         ]) {
-            wait.mockClear();
-            expect(() => withSqliteTransformPass(run)).toThrow("after 3 attempts");
-            expect(wait).toHaveBeenCalledTimes(2);
+            expect(() => withSqliteTransformPass(run)).toThrow("acquisition remained busy");
             expect(callbacks).toBe(0);
         }
     } finally {
-        wait.mockRestore();
         blocker.exec("ROLLBACK");
         blocker.close();
         db.close();
