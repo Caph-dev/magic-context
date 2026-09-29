@@ -119,10 +119,14 @@ describe("session_shutdown handler (drain location)", () => {
 		);
 	});
 
-	test("aborts a recomp that outlives the graceful drain before shutdown returns", () => {
+	test("aborts recomp immediately and again after the bounded drain", () => {
 		const drainAt = body.indexOf("awaitInFlightRecomps(sessionId)");
 		const abortAt = body.indexOf("abortInFlightRecomps(sessionId)");
-		expect(abortAt).toBeGreaterThan(drainAt);
+		expect(abortAt).toBeGreaterThanOrEqual(0);
+		expect(abortAt).toBeLessThan(drainAt);
+		expect(
+			body.indexOf("abortInFlightRecomps(sessionId)", drainAt),
+		).toBeGreaterThan(drainAt);
 	});
 
 	test("drains the current extension owner's dreamers through withTimeout", () => {

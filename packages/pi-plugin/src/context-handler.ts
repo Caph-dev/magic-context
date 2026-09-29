@@ -4002,12 +4002,15 @@ export function registerPiContextHandler(
  * fast-path so we don't hit the DB just to dedupe per turn.
  *
  * We store the actual Promise (not just the session id) so the
- * `session_shutdown` handler can `await` outstanding runs before Pi
- * exits — critical for `pi --print` mode where the parent process
- * exits as soon as `agent_end` fires, otherwise killing the historian
- * subprocess mid-run.
+ * `session_shutdown` handler can cancel and await outstanding runs.
+ * Headless sessions do not launch background historians.
  */
 const inFlightHistorian = new Map<string, Promise<unknown>>();
+const historianAbortControllers = new Map<string, AbortController>();
+
+export function abortInFlightHistorians(sessionId: string): void {
+	historianAbortControllers.get(sessionId)?.abort();
+}
 
 /**
  * Wait for one session's in-flight historian run to complete. Called from the
@@ -4263,7 +4266,10 @@ function spawnPiHistorianRun(args: {
 		fallbackModelId,
 	} = args;
 	const holderId = crypto.randomUUID();
+	const controller = new AbortController();
+	historianAbortControllers.set(sessionId, controller);
 	const runPromise = (async () => {
+		if (controller.signal.aborted) return;
 		const lease = acquireCompartmentLease(db, sessionId, holderId);
 		if (!lease) {
 			sessionLog(
@@ -4289,6 +4295,7 @@ function spawnPiHistorianRun(args: {
 				appendCompaction: resolvePiAppendCompaction(ctx),
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
 				runner: historian.runner,
+				signal: controller.signal,
 				historianModel: historian.model,
 				fallbackModels: historian.fallbackModels,
 				fallbackModelId,
@@ -4392,6 +4399,8 @@ function spawnPiHistorianRun(args: {
 		.finally(() => {
 			try {
 				inFlightHistorian.delete(sessionId);
+				if (historianAbortControllers.get(sessionId) === controller)
+					historianAbortControllers.delete(sessionId);
 				unregister();
 				if (isContextHandlerSessionActive(sessionId)) {
 					historian.onStatusChange?.(ctx, sessionId);
@@ -4806,6 +4815,9 @@ function maybeFireHistorian(args: {
 			return;
 		}
 
+		// Headless Pi exits after agent_end without dispatching session_shutdown.
+		// Leave the eligible history in the store for the next interactive pass.
+		if (!ctx.hasUI) return;
 		triggered = true;
 		sessionLog(
 			sessionId,
@@ -4814,9 +4826,8 @@ function maybeFireHistorian(args: {
 
 		// Fire-and-forget for the user's LLM call: the parent agent
 		// turn never awaits this. But we DO track the Promise in
-		// inFlightHistorian so `awaitInFlightHistorians()` can wait
-		// at session_shutdown — without that, `pi --print` mode would
-		// kill the historian subprocess mid-run when the parent exits.
+		// inFlightHistorian so shutdown can cancel the child and wait for
+		// the run's finally block to release its compartment-state lease.
 		spawnPiHistorianRun({
 			pi: args.pi,
 			ctx,

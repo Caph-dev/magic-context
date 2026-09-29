@@ -20,7 +20,10 @@ import * as logger from "@magic-context/core/shared/logger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
 
-import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import {
+	ensureProjectRegisteredFromPiDirectory,
+	unregisterPiProjectEmbeddings,
+} from "./embedding-bootstrap";
 import { createTestDb } from "./test-utils.test";
 
 describe("ensureProjectRegisteredFromPiDirectory", () => {
@@ -58,6 +61,20 @@ describe("ensureProjectRegisteredFromPiDirectory", () => {
 			}
 			if (oldConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
 			else process.env.XDG_CONFIG_HOME = oldConfigHome;
+			closeQuietly(db);
+		}
+	});
+
+	it("shutdown unregisters project embedding providers", async () => {
+		const db = createTestDb();
+		const directory = createTestTempDir("pi-embedding-shutdown-").dir;
+		try {
+			await ensureProjectRegisteredFromPiDirectory(directory, db);
+			const identity = resolveProjectIdentity(directory);
+			expect(getProjectEmbeddingSnapshot(identity)).not.toBeNull();
+			unregisterPiProjectEmbeddings(db);
+			expect(getProjectEmbeddingSnapshot(identity)).toBeNull();
+		} finally {
 			closeQuietly(db);
 		}
 	});

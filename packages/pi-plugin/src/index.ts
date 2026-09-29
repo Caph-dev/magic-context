@@ -67,6 +67,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	applySqliteTuningPragmas,
+	closeDatabase,
 	openDatabaseAsync,
 	setSqlitePragmaConfig,
 } from "@magic-context/core/features/magic-context/storage-db";
@@ -137,6 +138,7 @@ import {
 } from "./commands/pi-command-utils";
 import { loadPiConfig, loadPiConfigDetailed } from "./config";
 import {
+	abortInFlightHistorians,
 	awaitInFlightHistorians,
 	clearContextHandlerSession,
 	clearPiM0Cache,
@@ -160,7 +162,9 @@ import {
 	maybeChannel1ReminderForToolResult,
 	maybeDeliverChannel2Pi,
 } from "./ctx-reduce-nudge-pi";
+import { stopStatusDialogRefresh } from "./dialogs/status-dialog";
 import {
+	abortInFlightDreamers,
 	awaitInFlightDreamers,
 	registerPiDreamerProject,
 	unregisterPiDreamerProject,
@@ -168,7 +172,10 @@ import {
 } from "./dreamer";
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { registerPiDroppedInputGuard } from "./dropped-input-guard-pi";
-import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import {
+	ensureProjectRegisteredFromPiDirectory,
+	unregisterPiProjectEmbeddings,
+} from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import { bootPiRuntimeWithDeadline } from "./pi-boot-deadline";
 import {
@@ -215,6 +222,8 @@ import {
 const PI_HARNESS_DETECTION = await resolvePiHarnessDetection();
 const PI_HARNESS_KIND = PI_HARNESS_DETECTION.kind;
 const PREFIX = `[magic-context][${PI_HARNESS_KIND}]`;
+let databaseExitHookRegistered = false;
+const activePiRuntimes = new Set<object>();
 const PI_BOOT_DEADLINE_MS = 15_000;
 
 // ---------------------------------------------------------------------------
@@ -1082,6 +1091,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		mmapSizeMb: bootConfig.config.sqlite.mmap_size_mb,
 	});
 
+	// The handle is shared by same-process sessions and /reload. Close it only
+	// when Pi actually exits, after extension shutdown has released its workers.
+	if (!databaseExitHookRegistered) {
+		process.once("exit", closeDatabase);
+		databaseExitHookRegistered = true;
+	}
 	const storageDir = getMagicContextStorageDir();
 	const dbPath = join(storageDir, "context.db");
 	let openFailureCause: string | null = null;
@@ -1229,6 +1244,7 @@ async function startPiMagicContextRuntime(
 	const projectDir = process.cwd();
 	const seenDreamerProjectIdentities = new Set<string>();
 	const dreamerRegistrationOwner = {};
+	activePiRuntimes.add(dreamerRegistrationOwner);
 	const commandLifecycleController = new AbortController();
 	registerCtxStatusLifecycleSignal(pi, commandLifecycleController.signal);
 	let sessionShuttingDown = false;
@@ -1652,7 +1668,7 @@ async function startPiMagicContextRuntime(
 		projectDepsByDir.delete(ctx.cwd);
 		const current = resolveCurrentProjectDeps(ctx);
 		activeModelRegistry = ctx.modelRegistry;
-		syncDreamerProjectRegistration(current, ctx.modelRegistry);
+		if (ctx.hasUI) syncDreamerProjectRegistration(current, ctx.modelRegistry);
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
 
 		const failuresToShow = claimConfigParseFailuresOnce(
@@ -1869,6 +1885,7 @@ async function startPiMagicContextRuntime(
 	info("registered /ctx-recomp");
 
 	registerCtxWrapupCommand(pi, {
+		shutdownSignal: commandLifecycleController.signal,
 		db,
 		runner: wrapupRunner,
 		historianModel: bootProjectDeps.historianConfig?.model,
@@ -1941,11 +1958,13 @@ async function startPiMagicContextRuntime(
 		resolveDreamerEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		onProjectSeen: (identity) => seenDreamerProjectIdentities.add(identity),
-		ensureRegistered: (ctx) =>
-			syncDreamerProjectRegistration(
-				resolveCurrentProjectDeps(ctx),
-				ctx.modelRegistry,
-			),
+		ensureRegistered: (ctx) => {
+			if ((ctx as typeof ctx & { hasUI?: boolean }).hasUI)
+				syncDreamerProjectRegistration(
+					resolveCurrentProjectDeps(ctx),
+					ctx.modelRegistry,
+				);
+		},
 		registrationOwner: dreamerRegistrationOwner,
 	});
 	info("registered /ctx-dream");
@@ -1970,7 +1989,6 @@ async function startPiMagicContextRuntime(
 	// PiSubagentRunner to spawn child sessions for each task.
 	const dreamerConfig = bootProjectDeps.dreamerConfig;
 	if (dreamerConfig) {
-		syncDreamerProjectRegistration(bootProjectDeps);
 		info(`registered dreamer (${summarizeDreamSchedule(dreamerConfig)})`);
 	} else {
 		info(
@@ -2064,7 +2082,11 @@ async function startPiMagicContextRuntime(
 			// shared helper releases that ownership explicitly.
 			try {
 				activeModelRegistry = ctx.modelRegistry;
-				syncDreamerProjectRegistration(effectiveProjectDeps, ctx.modelRegistry);
+				if (ctx.hasUI)
+					syncDreamerProjectRegistration(
+						effectiveProjectDeps,
+						ctx.modelRegistry,
+					);
 			} catch (err) {
 				warn("before_agent_start: dreamer registration sync threw:", err);
 			}
@@ -2295,15 +2317,8 @@ async function startPiMagicContextRuntime(
 	//     next session start re-evaluates and either picks up where the
 	//     prior run left off or recovers from `historian_failure_count`.
 	//
-	// `pi --print` (single-turn, exits after agent_end) is the one mode
-	// where backgrounding is genuinely incompatible with subprocess
-	// lifetime — Pi's process exits and SIGKILLs the still-running
-	// historian. That tradeoff is intentional: print mode is for
-	// scripting / one-shot tasks where blocking the user's interactive
-	// shell on a 30s historian is also wrong, just in a different way.
-	// We let print mode skip the wait too. Users who want guaranteed
-	// historian completion in print mode should run interactive Pi
-	// instead.
+	// Headless Pi exits after agent_end. The context handler leaves eligible
+	// history queued rather than launching a child that would outlive Pi.
 	pi.on("agent_end", (event, ctx) => {
 		// Synchronous return — DO NOT await background work here.
 		// awaitInFlightHistorians()/awaitInFlightDreamers() are still
@@ -2674,17 +2689,12 @@ async function startPiMagicContextRuntime(
 	// export — without releasing them, the dreamer timer would hold a
 	// stale reference to the previous extension instance.
 	//
-	// IMPORTANT: We do NOT close the SQLite handle here. `openDatabase()`
-	// caches handles in a process-lifetime Map keyed by path; closing
-	// the handle invalidates the cache entry, but the Map still returns
-	// the closed handle on the next `openDatabase()` call after reload,
-	// causing every tool/hook to fail with "database is not open". The
-	// DB handle is intentionally process-lifetime — Pi's `/reload`
-	// re-runs the extension code but keeps the host process alive, so
-	// the cached handle is still valid across reload boundaries.
+	// Other sessions and /reload share the SQLite handle. The process exit
+	// hook closes it after every extension has finished shutdown.
 	pi.on("session_shutdown", async (_event, ctx) => {
 		sessionShuttingDown = true;
 		commandLifecycleController.abort();
+		stopStatusDialogRefresh();
 		// Bounded drain of in-flight historian / dreamer runs that were
 		// kicked off by recent turns. We moved the drain here from
 		// `agent_end` because Pi awaits agent_end handlers and was
@@ -2694,11 +2704,8 @@ async function startPiMagicContextRuntime(
 		// JSONL session state reach a consistent compartment boundary
 		// before that session's cleanup completes.
 		//
-		// 5-second cap per drain protects interactive shutdown from a hung
-		// subagent. In `pi --print` mode the process exits after
-		// agent_end before this handler fires anyway, so the cap
-		// doesn't help that mode (and we don't pretend it does — see
-		// the comment block on the agent_end handler above).
+		// A five-second cap protects interactive shutdown from a hung child.
+		// Headless runs do not launch background maintenance.
 		const SHUTDOWN_DRAIN_MS = 5_000;
 		const sessionId = resolveSessionId(ctx);
 		// Stop this owner from admitting new Dreamer runs before snapshotting its
@@ -2715,6 +2722,8 @@ async function startPiMagicContextRuntime(
 			warn("shutdown: unregisterPiDreamerProject threw:", err);
 		}
 		if (sessionId) {
+			abortInFlightHistorians(sessionId);
+			abortInFlightRecomps(sessionId);
 			try {
 				await withTimeout(
 					awaitInFlightHistorians(sessionId),
@@ -2728,10 +2737,10 @@ async function startPiMagicContextRuntime(
 			} catch (err) {
 				warn("shutdown: recomp drain threw:", err);
 			}
-			// Timeout only stops waiting. Fence and cancel any run still alive before
-			// this handler returns and Pi disposes its command context.
+			// Keep the cancellation idempotent if the drain timed out.
 			abortInFlightRecomps(sessionId);
 		}
+		abortInFlightDreamers(dreamerRegistrationOwner);
 		try {
 			await withTimeout(
 				awaitInFlightDreamers(dreamerRegistrationOwner),
@@ -2766,6 +2775,8 @@ async function startPiMagicContextRuntime(
 		} catch {
 			// best-effort cleanup
 		}
+		activePiRuntimes.delete(dreamerRegistrationOwner);
+		if (activePiRuntimes.size === 0) unregisterPiProjectEmbeddings(db);
 	});
 
 	// Pi has no `session_deleted` event, but `session_before_switch`

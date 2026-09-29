@@ -102,6 +102,8 @@ function createCountingPi() {
 		registerTool: mock((tool: { name?: string }) => {
 			tools.push(tool.name ?? "<unnamed>");
 		}),
+		getActiveTools: () => [],
+		setActiveTools: () => {},
 		registerFlag: mock((name: string) => {
 			flags.push(name);
 		}),
@@ -196,6 +198,31 @@ describe("Pi in-process child guard (#247)", () => {
 		]);
 	}, 15_000);
 
+	it("headless Pi does not register scheduled dreamer children", async () => {
+		const configHome = isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const configDir = join(configHome, "cortexkit");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "magic-context.jsonc"),
+			JSON.stringify({ dreamer: { pi: { model: "test/dreamer" } } }),
+		);
+		const scheduled = mock(async () => () => {});
+		dreamerTest.setStartDreamScheduleTimerFactory(scheduled);
+		const runtime = createCountingPi();
+		await magicContextPiExtension(runtime.pi);
+		const ctx = {
+			cwd: process.cwd(),
+			hasUI: false,
+			sessionManager: { getSessionId: () => "ses-print" },
+			ui: { setStatus() {} },
+		};
+		await runtime.emitPiEvent("session_start", {}, ctx);
+		await runtime.emitPiEvent("before_agent_start", {}, ctx);
+		expect(scheduled).not.toHaveBeenCalled();
+		await runtime.emitPiEvent("session_shutdown", {}, ctx);
+	}, 20_000);
+
 	it("keeps session B historian and Dreamer live when session A shuts down", async () => {
 		const configHome = isolateXdgEnv();
 		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
@@ -251,6 +278,14 @@ describe("Pi in-process child guard (#247)", () => {
 		const runtimeB = createCountingPi();
 		await magicContextPiExtension(runtimeA.pi);
 		await magicContextPiExtension(runtimeB.pi);
+		const startCtx = {
+			cwd: process.cwd(),
+			hasUI: true,
+			ui: { notify: () => undefined, setStatus: () => undefined },
+			sessionManager: { getSessionId: () => "ses-live-b" },
+		};
+		await runtimeA.emitPiEvent("session_start", {}, startCtx);
+		await runtimeB.emitPiEvent("session_start", {}, startCtx);
 		await Promise.resolve();
 		expect(scheduledClients).toHaveLength(1);
 
@@ -277,7 +312,7 @@ describe("Pi in-process child guard (#247)", () => {
 			percent: number,
 		) => ({
 			cwd: process.cwd(),
-			hasUI: false,
+			hasUI: true,
 			model: {
 				provider: "test",
 				id: "model",
@@ -443,7 +478,7 @@ describe("Pi in-process child guard (#247)", () => {
 		expect(notifications).toBe(0);
 	});
 
-	it("aborts a recomp only after the five-second shutdown drain expires", async () => {
+	it("aborts a recomp before waiting for the bounded shutdown drain", async () => {
 		isolateXdgEnv();
 		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
 		const runtime = createCountingPi();
@@ -506,7 +541,7 @@ describe("Pi in-process child guard (#247)", () => {
 			}
 			const timeout = timers.findLast((timer) => timer.active);
 			expect(timeout?.delay).toBe(5_000);
-			expect(observedSignal?.aborted).toBe(false);
+			expect(observedSignal?.aborted).toBe(true);
 
 			timeout?.callback();
 			await shutdown;

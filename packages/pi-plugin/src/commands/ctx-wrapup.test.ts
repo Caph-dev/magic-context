@@ -359,6 +359,32 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 
+	it("shutdown interrupts the lease wait and releases the wrapup marker", async () => {
+		const db = createDb();
+		const sessionId = "pi-wrapup-shutdown-wait";
+		const controller = new AbortController();
+		try {
+			expect(acquireCompartmentLease(db, sessionId, "foreign")).not.toBeNull();
+			const run = runPiWrapup(
+				pi().api,
+				deps(db, {
+					shutdownSignal: controller.signal,
+					wrapupLeaseWaitTimeoutMs: 60_000,
+				}),
+				ctx(sessionId, 8),
+				sessionId,
+				2,
+			);
+			await Promise.resolve();
+			controller.abort();
+			const result = await run;
+			expect(result).toContain("## Magic Wrapup — Partial");
+			expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("contains SQLITE_BUSY while releasing a wrapup compartment lease", async () => {
 		const { dir, cleanup } = createTestTempDir(
 			"mc-test-temp-dir-helper-",
