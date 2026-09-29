@@ -262,6 +262,9 @@ export function runMergeIdentityCli(args: string[], deps: Partial<MergeIdentityD
     }
     const { from, to } = options;
     if (!from || !to) return 0;
+    console.log(
+        "Checking database holders (bounded process inspection; no changes applied yet)...",
+    );
     const holders = (deps.inspectHolders ?? defaultInspectHolders)(storageDir);
     const probe = (deps.probe ?? probeHostProcessesUsing)({
         files: [dbPath, `${dbPath}-wal`, `${dbPath}-shm`],

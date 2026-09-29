@@ -15,6 +15,13 @@ import {
     reportOpenCodeV2PluginCache,
 } from "./doctor-opencode2-cache";
 
+import type { execFileSync } from "node:child_process";
+import {
+    __setRpcIdentityTestHooks,
+    __resetRpcIdentityTestHooks,
+} from "@magic-context/core/shared/rpc-utils";
+import { Database } from "@magic-context/core/shared/sqlite";
+
 const tempDirs: string[] = [];
 afterEach(() => {
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -309,4 +316,57 @@ describe("host process probe", () => {
             });
         },
     );
+});
+
+it("Windows host probe never spawns lsof and uses process and exclusive lock evidence", () => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const dbPath = join(tempDir(), "context.db");
+    const db = new Database(dbPath);
+    db.exec("CREATE TABLE fixture (id INTEGER)");
+    let processes: unknown[] = [
+        {
+            ProcessId: process.pid,
+            ParentProcessId: 0,
+            Name: "bun.exe",
+            CommandLine: "bun test",
+            CreationDate: null,
+        },
+    ];
+    __setRpcIdentityTestHooks({
+        platform: "win32",
+        processListExecFileSync: (() => JSON.stringify(processes)) as typeof execFileSync,
+    });
+    const commands: string[] = [];
+    const spawn = (command: string) => {
+        commands.push(command);
+        return { status: 1, stdout: "" };
+    };
+    try {
+        Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+        expect(
+            probeHostProcessesUsing({ files: [dbPath, `${dbPath}-wal`], directories: [] }, spawn),
+        ).toEqual({ status: "free" });
+        db.exec("BEGIN EXCLUSIVE");
+        const locked = probeHostProcessesUsing({ files: [dbPath], directories: [] }, spawn);
+        expect(locked.status).toBe("unknown");
+        if (locked.status === "unknown") expect(locked.reason).toContain(dbPath);
+        db.exec("ROLLBACK");
+        processes = [
+            {
+                ProcessId: 54321,
+                ParentProcessId: 0,
+                Name: "opencode.exe",
+                CommandLine: "opencode serve",
+                CreationDate: null,
+            },
+        ];
+        const held = probeHostProcessesUsing({ files: [dbPath], directories: [] }, spawn);
+        expect(held.status).toBe("unknown");
+        if (held.status === "unknown") expect(held.reason).toContain("PID 54321");
+        expect(commands).toEqual([]);
+    } finally {
+        Object.defineProperty(process, "platform", descriptor);
+        __resetRpcIdentityTestHooks();
+        db.close();
+    }
 });

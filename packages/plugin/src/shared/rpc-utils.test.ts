@@ -14,6 +14,7 @@ import {
     isPidIdentityPlausible,
     type RpcPortFileRecord,
     readProcessProbeEvidence,
+    parseTasklistOutput,
 } from "./rpc-utils";
 
 const PID = 1234;
@@ -441,7 +442,7 @@ describe("isPidAlive", () => {
         expect(calls).toEqual([
             {
                 file: "tasklist",
-                args: ["/FO", "CSV", "/FI", `PID eq ${PID}`],
+                args: ["/FO", "CSV", "/NH", "/FI", `PID eq ${PID}`],
                 stdio: ["ignore", "pipe", "pipe"],
             },
         ]);
@@ -623,7 +624,9 @@ describe("isPidIdentityPlausible", () => {
         });
 
         expect(isPidIdentityPlausible(record(0))).toBe("plausible");
-        expect(calls).toEqual([{ file: "tasklist", args: ["/FO", "CSV", "/FI", `PID eq ${PID}`] }]);
+        expect(calls).toEqual([
+            { file: "tasklist", args: ["/FO", "CSV", "/NH", "/FI", `PID eq ${PID}`] },
+        ]);
 
         calls.length = 0;
         expect(isPidIdentityPlausible(record(NOW_MS))).toBe("inconclusive");
@@ -638,4 +641,26 @@ describe("isPidIdentityPlausible", () => {
             },
         ]);
     });
+});
+
+test("Spanish tasklist no-match is not running", () => {
+    const output =
+        "INFORMACIÓN: no hay tareas ejecutándose que coincidan con los\ncriterios especificados.";
+    expect(parseTasklistOutput(output)).toEqual([]);
+    __setRpcIdentityTestHooks({ platform: "win32", execFileSync: psOutput(output) });
+    expect(isPidAlive(PID)).toBe("dead");
+});
+
+test("German tasklist no-match is not running", () => {
+    expect(
+        parseTasklistOutput(
+            "INFORMATION: Es werden keine Aufgaben mit den angegebenen Kriterien ausgeführt.",
+        ),
+    ).toEqual([]);
+});
+
+test("tasklist CSV live process is running", () => {
+    expect(parseTasklistOutput('"opencode.exe","1234","Console","1","10,000 K"')).toEqual([
+        { pid: 1234, command: "opencode.exe" },
+    ]);
 });

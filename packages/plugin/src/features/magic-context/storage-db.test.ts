@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import {
     type chmodSync,
@@ -15,7 +15,11 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
+import {
+    __resetRpcIdentityTestHooks,
+    __setRpcIdentityTestHooks,
+    inspectWindowsProcessesSync,
+} from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -1393,4 +1397,72 @@ describe("storage-db", () => {
             }
         });
     });
+});
+
+it("checks 500 dead RPC PIDs with one Windows snapshot and prunes only dead records", () => {
+    const storage = makeTempDir("mc-rpc-snapshot-");
+    const rpc = join(storage, "rpc", "project");
+    mkdirSync(rpc, { recursive: true });
+    for (let pid = 100000; pid < 100500; pid++) {
+        writeFileSync(
+            join(rpc, `port-${pid}.json`),
+            JSON.stringify({ pid, port: 43123, started_at: 0 }),
+        );
+    }
+    const live = 100501;
+    const liveFile = join(rpc, `port-${live}.json`);
+    writeFileSync(liveFile, JSON.stringify({ pid: live, port: 43123, started_at: 0 }));
+    let calls = 0;
+    __setRpcIdentityTestHooks({
+        platform: "win32",
+        processListExecFileSync: (() => {
+            calls++;
+            return JSON.stringify([
+                {
+                    ProcessId: live,
+                    ParentProcessId: 0,
+                    Name: "opencode.exe",
+                    CommandLine: "opencode serve",
+                    CreationDate: null,
+                },
+            ]);
+        }) as typeof execFileSync,
+    });
+    const result = inspectRpcServerDiscovery(storage, inspectWindowsProcessesSync());
+    expect(calls).toBe(1);
+    expect(result.staleFiles).toHaveLength(500);
+    expect(existsSync(join(rpc, "port-100000.json"))).toBe(false);
+    expect(existsSync(liveFile)).toBe(true);
+    expect(result.serverPids).toEqual([live]);
+});
+
+it("RPC holder inspection reports slow progress and refuses after its deadline", () => {
+    const storage = makeTempDir("mc-rpc-deadline-");
+    const rpc = join(storage, "rpc", "project");
+    mkdirSync(rpc, { recursive: true });
+    writeFileSync(
+        join(rpc, "port-100000.json"),
+        JSON.stringify({ pid: 100000, port: 43123, started_at: 0 }),
+    );
+    const processes = {
+        pi: { state: "known" as const, processIds: [] },
+        liveness: () => "inconclusive" as const,
+        evidence: () => ({ startTime: null, commandLine: null }),
+    };
+    let ticks = 0;
+    const clock = spyOn(Date, "now").mockImplementation(() => (++ticks <= 2 ? 0 : 4000));
+    const report = spyOn(console, "error").mockImplementation(() => {});
+    try {
+        expect(inspectRpcServerDiscovery(storage, processes).state).toBe("inconclusive");
+        expect(report).toHaveBeenCalledWith("Inspecting RPC database holders: 0/1 records checked");
+        ticks = 0;
+        clock.mockImplementation(() => (++ticks <= 2 ? 0 : 16000));
+        expect(() => inspectRpcServerDiscovery(storage, processes)).toThrow(
+            "timed out after 15 seconds",
+        );
+        expect(existsSync(join(rpc, "port-100000.json"))).toBe(true);
+    } finally {
+        clock.mockRestore();
+        report.mockRestore();
+    }
 });

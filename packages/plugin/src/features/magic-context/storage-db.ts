@@ -24,6 +24,7 @@ import {
     classifyProcessKind,
     inspectLivePiProcesses,
     inspectProcessesAsync,
+    inspectWindowsProcessesSync,
     isOwnRpcServerRecord,
     isPidAlive,
     isPidIdentityPlausible,
@@ -530,6 +531,8 @@ export function inspectRpcServerDiscovery(
     storageDir: string,
     processes?: AsyncProcessInspection,
 ): RpcServerDiscovery {
+    const deadline = Date.now() + 15_000;
+    let progressAt = Date.now() + 3_000;
     const rpcRoot = join(storageDir, "rpc");
     let projectEntries: Dirent[];
     try {
@@ -562,11 +565,22 @@ export function inspectRpcServerDiscovery(
         return { state: "absent", serverPids: [], staleFiles: [] };
     }
 
+    if (!processes && process.platform === "win32") processes = inspectWindowsProcessesSync();
     const pids = new Set<number>();
     const processByPid = new Map<number, FailClosedBlockingProcess>();
     const staleFiles: string[] = [];
     const inconclusivePids = new Set<number>();
-    for (const portFile of portFiles) {
+    for (const [index, portFile] of portFiles.entries()) {
+        if (Date.now() >= deadline)
+            throw new Error(
+                "RPC holder inspection timed out after 15 seconds; no merge was applied. Close hosts and retry.",
+            );
+        if (Date.now() >= progressAt) {
+            console.error(
+                `Inspecting RPC database holders: ${index}/${portFiles.length} records checked`,
+            );
+            progressAt = Date.now() + 3_000;
+        }
         let raw: string;
         try {
             raw = rpcDiscoveryFs.readFileSync(portFile, "utf8");
@@ -609,7 +623,14 @@ export function inspectRpcServerDiscovery(
             if (!previous || (previous.kind === "process" && detected.kind !== "process")) {
                 processByPid.set(record.pid, detected);
             }
-        } else if (identity === "implausible") {
+        } else if (
+            identity === "implausible" &&
+            !(
+                (processes?.processSnapshot?.source === "cim" ||
+                    processes?.processSnapshot?.source === "tasklist") &&
+                liveness === "alive"
+            )
+        ) {
             staleFiles.push(portFile);
         } else {
             inconclusivePids.add(record.pid);
