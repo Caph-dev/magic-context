@@ -479,6 +479,7 @@ describe("OpenCode 2 hidden child completion", () => {
                 text: null,
                 reasoning: "private reasoning",
                 lengthCapped: true,
+                tokenLog: { max_tokens: null, finish_reason: "length", reasoning: 3 },
             });
             await close(state.executor, handle, true);
         } finally {
@@ -514,6 +515,14 @@ describe("OpenCode 2 hidden child completion", () => {
             expect(completion).toMatchObject({
                 text: "editor completion",
                 usage: { input: 101, output: 11, cacheRead: 7, cacheWrite: 5 },
+                tokenLog: {
+                    input: 101,
+                    output: 11,
+                    reasoning: 3,
+                    cache_read: 7,
+                    cache_write: 5,
+                    max_tokens: null,
+                },
                 providerId: "mock",
                 modelId: "cheap",
             });

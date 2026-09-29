@@ -8,6 +8,7 @@ import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import type { PromptArgs } from "../../../shared/model-suggestion-retry";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
+import { formatRunTokenLog, runTokenLog } from "../../../shared/run-token-log";
 
 export interface HiddenSingleShotArgs<T> {
     executor: HiddenCompletionExecutor;
@@ -103,11 +104,16 @@ export async function runHiddenSingleShotPrompt<T>(
                 callContext: args.callContext,
                 fetchOutput: () => args.executor.collect(handle, 50),
                 validateOutput: (completion) => {
+                    const tokens = completion.tokenLog ?? runTokenLog(undefined);
+                    shared.sessionLog(
+                        args.parentSessionId ?? "dreamer",
+                        `${args.callContext} response_chars=${(completion.text ?? completion.reasoning ?? "").length} ${formatRunTokenLog(tokens)}`,
+                    );
                     if (completion.lengthCapped) {
                         throw new Error(
                             completion.reasoning && !completion.text
-                                ? `${args.callContext} ran out of output budget while reasoning (length-capped at ${completion.usage.output} tokens, no text) — set dreamer.maxTokens or use a low-reasoning model`
-                                : `${args.callContext} returned length-capped output`,
+                                ? `${args.callContext} ran out of output budget while reasoning (length-capped at ${completion.usage.output} tokens, no text; ${formatRunTokenLog(tokens)}) — set dreamer.maxTokens or use a low-reasoning model`
+                                : `${args.callContext} returned length-capped output; ${formatRunTokenLog(tokens)}`,
                         );
                     }
                     const text = completion.text;

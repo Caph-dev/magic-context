@@ -38,6 +38,10 @@ import {
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { ResolvedModelEntry } from "@magic-context/core/shared/model-resolution";
 import { piHarnessKindFromExecutable } from "@magic-context/core/shared/pi-executable";
+import {
+	formatRunTokenLog,
+	runTokenLog,
+} from "@magic-context/core/shared/run-token-log";
 import type {
 	CompletedSubagentToolCall,
 	SubagentProgressEvent,
@@ -1301,6 +1305,42 @@ export class PiSubagentRunner implements SubagentRunner {
 			const settle = (result: SubagentRunResult) => {
 				if (settled) return;
 				settled = true;
+				if (
+					accountingMessages.length > 0 &&
+					/historian|dreamer|classify/i.test(options.agent)
+				) {
+					const last = [...accountingMessages]
+						.reverse()
+						.find(
+							(message) =>
+								message !== null &&
+								typeof message === "object" &&
+								(message as { role?: string }).role === "assistant",
+						) as
+						| { usage?: unknown; stopReason?: string; content?: unknown[] }
+						| undefined;
+					const responseChars = result.ok
+						? result.assistantText.length
+						: (last?.content
+								?.filter(
+									(part): part is { type: string; text: string } =>
+										typeof part === "object" &&
+										part !== null &&
+										(part as { type?: string }).type === "text" &&
+										typeof (part as { text?: unknown }).text === "string",
+								)
+								.reduce((sum, part) => sum + part.text.length, 0) ?? 0);
+					const tokenDetails = formatRunTokenLog(
+						runTokenLog(last?.usage, options.maxOutputTokens, last?.stopReason),
+					);
+					if (!result.ok && result.reason === "truncated") {
+						result = { ...result, error: `${result.error}; ${tokenDetails}` };
+					}
+					sessionLog(
+						options.accountingSessionId ?? "subagent",
+						`${options.agent} response_chars=${responseChars} ${tokenDetails}`,
+					);
+				}
 				const outcome: SubagentRunResult = budget
 					? {
 							...result,

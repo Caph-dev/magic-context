@@ -34,6 +34,7 @@ import type { ModelInput, ResolvedModelEntry } from "../../shared/model-resoluti
 import { getSdkContextLimit, getSdkOutputLimit } from "../../shared/models-dev-cache";
 import { isRecord } from "../../shared/record-type-guard";
 import { modelBodyField, toModelEntry } from "../../shared/resolve-fallbacks";
+import { formatRunTokenLog, type RunTokenLog, runTokenLog } from "../../shared/run-token-log";
 import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
 import {
@@ -220,12 +221,31 @@ export function createV1HiddenCompletionExecutor(
                 );
             }
             const text = extractLatestAssistantText(messages);
+            const latest = Array.isArray(messages)
+                ? messages
+                      .filter(
+                          (message): message is Record<string, unknown> =>
+                              isRecord(message) &&
+                              isRecord(message.info) &&
+                              message.info.role === "assistant",
+                      )
+                      .sort(
+                          (left, right) =>
+                              historianMessageCreatedAt(right) - historianMessageCreatedAt(left),
+                      )[0]
+                : undefined;
+            const info = latest && isRecord(latest.info) ? latest.info : {};
             return {
                 messages,
                 text,
                 reasoning: text ? null : extractLatestHistorianReasoning(messages),
                 lengthCapped: hasLengthCappedOutput(messages),
                 usage: sumTokensFromChildMessages(messages),
+                tokenLog: runTokenLog(
+                    info.tokens,
+                    undefined,
+                    info.finish ?? info.finish_reason ?? info.finishReason,
+                ),
             };
         },
         async close(handle, settlement) {
@@ -244,8 +264,11 @@ export function createV1HiddenCompletionExecutor(
     };
 }
 
-export function historianReasoningBudgetDiagnostic(outputTokens: number): string {
-    return `historian ran out of output budget while reasoning (length-capped at ${outputTokens} tokens, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`;
+export function historianReasoningBudgetDiagnostic(
+    outputTokens: number,
+    tokens?: RunTokenLog,
+): string {
+    return `historian ran out of output budget while reasoning (length-capped at ${outputTokens} tokens, no text${tokens ? `; ${formatRunTokenLog(tokens)}` : ""}) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`;
 }
 
 export async function runValidatedHistorianPass(args: {
@@ -707,17 +730,26 @@ async function runHistorianPrompt(args: {
 
         completion = await executor.collect(handle, 50);
         const lengthCapped = completion.lengthCapped;
+        const tokens = {
+            ...runTokenLog(undefined, args.maxOutputTokens),
+            ...completion.tokenLog,
+            max_tokens: args.maxOutputTokens ?? null,
+        };
+        shared.sessionLog(
+            parentSessionId,
+            `historian response_chars=${(completion.text ?? completion.reasoning ?? "").length} ${formatRunTokenLog(tokens)}`,
+        );
         const textResult = completion.text;
         const reasoningResult = textResult ? null : completion.reasoning;
         const emptyError =
             !textResult && reasoningResult && lengthCapped
-                ? historianReasoningBudgetDiagnostic(completion.usage.output)
+                ? historianReasoningBudgetDiagnostic(completion.usage.output, tokens)
                 : !textResult && !reasoningResult
                   ? "Historian returned no assistant output."
                   : !textResult
                     ? "Historian returned reasoning but no assistant text."
                     : lengthCapped
-                      ? "Historian returned length-capped output."
+                      ? `Historian returned length-capped output. ${formatRunTokenLog(tokens)}`
                       : null;
         const invocationId = recordInvocation({
             status: emptyError ? "empty" : "completed",

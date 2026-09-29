@@ -1892,12 +1892,13 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
 
-		const resultPromise = runner.run(baseOptions);
+		const resultPromise = runner.run({ ...baseOptions, maxOutputTokens: 32 });
 		child.writeStdoutLine(
 			agentEnd([
 				{
 					role: "assistant",
 					content: [{ type: "text", text: "partial" }],
+					usage: { input: 5, output: 32, cacheRead: 0, cacheWrite: 1 },
 					stopReason: "length",
 				},
 			]),
@@ -1907,7 +1908,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(await resultPromise).toEqual({
 			ok: false,
 			reason: "truncated",
-			error: 'pi assistant stopped with reason "length"',
+			error:
+				'pi assistant stopped with reason "length"; tokens={"input":5,"output":32,"reasoning":null,"cache_read":0,"cache_write":1,"max_tokens":32,"finish_reason":"length"}',
 			durationMs: expect.any(Number),
 			meta: { stderr: undefined },
 		});

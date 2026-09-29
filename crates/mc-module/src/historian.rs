@@ -3092,14 +3092,22 @@ fn publish_output_from_awaiting(
         completion_now_ms,
         publication_fence,
     } = request;
+    // The host report does not carry usage; omitted values must not look like zero spend.
+    let tokens =
+        crate::historian_producer::producer_token_log(output.usage, None, output.length_capped);
+    tracing::info!(
+        session_id,
+        response_chars = output.text.chars().count(),
+        tokens = %tokens,
+        "historian response received"
+    );
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
 
     let validation_result = if output.length_capped {
         Err(HistorianValidationError {
             message:
-                "Historian output hit the length cap; refusing a potentially partial document."
-                    .to_string(),
+                format!("Historian output hit the length cap; refusing a potentially partial document. tokens={tokens}"),
         })
     } else {
         validate_historian_output(

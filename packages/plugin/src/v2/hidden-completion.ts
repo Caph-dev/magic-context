@@ -15,6 +15,7 @@ import { declareHostLimitation } from "../shared/host-limitations";
 import { log } from "../shared/logger";
 import type { PromptArgs } from "../shared/model-suggestion-retry";
 import { parseProviderModel, toModelEntry } from "../shared/resolve-fallbacks";
+import { runTokenLog } from "../shared/run-token-log";
 import type { Database } from "../shared/sqlite";
 import {
     HIDDEN_CURATE_AGENT,
@@ -1177,6 +1178,7 @@ export async function createV2HiddenCompletionExecutor(
                 }
                 run.completion = {
                     text,
+                    tokenLog: runTokenLog(tokens, run.identity.maxOutputTokens, row.data.finish),
                     ...(hiddenToolLoop(run.identity)
                         ? { messages: toolLoopMessages(attempt) }
                         : {}),

@@ -21,6 +21,7 @@ import {
     parseProviderModel,
     toModelEntry,
 } from "../../../shared/resolve-fallbacks";
+import { formatRunTokenLog, runTokenLog } from "../../../shared/run-token-log";
 import type { Database } from "../../../shared/sqlite";
 import { renderCapabilityRefusal } from "../../../shared/user-facing-codes";
 import {
@@ -421,11 +422,16 @@ async function classifyOneChunk(
                     fetchOutput: () => executor.collect(opened, 50),
                     validateOutput: (completion) => {
                         const messages = completion.messages ?? [];
+                        const tokens = completion.tokenLog ?? runTokenLog(undefined);
+                        shared.sessionLog(
+                            args.parentSessionId ?? "dreamer",
+                            `dreamer:classify response_chars=${(completion.text ?? completion.reasoning ?? "").length} ${formatRunTokenLog(tokens)}`,
+                        );
                         if (completion.lengthCapped) {
                             throw new Error(
                                 completion.reasoning && !completion.text
-                                    ? `classify ran out of output budget while reasoning (length-capped at ${completion.usage.output} tokens, no text) — set dreamer.maxTokens or use a low-reasoning model`
-                                    : "classify returned length-capped output",
+                                    ? `classify ran out of output budget while reasoning (length-capped at ${completion.usage.output} tokens, no text; ${formatRunTokenLog(tokens)}) — set dreamer.maxTokens or use a low-reasoning model`
+                                    : `classify returned length-capped output; ${formatRunTokenLog(tokens)}`,
                             );
                         }
                         const text = completion.text;
