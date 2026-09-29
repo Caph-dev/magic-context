@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+    beginSqliteWriterAsync,
     Database,
     SqliteAcquisitionBusyError,
     withAsyncPrivilegedWriter,
@@ -87,3 +88,25 @@ test("a foreground synchronous writer refuses busy without blocking the loop", (
         close();
     }
 });
+
+test("ready background publication retries on a timer and retains its write", async () => {
+    const { db, path, close } = fixture();
+    const locker = await startSqliteWriteLocker(path, 650);
+    let ticked = false;
+    try {
+        setTimeout(() => {
+            ticked = true;
+        }, 100);
+        await beginSqliteWriterAsync(db, "historian-publish");
+        db.prepare("INSERT INTO context_privilege_state(id, enabled) VALUES (1, 0)").run();
+        db.exec("COMMIT");
+        expect(ticked).toBe(true);
+        expect(db.prepare("SELECT COUNT(*) AS count FROM context_privilege_state").get()).toEqual({
+            count: 1,
+        });
+        expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+    } finally {
+        await locker.exited;
+        close();
+    }
+}, 30000);

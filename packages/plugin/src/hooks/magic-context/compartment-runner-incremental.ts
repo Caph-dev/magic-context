@@ -12,6 +12,7 @@ import {
 // (compartment-runner-recomp.ts, compartment-runner.ts, tests) keep working
 // unchanged. The implementation moved to ./historian-state-file.ts so Pi
 // can import it without pulling in the full incremental runner.
+import { beginSqliteWriterAsync } from "../../shared/sqlite";
 import { producerSourceLocalBudget } from "./derive-budgets";
 import {
     finishHistorianPublishStage,
@@ -993,7 +994,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         );
         let published = false;
         const transactionStartedAt = startHistorianPublishStage(sessionId, "publish-txn");
-        db.exec("BEGIN IMMEDIATE");
+        await beginSqliteWriterAsync(db, "historian-publish");
         try {
             if (!isCompartmentLeaseHeld(db, sessionId, holderId)) {
                 db.exec("ROLLBACK");

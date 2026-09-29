@@ -562,6 +562,43 @@ function acquireShort(db: Database, acquire: () => unknown, site: string): void 
     }
 }
 
+/** Begin an immediate transaction with bounded asynchronous retries on writer contention.
+ * Callers must recheck any lease or source snapshot after this function returns. */
+export async function beginSqliteWriterAsync(db: Database, site: string): Promise<void> {
+    const started = performance.now();
+    let attempts = 0;
+    for (;;) {
+        attempts++;
+        try {
+            db.exec("BEGIN IMMEDIATE");
+            const elapsed = performance.now() - started;
+            if (elapsed >= 250)
+                console.warn(
+                    `[magic-context] sqlite acquisition site=${site} lane=background elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=acquired`,
+                );
+            return;
+        } catch (error) {
+            if (!isTransientSqliteError(error)) throw error;
+            const elapsed = performance.now() - started;
+            if (elapsed >= FOREGROUND_ACQUISITION_BUDGET_MS) {
+                console.warn(
+                    `[magic-context] sqlite acquisition site=${site} lane=background elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=busy`,
+                );
+                throw error;
+            }
+            await new Promise<void>((resolve) =>
+                setTimeout(
+                    resolve,
+                    Math.min(
+                        attempts === 1 ? 500 : 1000,
+                        FOREGROUND_ACQUISITION_BUDGET_MS - elapsed,
+                    ),
+                ),
+            );
+        }
+    }
+}
+
 /** Retry admission before any turn work, yielding between short lock attempts. */
 export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () => T): Promise<T> {
     const started = performance.now();
