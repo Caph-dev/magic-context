@@ -637,7 +637,13 @@ describe("Rust mode authority adapter", () => {
                                 {
                                     id: "openai",
                                     models: {
-                                        fallback: { limit: { context: 64_000, output: 8_000 } },
+                                        fallback: {
+                                            limit: {
+                                                context: 400_000,
+                                                input: 272_000,
+                                                output: 128_000,
+                                            },
+                                        },
                                     },
                                 },
                             ],
@@ -661,7 +667,7 @@ describe("Rust mode authority adapter", () => {
             });
             expect(body.historian_model_limits).toEqual({
                 "anthropic/primary": { context: 200_000, output: 16_000 },
-                "openai/fallback": { context: 64_000, output: 8_000 },
+                "openai/fallback": { context: 400_000, input: 272_000, output: 128_000 },
             });
         } finally {
             clearModelsDevCache();

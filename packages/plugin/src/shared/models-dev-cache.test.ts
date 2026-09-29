@@ -2,7 +2,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveKnownHistorianContextLimit } from "../hooks/magic-context/derive-budgets";
+import {
+    resolveHistorianProducerLimits,
+    resolveKnownHistorianContextLimit,
+} from "../hooks/magic-context/derive-budgets";
+import {
+    historianProducerReserve,
+    producerInputTokenLimit,
+} from "../hooks/magic-context/producer-window-guard";
 import {
     clearModelsDevCache,
     getModelsDevCacheState,
@@ -229,6 +236,28 @@ describe("models-dev-cache (SDK-only)", () => {
         expect(getSdkContextLimit("openai", "gpt-5.4")).toBe(922000);
         expect(getSdkContextLimit("openai", "gpt-5.4-fast")).toBe(922000);
         expect(getSdkContextLimit("openai", "gpt-5.4-mini")).toBe(922000);
+    });
+
+    test("issue 567: production resolver keeps input cap separate from context reserve", async () => {
+        await refreshModelLimitsFromApi(
+            makeClient([
+                {
+                    id: "auth-provider",
+                    models: {
+                        model: { limit: { context: 400_000, input: 272_000, output: 128_000 } },
+                    },
+                },
+            ]),
+        );
+        const resolved = getSdkContextLimit("auth-provider", "model", undefined, {
+            reservation: "none",
+        });
+        const limits = resolveHistorianProducerLimits("auth-provider/model");
+        const reserve = historianProducerReserve(limits.context, undefined, 128_000);
+        expect(resolved).toBe(272_000);
+        expect(limits).toEqual({ context: 400_000, input: 272_000 });
+        expect(reserve).toBe(100_000);
+        expect(producerInputTokenLimit(limits.context, reserve, limits.input)).toBe(263_840);
     });
 
     test("explicit SDK-resolved config limit wins over a larger catalog or detected value", async () => {

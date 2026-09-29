@@ -936,8 +936,19 @@ pub fn assemble_historian_firing(
                 arc.start <= chunk.chunk.end_index && arc.end >= chunk.chunk.start_index
             });
     let system_tokens = estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT) as f64;
-    let producer_input_limit = crate::historian::producer_input_token_limit(
-        config.historian_context_limit_tokens,
+    let primary_limits = config
+        .model_chain
+        .first()
+        .and_then(|model| config.model_limits.get(model));
+    let primary_input = primary_limits.and_then(|limits| limits.input);
+    let primary_context = if primary_input.is_some() {
+        primary_limits.and_then(|limits| limits.context)
+    } else {
+        config.historian_context_limit_tokens
+    };
+    let producer_input_limit = crate::historian::producer_input_token_limit_with_input(
+        primary_context,
+        primary_input,
         config.max_output_tokens,
     );
     // A source-only allowance can consume the entire producer window before the
@@ -968,7 +979,8 @@ pub fn assemble_historian_firing(
         fit_atomic_historian_source_to_producer_window(
             &chunk.text,
             &chunk.tool_result_boundaries,
-            config.historian_context_limit_tokens,
+            primary_context,
+            primary_input,
             config.max_output_tokens,
             &fits_producer_prompt,
         )
@@ -1011,9 +1023,10 @@ pub fn assemble_historian_firing(
             })
             .map(|block| estimate_tokens(&block.bytes))
             .sum();
-        let guard_reason = crate::historian::producer_window_failure_reason(
+        let guard_reason = crate::historian::producer_window_failure_reason_with_input(
             producer_source_tokens,
-            config.historian_context_limit_tokens,
+            primary_context,
+            primary_input,
             config.max_output_tokens,
         );
         tracing::warn!("[mc-module][{}] historian oversize admission: range={}-{} rawChunkTokens={} producerSourceTokens={} historianChunkTokens={} guardReason={}", config.session_id, chunk.chunk.start_index, chunk.chunk.end_index, raw_chunk_tokens, producer_source_tokens, source_budget, guard_reason.as_deref().unwrap_or("none"));
@@ -1105,11 +1118,15 @@ fn fit_atomic_historian_source_to_producer_window(
     input: &str,
     result_boundaries: &[HistorianResultBoundary],
     context_limit_tokens: Option<usize>,
+    input_limit_tokens: Option<usize>,
     max_output_tokens: u32,
     fits_producer_prompt: &impl Fn(&str) -> bool,
 ) -> FittedHistorianSource {
-    let producer_input_limit_tokens =
-        crate::historian::producer_input_token_limit(context_limit_tokens, max_output_tokens);
+    let producer_input_limit_tokens = crate::historian::producer_input_token_limit_with_input(
+        context_limit_tokens,
+        input_limit_tokens,
+        max_output_tokens,
+    );
     let original_tokens = estimate_tokens(input);
     let Some(limit) = producer_input_limit_tokens else {
         return FittedHistorianSource {
@@ -2070,8 +2087,9 @@ mod tests {
                 },
                 true,
             );
-            let limit = crate::historian::producer_input_token_limit(
+            let limit = crate::historian::producer_input_token_limit_with_input(
                 Some(context_limit_tokens),
+                None,
                 max_output_tokens,
             )
             .unwrap();
@@ -2085,11 +2103,13 @@ mod tests {
                 body_tokens: 10_000,
             }],
             Some(context_limit_tokens),
+            None,
             max_output_tokens,
             &fits_prompt,
         );
-        let limit = crate::historian::producer_input_token_limit(
+        let limit = crate::historian::producer_input_token_limit_with_input(
             Some(context_limit_tokens),
+            None,
             max_output_tokens,
         )
         .unwrap();

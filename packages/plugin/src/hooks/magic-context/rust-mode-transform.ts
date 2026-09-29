@@ -79,7 +79,10 @@ import {
     type ToolAvailabilityVerdict,
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
-import { resolveKnownHistorianContextLimit } from "./derive-budgets";
+import {
+    resolveHistorianProducerLimits,
+    resolveKnownHistorianContextLimit,
+} from "./derive-budgets";
 import { isEditTool } from "./edit-marker";
 import {
     EmergencyFailClosedError,
@@ -1632,27 +1635,33 @@ function resolvedHistorianModelChain(
 
 function resolvedHistorianModelLimits(
     chain: readonly string[],
-): Record<string, { context?: number; output?: number }> {
+): Record<string, { context?: number; input?: number; output?: number }> {
     return Object.fromEntries(
         chain.map((key) => {
             const [provider, ...parts] = key.split("/");
             const output =
                 provider && parts.length ? getSdkOutputLimit(provider, parts.join("/")) : undefined;
-            const known = resolveKnownHistorianContextLimit(key);
+            const producerLimits = resolveHistorianProducerLimits(key);
+            const known =
+                producerLimits.input === undefined
+                    ? resolveKnownHistorianContextLimit(key)
+                    : undefined;
             const learned =
                 provider && parts.length
                     ? getSdkWindowGeometry(provider, parts.join("/"))?.derivation.window
                     : undefined;
             const context =
-                known === undefined
+                producerLimits.context ??
+                (known === undefined
                     ? learned
                     : learned === undefined
                       ? known
-                      : Math.min(known, learned);
+                      : Math.min(known, learned));
             return [
                 key,
                 {
                     ...(context !== undefined ? { context } : {}),
+                    ...(producerLimits.input !== undefined ? { input: producerLimits.input } : {}),
                     ...(output !== undefined ? { output } : {}),
                 },
             ];
