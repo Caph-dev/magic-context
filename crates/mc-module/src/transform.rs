@@ -2033,6 +2033,8 @@ pub enum TransformError {
     /// A stored coverage range overlaps, or the live array proves a present raw message
     /// would be trimmed without being covered by any compartment. Fail loud.
     CoverageGap(String),
+    /// Internal retry: a priced pass must use the ingress synthetic classification.
+    SyntheticTreatmentBust,
     /// The lexical hint query failed before a durable decision could be written.
     Search(String),
     /// CK ingress rejected an unsupported or unpairable block before any partial projection.
@@ -2078,6 +2080,7 @@ impl std::fmt::Display for TransformError {
                 "decider re-supplied an already-frozen reduction target with different bytes"
             ),
             TransformError::CoverageGap(m) => write!(f, "{m}"),
+            TransformError::SyntheticTreatmentBust => write!(f, "synthetic treatment requires a priced retry"),
             TransformError::Search(m) => write!(f, "search: {m}"),
             TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
             TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
@@ -2346,6 +2349,39 @@ fn response_marker_ttl(
         })
 }
 
+// A persisted tag proves this user row was previously served as non-synthetic. Keep
+// that treatment while replaying a cached prefix; a priced pass retries with the
+// original ingress so coverage and historian liveness see the corrected classification.
+fn previously_tagged_synthetic_rows(
+    store: &McStore,
+    req: &TransformRequest,
+) -> Result<Option<TransformRequest>, TransformError> {
+    if !req
+        .messages
+        .iter()
+        .any(|message| message.ck.meta.synthetic && message.ck.role == "user")
+    {
+        return Ok(None);
+    }
+    let tagged: HashSet<String> = store
+        .load_tags_for_session(&req.session_id)?
+        .into_iter()
+        .filter_map(|row| split_block_id(&row.block_id).map(|(mid, _)| mid.to_string()))
+        .collect();
+    if tagged.is_empty() {
+        return Ok(None);
+    }
+    let mut legacy = req.clone();
+    let mut changed = false;
+    for message in &mut legacy.messages {
+        if message.ck.meta.synthetic && message.ck.role == "user" && tagged.contains(&message.mid) {
+            message.ck.meta.synthetic = false;
+            changed = true;
+        }
+    }
+    Ok(changed.then_some(legacy))
+}
+
 fn apply_once_with_estimator_and_projection(
     store: &McStore,
     req: &TransformRequest,
@@ -2358,19 +2394,41 @@ fn apply_once_with_estimator_and_projection(
     emit_protected_tags_deprecation_once(req);
     let mut attempt = 0;
     let mut boundary_divergence_retry = false;
+    let legacy_req = if ctx.compaction_enabled {
+        previously_tagged_synthetic_rows(store, req)?
+    } else {
+        None
+    };
+    let mut replay_legacy_treatment = legacy_req.is_some();
     loop {
         let mut boundary_divergence_detected = false;
+        let pass_req = if replay_legacy_treatment {
+            legacy_req.as_ref().unwrap_or(req)
+        } else {
+            req
+        };
         match apply_once(
             store,
-            req,
+            pass_req,
             ctx,
             estimate_tokens,
             output_cache,
-            projection_cache,
+            if replay_legacy_treatment {
+                None
+            } else {
+                projection_cache
+            },
             boundary_divergence_retry,
             &mut boundary_divergence_detected,
             incremental_history,
+            replay_legacy_treatment,
         ) {
+            Err(TransformError::SyntheticTreatmentBust | TransformError::CoverageGap(_))
+                if replay_legacy_treatment =>
+            {
+                replay_legacy_treatment = false;
+                continue;
+            }
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
             {
@@ -3400,6 +3458,7 @@ fn apply_once(
     boundary_divergence_retry: bool,
     boundary_divergence_detected: &mut bool,
     incremental_history: bool,
+    replay_legacy_treatment: bool,
 ) -> Result<TransformWithProjection, TransformError> {
     *boundary_divergence_detected = false;
     if !ctx.compaction_enabled {
@@ -4886,6 +4945,9 @@ fn apply_once(
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     ) && !marker_hard_serves_frozen_prefix;
     let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;
+    if replay_legacy_treatment && is_provider_prefix_mutation_pass {
+        return Err(TransformError::SyntheticTreatmentBust);
+    }
     // A defer replays previously served provider bytes even in a subagent: its tool loop
     // has an Anthropic cached prefix too. Hold overlays first discovered on served blocks
     // until the scheduler selects a prefix mutation pass. Use the plan, not `is_bust_pass`,
@@ -29543,6 +29605,96 @@ pub(crate) mod tests {
             matches!(err, TransformError::CoverageGap(_)),
             "a leading gap must fail loud, not silently drop the early live item: {err:?}"
         );
+    }
+
+    #[test]
+    fn previously_tagged_synthetic_notice_keeps_priced_prefix_on_append_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut messages = vec![
+            item("first", 1, "first user"),
+            item("notice", 2, "synthetic notice"),
+            item("answer", 3, "signed thinking follows"),
+        ];
+        let mut request = active_opencode_req("synthetic-defer", "cfg0", messages.clone());
+        let priced = run(&s, &request, &spine());
+        assert_eq!(priced.action, "HARD");
+        let priced_prefix = priced.messages().to_vec();
+        assert!(serde_json::to_string(&priced_prefix).unwrap().contains("§"));
+
+        messages[1].ck.meta.synthetic = true;
+        messages.push(item("next", 4, "appended user"));
+        request.messages = messages;
+        let defer = run(&s, &request, &spine());
+        assert_eq!(defer.action, "SOFT+");
+        let shared_ck = &defer.messages()[..priced_prefix.len()];
+        assert_eq!(
+            serde_json::to_vec(shared_ck).unwrap(),
+            serde_json::to_vec(&priced_prefix).unwrap(),
+            "an appended defer must not change previously served CK bytes"
+        );
+        let native = |rows: &[ServedMessage]| {
+            let owned = rows
+                .iter()
+                .map(|row| row.deref().clone())
+                .collect::<Vec<_>>();
+            crate::codec::encode_opencode_with_session(
+                &owned,
+                &crate::codec::DecodeSidecar::new("opencode"),
+                Some("synthetic-defer"),
+                None,
+            )
+        };
+        assert_eq!(
+            serde_json::to_vec(&native(shared_ck)).unwrap(),
+            serde_json::to_vec(&native(&priced_prefix)).unwrap(),
+            "an appended defer must not change previously served native bytes"
+        );
+
+        let mut bust_request = request;
+        bust_request.render_config = "cfg1".to_string();
+        let busted = run(&s, &bust_request, &spine());
+        assert_eq!(busted.action, "HARD");
+        let notice = busted
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("notice"))
+            .unwrap();
+        assert!(notice.meta.synthetic);
+        assert!(!serde_json::to_string(notice).unwrap().contains("§2§"));
+    }
+
+    #[test]
+    fn tagged_marker_gap_heals_on_hard_without_replaying_legacy_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut messages = vec![
+            item("m1", 1, "covered one"),
+            item("notice", 2, "synthetic notice"),
+            item("m3", 3, "covered three"),
+            item("tail", 4, "signed thinking follows"),
+        ];
+        let request = active_opencode_req("ses", "cfg0", messages.clone());
+        let priced = run(&s, &request, &spine());
+        assert_eq!(priced.action, "HARD");
+        assert!(s
+            .load_tags_for_session("ses")
+            .unwrap()
+            .iter()
+            .any(|row| row.block_id == "notice#0"));
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "m1", "S1"), comp(2, 3, 3, "m3", "S2")],
+        )
+        .unwrap();
+        messages[1].ck.meta.synthetic = true;
+        let healed = run(&s, &active_opencode_req("ses", "cfg0", messages), &spine());
+        assert_eq!(healed.action, "HARD");
+        assert_eq!(healed.coverage_ordinal, Some(3));
+        assert!(healed
+            .messages()
+            .iter()
+            .all(|message| message.meta.harness_id.as_deref() != Some("notice")));
     }
 
     #[test]

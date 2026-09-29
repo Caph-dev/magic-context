@@ -32,7 +32,10 @@ describe("encodeOpenCodeMessagesToCk", () => {
         expect(after.ck.meta).toMatchObject({ synthetic: true });
         expect(after.ck.content).toEqual(before.ck.content);
         expect(JSON.stringify(after.ck)).toBe(JSON.stringify(before.ck));
-        const append = { info: { id: "msg_next", role: "user" }, parts: [{ type: "text", text: "next" }] };
+        const append = {
+            info: { id: "msg_next", role: "user" },
+            parts: [{ type: "text", text: "next" }],
+        };
         const priced = encodeOpenCodeMessagesToCk([row, append]);
         const deferred = encodeOpenCodeMessagesToCk([
             { ...row, parts: [...row.parts, { type: "compaction", auto: true }] },
