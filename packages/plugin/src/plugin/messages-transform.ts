@@ -19,7 +19,11 @@ import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-ref
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { replayRustModeBindingMismatchStrips } from "../hooks/magic-context/transform-postprocess-phase";
 import { log, sessionLog } from "../shared/logger";
-import { isTransientSqliteError, withSqliteTransformPass } from "../shared/sqlite";
+import {
+    isTransientSqliteError,
+    withAsyncPrivilegedWriter,
+    withSqliteTransformPass,
+} from "../shared/sqlite";
 
 export const ASSISTANT_TERMINAL_RETRY_MESSAGE =
     "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue.";
@@ -320,6 +324,10 @@ export function createMessagesTransformHandler(args: {
               })()
             : null;
         try {
+            if (!args.compactionOff && magicContext) {
+                const admissionDb = openDatabase();
+                if (admissionDb) await withAsyncPrivilegedWriter(admissionDb, () => undefined);
+            }
             await magicContext?.["experimental.chat.messages.transform"]?.(input, output);
             return output.messages;
         } catch (error) {

@@ -4,7 +4,7 @@ import { captureLkgSlot } from "../hooks/magic-context/lkg-replay";
 import { resetLkgSlotsForTest } from "../hooks/magic-context/lkg-slot";
 import { STORAGE_BUSY_MESSAGE } from "../hooks/magic-context/storage-busy-refusal";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
-import { Database, withPrivilegedWriter } from "../shared/sqlite";
+import { Database, withAsyncPrivilegedWriter } from "../shared/sqlite";
 import { adaptPayload } from "../v2/hooks/payload";
 import type { SessionContext } from "../v2/hooks/types";
 import { createMessagesTransformHandler } from "./messages-transform";
@@ -71,7 +71,6 @@ for (const host of ["OpenCode 1", "OpenCode 2"]) {
             const realExec = db.exec.bind(db);
             let attempts = 0;
             let callbacks = 0;
-            const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
             const exec = spyOn(db, "exec").mockImplementation((sql) => {
                 if (sql === "BEGIN IMMEDIATE" && ++attempts < clearsOn)
                     throw Object.assign(new Error("locked"), { code: "SQLITE_BUSY" });
@@ -81,7 +80,7 @@ for (const host of ["OpenCode 1", "OpenCode 2"]) {
                 const handler = createMessagesTransformHandler({
                     magicContext: {
                         "experimental.chat.messages.transform": async (_input, output) => {
-                            withPrivilegedWriter(db, () => {
+                            await withAsyncPrivilegedWriter(db, () => {
                                 callbacks++;
                                 (output.messages[0].parts[0] as { text: string }).text =
                                     "managed summary";
@@ -100,7 +99,6 @@ for (const host of ["OpenCode 1", "OpenCode 2"]) {
                 expect(retried.bytes()).toContain("managed summary");
             } finally {
                 exec.mockRestore();
-                wait.mockRestore();
                 db.close();
             }
         });
