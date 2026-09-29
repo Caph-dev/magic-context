@@ -2358,6 +2358,9 @@ async function startPiMagicContextRuntime(
 		} catch (err) {
 			log(`agent_end: channel2 delivery skipped: ${String(err)}`);
 		}
+		// Print mode never receives session_shutdown. Flush the buffered log now
+		// so its 500 ms logger timer does not keep a completed one-shot Pi alive.
+		if (!ctx.hasUI) flushLogger();
 	});
 
 	// Tool-execution-start hook: detect note-nudge triggers from

@@ -93,6 +93,10 @@ describe("agent_end handler (blocking-historian regression)", () => {
 		expect(codeOnly).not.toContain("awaitInFlightHistorians");
 	});
 
+	test("headless agent_end flushes the logger before print mode exits", () => {
+		expect(body).toContain("if (!ctx.hasUI) flushLogger();");
+	});
+
 	test("handler code does NOT call awaitInFlightDreamers", () => {
 		expect(codeOnly).not.toContain("awaitInFlightDreamers");
 	});
