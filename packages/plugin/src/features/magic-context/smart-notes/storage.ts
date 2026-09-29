@@ -317,9 +317,9 @@ export function markSmartNoteCompilationFailure(
     now: number,
     maxFailures: number,
     error: string,
+    persistent: boolean,
 ): void {
     const failureCount = readFailureCount(db, noteId, "check_failure_count") + 1;
-    const persistent = /response body too large|all HTTP sources inaccessible/.test(error);
     const status: NoteCheckStatus = persistent
         ? "uncompiled"
         : failureCount >= maxFailures

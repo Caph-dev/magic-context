@@ -54,6 +54,7 @@ export interface CompileSmartNoteFailure {
     ok: false;
     cancelled: boolean;
     error: string;
+    persistent: boolean;
 }
 
 export type CompileSmartNoteResult = CompileSmartNoteSuccess | CompileSmartNoteFailure;
@@ -74,7 +75,12 @@ export async function compileSmartNoteCheck(
     args: CompileSmartNoteArgs,
 ): Promise<CompileSmartNoteResult> {
     if (!args.note.surfaceCondition) {
-        return { ok: false, cancelled: false, error: "note has no surface condition" };
+        return {
+            ok: false,
+            cancelled: false,
+            error: "note has no surface condition",
+            persistent: false,
+        };
     }
     const prompt = `Compile this smart note condition into a sandbox check.
 
@@ -199,14 +205,17 @@ Remember: output only the JSON object described by the system prompt.`;
         const compiledCheck = normalizeCompiledCheck(response.compiled_check);
         const manifest = normalizeManifest(response.manifest);
         const checkCron = normalizeCron(response.check_cron);
-        for (const warning of manifestAdvisoryWarnings(compiledCheck, manifest)) {
-            log(`[dreamer] smart note #${args.note.id}: manifest advisory — ${warning}`);
-        }
         const dryRun = await dryRunSmartNoteCheck(
             compiledCheck,
             args.capabilityFactory,
             args.signal,
         );
+        for (const warning of [
+            ...manifestAdvisoryWarnings(compiledCheck, manifest),
+            ...dryRun.advisories,
+        ]) {
+            log(`[dreamer] smart note #${args.note.id}: manifest advisory — ${warning}`);
+        }
         if (!dryRun.ok) {
             const error = boundedError(`dry-run failed: ${dryRun.error}`);
             recordInvocation({
@@ -214,7 +223,12 @@ Remember: output only the JSON object described by the system prompt.`;
                 messages: outputMessages,
                 error,
             });
-            return { ok: false, cancelled: dryRun.cancelled, error };
+            return {
+                ok: false,
+                cancelled: dryRun.cancelled,
+                error,
+                persistent: !dryRun.cancelled && dryRun.persistent,
+            };
         }
         recordInvocation({ status: "completed", messages: outputMessages });
         return {
@@ -229,7 +243,7 @@ Remember: output only the JSON object described by the system prompt.`;
         const cancelled = args.signal.aborted;
         const message = boundedError(error instanceof Error ? error.message : String(error));
         recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
-        return { ok: false, cancelled, error: message };
+        return { ok: false, cancelled, error: message, persistent: false };
     } finally {
         // The carrier branch closes its own run; only the child-session branch
         // leaves a session behind to tear down.
@@ -251,7 +265,7 @@ export async function dryRunSmartNoteCheck(
     compiledCheck: string,
     capabilityFactory: SmartNoteCapabilityFactory,
     signal?: AbortSignal,
-): Promise<RunCompiledSmartNoteCheckResult> {
+): Promise<RunCompiledSmartNoteCheckResult & { advisories: string[] }> {
     const responses: Array<{ url: string; status: number }> = [];
     const dryRun = await runCompiledSmartNoteCheck({
         compiledCheck,
@@ -269,21 +283,17 @@ export async function dryRunSmartNoteCheck(
         signal,
         timeoutMs: 2_000,
     });
-    // A check that sees only inaccessible HTTP sources cannot distinguish an
-    // unmet trigger from a trigger it was never able to observe.
-    if (
+    // A note can wait for a release artifact that does not exist yet, so
+    // inaccessible HTTP sources are advisory rather than compilation errors.
+    const advisories =
         dryRun.ok &&
         responses.length > 0 &&
         responses.every(({ status }) => status === 401 || status === 403 || status === 404)
-    ) {
-        return {
-            ok: false,
-            cancelled: false,
-            network: false,
-            error: `all HTTP sources inaccessible: ${responses.map(({ url, status }) => `${url} (HTTP ${status})`).join(", ")}`,
-        };
-    }
-    return dryRun;
+            ? [
+                  `all HTTP sources currently return 401/403/404: ${responses.map(({ url, status }) => `${url} (HTTP ${status})`).join(", ")}`,
+              ]
+            : [];
+    return { ...dryRun, advisories };
 }
 
 export function parseCompilerOutput(output: string | null): CompilerResponse {

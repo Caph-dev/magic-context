@@ -112,16 +112,14 @@ describe("smart-note compiler dry-run sources", () => {
         return { met: second.status === 200 && second.body.includes("credential_categories") };
     }`;
 
-    test("reports every inaccessible source rather than compiling an uncheckable condition", async () => {
+    test("keeps all-404 sources compilable and reports an advisory", async () => {
         const result = await dryRunSmartNoteCheck(check, () => ({
             ...fakeCap,
             httpGet: async () => ({ status: 404, body: "404: Not Found" }),
         }));
-        expect(result.ok).toBe(false);
-        if (!result.ok) {
-            expect(result.error).toContain("CHANGELOG.md (HTTP 404)");
-            expect(result.error).toContain("schema.sql (HTTP 404)");
-        }
+        expect(result).toMatchObject({ ok: true, result: { met: false } });
+        expect(result.advisories[0]).toContain("CHANGELOG.md (HTTP 404)");
+        expect(result.advisories[0]).toContain("schema.sql (HTTP 404)");
     });
 
     test("retains a large-response network error instead of treating it as unmet", async () => {
@@ -131,7 +129,7 @@ describe("smart-note compiler dry-run sources", () => {
             httpGet: async () => {
                 throw new SmartNoteNetworkError(
                     `SMART_NOTE_NETWORK: response body too large at ${url} (received at least 65537 bytes; limit 65536)`,
-                    { terminal: true },
+                    { terminal: true, persistent: true },
                 );
             },
         }));
@@ -139,6 +137,7 @@ describe("smart-note compiler dry-run sources", () => {
         if (!result.ok) {
             expect(result.error).toContain(url);
             expect(result.error).toContain("65537 bytes");
+            expect(result.persistent).toBe(true);
         }
     });
 
@@ -150,7 +149,18 @@ describe("smart-note compiler dry-run sources", () => {
                 body: "no category yet",
             }),
         }));
-        expect(result).toEqual({ ok: true, result: { met: false } });
+        expect(result).toEqual({ ok: true, result: { met: false }, advisories: [] });
+    });
+
+    test("a terminal timeout does not become a persistent compilation failure", async () => {
+        const result = await dryRunSmartNoteCheck(check, () => ({
+            ...fakeCap,
+            httpGet: async () => {
+                throw new SmartNoteNetworkError("request timed out", { terminal: true });
+            },
+        }));
+        expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.persistent).toBe(false);
     });
 });
 

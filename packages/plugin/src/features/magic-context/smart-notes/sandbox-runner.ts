@@ -21,7 +21,7 @@ import type {
 } from "quickjs-emscripten";
 
 import type { SmartNoteCapabilityApi, SmartNoteCapabilityFactory } from "./capabilities";
-import { isSmartNoteNetworkError, type SmartNoteCheckResult } from "./types";
+import { isSmartNoteNetworkError, type SmartNoteCheckResult, SmartNoteNetworkError } from "./types";
 
 /**
  * The WASM module is expensive to instantiate (~1MB compile) but reusable across
@@ -175,6 +175,7 @@ export interface RunCompiledSmartNoteCheckFailure {
     cancelled: false;
     error: string;
     network: boolean;
+    persistent: boolean;
 }
 
 export interface RunCompiledSmartNoteCheckCancelled {
@@ -256,6 +257,7 @@ async function runCompiledSmartNoteCheckLocked(
     const controller = new AbortController();
     let externallyCancelled = false;
     let executionTimedOut = false;
+    let persistentNetworkFailure = false;
     const externalAbort = () => {
         externallyCancelled = true;
         controller.abort(options.signal?.reason);
@@ -276,7 +278,21 @@ async function runCompiledSmartNoteCheckLocked(
             context.runtime.setInterruptHandler(
                 () => controller.signal.aborted || Date.now() > deadline,
             );
-            installCapabilityObject(context, capabilities);
+            installCapabilityObject(context, {
+                ...capabilities,
+                httpGet: async (url) => {
+                    try {
+                        return await capabilities.httpGet(url);
+                    } catch (error) {
+                        // QuickJS turns host exceptions into guest errors, losing
+                        // the typed failure metadata before the outer catch.
+                        if (error instanceof SmartNoteNetworkError && error.persistent) {
+                            persistentNetworkFailure = true;
+                        }
+                        throw error;
+                    }
+                },
+            });
             disableAmbientDynamicCode(context);
             const result = await evalCheck(context, options.compiledCheck);
             const checkResult = result as { met?: unknown } | null;
@@ -291,15 +307,23 @@ async function runCompiledSmartNoteCheckLocked(
         // Queue deadlines and lease loss are control flow, not evidence that a
         // healthy compiled check is failing. Only this run's own timeout counts.
         if (externallyCancelled && !executionTimedOut) return cancelledResult(error);
-        return failureResult(formatSandboxError(error), isSmartNoteNetworkError(error));
+        return failureResult(
+            formatSandboxError(error),
+            isSmartNoteNetworkError(error),
+            persistentNetworkFailure,
+        );
     } finally {
         clearTimeout(timer);
         options.signal?.removeEventListener("abort", externalAbort);
     }
 }
 
-function failureResult(error: string, network: boolean): RunCompiledSmartNoteCheckFailure {
-    return { ok: false, cancelled: false, error: truncate(error), network };
+function failureResult(
+    error: string,
+    network: boolean,
+    persistent = false,
+): RunCompiledSmartNoteCheckFailure {
+    return { ok: false, cancelled: false, error: truncate(error), network, persistent };
 }
 
 function cancelledResult(reason: unknown): RunCompiledSmartNoteCheckCancelled {

@@ -251,19 +251,20 @@ describe("guarded HTTPS request agent", () => {
             return request;
         }) as typeof https.request);
         try {
-            await expect(
-                requestValidatedAddress(
-                    {
-                        url: new URL("https://example.test/CHANGELOG.md"),
-                        hostname: "example.test",
-                        addresses: [],
-                    },
-                    { address: "93.184.216.34", family: 4, classification: "global" },
-                    { signal, timeoutMs: 100, bodyLimitBytes: 65_536 },
-                ),
-            ).rejects.toThrow(
+            const error = await requestValidatedAddress(
+                {
+                    url: new URL("https://example.test/CHANGELOG.md"),
+                    hostname: "example.test",
+                    addresses: [],
+                },
+                { address: "93.184.216.34", family: 4, classification: "global" },
+                { signal, timeoutMs: 100, bodyLimitBytes: 65_536 },
+            ).catch((caught: unknown) => caught);
+            expect(error).toBeInstanceOf(SmartNoteNetworkError);
+            expect(error.message).toMatch(
                 /example\.test\/CHANGELOG\.md \(received at least 65537 bytes; limit 65536\)/,
             );
+            expect(error.persistent).toBe(true);
         } finally {
             spy.mockRestore();
         }

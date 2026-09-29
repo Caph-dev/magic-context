@@ -81,7 +81,7 @@ describe("smart-note compilation selection", () => {
 describe("persistent compilation failure", () => {
     test.each([
         "dry-run failed: SMART_NOTE_NETWORK: response body too large at https://example.com/CHANGELOG.md",
-        "dry-run failed: all HTTP sources inaccessible: https://example.com/schema.sql (HTTP 404)",
+        "dry-run failed: response exceeded configured ceiling",
     ])("records reason and does not retry nightly: %s", (error) => {
         const db = freshDb();
         try {
@@ -91,7 +91,7 @@ describe("persistent compilation failure", () => {
                 surfaceCondition: "when schema changes",
             });
             const now = Date.now();
-            markSmartNoteCompilationFailure(db, note.id, now, 3, error);
+            markSmartNoteCompilationFailure(db, note.id, now, 3, error, true);
             const stored = getNotes(db, { projectPath: PROJECT, type: "smart" })[0];
             expect(stored?.readyReason).toBe(`Condition can't be checked: ${error}; rewrite it`);
             expect(stored?.checkStatus).toBe("uncompiled");
@@ -112,6 +112,23 @@ describe("persistent compilation failure", () => {
             expect(
                 getNotes(db, { projectPath: PROJECT, type: "smart" })[0]?.readyReason,
             ).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("message wording cannot turn a transient failure into a week-long backoff", () => {
+        const db = freshDb();
+        try {
+            const note = addNote(db, "smart", {
+                projectPath: PROJECT,
+                content: "waiting",
+                surfaceCondition: "when release arrives",
+            });
+            const now = Date.now();
+            markSmartNoteCompilationFailure(db, note.id, now, 3, "response body too large", false);
+            const stored = getNotes(db, { projectPath: PROJECT, type: "smart" })[0];
+            expect(stored?.checkNextDueAt).toBeLessThan(now + 24 * 60 * 60 * 1_000);
         } finally {
             closeQuietly(db);
         }

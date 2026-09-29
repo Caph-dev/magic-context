@@ -329,6 +329,7 @@ async function compileNote(
                         now,
                         MAX_COMPILATION_FAILURES,
                         result.error,
+                        result.persistent,
                     );
                 },
             });
