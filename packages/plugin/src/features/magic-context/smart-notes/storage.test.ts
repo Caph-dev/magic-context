@@ -129,6 +129,8 @@ describe("persistent compilation failure", () => {
             markSmartNoteCompilationFailure(db, note.id, now, 3, "response body too large", false);
             const stored = getNotes(db, { projectPath: PROJECT, type: "smart" })[0];
             expect(stored?.checkNextDueAt).toBeLessThan(now + 24 * 60 * 60 * 1_000);
+            // A transient failure retries quietly; it doesn't ask the owner to rewrite.
+            expect(stored?.readyReason).toBeNull();
         } finally {
             closeQuietly(db);
         }

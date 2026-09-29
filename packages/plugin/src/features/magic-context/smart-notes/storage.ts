@@ -338,7 +338,9 @@ export function markSmartNoteCompilationFailure(
         failureCount,
         status,
         nextDueAt,
-        `Condition can't be checked: ${error}; rewrite it`,
+        // Only a failure that will repeat regardless of the watched event asks the
+        // owner to rewrite the condition; a transient failure just retries.
+        persistent ? `Condition can't be checked: ${error}; rewrite it` : null,
         now,
         noteId,
     );
