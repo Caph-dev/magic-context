@@ -46,13 +46,30 @@ describe("event-resolvers", () => {
         const model = "custom/model";
         const baseline = historyBudgetPolicyIdentity(0.15, 40, model);
         expect(historyBudgetPolicyIdentity(0.2, 40, model)).not.toBe(baseline);
-        expect(historyBudgetPolicyIdentity(0.15, { default: 65, [model]: 40 }, model)).toBe(baseline);
-        expect(historyBudgetPolicyIdentity(0.15, { default: 40, [model]: 50 }, model)).not.toBe(baseline);
-        expect(historyBudgetPolicyIdentity(0.15, 40, model, { default: 100000 })).toBe("p0.15:tokens:100000");
-        expect(historyBudgetPolicyIdentity(0.15, 40, model, { default: 100000, [model]: 110000 })).toBe("p0.15:tokens:110000");
-        expect(historyBudgetPolicyIdentity(0.15, 40, model, { default: 100000, "other/model": 110000 })).toBe("p0.15:tokens:100000");
-        expect(historyBudgetPolicyIdentity(undefined, 40, model)).toBe(historyBudgetPolicyIdentity(undefined, 80, model, { default: 100000 }));
-        expect(historyBudgetPolicyIdentity(0.15, 95, model)).toBe(historyBudgetPolicyIdentity(0.15, 90, model));
+        expect(historyBudgetPolicyIdentity(0.15, { default: 65, [model]: 40 }, model)).toBe(
+            baseline,
+        );
+        expect(historyBudgetPolicyIdentity(0.15, { default: 40, [model]: 50 }, model)).not.toBe(
+            baseline,
+        );
+        expect(historyBudgetPolicyIdentity(0.15, 40, model, { default: 100000 })).toBe(
+            "p0.15:tokens:100000",
+        );
+        expect(
+            historyBudgetPolicyIdentity(0.15, 40, model, { default: 100000, [model]: 110000 }),
+        ).toBe("p0.15:tokens:110000");
+        expect(
+            historyBudgetPolicyIdentity(0.15, 40, model, {
+                default: 100000,
+                "other/model": 110000,
+            }),
+        ).toBe("p0.15:tokens:100000");
+        expect(historyBudgetPolicyIdentity(undefined, 40, model)).toBe(
+            historyBudgetPolicyIdentity(undefined, 80, model, { default: 100000 }),
+        );
+        expect(historyBudgetPolicyIdentity(0.15, 95, model)).toBe(
+            historyBudgetPolicyIdentity(0.15, 90, model),
+        );
     });
 
     describe("resolveContextLimit", () => {
