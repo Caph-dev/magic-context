@@ -59,7 +59,9 @@ describe.skipIf(!rustPrereqs.ok)("rust timeout epoch recovery", () => {
         await h.subc.restoreModule({
             MC_DRIVE_FAULT: "transform_timeout",
             MC_DRIVE_FAULT_COUNT: "1",
-            MC_DRIVE_FAULT_DELAY_MS: "16000",
+            // The client waits 15s, then retries the exact final request for up to 45s
+            // without applying the transaction twice. This stall must outlast both.
+            MC_DRIVE_FAULT_DELAY_MS: "65000",
         });
 
         const beforeTimeout = h.readRustPasses().length;
@@ -70,7 +72,8 @@ describe.skipIf(!rustPrereqs.ok)("rust timeout epoch recovery", () => {
         // neither option applies a result from the module.
         expect(timeoutPasses.at(-1)?.applied).toBe(false);
         expect(["raw", "lkg"]).toContain(timeoutPasses.at(-1)?.servedFrom);
-        await Bun.sleep(2_000);
+        // Let the delayed execution finish before testing recovery.
+        await Bun.sleep(7_000);
 
         const beforeRecovery = timeoutPasses.length;
         await h.sendPrompt(sessionId, "first recovery pass", { timeoutMs: 90_000 });

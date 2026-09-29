@@ -92,7 +92,8 @@ describe.skipIf(!rustPrereqs.ok)("rust timeout double HARD", () => {
             await h.subc.restoreModule({
                 MC_DRIVE_FAULT: "transform_timeout",
                 MC_DRIVE_FAULT_COUNT: "1",
-                MC_DRIVE_FAULT_DELAY_MS: "16000",
+                // Outlast the client's 15s deadline plus its 45s retry of the exact final request.
+                MC_DRIVE_FAULT_DELAY_MS: "65000",
             });
 
             const logOffset = h.diagnosticLog().length;
@@ -102,7 +103,7 @@ describe.skipIf(!rustPrereqs.ok)("rust timeout double HARD", () => {
             });
             const timeoutPasses = await h.waitForRustPasses(beforeTimeout + 1, 30_000);
             expect(timeoutPasses.at(-1)).toMatchObject({ applied: false });
-            await Bun.sleep(2_000);
+            await Bun.sleep(7_000);
 
             const beforeRecovery = h.readRustPasses().length;
             const turns = STEADY_PASSES_AFTER_RECOVERY + 1;

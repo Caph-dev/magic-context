@@ -24,6 +24,10 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// It was re-minted again when the v1 entry began applying the historian
 			// and dreamer output caps sampled for each child run (7e00707c55,
 			// "reload historian and dreamer output caps per child run"); also v1.
+			// It was re-minted again when the v1 entry began telling the user and
+			// aborting the turn when busy storage refuses a pass instead of serving
+			// it raw (38a6a6cd12, "refuse unmanaged prompts on storage contention
+			// and Rust outages"); also a deliberate v1 change.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")
