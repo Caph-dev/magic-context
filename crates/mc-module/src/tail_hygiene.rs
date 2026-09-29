@@ -42,9 +42,6 @@ const RED_KEY_PREFIX: &str = "red:";
 const CAV_KEY_PREFIX: &str = "cav:";
 const CHANNEL1_REMINDER_OPEN: &str = "\n\n<system-reminder>\n";
 const CHANNEL1_REMINDER_CLOSE: &str = "\n</system-reminder>";
-const IMAGE_TOKEN_DIVISOR: u64 = 750;
-const IMAGE_FALLBACK_TOKENS: i64 = 1_200;
-const IMAGE_TOKEN_CAP: i64 = 4_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HygieneBand {
@@ -186,129 +183,9 @@ fn media_content(media: &MediaBlock) -> String {
         .unwrap_or_else(|| serde_json::to_string(&media.source).unwrap_or_default())
 }
 
-fn decode_base64_preview(payload: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(payload.len() * 3 / 4);
-    let mut quartet = [0u8; 4];
-    let mut filled = 0usize;
-    for byte in payload.bytes().take(512) {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        quartet[filled] = value;
-        filled += 1;
-        if filled == 4 {
-            output.push((quartet[0] << 2) | (quartet[1] >> 4));
-            output.push((quartet[1] << 4) | (quartet[2] >> 2));
-            output.push((quartet[2] << 6) | quartet[3]);
-            filled = 0;
-        }
-    }
-    if filled >= 2 {
-        output.push((quartet[0] << 2) | (quartet[1] >> 4));
-    }
-    if filled >= 3 {
-        output.push((quartet[1] << 4) | (quartet[2] >> 2));
-    }
-    Some(output)
-}
-
-fn image_dimensions(header: &str, bytes: &[u8]) -> Option<(u64, u64)> {
-    if header.contains("image/png")
-        && bytes.len() >= 24
-        && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-    {
-        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as u64;
-        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as u64;
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    if header.contains("image/gif") && bytes.len() >= 10 && bytes.starts_with(b"GIF") {
-        let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u64;
-        let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u64;
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    if (header.contains("image/jpeg") || header.contains("image/jpg"))
-        && bytes.starts_with(&[0xff, 0xd8])
-    {
-        let mut index = 2usize;
-        while index + 8 < bytes.len() {
-            if bytes[index] != 0xff {
-                index += 1;
-                continue;
-            }
-            let marker = bytes[index + 1];
-            let is_sof = matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf);
-            if is_sof {
-                let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u64;
-                let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u64;
-                return (width > 0 && height > 0).then_some((width, height));
-            }
-            if matches!(marker, 0xd8 | 0xd9 | 0x01) {
-                index += 2;
-                continue;
-            }
-            let segment_len = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
-            if segment_len < 2 {
-                return None;
-            }
-            index = index.saturating_add(2 + segment_len);
-        }
-    }
-    if header.contains("image/webp")
-        && bytes.len() >= 30
-        && bytes.starts_with(b"RIFF")
-        && &bytes[8..12] == b"WEBP"
-    {
-        let variant = &bytes[12..16];
-        let (width, height) = if variant == b"VP8 " {
-            (
-                u16::from_le_bytes([bytes[26], bytes[27]]) as u64 & 0x3fff,
-                u16::from_le_bytes([bytes[28], bytes[29]]) as u64 & 0x3fff,
-            )
-        } else if variant == b"VP8L" {
-            let width = 1 + (u16::from_le_bytes([bytes[21], bytes[22]]) as u64 & 0x3fff);
-            let height = 1
-                + (((bytes[22] as u64 >> 6)
-                    | ((bytes[23] as u64) << 2)
-                    | ((bytes[24] as u64) << 10))
-                    & 0x3fff);
-            (width, height)
-        } else if variant == b"VP8X" {
-            (
-                1 + bytes[24] as u64 + ((bytes[25] as u64) << 8) + ((bytes[26] as u64) << 16),
-                1 + bytes[27] as u64 + ((bytes[28] as u64) << 8) + ((bytes[29] as u64) << 16),
-            )
-        } else {
-            return None;
-        };
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    None
-}
-
-fn estimate_image_tokens(data_url: &str) -> i64 {
-    let Some((header, payload)) = data_url.split_once(',') else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let Some(bytes) = decode_base64_preview(payload) else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let Some((width, height)) = image_dimensions(header, &bytes) else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let pixels = width.saturating_mul(height);
-    let tokens = pixels.saturating_add(IMAGE_TOKEN_DIVISOR - 1) / IMAGE_TOKEN_DIVISOR;
-    (tokens as i64).clamp(1, IMAGE_TOKEN_CAP)
-}
-
 fn media_tokens(media: &MediaBlock, content: &str) -> i64 {
     match media.kind {
-        MediaKind::Image => estimate_image_tokens(content),
+        MediaKind::Image => crate::image_tokens::estimate_image_tokens(content),
         MediaKind::Audio | MediaKind::Video | MediaKind::File | MediaKind::Document => {
             estimated_tokens(content)
         }
@@ -406,6 +283,19 @@ fn neighborhood_consistent(
     matches!((previous_max, next_min), (Some(previous), Some(next)) if orphan_tag_number >= previous && orphan_tag_number <= next)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Block-id and caveman-key lookups made by this thread, read by the scaling test.
+    static ID_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one id lookup for the scaling test; compiles to nothing outside tests.
+#[inline(always)]
+fn count_id_probe() {
+    #[cfg(test)]
+    ID_PROBES.with(|probes| probes.set(probes.get() + 1));
+}
+
 /// Build part attribution from exact block identities. Pre-composite legacy rows whose block id is
 /// only a raw call id use the fallback only when one owner arc and its tag-number neighborhood are
 /// unambiguous; recurring call ids otherwise remain T-only.
@@ -413,28 +303,23 @@ fn tag_numbers_by_block_and_arc(
     projection: &FlatProjection,
     tag_rows: &[McTagRow],
 ) -> (HashMap<String, i64>, HashMap<String, i64>) {
-    let block_ids = projection
-        .blocks
-        .iter()
-        .map(|block| block.id.as_str())
-        .collect::<HashSet<_>>();
+    // One borrowed index serves both membership and lookup. The first block with an id wins,
+    // matching a front-to-back search when a projection repeats an id.
+    let mut block_by_id = HashMap::<&str, &FlatBlock>::with_capacity(projection.blocks.len());
+    for block in &projection.blocks {
+        block_by_id.entry(block.id.as_str()).or_insert(block);
+    }
     let message_indexes = projection_message_indexes(projection);
     let mut by_block = HashMap::new();
     let mut by_arc = HashMap::new();
     let mut bounds_by_message = HashMap::<usize, (i64, i64)>::new();
 
-    for row in tag_rows
-        .iter()
-        .filter(|row| block_ids.contains(row.block_id.as_str()))
-    {
-        by_block.insert(row.block_id.clone(), row.tag_number);
-        let Some(block) = projection
-            .blocks
-            .iter()
-            .find(|block| block.id == row.block_id)
-        else {
+    for row in tag_rows {
+        count_id_probe();
+        let Some(block) = block_by_id.get(row.block_id.as_str()).copied() else {
             continue;
         };
+        by_block.insert(row.block_id.clone(), row.tag_number);
         if let Some(arc_id) = &block.arc_id {
             by_arc.entry(arc_id.clone()).or_insert(row.tag_number);
         }
@@ -456,7 +341,8 @@ fn tag_numbers_by_block_and_arc(
         .collect::<HashSet<_>>();
     let mut orphan_rows = HashMap::<&str, Vec<&McTagRow>>::new();
     for row in tag_rows.iter().filter(|row| {
-        !block_ids.contains(row.block_id.as_str()) && call_ids.contains(row.block_id.as_str())
+        count_id_probe();
+        !block_by_id.contains_key(row.block_id.as_str()) && call_ids.contains(row.block_id.as_str())
     }) {
         orphan_rows
             .entry(row.block_id.as_str())
@@ -508,12 +394,23 @@ fn red_targets(core: &CoreState) -> HashSet<&str> {
         .collect()
 }
 
-fn caveman_content<'a>(core: &'a CoreState, block: &FlatBlock) -> Option<&'a str> {
-    let key = format!("{CAV_KEY_PREFIX}{}", block.id);
-    core.frozen_units
-        .iter()
-        .find(|unit| unit.key == key)
-        .map(|unit| unit.frozen_payload.as_str())
+/// Frozen caveman payloads keyed by the block id they rewrite. The first unit with a key wins,
+/// matching a front-to-back search of the frozen units.
+fn caveman_payloads(core: &CoreState) -> HashMap<&str, &str> {
+    let mut payloads = HashMap::new();
+    for unit in &core.frozen_units {
+        if let Some(block_id) = unit.key.strip_prefix(CAV_KEY_PREFIX) {
+            payloads
+                .entry(block_id)
+                .or_insert(unit.frozen_payload.as_str());
+        }
+    }
+    payloads
+}
+
+fn caveman_content<'a>(payloads: &HashMap<&str, &'a str>, block: &FlatBlock) -> Option<&'a str> {
+    count_id_probe();
+    payloads.get(block.id.as_str()).copied()
 }
 
 fn block_tag_number(
@@ -617,6 +514,7 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
         .filter_map(|block| block.arc_id.as_deref())
         .collect::<HashSet<_>>();
     let red_targets = red_targets(core);
+    let caveman_payloads = caveman_payloads(core);
     let reduced_arcs = projection
         .blocks
         .iter()
@@ -669,7 +567,7 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
             mc_store::CkKind::Text { text }
                 if block.role == "user" || block.role == "assistant" =>
             {
-                let content = caveman_content(core, block).unwrap_or(text);
+                let content = caveman_content(&caveman_payloads, block).unwrap_or(text);
                 let content = strip_channel1_reminder_spans(content);
                 if content.is_empty() || is_drop_sentinel(content) {
                     excluded_part(key, content)
@@ -1151,7 +1049,265 @@ mod tests {
             kind: "message".to_string(),
             token_count: 0,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
+        }
+    }
+
+    /// Tag attribution as it was before the borrowed block index: membership came from an id
+    /// set and every matching row searched the projection front to back. `comparisons` counts
+    /// the id comparisons that search made. Kept only as the differential reference.
+    fn scanning_tag_numbers_by_block_and_arc(
+        projection: &FlatProjection,
+        tag_rows: &[McTagRow],
+        comparisons: &std::cell::Cell<u64>,
+    ) -> (HashMap<String, i64>, HashMap<String, i64>) {
+        let block_ids = projection
+            .blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect::<HashSet<_>>();
+        let message_indexes = projection_message_indexes(projection);
+        let mut by_block = HashMap::new();
+        let mut by_arc = HashMap::new();
+        let mut bounds_by_message = HashMap::<usize, (i64, i64)>::new();
+        for row in tag_rows
+            .iter()
+            .filter(|row| block_ids.contains(row.block_id.as_str()))
+        {
+            by_block.insert(row.block_id.clone(), row.tag_number);
+            let Some(block) = projection.blocks.iter().find(|block| {
+                comparisons.set(comparisons.get() + 1);
+                block.id == row.block_id
+            }) else {
+                continue;
+            };
+            if let Some(arc_id) = &block.arc_id {
+                by_arc.entry(arc_id.clone()).or_insert(row.tag_number);
+            }
+            if let Some(index) = message_indexes.get(block.mid.as_str()) {
+                bounds_by_message
+                    .entry(*index)
+                    .and_modify(|(min, max)| {
+                        *min = (*min).min(row.tag_number);
+                        *max = (*max).max(row.tag_number);
+                    })
+                    .or_insert((row.tag_number, row.tag_number));
+            }
+        }
+        let call_ids = projection
+            .blocks
+            .iter()
+            .filter_map(|block| block.tool_call_id.as_deref())
+            .collect::<HashSet<_>>();
+        let mut orphan_rows = HashMap::<&str, Vec<&McTagRow>>::new();
+        for row in tag_rows.iter().filter(|row| {
+            !block_ids.contains(row.block_id.as_str()) && call_ids.contains(row.block_id.as_str())
+        }) {
+            orphan_rows
+                .entry(row.block_id.as_str())
+                .or_default()
+                .push(row);
+        }
+        for (call_id, rows) in orphan_rows {
+            if rows.len() != 1 {
+                continue;
+            }
+            let candidate_arcs = projection
+                .blocks
+                .iter()
+                .filter(|block| block.tool_call_id.as_deref() == Some(call_id))
+                .filter_map(|block| block.arc_id.as_deref())
+                .filter(|arc_id| !by_arc.contains_key(*arc_id))
+                .collect::<BTreeSet<_>>();
+            if candidate_arcs.len() != 1 {
+                continue;
+            }
+            let arc_id = *candidate_arcs.first().expect("one candidate arc");
+            let Some(owner_index) = projection
+                .blocks
+                .iter()
+                .filter(|block| block.arc_id.as_deref() == Some(arc_id))
+                .filter_map(|block| message_indexes.get(block.mid.as_str()).copied())
+                .min()
+            else {
+                continue;
+            };
+            if neighborhood_consistent(
+                rows[0].tag_number,
+                owner_index,
+                message_indexes.len(),
+                &bounds_by_message,
+            ) {
+                by_arc.insert(arc_id.to_string(), rows[0].tag_number);
+            }
+        }
+        (by_block, by_arc)
+    }
+
+    /// The caveman lookup before frozen units were indexed: a front-to-back search per block.
+    fn scanning_caveman_content<'a>(core: &'a CoreState, block: &FlatBlock) -> Option<&'a str> {
+        let key = format!("{CAV_KEY_PREFIX}{}", block.id);
+        core.frozen_units
+            .iter()
+            .find(|unit| unit.key == key)
+            .map(|unit| unit.frozen_payload.as_str())
+    }
+
+    fn frozen(key: String, payload: &str) -> mc_core::FrozenUnit {
+        mc_core::FrozenUnit {
+            key,
+            kind: "caveman".to_string(),
+            frozen_payload: payload.to_string(),
+            durability_class: mc_core::DurabilityClass::Lineage,
+            reset_rule: String::new(),
+        }
+    }
+
+    /// A tool-heavy tail of `arcs` call/result pairs plus a user text per arc, every block
+    /// tagged. Also carries rows for blocks outside the projection, legacy rows keyed by a raw
+    /// call id (unique and recurring), a call id shared by two arcs, and caveman units with a
+    /// duplicate key, so the orphan and first-match rules are exercised.
+    fn hygiene_scale_fixture(arcs: usize) -> (FlatProjection, Vec<McTagRow>, CoreState) {
+        let mut messages = Vec::new();
+        let mut tags = Vec::new();
+        let mut core = CoreState::default();
+        let mut number = 0i64;
+        for n in 0..arcs {
+            let ordinal = n as u64 * 3 + 1;
+            // Every 97th arc reuses the previous arc's call id, as recurring provider ids do.
+            let call_id = if n % 97 == 96 {
+                format!("c{}", n - 1)
+            } else {
+                format!("c{n}")
+            };
+            messages.push(message(
+                &format!("call{n}"),
+                ordinal,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: call_id.clone(),
+                    name: "read".to_string(),
+                    input: json!({ "path": format!("f{n}") }),
+                    provider_executed: false,
+                }],
+            ));
+            messages.push(message(
+                &format!("result{n}"),
+                ordinal + 1,
+                "user",
+                vec![CkKind::ToolResult {
+                    id: call_id.clone(),
+                    tool_name: "read".to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: format!("out {n}"),
+                    }),
+                    provider_executed: false,
+                }],
+            ));
+            messages.push(text(&format!("user{n}"), ordinal + 2, &format!("ask {n}")));
+            if n % 13 == 5 {
+                // Legacy rows name the raw call id instead of a block id.
+                number += 1;
+                tags.push(tag(number, &call_id));
+            } else {
+                for block in [format!("call{n}#0"), format!("result{n}#0")] {
+                    number += 1;
+                    tags.push(tag(number, &block));
+                }
+            }
+            number += 1;
+            tags.push(tag(number, &format!("user{n}#0")));
+            if n % 7 == 0 {
+                number += 1;
+                tags.push(tag(number, &format!("gone{n}#0")));
+            }
+            if n % 5 == 0 {
+                core.frozen_units
+                    .push(frozen(format!("{CAV_KEY_PREFIX}user{n}#0"), "short"));
+                if n % 10 == 0 {
+                    core.frozen_units
+                        .push(frozen(format!("{CAV_KEY_PREFIX}user{n}#0"), "second"));
+                }
+            }
+        }
+        (project_messages(&messages).unwrap(), tags, core)
+    }
+
+    /// The indexed attribution and caveman lookup must agree exactly with the front-to-back
+    /// searches they replace, including legacy raw-call-id rows, recurring call ids, rows for
+    /// absent blocks and duplicate caveman keys.
+    #[test]
+    fn indexed_hygiene_attribution_matches_scanning_reference() {
+        for arcs in [1, 40, 300] {
+            let (projection, tags, core) = hygiene_scale_fixture(arcs);
+            let comparisons = std::cell::Cell::new(0);
+            assert_eq!(
+                tag_numbers_by_block_and_arc(&projection, &tags),
+                scanning_tag_numbers_by_block_and_arc(&projection, &tags, &comparisons),
+                "arcs={arcs}"
+            );
+            let payloads = caveman_payloads(&core);
+            let mut caveman_hits = 0;
+            for block in &projection.blocks {
+                let indexed = caveman_content(&payloads, block);
+                assert_eq!(indexed, scanning_caveman_content(&core, block));
+                caveman_hits += usize::from(indexed.is_some());
+            }
+            assert_eq!(caveman_hits, arcs.div_ceil(5), "arcs={arcs}");
+        }
+        // The fixture must reach the legacy fallback for the comparison to cover it.
+        let (projection, tags, _) = hygiene_scale_fixture(300);
+        let (by_block, by_arc) = tag_numbers_by_block_and_arc(&projection, &tags);
+        let legacy_numbers = tags
+            .iter()
+            .filter(|row| !row.block_id.contains('#'))
+            .map(|row| row.tag_number)
+            .collect::<HashSet<_>>();
+        assert!(by_arc
+            .values()
+            .any(|number| legacy_numbers.contains(number)));
+        assert!(!by_block.keys().any(|id| id.starts_with("gone")));
+    }
+
+    /// Scaling counter for the hygiene measurement: id lookups made by the full production
+    /// measurement must grow linearly with tagged blocks, while the replaced front-to-back
+    /// search grows quadratically. Counts, not wall clock, so the result is load-independent.
+    #[test]
+    #[ignore = "scaling benchmark; run with --ignored --nocapture"]
+    fn hygiene_lookup_scaling_counts() {
+        let mut per_block = Vec::new();
+        for arcs in [334, 1_334, 5_334] {
+            let (projection, tags, core) = hygiene_scale_fixture(arcs);
+            let blocks = projection.blocks.len();
+            let window = crate::protection_window::ProtectionWindow::from_persisted_rows(&tags, 0);
+            ID_PROBES.with(|probes| probes.set(0));
+            let measured = measure_tail_hygiene_with_pending_drops(
+                &projection,
+                &core,
+                None,
+                &tags,
+                &window.tag_numbers,
+                &HashSet::new(),
+                &HashSet::new(),
+            );
+            let probes = ID_PROBES.with(std::cell::Cell::get);
+            let comparisons = std::cell::Cell::new(0);
+            scanning_tag_numbers_by_block_and_arc(&projection, &tags, &comparisons);
+            eprintln!(
+                "hygiene-scaling tagged_blocks={blocks} tag_rows={} indexed_probes={probes} scanning_comparisons={} t={}",
+                tags.len(),
+                comparisons.get(),
+                measured.t
+            );
+            per_block.push((blocks, probes as f64 / blocks as f64));
+        }
+        // Linear: lookups per block stay flat (within 10%) from ~1k to ~16k blocks.
+        let (_, first) = per_block[0];
+        for (blocks, ratio) in &per_block {
+            assert!(
+                (*ratio - first).abs() <= first * 0.1,
+                "{blocks} blocks: {ratio} probes per block vs {first}"
+            );
         }
     }
 
@@ -1845,7 +2001,7 @@ mod tests {
             kind: input.kind.clone(),
             token_count: input.token_count,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
     }
 

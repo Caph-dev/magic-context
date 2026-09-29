@@ -7466,7 +7466,7 @@ fn new_caveman_units(
             {
                 return None;
             }
-            let source = String::from_utf8(row.source_bytes.clone()).ok()?;
+            let source = std::str::from_utf8(&row.source_bytes).ok()?.to_owned();
             (!source.is_empty()).then_some((tag_number, block.id.clone(), source))
         })
         .collect::<Vec<_>>();
@@ -9451,6 +9451,20 @@ fn tag_mint_frontier_cache() -> &'static Mutex<TagMintFrontierCache> {
     })
 }
 
+/// Append this pass's mints to the shared tag rows and return the index of the first mint.
+/// A pass with nothing to mint leaves the rows untouched: they are usually shared with the
+/// retained tag baseline, and requesting mutable access would copy every row to append nothing.
+fn append_minted_tag_rows(
+    tag_rows: &mut Arc<Vec<McTagRow>>,
+    tag_mints: Vec<TagMintInput>,
+    created_at_ms: i64,
+) -> usize {
+    if tag_mints.is_empty() {
+        return tag_rows.len();
+    }
+    append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mints, created_at_ms)
+}
+
 fn append_tag_mint_rows(
     tag_rows: &mut Vec<McTagRow>,
     tag_mints: Vec<TagMintInput>,
@@ -9468,7 +9482,7 @@ fn append_tag_mint_rows(
                 kind: input.kind,
                 token_count: input.token_count.max(0),
                 created_at_ms,
-                source_bytes: input.source_bytes,
+                source_bytes: input.source_bytes.into(),
             }),
     );
     start
@@ -9589,6 +9603,7 @@ fn timestamp_temporal_marks(
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
 ) -> Vec<TemporalMarkInput> {
+    let first_text_blocks = first_text_block_by_message(projection);
     let mut previous = None;
     let mut marks = Vec::new();
     for message in &req.messages {
@@ -9608,14 +9623,10 @@ fn timestamp_temporal_marks(
                 )
             });
             if let Some(marker_text) = marker_text {
-                if let Some(block_id) = projection.blocks.iter().find_map(|block| {
-                    (block.mid == message.mid
-                        && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
-                    .then(|| block.id.clone())
-                }) {
+                if let Some(block_id) = first_text_blocks.get(message.mid.as_str()) {
                     marks.push(TemporalMarkInput {
                         ordinal: message.ordinal,
-                        block_id,
+                        block_id: (*block_id).to_string(),
                         marker_text,
                     });
                 }
@@ -9624,6 +9635,18 @@ fn timestamp_temporal_marks(
         previous = Some(message);
     }
     marks
+}
+
+/// The id of each message's first text block, in projection order. Equivalent to searching
+/// the projection from the front for a message's first text block, built in one pass.
+fn first_text_block_by_message(projection: &FlatProjection) -> HashMap<&str, &str> {
+    let mut first = HashMap::new();
+    for block in &projection.blocks {
+        if matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+            first.entry(block.mid.as_str()).or_insert(block.id.as_str());
+        }
+    }
+    first
 }
 
 fn temporal_parity_transition_needed(
@@ -10060,6 +10083,84 @@ fn user_hint_target_was_served(meta: &ModuleMeta, block_id: &str) -> bool {
     overlay_target_was_served(&meta.served_output_fingerprint, block_id)
 }
 
+/// Each message's text blocks in projection order, so a message's blocks are found without
+/// scanning the whole projection.
+fn text_blocks_by_message_id(projection: &FlatProjection) -> HashMap<&str, Vec<&FlatBlock>> {
+    let mut by_message = HashMap::<&str, Vec<&FlatBlock>>::new();
+    for block in &projection.blocks {
+        if matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+            by_message
+                .entry(block.mid.as_str())
+                .or_default()
+                .push(block);
+        }
+    }
+    by_message
+}
+
+/// The first of a message's text blocks (in projection order) that has a tag mint time, with
+/// that time.
+fn first_minted_text_block(
+    text_blocks: Option<&Vec<&FlatBlock>>,
+    mint_by_block: &HashMap<&str, i64>,
+) -> Option<(String, i64)> {
+    text_blocks.into_iter().flatten().find_map(|block| {
+        mint_by_block
+            .get(block.id.as_str())
+            .copied()
+            .map(|created_at| (block.id.clone(), created_at))
+    })
+}
+
+/// Reconcile the canonical timestamp marks with the stored temporal rows. A mark whose block
+/// already has a row keeps that row's text unless a temporal rewrite is in progress; a mark
+/// without a row is stored only when it is past the overlay frontier or a rewrite is in
+/// progress. Every existing mark is checked regardless of its age. Returns the marks this pass
+/// decided or rewrote, in canonical order.
+fn reconcile_canonical_temporal_marks(
+    temporal_rows: &mut Vec<TemporalMarkRow>,
+    canonical_marks: Vec<TemporalMarkInput>,
+    rewrite_temporal_marks: bool,
+    frontier: Option<u64>,
+    now_ms: i64,
+    decided_temporal: &mut HashSet<String>,
+) -> Vec<TemporalMarkInput> {
+    let mut temporal_marks = Vec::new();
+    // Position of the first stored row for each block, kept current as rows are appended, so
+    // each canonical mark finds the same row a front-to-back search would.
+    let mut temporal_row_by_block = HashMap::<String, usize>::with_capacity(temporal_rows.len());
+    for (index, row) in temporal_rows.iter().enumerate() {
+        temporal_row_by_block
+            .entry(row.block_id.clone())
+            .or_insert(index);
+    }
+    for mark in canonical_marks {
+        if let Some(&index) = temporal_row_by_block.get(mark.block_id.as_str()) {
+            let existing = &mut temporal_rows[index];
+            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                existing.marker_text = mark.marker_text.clone();
+                temporal_marks.push(mark);
+            }
+            continue;
+        }
+        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+        if !rewrite_temporal_marks && !is_new {
+            continue;
+        }
+        temporal_row_by_block
+            .entry(mark.block_id.clone())
+            .or_insert(temporal_rows.len());
+        temporal_rows.push(TemporalMarkRow {
+            block_id: mark.block_id.clone(),
+            marker_text: mark.marker_text.clone(),
+            created_at: now_ms,
+        });
+        decided_temporal.insert(mark.block_id.clone());
+        temporal_marks.push(mark);
+    }
+    temporal_marks
+}
+
 fn compute_active_overlay_decisions(
     input: OverlayComputation<'_, '_>,
 ) -> Result<PendingOverlayDecisions, TransformError> {
@@ -10120,8 +10221,7 @@ fn compute_active_overlay_decisions(
     let tag_mint_candidates = tag_mint_work.candidate_count;
     let tag_mint_tokenized_bytes = tag_mint_work.tokenized_bytes;
     let tag_mint_count = tag_mint_work.inputs.len();
-    let tag_mint_start =
-        append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mint_work.inputs, ctx.now_ms);
+    let tag_mint_start = append_minted_tag_rows(tag_rows, tag_mint_work.inputs, ctx.now_ms);
     let tag_mint_ms = elapsed_ms(tag_mint_started_at);
     let temporal_started_at = Instant::now();
 
@@ -10142,34 +10242,20 @@ fn compute_active_overlay_decisions(
         .iter()
         .map(|row| row.block_id.clone())
         .collect::<HashSet<_>>();
-    let mut temporal_marks = Vec::new();
-    for mark in canonical_marks {
-        if let Some(existing) = temporal_rows
-            .iter_mut()
-            .find(|row| row.block_id == mark.block_id)
-        {
-            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
-                existing.marker_text = mark.marker_text.clone();
-                temporal_marks.push(mark);
-            }
-            continue;
-        }
-        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
-        if !rewrite_temporal_marks && !is_new {
-            continue;
-        }
-        temporal_rows.push(TemporalMarkRow {
-            block_id: mark.block_id.clone(),
-            marker_text: mark.marker_text.clone(),
-            created_at: ctx.now_ms,
-        });
-        decided_temporal.insert(mark.block_id.clone());
-        temporal_marks.push(mark);
-    }
+    let mut temporal_marks = reconcile_canonical_temporal_marks(
+        temporal_rows,
+        canonical_marks,
+        rewrite_temporal_marks,
+        frontier,
+        ctx.now_ms,
+        &mut decided_temporal,
+    );
 
     // Timestamp-free callers retain the legacy first-sight basis for the live tail. OpenCode
     // supplies immutable per-message times, so its messages are already covered above.
     let authored_tail = eligible_authored_user_tail(req);
+    // Text blocks per message in projection order, built only if some message is new.
+    let mut text_blocks_by_message: Option<HashMap<&str, Vec<&FlatBlock>>> = None;
     let mut previous_new_user_mint = None;
     for message in req.messages.iter().filter(|message| {
         !message.ck.meta.synthetic
@@ -10184,20 +10270,10 @@ fn compute_active_overlay_decisions(
             previous_new_user_mint = None;
             continue;
         }
-        let Some((block_id, current_mint)) = projection
-            .blocks
-            .iter()
-            .filter(|block| block.mid == message.mid)
-            .find_map(|block| {
-                matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
-                    .then(|| {
-                        mint_by_block
-                            .get(block.id.as_str())
-                            .copied()
-                            .map(|created_at| (block.id.clone(), created_at))
-                    })
-                    .flatten()
-            })
+        let text_blocks =
+            text_blocks_by_message.get_or_insert_with(|| text_blocks_by_message_id(projection));
+        let Some((block_id, current_mint)) =
+            first_minted_text_block(text_blocks.get(message.mid.as_str()), &mint_by_block)
         else {
             previous_new_user_mint = None;
             continue;
@@ -10943,13 +11019,22 @@ fn tag_rows_for_hygiene(
         .iter()
         .map(|block| block.id.as_str())
         .collect::<HashSet<_>>();
+    // Hygiene reads tag identities (number, block, kind, token count), never the stored source
+    // payload, so the retained rows are copied without it.
     let mut rows = stored_rows
         .iter()
         .filter(|row| {
             !projected_ids.contains(row.block_id.as_str())
                 || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
         })
-        .cloned()
+        .map(|row| McTagRow {
+            tag_number: row.tag_number,
+            block_id: row.block_id.clone(),
+            kind: row.kind.clone(),
+            token_count: row.token_count,
+            created_at_ms: row.created_at_ms,
+            source_bytes: Default::default(),
+        })
         .collect::<Vec<_>>();
     let existing_ids = rows
         .iter()
@@ -10971,7 +11056,7 @@ fn tag_rows_for_hygiene(
             kind: kind.as_store_kind().to_string(),
             token_count: 0,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         });
     }
     if rows.is_empty() && derive_when_empty {
@@ -10990,7 +11075,7 @@ fn tag_rows_for_hygiene(
                     .to_string(),
                 token_count: 0,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
     }
@@ -16029,6 +16114,295 @@ pub(crate) mod tests {
         }
     }
 
+    /// Stage profile of a large real session, rebuilt with scrubbed content.
+    ///
+    /// Inputs (all read-only copies; the live store is never opened):
+    /// - `MC_PROFILE_STORE`: a `store.db` copy (`sqlite3 -readonly <live> "VACUUM INTO ..."`).
+    ///   It is copied again into a temporary directory before anything opens it.
+    /// - `MC_PROFILE_SESSION`: the session id.
+    /// - `MC_PROFILE_IDENTITIES`: `mid|identities-json` lines exported from that copy's
+    ///   `mc_block_identities`, giving every message's block kinds in order.
+    /// - `MC_PROFILE_SHAPE`: tab-separated `mid role created_ms completed_ms` lines exported
+    ///   from the host database in host order (roles and times only, no content). A line's
+    ///   position is the message ordinal, plus the optional `MC_PROFILE_ORDINAL_OFFSET`.
+    ///
+    /// Every block keeps its real id, kind and, when tagged, its stored source length; all text
+    /// is replaced by filler. The session's real tag rows stay in the store, so tag caching,
+    /// hygiene attribution and temporal marks run at production scale. Cache state and the
+    /// session's coverage rows are cleared so the first pass bootstraps deterministically and
+    /// the whole rebuilt array is live tail. Prints stage timings per pass and a
+    /// digest of each served array, so two builds can be compared for time and bytes.
+    #[test]
+    #[ignore = "requires scrubbed real-session inputs; see the doc comment"]
+    fn real_session_stage_profile() {
+        use mc_store::{
+            CkKind, CkOutputKind, CkToolOutput, HarnessMeta, MediaBlock, MediaKind, OpaqueBlock,
+            ProviderExtras,
+        };
+        use sha2::{Digest, Sha256};
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} is required"));
+        let session = env("MC_PROFILE_SESSION");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(env("MC_PROFILE_STORE"), dir.path().join("store.db")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+            conn.execute("DELETE FROM mc_cache_state", []).unwrap();
+            // The rebuilt array cannot reproduce the host's exact ordinals, so stored coverage
+            // (compartments, roots, fingerprints, frontiers, queued drops) would claim positions
+            // the array cannot match. Clearing the session's rows except tags and the overlays
+            // keyed by block id makes the whole rebuilt array live tail, which keeps every
+            // tagged block in the projection.
+            const KEEP: [&str; 6] = [
+                "mc_tags",
+                "mc_tag_cache_generations",
+                "mc_temporal_marks",
+                "mc_user_hints",
+                "mc_channel1_appends",
+                "mc_notes",
+            ];
+            let tables = conn
+                .prepare(
+                    "SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS \
+                     (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'session_id')",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for table in tables
+                .iter()
+                .filter(|table| !KEEP.contains(&table.as_str()))
+            {
+                conn.execute(
+                    &format!("DELETE FROM \"{table}\" WHERE session_id = ?1"),
+                    rusqlite::params![session],
+                )
+                .unwrap();
+            }
+            conn.execute("UPDATE cortexkit_fence SET epoch=1", [])
+                .unwrap();
+        }
+        let s = store(dir.path());
+        let tag_lengths = s
+            .load_tags_for_session(&session)
+            .unwrap()
+            .into_iter()
+            .map(|tag| (tag.block_id, tag.source_bytes.len()))
+            .collect::<HashMap<_, _>>();
+        let shape = std::fs::read_to_string(env("MC_PROFILE_SHAPE")).unwrap();
+        // Host ordinals can differ from the export's row position by a constant when the host
+        // skips rows; `MC_PROFILE_ORDINAL_OFFSET` corrects that so stored anchors line up.
+        let ordinal_offset = std::env::var("MC_PROFILE_ORDINAL_OFFSET")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let shape = shape
+            .lines()
+            .enumerate()
+            .filter_map(|(position, line)| {
+                let mut fields = line.split('\t');
+                let mid = fields.next()?;
+                let role = fields.next()?;
+                let created = fields.next().and_then(|v| v.parse::<i64>().ok());
+                let completed = fields.next().and_then(|v| v.parse::<i64>().ok());
+                Some((
+                    mid.to_string(),
+                    (
+                        role.to_string(),
+                        created,
+                        completed,
+                        (position as i64 + 1 + ordinal_offset).max(1) as u64,
+                    ),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let filler = |len: usize| {
+            let mut text = "scrubbed ".repeat(len / 9 + 1);
+            text.truncate(len.max(1));
+            text
+        };
+        let identities = std::fs::read_to_string(env("MC_PROFILE_IDENTITIES")).unwrap();
+        let mut messages = Vec::new();
+        let mut last_created = 0;
+        for line in identities.lines() {
+            let Some((mid, json_text)) = line.split_once('|') else {
+                continue;
+            };
+            let kinds: Vec<Value> = serde_json::from_str(json_text).unwrap();
+            // Real ordinals (host order) keep stored compartments and anchors consistent.
+            let (role, created, completed, ordinal) =
+                shape.get(mid).cloned().unwrap_or_else(|| {
+                    let after = messages.last().map_or(0, |m: &CkIngressMessage| m.ordinal);
+                    ("assistant".to_string(), None, None, after + 1)
+                });
+            let mut call_id = String::new();
+            let blocks = kinds
+                .iter()
+                .enumerate()
+                .map(|(index, identity)| {
+                    let len = tag_lengths
+                        .get(&format!("{mid}#{index}"))
+                        .copied()
+                        .unwrap_or(16);
+                    let kind = match identity["kind_tag"].as_str().unwrap_or("opaque") {
+                        "text" => CkKind::Text { text: filler(len) },
+                        "reasoning" => CkKind::Reasoning {
+                            text: filler(64),
+                            signature: Some(format!("sig-{mid}-{index}")),
+                        },
+                        "redacted_reasoning" => CkKind::RedactedReasoning { data: filler(32) },
+                        "tool_call" => {
+                            call_id = format!("call_{mid}_{index}");
+                            CkKind::ToolCall {
+                                id: call_id.clone(),
+                                name: "read".to_string(),
+                                input: json!({ "path": format!("file-{index}") }),
+                                provider_executed: false,
+                            }
+                        }
+                        "tool_result" => CkKind::ToolResult {
+                            id: call_id.clone(),
+                            tool_name: "read".to_string(),
+                            output: CkToolOutput::bare(CkOutputKind::Text { text: filler(len) }),
+                            provider_executed: false,
+                        },
+                        "media" => CkKind::Media(MediaBlock {
+                            kind: MediaKind::Image,
+                            media_type: "image/png".to_string(),
+                            filename: None,
+                            source: json!({ "type": "data_base64", "data": "aGVsbG8=" }),
+                        }),
+                        _ => CkKind::Opaque(OpaqueBlock {
+                            source: json!({ "type": "harness", "harness": "opencode" }),
+                            kind: "step-start".to_string(),
+                            raw: json!({ "type": "step-start" }),
+                            arc: None,
+                        }),
+                    };
+                    CkWireBlock::bare(kind)
+                })
+                .collect::<Vec<_>>();
+            // Keep block positions (and so block ids) stable while making every arc complete:
+            // an unanswered call becomes an opaque step, an unmatched result becomes text.
+            let answered = blocks
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::ToolResult { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let called = blocks
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let blocks = blocks
+                .into_iter()
+                .map(|block| match block.kind {
+                    CkKind::ToolCall { ref id, .. } if !answered.contains(id) => {
+                        CkWireBlock::bare(CkKind::Opaque(OpaqueBlock {
+                            source: json!({ "type": "harness", "harness": "opencode" }),
+                            kind: "step-start".to_string(),
+                            raw: json!({ "type": "step-start" }),
+                            arc: None,
+                        }))
+                    }
+                    CkKind::ToolResult {
+                        ref id, ref output, ..
+                    } if !called.contains(id) => {
+                        let text = match &output.kind {
+                            CkOutputKind::Text { text } => text.clone(),
+                            _ => String::new(),
+                        };
+                        CkWireBlock::bare(CkKind::Text { text })
+                    }
+                    _ => block,
+                })
+                .collect::<Vec<_>>();
+            let mut ck = CkWireMessage::from_parts(
+                &role,
+                blocks,
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            );
+            ck.meta.created_at_ms = created;
+            ck.meta.completed_at_ms = completed;
+            last_created = last_created.max(created.unwrap_or(0));
+            messages.push(CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck,
+            });
+        }
+        messages.sort_by_key(|message| message.ordinal);
+        let mut request = req(&session, "profile", messages);
+        request.serializer_profile = "opencode-aisdk".into();
+        // A host with the reduce tool, so tag minting and the tag overlay are active.
+        request.tool_present = true;
+        let dir_text = dir.path().to_str().unwrap().to_string();
+        let context = pctx("git:profile", &dir_text, last_created + 60_000);
+        let mut appended = request.clone();
+        let mut next = item(
+            "msg_zzzz_profile_append",
+            appended.messages.last().map_or(1, |m| m.ordinal + 1),
+            "one more question",
+        );
+        next.ck.meta.created_at_ms = Some(last_created + 30_000);
+        appended.messages.push(next);
+        eprintln!(
+            "real-profile session={session} messages={} tags={} tag_source_bytes={}",
+            request.messages.len(),
+            tag_lengths.len(),
+            tag_lengths.values().sum::<usize>()
+        );
+        for (name, pass_request) in [
+            ("A-bootstrap", &request),
+            ("B1-replay", &request),
+            ("B2-replay", &request),
+            ("B3-replay", &request),
+            ("C-append", &appended),
+            ("D-replay", &appended),
+        ] {
+            let started = Instant::now();
+            let output = apply_once_with_estimator_and_projection(
+                &s,
+                pass_request,
+                &context,
+                mc_tokenizer::estimate_tokens,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+            let execute_ms = elapsed_ms(started);
+            let mut digest = Sha256::new();
+            for message in output.response.messages() {
+                digest.update(serde_json::to_vec(&**message).unwrap());
+            }
+            let tags = s.load_tags_for_session(&session).unwrap();
+            let timings = output.response.timings.as_ref().unwrap();
+            eprintln!(
+                "real-profile pass={name} decision={} transform_execute={execute_ms:.1} planning={:.1} state_evolution={:.1} tag_overlay={:.1} temporal={:.1} caveman={:.1} build_output={:.1} total={:.1} served_messages={} tags={} max_tag={} served_sha256={:x}",
+                output.response.decision,
+                timings.planning,
+                timings.state_evolution,
+                timings.tag_overlay,
+                timings.temporal,
+                timings.caveman,
+                timings.build_output,
+                timings.total,
+                output.response.messages().len(),
+                tags.len(),
+                tags.last().map_or(0, |tag| tag.tag_number),
+                digest.finalize()
+            );
+        }
+    }
+
     #[test]
     fn apply_once_records_per_stage_timings() {
         let dir = tempfile::tempdir().unwrap();
@@ -16563,6 +16937,335 @@ pub(crate) mod tests {
             }
             assert_eq!(calls.get(), 0, "carrier count={count}, bytes={bytes}");
         }
+    }
+
+    fn payload_tag(number: i64, block_id: &str, payload: &str) -> McTagRow {
+        McTagRow {
+            tag_number: number,
+            block_id: block_id.to_string(),
+            kind: "message".to_string(),
+            token_count: number * 3,
+            created_at_ms: number * 1_000,
+            source_bytes: payload.as_bytes().into(),
+        }
+    }
+
+    /// A pass that mints nothing must leave the tag rows shared with the retained baseline, and
+    /// a pass that mints must produce exactly the rows and start index the copying append did
+    /// while sharing every earlier row's stored payload instead of copying it.
+    #[test]
+    fn tag_mint_append_shares_rows_and_payloads() {
+        let baseline = Arc::new(vec![
+            payload_tag(4, "a#0", "alpha payload"),
+            payload_tag(9, "b#0", "beta payload"),
+            payload_tag(7, "c#0", "gamma payload"),
+        ]);
+        let mut rows = Arc::clone(&baseline);
+        assert_eq!(append_minted_tag_rows(&mut rows, Vec::new(), 5), 3);
+        assert!(
+            Arc::ptr_eq(&rows, &baseline),
+            "a no-mint pass copied the rows"
+        );
+
+        let mint = || {
+            vec![TagMintInput {
+                block_id: "d#0".to_string(),
+                kind: "tool_result".to_string(),
+                token_count: -2,
+                source_bytes: b"delta".to_vec(),
+            }]
+        };
+        let start = append_minted_tag_rows(&mut rows, mint(), 5);
+        let mut copying = (*baseline).clone();
+        let copying_start = append_tag_mint_rows(&mut copying, mint(), 5);
+        assert_eq!(
+            (start, rows.as_slice()),
+            (copying_start, copying.as_slice())
+        );
+        assert_eq!(rows[3].tag_number, 10);
+        assert_eq!(baseline.len(), 3, "the retained baseline is not mutated");
+        for (row, original) in rows.iter().zip(baseline.iter()) {
+            assert!(Arc::ptr_eq(&row.source_bytes, &original.source_bytes));
+        }
+    }
+
+    /// Hygiene preparation keeps exactly the rows, order and identities the cloning version
+    /// kept, but none of their stored payload bytes.
+    #[test]
+    fn hygiene_rows_are_identity_only_and_match_cloned_rows() {
+        let projection = project_messages(&[
+            item("live-a", 1, "first"),
+            item("live-b", 2, "second"),
+            item("live-c", 3, "third"),
+        ])
+        .unwrap();
+        let stored = vec![
+            payload_tag(1, "gone#0", &"historical ".repeat(500)),
+            payload_tag(2, "live-a#0", "first"),
+            payload_tag(3, "live-b#0", "second"),
+        ];
+        let overlay = TagOverlayState {
+            // live-a keeps its stored number, live-b was renumbered, live-c is a new mint.
+            tag_by_block_id: BTreeMap::from([
+                ("live-a#0".to_string(), 2),
+                ("live-b#0".to_string(), 30),
+                ("live-c#0".to_string(), 4),
+            ]),
+            ..Default::default()
+        };
+        for derive_when_empty in [false, true] {
+            let view = tag_rows_for_hygiene(&projection, &stored, &overlay, derive_when_empty);
+            assert!(view.iter().all(|row| row.source_bytes.is_empty()));
+            let identities = |rows: &[McTagRow]| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.tag_number,
+                            row.block_id.clone(),
+                            row.kind.clone(),
+                            row.token_count,
+                            row.created_at_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            // The cloning version: surviving stored rows copied whole, then the same additions.
+            let projected = projection
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<HashSet<_>>();
+            let mut cloned = stored
+                .iter()
+                .filter(|row| {
+                    !projected.contains(row.block_id.as_str())
+                        || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            cloned.push(McTagRow {
+                tag_number: 4,
+                block_id: "live-c#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            });
+            cloned.push(McTagRow {
+                tag_number: 30,
+                block_id: "live-b#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            });
+            cloned.sort_by_key(|row| row.tag_number);
+            assert_eq!(identities(&view), identities(&cloned));
+        }
+    }
+
+    /// A timestamped conversation for the temporal differential: users with one or two text
+    /// blocks, assistants with and without completion times, gaps from seconds to days, and
+    /// one user repeated under the same id.
+    fn temporal_fixture(messages: usize) -> TransformRequest {
+        let mut created = 1_700_000_000_000i64;
+        let mut out = Vec::new();
+        for n in 0..messages {
+            let role = if n % 2 == 0 { "user" } else { "assistant" };
+            let texts: &[&str] = if n % 6 == 0 { &["a", "b"] } else { &["only"] };
+            let mid = if n == 40 {
+                "u0".to_string()
+            } else {
+                format!("u{n}")
+            };
+            let mut message = wire_item(role, &mid, n as u64 + 1, texts);
+            created += [1_000, 90_000, 4_000_000, 90_000_000, 7][n % 5];
+            message.ck.meta.created_at_ms = (n % 17 != 3).then_some(created);
+            message.ck.meta.completed_at_ms =
+                (role == "assistant" && n % 3 == 0).then_some(created + 500);
+            out.push(message);
+        }
+        req("temporal-diff", "cfg0", out)
+    }
+
+    /// `timestamp_temporal_marks` before the first-text-block index: a front-to-back
+    /// projection search per authored user. Kept only as the differential reference.
+    fn scanning_timestamp_temporal_marks(
+        req: &TransformRequest,
+        projection: &FlatProjection,
+        mutation_exempt_mid: Option<&str>,
+        lineage_anchor_mid: Option<&str>,
+    ) -> Vec<TemporalMarkInput> {
+        let mut previous = None;
+        let mut marks = Vec::new();
+        for message in &req.messages {
+            if is_authored_user_message(message)
+                && mutation_exempt_mid != Some(message.mid.as_str())
+                && lineage_anchor_mid != Some(message.mid.as_str())
+            {
+                let marker_text = previous.and_then(|prior: &CkIngressMessage| {
+                    let previous_created = prior.ck.meta.created_at_ms?;
+                    let current_created = message.ck.meta.created_at_ms?;
+                    let previous_end = prior.ck.meta.completed_at_ms.unwrap_or(previous_created);
+                    Some(
+                        current_created
+                            .checked_sub(previous_end)
+                            .and_then(temporal_gap_prefix)
+                            .unwrap_or_default(),
+                    )
+                });
+                if let Some(marker_text) = marker_text {
+                    if let Some(block_id) = projection.blocks.iter().find_map(|block| {
+                        (block.mid == message.mid
+                            && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
+                        .then(|| block.id.clone())
+                    }) {
+                        marks.push(TemporalMarkInput {
+                            ordinal: message.ordinal,
+                            block_id,
+                            marker_text,
+                        });
+                    }
+                }
+            }
+            previous = Some(message);
+        }
+        marks
+    }
+
+    /// The canonical-mark reconciliation before the row index: a front-to-back row search
+    /// per mark. Kept only as the differential reference.
+    fn scanning_reconcile_canonical_temporal_marks(
+        temporal_rows: &mut Vec<TemporalMarkRow>,
+        canonical_marks: Vec<TemporalMarkInput>,
+        rewrite_temporal_marks: bool,
+        frontier: Option<u64>,
+        now_ms: i64,
+        decided_temporal: &mut HashSet<String>,
+    ) -> Vec<TemporalMarkInput> {
+        let mut temporal_marks = Vec::new();
+        for mark in canonical_marks {
+            if let Some(existing) = temporal_rows
+                .iter_mut()
+                .find(|row| row.block_id == mark.block_id)
+            {
+                if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                    existing.marker_text = mark.marker_text.clone();
+                    temporal_marks.push(mark);
+                }
+                continue;
+            }
+            let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+            if !rewrite_temporal_marks && !is_new {
+                continue;
+            }
+            temporal_rows.push(TemporalMarkRow {
+                block_id: mark.block_id.clone(),
+                marker_text: mark.marker_text.clone(),
+                created_at: now_ms,
+            });
+            decided_temporal.insert(mark.block_id.clone());
+            temporal_marks.push(mark);
+        }
+        temporal_marks
+    }
+
+    /// Indexed temporal overlays must reproduce the scanning implementation exactly: the
+    /// canonical marks, the reconciled rows (including rewrites of old marks far behind the
+    /// frontier, duplicate stored rows and rows for absent blocks), the decided set, and the
+    /// timestamp-free first-minted-text-block choice for every message.
+    #[test]
+    fn indexed_temporal_overlays_match_scanning_reference() {
+        let request = temporal_fixture(240);
+        let projection = project_messages(&request.messages).unwrap();
+        for (exempt, anchor) in [(None, None), (Some("u12"), Some("u30"))] {
+            let canonical = timestamp_temporal_marks(&request, &projection, exempt, anchor);
+            assert_eq!(
+                canonical,
+                scanning_timestamp_temporal_marks(&request, &projection, exempt, anchor)
+            );
+            assert!(canonical.iter().any(|mark| !mark.marker_text.is_empty()));
+            // Stored rows: some old marks with stale text, a duplicated block, an absent block.
+            let mut stored = Vec::new();
+            for (index, mark) in canonical.iter().enumerate().filter(|(i, _)| i % 3 == 0) {
+                stored.push(TemporalMarkRow {
+                    block_id: mark.block_id.clone(),
+                    marker_text: if index % 2 == 0 {
+                        mark.marker_text.clone()
+                    } else {
+                        "stale".to_string()
+                    },
+                    created_at: index as i64,
+                });
+            }
+            stored.push(stored[0].clone());
+            stored.push(TemporalMarkRow {
+                block_id: "absent#0".to_string(),
+                marker_text: String::new(),
+                created_at: 1,
+            });
+            for rewrite in [false, true] {
+                for frontier in [None, Some(0), Some(120), Some(10_000)] {
+                    let mut rows = stored.clone();
+                    let mut decided = rows.iter().map(|row| row.block_id.clone()).collect();
+                    let marks = reconcile_canonical_temporal_marks(
+                        &mut rows,
+                        canonical.clone(),
+                        rewrite,
+                        frontier,
+                        99,
+                        &mut decided,
+                    );
+                    let mut reference_rows = stored.clone();
+                    let mut reference_decided = reference_rows
+                        .iter()
+                        .map(|row| row.block_id.clone())
+                        .collect();
+                    let reference_marks = scanning_reconcile_canonical_temporal_marks(
+                        &mut reference_rows,
+                        canonical.clone(),
+                        rewrite,
+                        frontier,
+                        99,
+                        &mut reference_decided,
+                    );
+                    let case = format!("rewrite={rewrite} frontier={frontier:?}");
+                    assert_eq!(marks, reference_marks, "{case}");
+                    assert_eq!(rows, reference_rows, "{case}");
+                    assert_eq!(decided, reference_decided, "{case}");
+                }
+            }
+        }
+        // Timestamp-free path: the first minted text block per message.
+        let minted = projection
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 4 != 1)
+            .map(|(index, block)| (block.id.as_str(), index as i64))
+            .collect::<HashMap<_, _>>();
+        let text_blocks = text_blocks_by_message_id(&projection);
+        let mut found = 0;
+        for message in &request.messages {
+            let reference = projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == message.mid)
+                .find_map(|block| {
+                    matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
+                        .then(|| {
+                            minted
+                                .get(block.id.as_str())
+                                .copied()
+                                .map(|created_at| (block.id.clone(), created_at))
+                        })
+                        .flatten()
+                });
+            let indexed = first_minted_text_block(text_blocks.get(message.mid.as_str()), &minted);
+            found += usize::from(indexed.is_some());
+            assert_eq!(indexed, reference, "{}", message.mid);
+        }
+        assert!(found > 100);
     }
 
     #[test]
@@ -19347,7 +20050,7 @@ pub(crate) mod tests {
                 kind: kind.clone(),
                 token_count: *tokens,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
         // Coalesce assistant text and its following call under the same CC message id.
@@ -19465,7 +20168,7 @@ pub(crate) mod tests {
                 kind: "tool_result".into(),
                 token_count: 10_000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
         ctx.tag_window_protected_block_ids =
@@ -33125,7 +33828,7 @@ pub(crate) mod tests {
                     .find(|block| block.id == row.block_id)
                     .unwrap();
                 let (_, source) = taggable_source(block).expect("minted tags must be overlayable");
-                assert_eq!(row.source_bytes, source.as_bytes());
+                assert_eq!(&*row.source_bytes, source.as_bytes());
             }
             assert_eq!(tail_bytes(&response, "m1"), "§1§   user §7§");
             assert_eq!(tail_bytes(&response, "text"), "§2§   text output");
@@ -33436,7 +34139,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let cached = load_cached_tags(&store, session).unwrap();
-        assert_eq!(cached[0].source_bytes, b"old");
+        assert_eq!(&*cached[0].source_bytes, b"old");
         let before = store.tag_cache_summary(session).unwrap();
 
         // This bypasses transform commits, so only the SQLite mutation trigger can invalidate
@@ -33453,7 +34156,7 @@ pub(crate) mod tests {
         assert_ne!(after.generation, before.generation);
 
         let refilled = load_cached_tags(&store, session).unwrap();
-        assert_eq!(refilled[0].source_bytes, b"poisoned");
+        assert_eq!(&*refilled[0].source_bytes, b"poisoned");
     }
 
     #[test]
@@ -33474,9 +34177,9 @@ pub(crate) mod tests {
         let b = load_cached_tags(&store, "tag-cache-b").unwrap();
         let a_second = load_cached_tags(&store, "tag-cache-a").unwrap();
         assert_eq!(a_first[0].block_id, "a#0");
-        assert_eq!(a_second[0].source_bytes, b"A");
+        assert_eq!(&*a_second[0].source_bytes, b"A");
         assert_eq!(b[0].block_id, "b#0");
-        assert_eq!(b[0].source_bytes, b"B");
+        assert_eq!(&*b[0].source_bytes, b"B");
     }
 
     #[test]
@@ -34872,7 +35575,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 1_500,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -34892,7 +35595,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 1_000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let applying_window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -35119,7 +35822,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 4_000,
                 created_at_ms: 0,
-                source_bytes: b"old source".to_vec(),
+                source_bytes: b"old source".to_vec().into(),
             },
             McTagRow {
                 tag_number: 8,
@@ -35127,7 +35830,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 4_000,
                 created_at_ms: 0,
-                source_bytes: b"new source".to_vec(),
+                source_bytes: b"new source".to_vec().into(),
             },
         ];
         let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -36731,7 +37434,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         }];
         let no_units = new_caveman_units(
             &CoreState::default(),
@@ -36950,7 +37653,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         }];
         let units = new_caveman_units(
             &core,
@@ -36992,7 +37695,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         };
         assert!(new_caveman_units(
             &CoreState::default(),

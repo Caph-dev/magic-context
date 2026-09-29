@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
     estimateImageTokensFromDataUrl,
     estimateToolAttachmentImageTokens,
@@ -97,4 +98,30 @@ describe("estimateImageTokensFromDataUrl", () => {
         const tokens = estimateImageTokensFromDataUrl("data:image/png;base64garbage");
         expect(tokens).toBeGreaterThan(0);
     });
+});
+
+// The Rust module counts image carriers with its own port of this estimator
+// (crates/mc-module/src/image_tokens.rs). Both read this shared fixture so the two
+// implementations cannot drift apart: each format, the cap, the one-token floor and
+// each fallback path.
+describe("image token parity with the Rust module", () => {
+    const fixturePath = new URL(
+        "../../../../../crates/mc-module/testdata/image-token-parity.json",
+        import.meta.url,
+    );
+    const cases = JSON.parse(readFileSync(fixturePath, "utf8")) as Array<{
+        name: string;
+        url: string;
+        tokens: number;
+    }>;
+
+    test("the shared fixture is present", () => {
+        expect(cases.length).toBeGreaterThanOrEqual(10);
+    });
+
+    for (const { name, url, tokens } of cases) {
+        test(name, () => {
+            expect(estimateImageTokensFromDataUrl(url)).toBe(tokens);
+        });
+    }
 });

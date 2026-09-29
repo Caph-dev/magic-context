@@ -272,7 +272,7 @@ mod tests {
             kind: kind.to_string(),
             token_count,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
     }
 
@@ -347,7 +347,7 @@ mod tests {
         );
         null_backfill[8].token_count = 4_000;
         for row in &mut null_backfill {
-            row.source_bytes = b"[edit_marker]".to_vec();
+            row.source_bytes = b"[edit_marker]".to_vec().into();
         }
         assert_eq!(
             ProtectionWindow::from_persisted_rows(&null_backfill, 16_000).row_identities,
@@ -376,7 +376,7 @@ mod lifecycle_and_coordinate_tests {
             kind: "tool_result".to_string(),
             token_count,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
     }
 
@@ -522,7 +522,7 @@ mod calibration_tests {
                 kind: "tool".into(),
                 token_count: 1000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect();
         let window = ProtectionWindow::from_persisted_rows_calibrated(&rows, 6000, 1.551639);

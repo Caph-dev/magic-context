@@ -36,6 +36,7 @@ pub mod historian_prompt;
 pub mod historian_runner;
 pub mod historian_validate;
 pub mod host_store;
+mod image_tokens;
 pub mod injection;
 pub mod m0_compose;
 pub mod m1_compose;
@@ -19102,11 +19103,7 @@ fn cached_boundary_messages(
                     provider_executed: block.provider_executed,
                     byte_size: block.bytes.len(),
                     arc_id: block.arc_id.clone(),
-                    original_token_count: cache_snapshot.token_count(
-                        &block.id,
-                        &block.bytes,
-                        &block.content_hash,
-                    ),
+                    original_token_count: boundary_block_tokens(block, &mut cache_snapshot),
                     original: Arc::clone(&block.bytes),
                     rendered: None,
                     ignored: false,
@@ -19123,6 +19120,23 @@ fn cached_boundary_messages(
         tokenized_blocks,
         token_cache_snapshot: cache_snapshot,
     }
+}
+
+/// Token count the trigger's boundary accounting uses for one block. An image carrier counts at
+/// its provider cost from its pixel dimensions (the rule the TypeScript final-wire estimator
+/// uses), never by text-tokenizing its base64 bytes, which both overstated it by orders of
+/// magnitude and cost a full tokenizer pass over the payload. Every other block, including
+/// non-image media and opaque parts, keeps its cached text-token count.
+fn boundary_block_tokens(
+    block: &crate::ck_wire::FlatBlock,
+    cache_snapshot: &mut BoundaryTokenCacheSnapshot,
+) -> usize {
+    if let crate::ck_wire::CkKind::Media(media) = &block.wire.kind {
+        if let Some(tokens) = crate::image_tokens::media_image_tokens(media) {
+            return tokens;
+        }
+    }
+    cache_snapshot.token_count(&block.id, &block.bytes, &block.content_hash)
 }
 
 fn sel_kind_for_flat(block: &crate::ck_wire::FlatBlock) -> SelKind {
@@ -20054,7 +20068,7 @@ mod tests {
                 kind: "text".to_string(),
                 token_count: 37,
                 created_at_ms: 1,
-                source_bytes: bytes.clone(),
+                source_bytes: bytes.clone().into(),
             }],
         );
         let mut snapshot = cache.snapshot("session");
@@ -20119,6 +20133,72 @@ mod tests {
         bounded.replace("second", second);
         assert!(!bounded.sessions.contains_key("first"));
         assert!(bounded.sessions.contains_key("second"));
+    }
+
+    /// An image carrier in the trigger's boundary accounting is counted from its pixel
+    /// dimensions and never reaches the text tokenizer, however large its payload or however
+    /// many carriers there are; the text beside it still tokenizes once per block.
+    #[test]
+    fn trigger_boundary_image_carrier_tokenization_cost_is_bounded() {
+        use crate::ck_wire::{
+            CkIngressMessage, CkKind, CkWireBlock, CkWireMessage, HarnessMeta, MediaBlock,
+            MediaKind, ProviderExtras,
+        };
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../testdata/image-token-parity.json")).unwrap();
+        let png = cases
+            .iter()
+            .find(|case| case["name"] == "png-1920x1080")
+            .unwrap();
+        let (_, header_payload) = png["url"].as_str().unwrap().split_once(',').unwrap();
+        let expected = png["tokens"].as_u64().unwrap() as usize;
+        for (carriers, payload_bytes) in [(1usize, 64usize), (64, 65_536)] {
+            // A real header followed by filler, so the payload grows but the image does not.
+            let data = format!(
+                "{header_payload}{}",
+                "A".repeat(payload_bytes.saturating_sub(header_payload.len()))
+            );
+            let messages = (0..carriers)
+                .map(|index| CkIngressMessage {
+                    mid: format!("carrier-{index}"),
+                    ordinal: index as u64 + 1,
+                    ck: CkWireMessage::from_parts(
+                        "user",
+                        vec![
+                            CkWireBlock::bare(CkKind::Text {
+                                text: format!("caption {index}"),
+                            }),
+                            CkWireBlock::bare(CkKind::Media(MediaBlock {
+                                kind: MediaKind::Image,
+                                media_type: "image/png".to_string(),
+                                filename: None,
+                                source: json!({ "type": "data_base64", "data": data }),
+                            })),
+                        ],
+                        None,
+                        ProviderExtras::new(),
+                        HarnessMeta::default(),
+                    ),
+                })
+                .collect::<Vec<_>>();
+            let request = transform_request(messages, 140_000, 200_000);
+            let projection = crate::ck_wire::project_messages(&request.messages).unwrap();
+            let token_cache =
+                Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES));
+            let built = boundary_messages(&request, &projection, &token_cache);
+            assert_eq!(
+                built.tokenized_blocks, carriers,
+                "only the captions reach the tokenizer ({carriers} carriers of {payload_bytes} bytes)"
+            );
+            for message in &built.messages {
+                let image = message
+                    .blocks
+                    .iter()
+                    .find(|block| matches!(block.kind, SelKind::Media))
+                    .unwrap();
+                assert_eq!(image.original_token_count, expected);
+            }
+        }
     }
 
     #[test]
