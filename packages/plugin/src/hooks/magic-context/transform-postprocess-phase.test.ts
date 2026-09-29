@@ -581,6 +581,58 @@ function serializeAnthropicVisibleRoleGroups(messages: MessageLike[]): string {
 }
 
 describe("stripped placeholder replay across temporary marker windows", () => {
+    for (const providerID of ["anthropic", "openai-compatible"]) {
+        it(`freezes a marker-only final assistant across a priced pass and appended defer (${providerID})`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `ses-marker-only-${providerID}`;
+            const makePrefix = (): MessageLike[] =>
+                [
+                    {
+                        info: { id: "user", role: "user", sessionID: sessionId },
+                        parts: [{ type: "text", text: "continue" }],
+                    },
+                    {
+                        info: { id: "last", role: "assistant", sessionID: sessionId },
+                        parts: [
+                            { type: "text", text: "§672§ [dropped §672§]" },
+                            { type: "reasoning", text: "[cleared]" },
+                        ],
+                    },
+                ] as unknown as MessageLike[];
+            const first = makePrefix();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, first, {
+                    schedulerDecision: "execute",
+                    pendingMaterializationSessions: new Set([sessionId]),
+                    schedulerDeferReason: null,
+                    resolvedProviderID: providerID,
+                }),
+            );
+            expect(getStrippedPlaceholderIds(db, sessionId).has("last")).toBe(true);
+            const prefix = JSON.stringify(first);
+            expect(first[1]?.parts).toEqual([
+                { type: "text", text: providerID === "anthropic" ? "" : "[dropped]" },
+            ]);
+            const second = [
+                ...makePrefix(),
+                {
+                    info: { id: "new", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "§655§ [cleared]" }],
+                },
+            ] as MessageLike[];
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, second, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: providerID,
+                }),
+            );
+            expect(JSON.stringify(second.slice(0, first.length))).toBe(prefix);
+            expect(second[2]?.parts).toEqual([{ type: "text", text: "§655§ [cleared]" }]);
+            expect(getStrippedPlaceholderIds(db, sessionId).has("new")).toBe(false);
+        });
+    }
+
     for (const [missingPassDecision, replayPassDecision] of [
         ["execute", "defer"],
         ["defer", "execute"],
@@ -3187,7 +3239,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         );
     });
 
-    it("preserves a pre-deploy whitespace prefix through a HARD fold and rebuilt defer tail", async () => {
+    it("neutralizes a tag-only assistant on the HARD fold and replays its sentinel on defer", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-hardfold-inert-whitespace";
@@ -3228,7 +3280,6 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         });
         insertTag(db, sessionId, "assistant-framing:p0", "message", 1, 1);
         markWhitespaceAssistantTagInert(db, sessionId, 1, "assistant-framing:p0");
-        const previousServe = "§1§  ";
         const makeTail = () =>
             [
                 {
@@ -3289,7 +3340,8 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         );
         expect(hardResult.materialized).toBe(true);
         expect(marker?.boundaryOrdinal).toBe(10);
-        expect(hardWhitespace?.parts).toEqual([{ type: "text", text: previousServe }]);
+        // A bare tag is a complete marker; its replacement text is replayed on later passes.
+        expect(hardWhitespace?.parts).toEqual([{ type: "text", text: "[dropped]" }]);
         const hardWire = JSON.stringify(hardMessages);
 
         const deferMessages = [
@@ -3327,7 +3379,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         const deferWhitespace = deferMessages.find(
             (message) => message.info.id === "assistant-framing",
         );
-        expect(deferWhitespace?.parts).toEqual([{ type: "text", text: previousServe }]);
+        expect(deferWhitespace?.parts).toEqual([{ type: "text", text: "[dropped]" }]);
         expect(JSON.stringify(deferMessages)).toBe(hardWire);
     });
 

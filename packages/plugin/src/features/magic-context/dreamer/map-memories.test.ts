@@ -1322,3 +1322,87 @@ describe("independent re-queue heal", () => {
         }
     });
 });
+
+test("a budget-finalized mapping manifest banks its closed subset", async () => {
+    const db = freshDb();
+    try {
+        const projectIdentity = "git:budget-map";
+        const dir = tempProject();
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "ARCHITECTURE",
+            content: "Budgeted mapping fact.",
+        });
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "ARCHITECTURE",
+            content: "Another mapping fact for the next run.",
+        });
+        const messages: unknown[] = [];
+        let sends = 0;
+        let aborted = false;
+        const args = mapArgs(db, dir, projectIdentity);
+        args.tokenBudget = 100;
+        args.deadline = Date.now() + MAP_BATCH_FLOOR_MS + 500;
+        args.parentSessionId = "ses-parent-map";
+        args.client = {
+            session: {
+                create: async () => ({ data: { id: "map-budget-child" } }),
+                messages: async () => ({ data: [...messages] }),
+                abort: async () => {
+                    aborted = true;
+                    return { data: true };
+                },
+                status: async () => {
+                    if (sends === 1 && !aborted) {
+                        if (messages.length === 1)
+                            messages.push({
+                                info: {
+                                    id: "step",
+                                    role: "assistant",
+                                    finish: "tool-calls",
+                                    tokens: { input: 81 },
+                                    time: { created: 1, completed: 2 },
+                                },
+                                parts: [{ type: "tool" }],
+                            });
+                        return { data: { "map-budget-child": { type: "busy" } } };
+                    }
+                    if (sends === 2 && messages.length === 3)
+                        messages.push({
+                            info: {
+                                id: "final",
+                                role: "assistant",
+                                finish: "stop",
+                                tokens: { input: 1 },
+                                time: { created: 3, completed: 4 },
+                            },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: `<mappings><memory id="${memory.id}" independent="true"/></mappings>`,
+                                },
+                            ],
+                        });
+                    return { data: {} };
+                },
+                promptAsync: async (request: { body: { parts: Array<{ text: string }> } }) => {
+                    sends++;
+                    messages.push({
+                        info: { id: `user-${sends}`, role: "user" },
+                        parts: request.body.parts,
+                    });
+                    return { data: undefined };
+                },
+                delete: async () => ({}),
+            },
+        } as never;
+        const result = await mapMemories(args);
+        expect(sends).toBe(2);
+        expect(result.independent).toBe(1);
+        expect(result.remaining).toBe(1);
+        expect(result.complete).toBe(false);
+    } finally {
+        closeQuietly(db);
+    }
+});

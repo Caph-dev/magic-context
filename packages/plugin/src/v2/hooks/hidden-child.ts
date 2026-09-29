@@ -97,6 +97,7 @@ export interface HiddenChildAttempt {
     shaped: boolean;
     steps?: number;
     stepLimit?: HiddenAgentStepLimit;
+    budgetExceeded?: Error;
     observedMessages?: SessionContext["messages"];
     marker?: string;
 }

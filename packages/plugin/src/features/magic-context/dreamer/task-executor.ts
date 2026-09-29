@@ -128,6 +128,7 @@ import type {
     TaskExecutor,
     TaskExecutorContext,
 } from "./task-scheduler";
+import { DreamTokenBudgetExceeded } from "./token-budget";
 import { runVerify } from "./verify";
 
 export interface DreamTaskExecutorDeps {
@@ -165,6 +166,10 @@ export interface DreamTaskExecutorDeps {
     retinaHandoff?: boolean;
     /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
     onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
+    /** Pi's process runner reports usage after each child exits rather than through session.messages. */
+    readTokenBudget?: (
+        task: DreamTaskName,
+    ) => { spent: number; finalizeFired: boolean } | undefined;
     /** Optional callback for tests and host integrations to resolve the smallest usable input window across child model attempts. */
     resolveRetrospectiveUsableInputTokens?: (models: readonly ModelInput[]) => number | undefined;
     moduleClient?: ClassifyModuleClient & {
@@ -195,6 +200,16 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
 
     const described = describeError(error);
     const message = described.brief;
+    if (error instanceof DreamTokenBudgetExceeded) {
+        return {
+            failure_class: "token_budget",
+            model_attempted: null,
+            models_tried: [],
+            provider_error: null,
+            timeout_ms: null,
+            child_session_id: error.sessionId,
+        };
+    }
     if (error instanceof Error && error.name === "HiddenAgentStepLimit") {
         return {
             failure_class: "step_limit",
@@ -419,6 +434,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         ctx: TaskExecutorContext,
     ): Promise<TaskExecOutcome> => {
         const { db, projectIdentity, holderId, leaseKey } = ctx;
+        (
+            deps.client as unknown as
+                | { resetDreamTokenBudget?: (task: DreamTaskName) => void }
+                | undefined
+        )?.resetDreamTokenBudget?.(config.task);
         const startedAt = Date.now();
         const leaseAcquisition: LeaseAcquisition =
             ctx.leaseAcquisition ??
@@ -495,6 +515,21 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             throw new Error("Dream lease lost during executor setup");
         }
 
+        let budgetSpent = 0;
+        let budgetFinalized = false;
+        const childSpending = new Map<string, number>();
+        const onBudgetUpdate = (state: {
+            spent: number;
+            finalizeFired: boolean;
+            sessionId?: string;
+        }) => {
+            if (state.sessionId) {
+                const previous = childSpending.get(state.sessionId) ?? 0;
+                budgetSpent += Math.max(0, state.spent - previous);
+                childSpending.set(state.sessionId, state.spent);
+            } else budgetSpent = Math.max(budgetSpent, state.spent);
+            budgetFinalized ||= state.finalizeFired;
+        };
         const recordRun = (
             status: "completed" | "failed",
             error: string | null,
@@ -508,10 +543,23 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 /** Successful progress/detail; empty strings are omitted so absent
                  *  and empty have the same persisted meaning. */
                 progress?: string | null;
+                banked?: number;
                 failure?: DreamRunFailureDetail;
             },
         ): void => {
             try {
+                const hostBudget =
+                    deps.readTokenBudget?.(config.task) ??
+                    (
+                        deps.client as unknown as
+                            | {
+                                  readTokenBudget?: (
+                                      task: DreamTaskName,
+                                  ) => { spent: number; finalizeFired: boolean } | undefined;
+                              }
+                            | undefined
+                    )?.readTokenBudget?.(config.task);
+                if (hostBudget) onBudgetUpdate(hostBudget);
                 insertDreamRun(db, {
                     projectPath: projectIdentity,
                     startedAt,
@@ -531,6 +579,28 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                                   }
                                 : {}),
                             ...(extra?.progress ? { progress: extra.progress } : {}),
+                            ...(config.tokenBudget
+                                ? {
+                                      tokenBudget: {
+                                          budget: config.tokenBudget,
+                                          spent: budgetSpent,
+                                          finalizeFired: budgetFinalized,
+                                          banked:
+                                              extra?.banked ??
+                                              processedDreamTaskItems(
+                                                  backlogAtStart.pending,
+                                                  (
+                                                      extra?.backlogAfter ??
+                                                      getDreamTaskBacklog(
+                                                          db,
+                                                          projectIdentity,
+                                                          config.task,
+                                                      )
+                                                  ).pending,
+                                              ),
+                                      },
+                                  }
+                                : {}),
                             backlog: (() => {
                                 const end =
                                     extra?.backlogAfter ??
@@ -687,6 +757,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     moduleRoute,
+                    tokenBudget: config.tokenBudget,
+                    onBudgetUpdate,
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(
@@ -737,6 +809,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                     moduleRoute,
+                    tokenBudget: config.tokenBudget,
+                    onBudgetUpdate,
                     onProgress: (processed, refused) => reportProgress(processed, refused),
                 });
                 const processed =
@@ -761,6 +835,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                             progress: broadProgress,
                             memoryChanges: computeMemoryDelta(memoryBefore),
                             backlogAfter,
+                            banked: result.verified + result.updated + result.archived,
                         });
                         return { status: "completed" };
                     }
@@ -772,6 +847,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                         progress: verificationProgress,
                         memoryChanges: computeMemoryDelta(memoryBefore),
                         backlogAfter,
+                        banked: result.verified + result.updated + result.archived,
                     });
                     // A hot retry would split the deadline the same way and time out
                     // again, so a batch timeout waits for the next scheduled run.
@@ -781,6 +857,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     progress: verificationProgress,
                     memoryChanges: computeMemoryDelta(memoryBefore),
                     backlogAfter,
+                    banked: result.verified + result.updated + result.archived,
                 });
                 return { status: "completed" };
             }
@@ -878,6 +955,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                     rawProviderFactory: deps.primerRawProviderFactory,
+                    tokenBudget: config.tokenBudget,
+                    onBudgetUpdate,
                     onProgress: (processed) => reportProgress(processed),
                 });
                 recordRun("completed", null);
@@ -914,6 +993,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "retrospective") {
                 const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
                 const retro = await runRetrospectiveTask(config, ctx, {
+                    onBudgetUpdate,
                     deps,
                     deadline,
                     parent,
@@ -952,6 +1032,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
 
             // Agentic tasks: verify / curate / maintain-docs.
             return await runAgenticTask(config, ctx, {
+                onBudgetUpdate,
                 deps,
                 deadline,
                 parent,
@@ -962,6 +1043,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 moduleRoute,
             });
         } catch (error) {
+            if (error instanceof DreamTokenBudgetExceeded) {
+                budgetSpent = Math.max(budgetSpent, error.spent);
+            }
             const classified = classifyFailure(error);
             const retrospectiveOverflow =
                 error instanceof RetrospectivePromptOverflowError ? error : null;
@@ -1220,6 +1304,7 @@ async function runRetrospectiveTask(
         deadline: number;
         parent: string | undefined;
         invocationStartedAt: number;
+        onBudgetUpdate: (state: { spent: number; finalizeFired: boolean }) => void;
         moduleRoute?: DreamerModuleRoute;
     },
 ): Promise<{
@@ -1227,7 +1312,7 @@ async function runRetrospectiveTask(
     taskStateJson?: string;
 }> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
-    const { deps, deadline, parent } = helpers;
+    const { deps, deadline, parent, onBudgetUpdate } = helpers;
     const provider = resolveRetrospectiveProvider(deps, db, projectIdentity);
     if (!provider) {
         log("[dreamer] retrospective: no raw provider available — clean no-op");
@@ -1314,6 +1399,7 @@ async function runRetrospectiveTask(
                 timeoutMs: Math.max(1, deadline - Date.now()),
                 title: "magic-context-dream-retrospective",
                 directory: deps.sessionDirectory,
+                metadata: { tokenBudget: config.tokenBudget, onBudgetUpdate },
             });
             childSessionId = hiddenHandle.id;
         } else {
@@ -1360,6 +1446,14 @@ async function runRetrospectiveTask(
                     signal: abortController.signal,
                     fallbackModels: config.fallbackModels,
                     callContext: "dreamer:retrospective",
+                    ...(!hiddenHandle && deps.client
+                        ? {
+                              transport: shared.createPromptAsyncTransport(deps.client, sessionId, {
+                                  tokenBudget: config.tokenBudget,
+                                  onBudgetUpdate,
+                              }),
+                          }
+                        : {}),
                     ...(hiddenHandle && deps.hiddenCompletionExecutor
                         ? {
                               transport: Object.assign(
@@ -1637,6 +1731,7 @@ async function runAgenticTask(
                     merged: number;
                 } | null;
                 progress?: string | null;
+                banked?: number;
                 failure?: DreamRunFailureDetail;
                 backlogAfter?: { pending: number; total: number };
             },
@@ -1645,12 +1740,13 @@ async function runAgenticTask(
             before: ReturnType<typeof getMemoryCountsByStatus>,
         ) => { written: number; deleted: number; archived: number; merged: number } | null;
         reportProgress: (processed: number, refused?: number) => void;
+        onBudgetUpdate: (state: { spent: number; finalizeFired: boolean }) => void;
         leaseAcquisition: LeaseAcquisition;
         moduleRoute?: DreamerModuleRoute;
     },
 ): Promise<TaskExecOutcome> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
-    const { deps, deadline, parent } = helpers;
+    const { deps, deadline, parent, onBudgetUpdate } = helpers;
     const task = config.task as DreamingTask;
     const docsDir = deps.sessionDirectory;
     const invocationStartedAt = Date.now();
@@ -1821,6 +1917,7 @@ async function runAgenticTask(
                     prompt: taskPrompt,
                     title: `magic-context-dream-${task}`,
                     callContext: `dreamer:${task}`,
+                    metadata: { tokenBudget: config.tokenBudget, onBudgetUpdate },
                     allowEmpty: task === "curate",
                     model: config.model,
                     fallbackModels: config.fallbackModels,
@@ -1894,6 +1991,11 @@ async function runAgenticTask(
                         signal: abortController.signal,
                         fallbackModels: config.fallbackModels,
                         callContext: `dreamer:${task}`,
+                        transport: shared.createPromptAsyncTransport(
+                            requireDreamClient(deps.client),
+                            sessionId,
+                            { tokenBudget: config.tokenBudget, onBudgetUpdate },
+                        ),
                         fetchOutput: async () => {
                             const messagesResponse = await requireDreamClient(
                                 deps.client,

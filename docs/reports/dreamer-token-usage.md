@@ -810,3 +810,18 @@ The script opens all DBs in read-only transactions; it does not invoke the appli
 Before choosing a production token budget, preserve a **content-free** durable record per child/provider attempt: task-run ID, child ID, Broca run ID when present, model, configured cap/deadline/version, true completed step count and terminal reason, all usage fields including reasoning, per-step input/cache/output, tool name + output size, and committed useful-unit counters. Keep failures' partial usage before deleting child sessions. For Pi, collect this from stdout instead of enabling full raw transcript persistence. For docs/curate, distinguish accepted mutations/proposals from list/get calls. This closes the two most serious gaps: expensive missing transcripts and “completed” statuses without an attributable useful-output denominator.
 
 **Recommended first experiment:** map/verify on the same project/backlog with file-grouped batches and bounded symbol reads, holding useful-memory throughput constant. Compare token/unit, cumulative prompt tokens, actual cap terminals, wall time and refusal/skip rates. Follow with docs and curate. Do not make a global batch reduction based only on this selected retained sample, and do not use token volume as a dollar-cost estimate.
+
+## Follow-up: prompt-token guard defaults (2026-09-29)
+
+Tool-loop children now accept `dreamer.tasks.<task>.token_budget` as a positive integer. The budget sums each provider step's reported **input + cache read + cache write**; output/reasoning tokens are deliberately excluded. The guard asks for the normal task result at 80% and hard-stops at 100% or after two refused tool calls. A terminal manifest is still parsed by the existing task validator: valid IDs are banked, omitted IDs stay in the backlog. `token_budget` failures use MC-D11, distinct from the step-cap MC-D10. These are **per child**, not per scheduler run or per task across batches.
+
+| Tool-loop task | Default prompt tokens | Reason for the provisional ceiling |
+|---|---:|---|
+| map-memories | 1,500,000 | Gemini child median input + cache read ≈2.02M, p90 ≈3.09M; stop before the common expensive 60-turn tail. |
+| verify, verify-broad | 1,700,000 | Deeper backing-file reads need slightly more room than map. The report identifies these with map as 69.4% of all tokens. |
+| curate | 1,500,000 | Gemini median ≈998K, p90 ≈3.81M; the 150-step allowance and a 21.1M-cache-read outlier call for an earlier cost stop. |
+| maintain-docs | 1,600,000 | Gemini median ≈3.05M and p90 ≈5.26M; the proposal can cover only checked claims rather than exhaust the repository. |
+| retrospective | 300,000 | Gemini median ≈5K and p90 ≈70K; this ceiling leaves room for exceptional multi-session deepening. |
+| refresh-primers | 350,000 | No invocation sample survived; a single read-only primer investigation should need less than a map batch. Recalibrate once step telemetry exists. |
+
+These values are cost ceilings, not claims that every task can complete its entire queue within one child. The source investigation above measures a single machine and mixed providers; check accepted units and skipped IDs before tightening them. OpenCode 2 hidden children lack a pre-tool execution hook: after the soft threshold its executor interrupts the child rather than prompting it to continue with tools enabled. OpenCode 1 uses its session's async generation abort and a second ordinary user turn without changing the agent/tools. Pi uses RPC steer on the same `--no-session` process and a child extension's `tool_call` block; pi-compatible hosts without RPC stop at the soft threshold instead.

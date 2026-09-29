@@ -47,6 +47,7 @@ import {
     providerOutputFailureFromInvalidManifest,
 } from "./provider-output-failure";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
+import { DreamTokenBudgetExceeded } from "./token-budget";
 import { buildVerifyDiffEvidence } from "./verify-diff";
 import { partitionVerifyScope } from "./verify-gate";
 import {
@@ -128,6 +129,8 @@ export interface VerifyArgs {
     forceBroad?: boolean;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    tokenBudget?: number;
+    onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     language?: string;
     moduleRoute?: DreamerModuleRoute;
     onProgress?: (processed: number, refused: number) => void;
@@ -336,6 +339,7 @@ async function verifyOneBatch(
                 prompt,
                 title: "magic-context-dream-verify",
                 callContext: "dreamer:verify",
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 language: args.language,
@@ -392,7 +396,10 @@ async function verifyOneBatch(
             {
                 // Send without holding a request open for the whole batch, so the
                 // slice below is the only timer (see prompt-async-transport.ts).
-                transport: shared.createPromptAsyncTransport(client, agentSessionId),
+                transport: shared.createPromptAsyncTransport(client, agentSessionId, {
+                    tokenBudget: args.tokenBudget,
+                    onBudgetUpdate: args.onBudgetUpdate,
+                }),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,
@@ -451,7 +458,12 @@ async function verifyOneBatch(
                 args.sessionDirectory,
             ),
         });
-        if (error instanceof DreamerModuleFailureError || signal.aborted) throw error;
+        if (
+            error instanceof DreamerModuleFailureError ||
+            error instanceof DreamTokenBudgetExceeded ||
+            signal.aborted
+        )
+            throw error;
         // A timeout is a budget verdict, not a failure of this run: report it so the
         // run can stop cleanly with its earlier batches banked.
         if (

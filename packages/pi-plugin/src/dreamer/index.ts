@@ -1,6 +1,5 @@
 import { homedir } from "node:os";
 import { parse, resolve } from "node:path";
-
 import type {
 	DreamerConfig,
 	EmbeddingConfig,
@@ -17,6 +16,7 @@ import {
 	type ManualRunResult,
 	runManualDream,
 } from "@magic-context/core/features/magic-context/dreamer/task-scheduler";
+import { DreamTokenBudgetExceeded } from "@magic-context/core/features/magic-context/dreamer/token-budget";
 import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
@@ -289,6 +289,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 			opts.sampleDreamRun
 				? opts.sampleDreamRun().dreamerConfig?.maxTokens
 				: opts.config.maxTokens,
+		() => opts.sampleDreamRun?.().dreamerConfig ?? opts.config,
 	);
 
 	let cleanup: (() => void) | undefined;
@@ -364,6 +365,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				owners.get(manualOpts.registrationOwner)?.projectDir ===
 				manualOpts.projectDir,
 			() => dreamerConfig.maxTokens,
+			() => dreamerConfig,
 		);
 		const manualRun = runManualDream({
 			db: manualOpts.db,
@@ -514,8 +516,17 @@ function createPiDreamerClient(
 	onAdjunctsRefreshNeeded = opts.onAdjunctsRefreshNeeded,
 	isRegistrationOwnerActive: () => boolean = () => true,
 	getMaxOutputTokens: () => number | undefined = () => opts.config.maxTokens,
-): DreamTimerClient {
+	getDreamerConfig: () => PiDreamerOptions["config"] = () => opts.config,
+): DreamTimerClient & {
+	readTokenBudget: (
+		task: string,
+	) => { spent: number; finalizeFired: boolean } | undefined;
+} {
 	const runner = piSubagentRunnerFactory();
+	const budgetStates = new Map<
+		string,
+		{ spent: number; finalizeFired: boolean }
+	>();
 	const assertRegistrationOwnerActive = (): void => {
 		if (!isRegistrationOwnerActive()) {
 			throw new Error(
@@ -589,12 +600,41 @@ function createPiDreamerClient(
 				accountingSessionId: opts.projectIdentity,
 				accountingSubagent: "dreamer",
 				accountingTask: accountingTaskFromTitle(dreamSession.title),
+				tokenBudget: (() => {
+					const task = accountingTaskFromTitle(dreamSession.title);
+					if (!task) return undefined;
+					return buildDreamTaskRuntimeConfigs(
+						getDreamerConfig(),
+						opts.harness,
+					).find((entry) => entry.task === task)?.tokenBudget;
+				})(),
 			});
 			inFlightDreams.set(runPromise, opts.registrationOwner);
 			try {
 				const result = await runPromise;
+				const budget = result.meta?.tokenBudget as
+					| { spent?: number; finalizeFired?: boolean }
+					| undefined;
+				const budgetTask = accountingTaskFromTitle(dreamSession.title);
+				if (budgetTask && budget && typeof budget.spent === "number") {
+					const prior = budgetStates.get(budgetTask);
+					budgetStates.set(budgetTask, {
+						spent: (prior?.spent ?? 0) + budget.spent,
+						finalizeFired:
+							(prior?.finalizeFired ?? false) || budget.finalizeFired === true,
+					});
+				}
 				assertRegistrationOwnerActive();
 				if (!result.ok) {
+					if (result.reason === "token_budget") {
+						throw new DreamTokenBudgetExceeded(
+							dreamSession.id,
+							Number(
+								(result.meta?.tokenBudget as { spent?: number } | undefined)
+									?.spent ?? 0,
+							),
+						);
+					}
 					if (result.reason === "step_limit") {
 						throw new HiddenAgentStepLimit(
 							"pi-dreamer",
@@ -649,7 +689,16 @@ function createPiDreamerClient(
 		},
 	};
 
-	return { session } as unknown as DreamTimerClient;
+	return {
+		session,
+		readTokenBudget: (task: string) => budgetStates.get(task),
+		resetDreamTokenBudget: (task: string) => budgetStates.delete(task),
+	} as unknown as DreamTimerClient & {
+		readTokenBudget: (
+			task: string,
+		) => { spent: number; finalizeFired: boolean } | undefined;
+		resetDreamTokenBudget: (task: string) => void;
+	};
 }
 
 function readDirectory(args: { query?: unknown }): string | undefined {

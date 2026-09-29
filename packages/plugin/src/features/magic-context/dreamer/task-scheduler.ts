@@ -48,6 +48,8 @@ export interface DreamTaskRuntimeConfig {
     thinkingLevel?: PiThinkingLevel;
     language?: string;
     timeoutMinutes: number;
+    /** Cumulative prompt-token ceiling for one tool-loop child. */
+    tokenBudget?: number;
     /** review-user-memories */
     promotionThreshold?: number;
     /** retrospective source lookback; old rows are skipped by advancing its content watermark. */

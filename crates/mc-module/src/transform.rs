@@ -12312,10 +12312,15 @@ fn is_ignored_block(block: &CkWireBlock) -> bool {
 }
 
 fn is_dropped_placeholder_text(text: &str) -> bool {
-    static DROPPED_PLACEHOLDERS: OnceLock<regex::Regex> = OnceLock::new();
-    DROPPED_PLACEHOLDERS
-        .get_or_init(|| regex::Regex::new(r"^(?:\s*\[dropped(?: §\d+§)?\])+\s*$").unwrap())
-        .is_match(text)
+    static MARKER_ONLY: OnceLock<regex::Regex> = OnceLock::new();
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && MARKER_ONLY
+            .get_or_init(|| {
+                regex::Regex::new(r"^(?:(?:§\d+§|\[dropped(?: §\d+§)?\]|\[cleared\])\s*)+$")
+                    .unwrap()
+            })
+            .is_match(trimmed)
 }
 
 fn tag_stripped_text(text: &str) -> &str {
@@ -12437,11 +12442,22 @@ fn is_dropped_placeholder_block(block: &CkWireBlock) -> bool {
     )
 }
 
-fn has_text_or_reasoning_block(block: &CkWireBlock) -> bool {
-    matches!(
-        &block.kind,
-        ck_wire::CkKind::Text { .. } | ck_wire::CkKind::Reasoning { .. }
-    )
+fn whole_marker_or_blank_message(blocks: &[CkWireBlock]) -> bool {
+    let mut has_content = false;
+    for block in blocks {
+        if is_ignored_block(block) || is_metadata_block(block) {
+            continue;
+        }
+        let text = match &block.kind {
+            ck_wire::CkKind::Text { text } | ck_wire::CkKind::Reasoning { text, .. } => text,
+            _ => return false,
+        };
+        has_content = true;
+        if !text.trim().is_empty() && !is_dropped_placeholder_block(block) {
+            return false;
+        }
+    }
+    has_content
 }
 
 fn whole_system_injected(blocks: &[CkWireBlock]) -> bool {
@@ -12670,14 +12686,7 @@ fn new_frozen_strip_units(
                     units.insert(unit.key.clone(), unit);
                 }
             }
-            if !blocks.is_empty()
-                && blocks.iter().all(|block| {
-                    is_ignored_block(block)
-                        || is_metadata_block(block)
-                        || is_dropped_placeholder_block(block)
-                })
-                && blocks.iter().any(has_text_or_reasoning_block)
-            {
+            if whole_marker_or_blank_message(blocks) {
                 let unit = strip_unit("placeholder", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -12767,13 +12776,12 @@ fn apply_surface_strips(
 ) {
     replay_reasoning_clear(frozen_units, &message.mid, rebuilt);
     let sentinel = provider_sentinel_text(req);
-    let whole_strip = (!reasoning_policy.exempt)
-        .then(|| {
-            output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
-                output_message_strip_unit(frozen_units, "system_injected", &message.mid)
-            })
-        })
-        .flatten();
+    let whole_strip =
+        output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
+            (!reasoning_policy.exempt)
+                .then(|| output_message_strip_unit(frozen_units, "system_injected", &message.mid))
+                .flatten()
+        });
     if whole_strip.is_some() {
         rebuilt.content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text: sentinel })];
         rebuilt.mark_modified();
@@ -27392,6 +27400,147 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn marker_only_final_assistant_freezes_on_bust_and_replays_after_append() {
+        for (provider, sentinel) in [("anthropic", ""), ("openai-compatible", "[dropped]")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let session = format!("marker-only-{provider}");
+            let user = wire_item("user", "user", 1, &["continue"]);
+            let mut assistant = wire_item("assistant", "last", 2, &["§672§ [dropped §672§]"]);
+            assistant
+                .ck
+                .content
+                .push(CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "[cleared]".into(),
+                    signature: None,
+                }));
+            let mut request = req(&session, "cfg0", vec![user, assistant]);
+            request.provider_id = Some(provider.into());
+            let first = run(&store, &request, &spine());
+            assert_eq!(first.action, "HARD");
+            assert_eq!(tail_bytes(&first, "last"), sentinel);
+            assert!(store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:last"));
+            let first_wire = serde_json::to_vec(first.ck_messages.as_ref().unwrap()).unwrap();
+            request
+                .messages
+                .push(wire_item("assistant", "new", 3, &["§655§ [cleared]"]));
+            let second = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&second, "last"), sentinel);
+            assert_eq!(
+                serde_json::to_vec(
+                    &second.ck_messages.as_ref().unwrap()
+                        [..first.ck_messages.as_ref().unwrap().len()]
+                )
+                .unwrap(),
+                first_wire,
+                "the shared prefix must remain byte-identical after append"
+            );
+            assert_eq!(tail_bytes(&second, "new"), "§655§ [cleared]");
+            assert!(!store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:new"));
+        }
+    }
+
+    #[test]
+    fn blank_only_final_assistant_uses_provider_sentinel_and_replays() {
+        for (provider, sentinel) in [("anthropic", ""), ("openai-compatible", "[dropped]")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let session = format!("blank-only-{provider}");
+            let mut request = req(
+                &session,
+                "cfg0",
+                vec![
+                    wire_item("user", "user", 1, &["continue"]),
+                    wire_item("assistant", "last", 2, &[" \t"]),
+                ],
+            );
+            request.provider_id = Some(provider.into());
+            let first = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&first, "last"), sentinel);
+            assert!(store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:last"));
+            request
+                .messages
+                .push(wire_item("assistant", "new", 3, &["answer"]));
+            let second = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&second, "last"), sentinel);
+            assert_eq!(
+                serde_json::to_vec(
+                    &second.ck_messages.as_ref().unwrap()
+                        [..first.ck_messages.as_ref().unwrap().len()]
+                )
+                .unwrap(),
+                serde_json::to_vec(first.ck_messages.as_ref().unwrap()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn marker_only_parity_examples() {
+        let cases: Value =
+            serde_json::from_str(include_str!("../../../testdata/marker-only-parity.json"))
+                .unwrap();
+        for text in cases["positive"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            assert!(is_dropped_placeholder_text(text), "positive: {text:?}");
+        }
+        for text in cases["negative"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            assert!(!is_dropped_placeholder_text(text), "negative: {text:?}");
+        }
+        for parts in cases["positivePartCombinations"].as_array().unwrap() {
+            let blocks: Vec<_> = parts
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| {
+                    CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: part.as_str().unwrap().into(),
+                    })
+                })
+                .collect();
+            assert!(whole_marker_or_blank_message(&blocks), "parts: {parts:?}");
+        }
+    }
+
+    #[test]
+    fn marker_only_text_and_reasoning_blocks_are_complete_markers() {
+        for kind in [
+            ck_wire::CkKind::Text {
+                text: "§672§ [dropped §672§]".into(),
+            },
+            ck_wire::CkKind::Reasoning {
+                text: "[cleared]".into(),
+                signature: None,
+            },
+        ] {
+            assert!(is_dropped_placeholder_block(&CkWireBlock::bare(kind)));
+        }
+        assert!(!is_dropped_placeholder_block(&CkWireBlock::bare(
+            ck_wire::CkKind::Text {
+                text: "see [dropped §3§] above".into(),
+            }
+        )));
+    }
+
+    #[test]
     fn dropped_assistant_shell_does_not_steal_signed_reasoning_exemption() {
         let signed = CkWireMessage::from_parts(
             "assistant",
@@ -31681,7 +31830,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn opencode_tagging_surface_leaves_whitespace_only_assistant_framing_inert() {
+    fn opencode_tagging_surface_neutralizes_whitespace_only_assistant_without_tagging() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let request = active_opencode_req(
@@ -31692,7 +31841,7 @@ pub(crate) mod tests {
 
         let response = run(&s, &request, &spine());
 
-        assert_eq!(tail_bytes(&response, "blank-assistant"), "  \n\t");
+        assert_eq!(tail_bytes(&response, "blank-assistant"), "[dropped]");
         assert!(s
             .load_tags_for_session("opencode-whitespace-framing")
             .unwrap()

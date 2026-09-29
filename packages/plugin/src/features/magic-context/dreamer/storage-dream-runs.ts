@@ -6,6 +6,7 @@ export type DreamRunFailureClass =
     | "provider_timeout"
     | "provider_error"
     | "step_limit"
+    | "token_budget"
     | "empty_completion"
     | "no_models"
     | "child_aborted"
@@ -34,6 +35,8 @@ export interface DreamRunTaskSummary {
     /** Successful progress/detail. Missing means no progress was reported; an
      * empty string is treated as absent and is not persisted. */
     progress?: string;
+    /** Child prompt-token budget, consumption, finalize turn and accepted units. */
+    tokenBudget?: { budget: number; spent: number; finalizeFired: boolean; banked: number };
     backlog?: DreamTaskRunBacklog;
 }
 

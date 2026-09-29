@@ -1752,6 +1752,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1767,6 +1773,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1782,6 +1794,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1797,6 +1815,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1812,6 +1836,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1827,6 +1857,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1843,6 +1879,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 },
                 "recency_days": {
                   "default": 30,
@@ -1868,6 +1910,12 @@
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
                 },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
                 "max_tokens": {
                   "default": 12000,
                   "description": "Maximum combined token count of proposed ARCHITECTURE.md and STRUCTURE.md",
@@ -1889,6 +1937,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1905,6 +1959,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 },
                 "promotion_threshold": {
                   "default": 3,
@@ -1930,6 +1990,12 @@
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
                 },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
                 "promotion_threshold": {
                   "default": 2,
                   "description": "promote-primers: min recurring source days before promotion is considered (default: 2)",
@@ -1952,6 +2018,12 @@
                   "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false

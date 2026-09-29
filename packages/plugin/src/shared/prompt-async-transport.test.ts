@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
-
+import { refuseBudgetedToolCall } from "../features/magic-context/dreamer/token-budget";
+import { createDroppedInputToolExecuteBeforeHook } from "../hooks/magic-context/dropped-input-guard";
 import { promptSyncWithValidatedOutputRetry } from "./model-suggestion-retry";
 import {
     createPromptAsyncTransport,
@@ -185,6 +186,258 @@ describe("promptAsyncAndWaitForIdle", () => {
                 pollIntervalMs: 5,
             }),
         ).rejects.toBeDefined();
+    });
+});
+
+describe("dreamer budget on an async child", () => {
+    test("sums prompt usage across validation retries in the same child", async () => {
+        const messages: unknown[] = [];
+        const states: Array<{ spent: number }> = [];
+        let sends = 0;
+        let aborted = false;
+        const client = {
+            session: {
+                messages: async () => ({ data: [...messages] }),
+                promptAsync: async (req: { body: { parts: unknown[] } }) => {
+                    sends++;
+                    messages.push({
+                        info: { id: `user-${sends}`, role: "user" },
+                        parts: req.body.parts,
+                    });
+                    return { data: undefined };
+                },
+                abort: async () => {
+                    aborted = true;
+                    return { data: true };
+                },
+                status: async () => {
+                    const latest = messages.at(-1) as { info?: { id?: string } } | undefined;
+                    if (sends === 1 && latest?.info?.id === "user-1")
+                        messages.push({
+                            info: {
+                                id: "a1",
+                                role: "assistant",
+                                finish: "stop",
+                                tokens: { input: 60 },
+                                time: { created: 1, completed: 2 },
+                            },
+                            parts: [{ type: "text", text: "invalid manifest" }],
+                        });
+                    if (sends === 2 && latest?.info?.id === "user-2")
+                        messages.push({
+                            info: {
+                                id: "a2",
+                                role: "assistant",
+                                finish: "tool-calls",
+                                tokens: { input: 25 },
+                                time: { created: 3, completed: 4 },
+                            },
+                            parts: [{ type: "tool" }],
+                        });
+                    if (sends === 3 && latest?.info?.id === "user-3")
+                        messages.push({
+                            info: {
+                                id: "a3",
+                                role: "assistant",
+                                finish: "stop",
+                                tokens: { input: 1 },
+                                time: { created: 5, completed: 6 },
+                            },
+                            parts: [{ type: "text", text: "<mappings/>" }],
+                        });
+                    return {
+                        data: sends === 2 && !aborted ? { "ses-child": { type: "busy" } } : {},
+                    };
+                },
+            },
+        } as never;
+        const transport = createPromptAsyncTransport(client, "ses-child", {
+            pollIntervalMs: 1,
+            tokenBudget: 100,
+            onBudgetUpdate: (state) => states.push(state),
+        });
+        if (!transport) throw new Error("missing async transport");
+        await transport(request());
+        await transport(request());
+        expect(sends).toBe(3);
+        expect(states.at(-1)?.spent).toBe(86);
+    });
+    test("does not send a finalize turn when the child finishes below budget", async () => {
+        const host = asyncHost({ plan: ["busy", "settle"] });
+        const originalMessages = host.client.session.messages;
+        host.client.session.messages = mock(
+            async (...args: Parameters<typeof originalMessages>) => {
+                const response = await originalMessages(...args);
+                for (const message of response.data) {
+                    if (message.info.role === "assistant") message.info.tokens = { input: 39 };
+                }
+                return response;
+            },
+        );
+        await promptAsyncAndWaitForIdle(host.client as never, request(), {
+            pollIntervalMs: 1,
+            tokenBudget: 100,
+        });
+        expect(host.promptAsync).toHaveBeenCalledTimes(1);
+        expect(host.abort).not.toHaveBeenCalled();
+    });
+    test("returns the final manifest after a soft nudge without changing the child agent", async () => {
+        const host = asyncHost({ plan: ["busy", "settle"] });
+        const messages: Array<{
+            info: {
+                id: string;
+                role: string;
+                tokens?: unknown;
+                time?: { completed: number };
+                finish?: string;
+            };
+            parts: unknown[];
+        }> = [];
+        let sends = 0;
+        const client = {
+            session: {
+                messages: async () => ({ data: [...messages] }),
+                promptAsync: mock(async (_req: unknown) => {
+                    sends++;
+                    messages.push({ info: { id: `u${sends}`, role: "user" }, parts: [] });
+                    return { data: undefined };
+                }),
+                abort: host.abort,
+                status: async () => {
+                    if (sends === 1 && !messages.some((m) => m.info.id === "a1")) {
+                        messages.push({
+                            info: {
+                                id: "a1",
+                                role: "assistant",
+                                tokens: { input: 81 },
+                                time: { completed: 1 },
+                                finish: "tool-calls",
+                            },
+                            parts: [],
+                        });
+                    }
+                    if (sends === 2 && !messages.some((m) => m.info.id === "a2")) {
+                        messages.push({
+                            info: {
+                                id: "a2",
+                                role: "assistant",
+                                tokens: { input: 1 },
+                                time: { completed: 2 },
+                                finish: "stop",
+                            },
+                            parts: [{ type: "text", text: "<mappings/>" }],
+                        });
+                    }
+                    return {
+                        data:
+                            sends === 1 && host.abort.mock.calls.length === 0
+                                ? { "ses-child": { type: "busy" } }
+                                : {},
+                    };
+                },
+            },
+        } as never;
+        const body = {
+            ...request(),
+            body: {
+                agent: "dreamer-memory-mapper",
+                system: "same system",
+                parts: [{ type: "text", text: "work" }],
+            },
+        };
+        await promptAsyncAndWaitForIdle(client, body, { pollIntervalMs: 1, tokenBudget: 100 });
+        const prompts = (client as { session: { promptAsync: ReturnType<typeof mock> } }).session
+            .promptAsync.mock.calls;
+        expect(prompts).toHaveLength(2);
+        expect((prompts[1]?.[0] as typeof body).body.agent).toBe(
+            (prompts[0]?.[0] as typeof body).body.agent,
+        );
+        expect(messages.at(-1)?.parts).toEqual([{ type: "text", text: "<mappings/>" }]);
+        expect(host.abort).toHaveBeenCalledTimes(1);
+    });
+    test("finalizes once, refuses two tool calls, and keeps agent and tools unchanged", async () => {
+        const messages: Array<{
+            info: {
+                id: string;
+                role: string;
+                tokens?: unknown;
+                time?: { completed: number };
+                finish?: string;
+            };
+            parts: unknown[];
+        }> = [];
+        const toolsByAgent: Record<string, unknown[]> = {
+            "dreamer-memory-mapper": [{ name: "read", parameters: { type: "object" } }],
+        };
+        const capturedTools: string[] = [];
+        const prompts: unknown[] = [];
+        let stage = 0;
+        const client = {
+            session: {
+                messages: async () => ({ data: [...messages] }),
+                promptAsync: async (req: unknown) => {
+                    prompts.push(req);
+                    const agent = (req as { body: { agent: string } }).body.agent;
+                    capturedTools.push(JSON.stringify(toolsByAgent[agent] ?? []));
+                    if (prompts.length === 1)
+                        messages.push({ info: { id: "u1", role: "user" }, parts: [] });
+                    else messages.push({ info: { id: "u2", role: "user" }, parts: [] });
+                    return { data: undefined };
+                },
+                abort: mock(async () => ({ data: true })),
+                status: async () => {
+                    stage++;
+                    if (stage === 1)
+                        messages.push({
+                            info: {
+                                id: "a1",
+                                role: "assistant",
+                                tokens: { input: 10, cache: { read: 71, write: 0 } },
+                                time: { completed: 1 },
+                                finish: "tool-calls",
+                            },
+                            parts: [],
+                        });
+                    if (prompts.length === 2 && !messages.some((m) => m.info.id === "a2"))
+                        messages.push({
+                            info: {
+                                id: "a2",
+                                role: "assistant",
+                                tokens: { input: 1, cache: { read: 1, write: 0 } },
+                                time: { completed: 2 },
+                                finish: "stop",
+                            },
+                            parts: [{ type: "text", text: "<manifest/>" }],
+                        });
+                    return { data: stage === 1 ? { "ses-child": { type: "busy" } } : {} };
+                },
+            },
+        } as never;
+        const run = promptAsyncAndWaitForIdle(
+            client,
+            {
+                ...request(),
+                body: { agent: "dreamer-memory-mapper", parts: [{ type: "text", text: "go" }] },
+            },
+            { pollIntervalMs: 1, tokenBudget: 100 },
+        );
+        // Wait for the follow-up to be enqueued before simulating the tool hook.
+        while (prompts.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+        const before = createDroppedInputToolExecuteBeforeHook();
+        await expect(
+            before({ sessionID: "ses-child", tool: "read" }, { args: { path: "a" } }),
+        ).rejects.toThrow("Out of token budget");
+        await expect(
+            before({ sessionID: "ses-child", tool: "read" }, { args: { path: "b" } }),
+        ).rejects.toThrow("Out of token budget");
+        await expect(run).rejects.toThrow("token_budget");
+        expect(prompts).toHaveLength(2);
+        expect(capturedTools[0]).not.toBe("[]");
+        expect(capturedTools[1]).toBe(capturedTools[0]);
+        expect(
+            (prompts[1] as { body: { parts: Array<{ text: string }> } }).body.parts[0]?.text,
+        ).toContain("no more tool calls");
+        expect(refuseBudgetedToolCall("ses-child")).toBeNull();
     });
 });
 

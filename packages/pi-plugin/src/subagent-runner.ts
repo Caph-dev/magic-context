@@ -20,6 +20,11 @@ import {
 } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import {
+	createDreamTokenBudget,
+	TOKEN_BUDGET_FINALIZE_MESSAGE,
+	TOKEN_BUDGET_TOOL_REFUSAL,
+} from "@magic-context/core/features/magic-context/dreamer/token-budget";
 import { probeChildSpawnFence } from "@magic-context/core/features/magic-context/schema-fence-probe";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage";
 import type { SubagentKind } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
@@ -1082,6 +1087,9 @@ export class PiSubagentRunner implements SubagentRunner {
 		const startTime = Date.now();
 		let recordedAccounting = false;
 		const cap = subagentStepCap(options.agent);
+		const budget = options.tokenBudget
+			? createDreamTokenBudget(options.tokenBudget)
+			: undefined;
 		const telemetry = new SubagentTelemetry(options.systemPrompt, (line) =>
 			sessionLog(options.accountingSessionId ?? "subagent", line),
 		);
@@ -1205,8 +1213,18 @@ export class PiSubagentRunner implements SubagentRunner {
 		// Pi's print mode concatenates stdin into the initial message, so when we
 		// pipe the prompt we must omit the positional argv to avoid duplication.
 		const promptBytes = Buffer.byteLength(options.userMessage, "utf8");
+		const budgetToolGuardAvailable =
+			SUBAGENT_ENTRY_PATH !== undefined ||
+			this.subagentExtensions?.some(
+				(extension) => basename(extension) === "subagent-entry.js",
+			) === true;
+		const rpcBudget =
+			options.tokenBudget !== undefined &&
+			this.invocation.targetHarness === "pi" &&
+			budgetToolGuardAvailable;
 		const deliverViaStdin =
-			promptBytes > PROMPT_ARGV_MAX_BYTES || this.platform === "win32";
+			!rpcBudget &&
+			(promptBytes > PROMPT_ARGV_MAX_BYTES || this.platform === "win32");
 		let systemPromptTempDir: string | undefined;
 		let systemPromptPath: string | undefined;
 		const cleanupSystemPromptFile = () => {
@@ -1233,13 +1251,39 @@ export class PiSubagentRunner implements SubagentRunner {
 				);
 			}
 		}
+		if (rpcBudget && !systemPromptTempDir) {
+			try {
+				systemPromptTempDir = mkdtempSync(join(tmpdir(), "mc-pi-prompt-"));
+			} catch (error) {
+				return failBeforeSpawn(
+					"spawn_failed",
+					`failed to prepare pi budget guard: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+		const budgetGuardFile =
+			rpcBudget && systemPromptTempDir
+				? join(systemPromptTempDir, "budget-guard")
+				: undefined;
+		if (budgetGuardFile) {
+			try {
+				writeFileSync(budgetGuardFile, "", "utf8");
+			} catch (error) {
+				cleanupSystemPromptFile();
+				return failBeforeSpawn(
+					"spawn_failed",
+					`failed to write pi budget guard: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 		const args = buildArgs(options, {
 			targetHarness: this.invocation.targetHarness,
 			disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
 			subagentExtensions: this.subagentExtensions,
-			omitPositionalMessage: deliverViaStdin,
+			omitPositionalMessage: deliverViaStdin || rpcBudget,
 			systemPromptPath,
 			modelRef: modelRefOverride,
+			rpc: rpcBudget,
 		});
 
 		// The model spec is `provider/model` — Pi accepts that directly via
@@ -1257,20 +1301,26 @@ export class PiSubagentRunner implements SubagentRunner {
 			const settle = (result: SubagentRunResult) => {
 				if (settled) return;
 				settled = true;
+				const outcome: SubagentRunResult = budget
+					? {
+							...result,
+							meta: { ...result.meta, tokenBudget: budget.snapshot() },
+						}
+					: result;
 				cleanupSystemPromptFile();
 				// recordAccounting must never block resolution: a throw here (e.g.
 				// a DB write failure during token accounting) would leave the
 				// promise unresolved and hang the caller (historian/dreamer).
 				// Accounting is best-effort telemetry; resolve regardless.
 				try {
-					recordAccounting(result, accountingMessages);
+					recordAccounting(outcome, accountingMessages);
 				} catch (err) {
 					sessionLog(
 						options.accountingSessionId ?? "subagent",
 						`subagent accounting failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 					);
 				}
-				resolve(result);
+				resolve(outcome);
 			};
 
 			// Helper that wraps the optional caller-provided progress
@@ -1300,6 +1350,7 @@ export class PiSubagentRunner implements SubagentRunner {
 							...process.env,
 							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
 							MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
+							MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
 							MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
 								/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
 									options.agent,
@@ -1326,7 +1377,11 @@ export class PiSubagentRunner implements SubagentRunner {
 						// for oversized prompts elsewhere). Otherwise it stays closed
 						// because the message rides in argv and print-mode would block
 						// reading an open, idle stdin.
-						stdio: [deliverViaStdin ? "pipe" : "ignore", "pipe", "pipe"],
+						stdio: [
+							deliverViaStdin || rpcBudget ? "pipe" : "ignore",
+							"pipe",
+							"pipe",
+						],
 					},
 				);
 			} catch (error) {
@@ -1356,7 +1411,26 @@ export class PiSubagentRunner implements SubagentRunner {
 			// Stdin-delivery path: feed the message through stdin, then close it so
 			// Pi's print-mode stdin read resolves (it waits for EOF). Guarded by
 			// child.stdin presence (only opened when deliverViaStdin).
-			if (deliverViaStdin && child.stdin) {
+			if (rpcBudget && child.stdin) {
+				child.stdin.on("error", (error) => {
+					terminateChild(child);
+					settle({
+						ok: false,
+						reason: budget?.snapshot().finalizeFired
+							? "token_budget"
+							: "spawn_failed",
+						error: `Pi RPC input failed: ${error.message}`,
+						durationMs: Date.now() - startTime,
+					});
+				});
+				child.stdin.write(
+					`${JSON.stringify({
+						type: "prompt",
+						message: options.userMessage,
+						id: "dreamer-initial",
+					})}\n`,
+				);
+			} else if (deliverViaStdin && child.stdin) {
 				// A pipe failure (child exited early / was terminated mid-write)
 				// surfaces as an async "error" event on the stream, NOT via the
 				// try/catch around .end(). Without a listener, an EPIPE would
@@ -1504,7 +1578,121 @@ export class PiSubagentRunner implements SubagentRunner {
 					message?: unknown;
 				};
 
+				if (
+					rpcBudget &&
+					e.type === "response" &&
+					(event as { command?: string; success?: boolean }).success === false
+				) {
+					const reply = event as { command?: string; error?: string };
+					if (
+						reply.command === "prompt" ||
+						(reply.command === "steer" && !sawAgentEnd)
+					) {
+						terminateChild(child);
+						settle({
+							ok: false,
+							reason:
+								reply.command === "steer" ? "token_budget" : "model_failed",
+							error: reply.error ?? `Pi RPC ${reply.command} failed`,
+							durationMs: Date.now() - startTime,
+						});
+						return;
+					}
+				}
 				telemetry.observe(event);
+				if (budget && e.type === "message_end") {
+					const message = e.message as
+						| {
+								role?: string;
+								stopReason?: string;
+								content?: unknown[];
+								usage?: {
+									input?: number;
+									cacheRead?: number;
+									cacheWrite?: number;
+								};
+						  }
+						| undefined;
+					if (message?.role === "assistant") {
+						const usage = message.usage;
+						const finished =
+							message.stopReason === "stop" &&
+							!(
+								Array.isArray(message.content) &&
+								message.content.some(
+									(part) =>
+										typeof part === "object" &&
+										part !== null &&
+										(part as { type?: string }).type === "toolCall",
+								)
+							);
+						const decision = budget.charge(
+							usage?.input ?? 0,
+							usage?.cacheRead ?? 0,
+							usage?.cacheWrite ?? 0,
+							finished,
+							rpcBudget,
+						);
+						if (
+							decision === "stop" ||
+							(decision === "finalize" && !rpcBudget)
+						) {
+							terminateChild(child);
+							settle({
+								ok: false,
+								reason: "token_budget",
+								error: "MC-D11: Pi dreamer exceeded its prompt-token budget",
+								durationMs: Date.now() - startTime,
+								meta: { tokenBudget: budget.snapshot() },
+							});
+							return;
+						}
+						if (decision === "finalize" && rpcBudget) {
+							try {
+								if (!budgetGuardFile)
+									throw new Error("missing budget guard file");
+								writeFileSync(budgetGuardFile, "finalize", "utf8");
+							} catch {
+								terminateChild(child);
+								settle({
+									ok: false,
+									reason: "token_budget",
+									error: "MC-D11: Pi could not activate its tool guard",
+									durationMs: Date.now() - startTime,
+								});
+								return;
+							}
+							child.stdin?.write(
+								`${JSON.stringify({
+									type: "steer",
+									message: TOKEN_BUDGET_FINALIZE_MESSAGE,
+									id: "dreamer-finalize",
+								})}\n`,
+							);
+						}
+					}
+				}
+				const resultParts = (
+					event as { result?: { content?: Array<{ text?: string }> } }
+				).result?.content;
+				if (
+					budget?.snapshot().finalizeFired &&
+					e.type === "tool_execution_end" &&
+					resultParts?.some((part) => part.text === TOKEN_BUDGET_TOOL_REFUSAL)
+				) {
+					const refusal = budget.refuseTool();
+					if (refusal?.hardStopped) {
+						terminateChild(child);
+						settle({
+							ok: false,
+							reason: "token_budget",
+							error: "MC-D11: Pi dreamer made two calls after finalize",
+							durationMs: Date.now() - startTime,
+							meta: { tokenBudget: budget.snapshot() },
+						});
+						return;
+					}
+				}
 				if (cap !== undefined && telemetry.steps > cap) {
 					if (e.type === "message_end") accumulatedMessages.push(e.message);
 					if (e.type === "agent_end" && Array.isArray(e.messages))
@@ -2064,15 +2252,16 @@ export function buildArgs(
 		subagentEntryPath?: string;
 		systemPromptPath?: string;
 		modelRef?: string;
+		rpc?: boolean;
 		historianCalibrationEntryPath?: string | null;
 	},
 ): string[] {
 	const targetHarness = opts?.targetHarness ?? resolvePiHarnessKind();
 	const ompTarget = targetHarness === "omp";
 	const args: string[] = [
-		"--print",
+		...(opts?.rpc ? [] : ["--print"]),
 		"--mode",
-		"json",
+		opts?.rpc ? "rpc" : "json",
 		// `--no-session` makes Pi use SessionManager.inMemory() — no
 		// JSONL is written to ~/.pi/agent/sessions/<cwd>/, so historian,
 		// dreamer, recomp, and compressor child sessions never
@@ -2140,7 +2329,8 @@ export function buildArgs(
 	const subagentEntryPath = opts?.subagentEntryPath ?? SUBAGENT_ENTRY_PATH;
 	const shouldLoadSubagentExtension =
 		subagentEntryPath &&
-		(SEARCH_ONLY_SUBAGENT_TOOL_AGENTS.has(options.agent) ||
+		(opts?.rpc ||
+			SEARCH_ONLY_SUBAGENT_TOOL_AGENTS.has(options.agent) ||
 			DREAMER_ACTION_AGENTS.has(options.agent));
 	if (shouldLoadSubagentExtension) {
 		args.push("--extension", subagentEntryPath);
