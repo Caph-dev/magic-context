@@ -1431,6 +1431,7 @@ interface RunPostTransformPhaseArgs {
         memoryEnabled?: boolean;
         memoryInjectionBudgetTokens?: number;
         historyBudgetTokens?: number;
+        historyBudgetPolicyIdentity?: string;
         temporalAwareness?: boolean;
         hardSignals?: M0HardSignals;
         /** mural.enabled — drives the on-demand deterministic mural
@@ -1705,6 +1706,7 @@ export async function runPostTransformPhase(
                   muralEnabled: args.m0M1.muralEnabled,
                   memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                   historyBudgetTokens: args.m0M1.historyBudgetTokens,
+                  historyBudgetPolicyIdentity: args.m0M1.historyBudgetPolicyIdentity,
                   hardSignals: args.m0M1.hardSignals,
               })
             : { value: false, reason: null };
@@ -1773,6 +1775,7 @@ export async function runPostTransformPhase(
                 memoryEnabled: args.m0M1.memoryEnabled,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
+                historyBudgetPolicyIdentity: args.m0M1.historyBudgetPolicyIdentity,
                 temporalAwareness: args.m0M1.temporalAwareness,
                 isCacheBustingPass: true,
                 contentionFallbackPrefix: cachedPrefixBeforePreflight,
@@ -2490,6 +2493,7 @@ export async function runPostTransformPhase(
                 memoryEnabled: args.m0M1.memoryEnabled,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
+                historyBudgetPolicyIdentity: args.m0M1.historyBudgetPolicyIdentity,
                 temporalAwareness: args.m0M1.temporalAwareness,
                 isCacheBustingPass,
                 preparedPrefix,

@@ -100,6 +100,7 @@ import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
+    historyBudgetPolicyIdentity,
     resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveModelKey,
@@ -1645,13 +1646,32 @@ export function createTransform(deps: TransformDeps) {
         const boundaryUsageForProtectedTail = persistedUsageFreshForBoundary ?? contextUsageEarly;
         const boundaryUsageSource = persistedUsageFreshForBoundary ? "persisted" : "live";
 
+        const historyPolicyIdentity = historyBudgetPolicyIdentity(
+            deps.historyBudgetPercentage,
+            deps.executeThresholdPercentage,
+            currentModelKeyForBoundary,
+            deps.executeThresholdTokens,
+        );
+        // A cold-pass usage reset must not hide the last matched usable window.
+        // For catalog-absent models, rendering against the 60K default here would
+        // manufacture a larger baseline, then force a shrink on the next pass.
+        // A newly resolved live/catalog/overflow limit always takes precedence.
+        const historyContextLimit =
+            resolvedContextLimit ??
+            (currentModelKeyForBoundary &&
+            persistedUsageBeforeResets?.lastObservedModelKey &&
+            piModelRefToCanonical(currentModelKeyForBoundary) ===
+                piModelRefToCanonical(persistedUsageBeforeResets.lastObservedModelKey) &&
+            persistedUsageBeforeResets.lastUsageContextLimit > 0
+                ? persistedUsageBeforeResets.lastUsageContextLimit
+                : undefined);
         const historyBudgetTokens = resolveHistoryBudgetTokens(
             deps.historyBudgetPercentage,
             contextUsageEarly,
             deps.executeThresholdPercentage,
             deps.getModelKey?.(sessionId),
             deps.executeThresholdTokens,
-            resolvedContextLimit,
+            historyContextLimit,
         );
         // Ceiling for the tiered emergency drop = contextLimit × executeThreshold%
         // (the usable working ceiling, NOT scaled by history_budget_percentage).
@@ -2513,6 +2533,7 @@ export function createTransform(deps: TransformDeps) {
                 muralEnabled: deps.muralEnabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
+                historyBudgetPolicyIdentity: historyPolicyIdentity,
                 hardSignals: m0HardSignals,
             }).value;
         const protectionCacheBustingPass =
@@ -2711,6 +2732,7 @@ export function createTransform(deps: TransformDeps) {
                 memoryEnabled: deps.memoryConfig?.enabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
+                historyBudgetPolicyIdentity: historyPolicyIdentity,
                 temporalAwareness: deps.experimentalTemporalAwareness,
                 hardSignals: m0HardSignals,
                 muralEnabled: deps.muralEnabled,

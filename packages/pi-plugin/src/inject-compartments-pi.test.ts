@@ -2360,7 +2360,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 				mustMaterializePi({ ...state, muralEnabled: undefined }, db),
 			).toEqual({
 				value: true,
-				reason: "render_config",
+				reason: "render_config:mural(true→false)",
 				mismatch: { signal: "muralEnabled", cached: true, current: false },
 			});
 		} finally {
@@ -2780,6 +2780,278 @@ it("Fable HARD history uses the real-token budget in Pi", () => {
 				compartments,
 				[],
 			),
+		);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi keeps policy-identified m0 frozen as live budgets rise and folds a policy edit once", () => {
+	const db = createTestDb();
+	try {
+		const state = {
+			...piState("ses-pi-policy", ""),
+			historyBudgetTokens: 13762,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+		};
+		const first = injectM0M1Pi(
+			state,
+			db,
+			[userMessage("seed", 1)] as never,
+			undefined,
+			false,
+		);
+		expect(first.m0Materialized).toBe(true);
+		const baseline = getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes;
+		for (const historyBudgetTokens of [15670, 16200, 16800]) {
+			const replay = injectM0M1Pi(
+				{ ...state, historyBudgetTokens },
+				db,
+				[userMessage("grow", 2)] as never,
+				undefined,
+				false,
+			);
+			expect(replay.m0Materialized).toBe(false);
+			expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes).toEqual(
+				baseline,
+			);
+		}
+		const edited = {
+			...state,
+			historyBudgetTokens: 22400,
+			historyBudgetPolicyIdentity: "p0.2:percentage:40",
+		};
+		expect(mustMaterializePi(edited, db).reason).toContain(
+			"render_config:budget(",
+		);
+		expect(
+			injectM0M1Pi(
+				edited,
+				db,
+				[userMessage("edit", 3)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(true);
+		expect(
+			injectM0M1Pi(
+				edited,
+				db,
+				[userMessage("replay", 4)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(false);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi adopts legacy numeric history silently and retains absolute memory-budget edits", () => {
+	const db = createTestDb();
+	try {
+		const state = {
+			...piState("ses-pi-legacy-policy", ""),
+			historyBudgetTokens: 12000,
+			injectionBudgetTokens: 4000,
+		};
+		injectM0M1Pi(
+			state,
+			db,
+			[userMessage("legacy", 1)] as never,
+			undefined,
+			false,
+		);
+		const current = {
+			...state,
+			historyBudgetTokens: 16000,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+		};
+		expect(mustMaterializePi(current, db).value).toBe(false);
+		expect(
+			mustMaterializePi({ ...current, injectionBudgetTokens: 5000 }, db).reason,
+		).toBe("render_config:budget(m4000-h12000→m5000-hp0.15:percentage:40)");
+		const hard = {
+			...current,
+			hardSignals: {
+				systemHash: "new-system",
+				modelKey: "",
+				cacheExpired: false,
+				lastResponseTime: 0,
+			},
+		};
+		expect(
+			injectM0M1Pi(
+				hard,
+				db,
+				[userMessage("hard", 2)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(true);
+		expect(
+			getOrCreateSessionMeta(db, state.sessionId).cachedM0UpgradeState,
+		).toContain("hp0.15:percentage:40");
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi review: legacy replay survives restart and only a natural HARD records policy", () => {
+	const db = createTestDb();
+	try {
+		const hardSignals = {
+			modelKey: "review/larger-model",
+			systemHash: "",
+			cacheExpired: false,
+			lastResponseTime: 0,
+		};
+		const legacy = {
+			...piState("ses-pi-review-restart", ""),
+			historyBudgetTokens: 12000,
+			hardSignals,
+		};
+		injectM0M1Pi(
+			legacy,
+			db,
+			[userMessage("seed", 1)] as never,
+			undefined,
+			false,
+		);
+		const legacyIdentity = getOrCreateSessionMeta(
+			db,
+			legacy.sessionId,
+		).cachedM0UpgradeState?.split("|rendered-budgets:")[0];
+		db.prepare(
+			"UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?",
+		).run(legacyIdentity, legacy.sessionId);
+		const before = getOrCreateSessionMeta(db, legacy.sessionId);
+		expect(before.cachedM0UpgradeState).toContain("-h12000");
+		for (let restart = 0; restart < 2; restart++) {
+			const state = {
+				...piState(legacy.sessionId, ""),
+				historyBudgetTokens: restart === 0 ? 16000 : 1,
+				hardSignals,
+				historyBudgetPolicyIdentity: "p0.15:percentage:40",
+			};
+			expect(
+				injectM0M1Pi(
+					state,
+					db,
+					[userMessage("replay", 2)] as never,
+					undefined,
+					false,
+				).m0Materialized,
+			).toBe(false);
+			const after = getOrCreateSessionMeta(db, legacy.sessionId);
+			expect(after.cachedM0Bytes).toEqual(before.cachedM0Bytes);
+			expect(after.cachedM0UpgradeState).toBe(before.cachedM0UpgradeState);
+		}
+		const hard = {
+			...piState(legacy.sessionId, ""),
+			historyBudgetTokens: 100,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+			hardSignals: {
+				modelKey: "review/smaller-model",
+				systemHash: "",
+				cacheExpired: false,
+				lastResponseTime: 0,
+			},
+		};
+		expect(mustMaterializePi(hard, db).reason).toBe("model_change");
+		expect(
+			injectM0M1Pi(
+				hard,
+				db,
+				[userMessage("hard", 3)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(true);
+		expect(
+			getOrCreateSessionMeta(db, legacy.sessionId).cachedM0UpgradeState,
+		).toContain("-hp0.15:percentage:40");
+		expect(
+			injectM0M1Pi(
+				hard,
+				db,
+				[userMessage("replay", 4)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(false);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi shrinking budget refolds an oversized baseline once with empty m1", () => {
+	const db = createTestDb();
+	try {
+		const state = {
+			...piState("ses-pi-review-shrink", ""),
+			historyBudgetTokens: 12000,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+		};
+		appendCompartments(db, state.sessionId, [
+			{
+				sequence: 1,
+				startMessage: 1,
+				endMessage: 1,
+				startMessageId: "seed",
+				endMessageId: "seed",
+				title: "large baseline",
+				content: "",
+				p1: "history bytes ".repeat(500),
+				p2: "dense",
+				p3: "brief",
+				p4: "anchor",
+				importance: 100,
+			},
+		]);
+		injectM0M1Pi(state, db, [userMessage("seed", 1)] as never, undefined, true);
+		const before = getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes;
+		expect(before?.toString()).toContain("large baseline");
+		const shrink = { ...state, historyBudgetTokens: 1 };
+		const resized = injectM0M1Pi(
+			shrink,
+			db,
+			[userMessage("resize", 2)] as never,
+			undefined,
+			false,
+		);
+		expect(resized.m0Materialized).toBe(true);
+		expect(resized.m0Reason).toContain("render_config:budget_shrink(");
+		const after = getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes;
+		expect(after?.length).toBeLessThan(before?.length ?? 0);
+		expect(
+			getOrCreateSessionMeta(db, state.sessionId).cachedM0UpgradeState,
+		).toContain("|rendered-budgets:");
+		for (const recompute of [false, true, true]) {
+			expect(
+				injectM0M1Pi(
+					shrink,
+					db,
+					[userMessage("replay", 3)] as never,
+					undefined,
+					recompute,
+				).m0Materialized,
+			).toBe(false);
+			expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes).toEqual(
+				after,
+			);
+		}
+		expect(
+			injectM0M1Pi(
+				state,
+				db,
+				[userMessage("growth", 4)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(false);
+		expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes).toEqual(
+			after,
 		);
 	} finally {
 		closeQuietly(db);

@@ -12,6 +12,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
 import {
+    historyBudgetPolicyIdentity,
     resolveCacheTtl,
     resolveContextLimit,
     resolveContextWindowGeometry,
@@ -23,6 +24,37 @@ import {
 } from "./event-resolvers";
 
 describe("event-resolvers", () => {
+    it("identifies the selected history policy without a live window or unrelated model overrides", () => {
+        expect(
+            historyBudgetPolicyIdentity(0.15, { default: 65, "custom/model": 40 }, "custom/model"),
+        ).toBe("p0.15:percentage:40");
+        expect(
+            historyBudgetPolicyIdentity(0.15, 40, "custom/model", { "custom/model": 150000 }),
+        ).toBe("p0.15:tokens:150000");
+        expect(
+            historyBudgetPolicyIdentity(0.15, 40, "custom/model", { "custom/model": 160000 }),
+        ).toBe("p0.15:tokens:160000");
+        expect(
+            historyBudgetPolicyIdentity(0.15, 40, "custom/model", { "other/model": 160000 }),
+        ).toBe("p0.15:percentage:40");
+        expect(historyBudgetPolicyIdentity(undefined, 40, "custom/model")).toBe("pdefault");
+        expect(
+            historyBudgetPolicyIdentity(0.2, { default: 65, "openai/gpt": 40 }, "openai-codex/gpt"),
+        ).toBe("p0.2:percentage:40");
+    });
+    it("review: effective policy identity covers mode, selected overrides, fraction and default history", () => {
+        const model = "custom/model";
+        const baseline = historyBudgetPolicyIdentity(0.15, 40, model);
+        expect(historyBudgetPolicyIdentity(0.2, 40, model)).not.toBe(baseline);
+        expect(historyBudgetPolicyIdentity(0.15, { default: 65, [model]: 40 }, model)).toBe(baseline);
+        expect(historyBudgetPolicyIdentity(0.15, { default: 40, [model]: 50 }, model)).not.toBe(baseline);
+        expect(historyBudgetPolicyIdentity(0.15, 40, model, { default: 100000 })).toBe("p0.15:tokens:100000");
+        expect(historyBudgetPolicyIdentity(0.15, 40, model, { default: 100000, [model]: 110000 })).toBe("p0.15:tokens:110000");
+        expect(historyBudgetPolicyIdentity(0.15, 40, model, { default: 100000, "other/model": 110000 })).toBe("p0.15:tokens:100000");
+        expect(historyBudgetPolicyIdentity(undefined, 40, model)).toBe(historyBudgetPolicyIdentity(undefined, 80, model, { default: 100000 }));
+        expect(historyBudgetPolicyIdentity(0.15, 95, model)).toBe(historyBudgetPolicyIdentity(0.15, 90, model));
+    });
+
     describe("resolveContextLimit", () => {
         // resolveContextLimit reads from getModelsDevContextLimit (which overlays
         // opencode.json custom provider limits on top of the models.dev cache).
