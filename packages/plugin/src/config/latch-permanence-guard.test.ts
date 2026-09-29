@@ -53,6 +53,10 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "VERDICT",
         reason: "Correct: circuit state expires and a half-open probe re-evaluates the endpoint.",
     },
+    "packages/plugin/src/features/magic-context/memory/project-identity.ts:homeProjectPermission": {
+        classification: "VERDICT",
+        reason: "Boot config publishes the home-project permission; the setter replaces it on another host initialization, while explicit resolution arguments override it.",
+    },
     "packages/plugin/src/features/magic-context/memory/project-identity.ts:directoryFallbackCache":
         {
             classification: "VERDICT",

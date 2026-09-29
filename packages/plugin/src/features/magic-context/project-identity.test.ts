@@ -16,6 +16,8 @@ import {
     resolveProjectIdentityForSession,
     resolveProjectIdentityOrFallback,
     resolveProjectIdentityStrict,
+    setHomeProjectPermission,
+    shouldSkipHomeProjectMemory,
     storedPathBelongsToIdentity,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "./project-identity";
@@ -98,6 +100,35 @@ function makeGitFailure(fields: {
 }
 
 describe("project identity", () => {
+    it("applies the boot home permission to strict, fallback, and stored identities", () => {
+        const home = makeTempDir("identity-home-policy-");
+        __setProjectIdentityTestHooks({ homeDirectory: () => home });
+        expect(shouldSkipHomeProjectMemory(home)).toBe(true);
+        expect(resolveProjectIdentityForSession(home)).toBeUndefined();
+        expect(expectProjectIdentityError(() => resolveProjectIdentity(home)).errorClass).toBe(
+            "home_project_disabled",
+        );
+        expect(
+            expectProjectIdentityError(() => resolveProjectIdentityStrict(home)).errorClass,
+        ).toBe("home_project_disabled");
+        expect(
+            expectProjectIdentityError(() => resolveProjectIdentityOrFallback(home)).errorClass,
+        ).toBe("home_project_disabled");
+        expect(normalizeStoredProjectPath(home)).toBe(home);
+
+        setHomeProjectPermission(true);
+        expect(shouldSkipHomeProjectMemory(home)).toBe(false);
+        const identity = resolveProjectIdentity(home);
+        expect(identity).toBe(expectedDirIdentity(home));
+        expect(resolveProjectIdentityOrFallback(home)).toBe(identity);
+        expect(normalizeStoredProjectPath(home)).toBe(identity);
+        expect(storedPathBelongsToIdentity(home, identity)).toBe(true);
+        expectProjectIdentityError(() => resolveProjectIdentity(home, false));
+        expectProjectIdentityError(() => resolveProjectIdentityStrict(home, false));
+        setHomeProjectPermission(false);
+        expect(shouldSkipHomeProjectMemory(home)).toBe(true);
+        expectProjectIdentityError(() => resolveProjectIdentity(home));
+    });
     it("resolveProjectIdentityStrict returns the git root commit identity", () => {
         const repo = makeRepoWithGitMetadata("project-identity-git-");
         __setProjectIdentityTestHooks({ execFileSync: returningRootCommit(FIRST_ROOT_COMMIT) });

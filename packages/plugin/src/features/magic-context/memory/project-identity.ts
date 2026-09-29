@@ -55,6 +55,32 @@ interface SessionIdentityCacheEntry {
     revalidateAt: number | null;
 }
 const sessionIdentityCache = new Map<string, SessionIdentityCacheEntry>();
+// Boot policy applies to identity lookups made outside the session path (historian, RPC, tools).
+let homeProjectPermission = false;
+let homeProjectSkipLogged = false;
+
+export function setHomeProjectPermission(allowed: boolean): void {
+    homeProjectPermission = allowed;
+}
+
+/** Skip memory work on a disallowed home project without generating repeated failures. */
+export function shouldSkipHomeProjectMemory(directory: string): boolean {
+    try {
+        assertProjectAllowed(directory, homeProjectPermission);
+        return false;
+    } catch (error) {
+        if (
+            !(error instanceof ProjectIdentityError) ||
+            error.errorClass !== "home_project_disabled"
+        )
+            throw error;
+        if (!homeProjectSkipLogged) {
+            homeProjectSkipLogged = true;
+            log("[magic-context] home project memory disabled; skipping memory features");
+        }
+        return true;
+    }
+}
 let execFileSyncForIdentity: typeof execFileSync = execFileSync;
 let userHomeDirectoryForIdentity = (): string => homedir();
 let nowMs = (): number => Date.now();
@@ -262,7 +288,10 @@ function classifyGitError(error: unknown, rawDirectory: string): ProjectIdentity
  * The cache is process-local, keyed by `path.resolve(directory)`, and stores only successful git
  * identities. Transient failures are never cached.
  */
-export function resolveProjectIdentityStrict(directory: string, allowHomeProject = false): string {
+export function resolveProjectIdentityStrict(
+    directory: string,
+    allowHomeProject = homeProjectPermission,
+): string {
     assertProjectAllowed(directory, allowHomeProject);
     const canonical = path.resolve(directory);
     const cached = identityCache.get(canonical);
@@ -453,7 +482,10 @@ function assertProjectAllowed(directory: string, allowHomeProject: boolean): voi
     }
 }
 
-export function resolveProjectIdentity(directory: string, allowHomeProject = false): string {
+export function resolveProjectIdentity(
+    directory: string,
+    allowHomeProject = homeProjectPermission,
+): string {
     assertProjectAllowed(directory, allowHomeProject);
     const canonical = path.resolve(directory);
     const cachedFallback = directoryFallbackCache.get(canonical);
@@ -511,7 +543,7 @@ export function resolveProjectIdentity(directory: string, allowHomeProject = fal
 
 export function resolveProjectIdentityOrFallback(
     directory: string,
-    allowHomeProject = false,
+    allowHomeProject = homeProjectPermission,
 ): string {
     try {
         return resolveProjectIdentity(directory, allowHomeProject);
@@ -629,7 +661,7 @@ export function isUsableProjectIdentity(identity: string | null | undefined): id
 
 export function resolveProjectIdentityForSession(
     directory: string,
-    allowHomeProject = false,
+    allowHomeProject = homeProjectPermission,
 ): string | undefined {
     const resolvedDirectory = path.resolve(directory);
     const cacheKey = `${allowHomeProject ? "1" : "0"}\0${resolvedDirectory}`;
@@ -796,6 +828,8 @@ export function __clearProjectIdentityResolutionCacheForTests(directory?: string
 }
 
 export function __resetProjectIdentityForTests(): void {
+    homeProjectPermission = false;
+    homeProjectSkipLogged = false;
     identityCache.clear();
     linkedGitWorktreeCache.clear();
     lastKnownGitIdentityCache.clear();
