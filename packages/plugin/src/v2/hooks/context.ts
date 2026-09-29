@@ -16,7 +16,10 @@ import {
     formatFailClosedBlockingSummary,
     isFailClosedBlockingError,
 } from "../../features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentityForSession,
+    setHomeProjectPermission,
+} from "../../features/magic-context/memory/project-identity";
 import { detectOverflow } from "../../features/magic-context/overflow-detection";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import { backfillSessionActivity } from "../../features/magic-context/session-activity";
@@ -466,6 +469,7 @@ export async function applyV2SystemPrompt(
 export async function registerContext(context: V2Context) {
     const directory = context.location.directory;
     const config = loadPluginConfigDetailed(directory).config;
+    setHomeProjectPermission(config.allow_home_project);
     if (!config.enabled) return;
     const liveConfigReader = pluginConfigReader(directory, config);
     const compactionOff = !isCompactionEnabled(config);

@@ -133,13 +133,13 @@ export async function reportAuthorityMarkers(args: {
         return;
     }
 
+    const loaded = loadPluginConfig(process.cwd());
     let currentIdentity: string | undefined;
     try {
-        currentIdentity = resolveProjectIdentity(process.cwd());
+        currentIdentity = resolveProjectIdentity(process.cwd(), loaded.allow_home_project);
     } catch {
         // A doctor run must still report the durable fences when cwd identity fails.
     }
-    const loaded = loadPluginConfig(process.cwd());
     const transport = new SubcModuleTransport(
         loaded.subc?.connection_file ?? getDefaultSubcConnectionFile(),
     );
@@ -187,12 +187,18 @@ export async function runDoctorDrainAuthority(
         return 1;
     }
     try {
-        const projectPath = resolveProjectIdentity(projectRoot);
+        const loaded = loadPluginConfig(projectRoot);
+        let projectPath: string;
+        try {
+            projectPath = resolveProjectIdentity(projectRoot, loaded.allow_home_project);
+        } catch (error) {
+            console.error(error instanceof Error ? error.message : String(error));
+            return 1;
+        }
         if (!getAuthorityManagedMarker(db, projectPath)) {
             console.log(`No authority_managed marker exists for ${projectPath}.`);
             return 0;
         }
-        const loaded = loadPluginConfig(projectRoot);
         const module = authorityClient(
             new SubcModuleTransport(loaded.subc?.connection_file ?? getDefaultSubcConnectionFile()),
             projectRoot,

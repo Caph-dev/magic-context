@@ -31,7 +31,10 @@ import {
     embedPromotedFacts,
     promoteSessionFactsDurable,
 } from "../../features/magic-context/memory";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentity,
+    shouldSkipHomeProjectMemory,
+} from "../../features/magic-context/memory/project-identity";
 import {
     getMemoriesByProject,
     ModuleMemoryAuthorityError,
@@ -234,6 +237,7 @@ export function clearHistorianAlertState(sessionId: string): void {
 }
 
 export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Promise<void> {
+    if (shouldSkipHomeProjectMemory(deps.directory ?? process.cwd())) return;
     const {
         client,
         db,

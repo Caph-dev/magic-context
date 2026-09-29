@@ -34,7 +34,11 @@ import {
     emptyMemoryImportanceHistogram,
     getActiveMemoryImportanceHistogram,
 } from "../features/magic-context/memory/memory-diagnostics";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import {
+    ProjectIdentityError,
+    resolveProjectIdentity,
+    shouldSkipHomeProjectMemory,
+} from "../features/magic-context/memory/project-identity";
 import { getMessageIndexQueueHeapStats } from "../features/magic-context/message-index-async";
 import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
@@ -707,7 +711,8 @@ export function buildSidebarSnapshot(
         // last good breakdown instead of letting the bar flicker.
         return applyStickySnapshotCache(sessionId, fresh);
     } catch (err) {
-        log("[rpc] sidebar-snapshot error:", err);
+        if (!(err instanceof ProjectIdentityError && err.errorClass === "home_project_disabled"))
+            log("[rpc] sidebar-snapshot error:", err);
         throw err;
     }
 }
@@ -724,6 +729,7 @@ export function buildSidebarSnapshotRpcResponse(
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
 ): Record<string, unknown> {
+    if (shouldSkipHomeProjectMemory(directory)) return { error: "home project memory disabled" };
     try {
         return buildSidebarSnapshot(
             db,
@@ -771,7 +777,10 @@ export function buildStatusDetail(
         compactionEnabled,
     );
     const rustMode = config?.transform_mode === "rust";
-    const projectIdentity = rustMode ? resolveProjectIdentity(directory) : null;
+    const projectIdentity =
+        rustMode && !shouldSkipHomeProjectMemory(directory)
+            ? resolveProjectIdentity(directory)
+            : null;
     const moduleMemoryAuthority = moduleStatus?.authority?.memories;
     const moduleMemoryState = moduleMemoryAuthority?.state;
     const moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
@@ -1476,6 +1485,7 @@ export function registerRpcHandlers(
     rpcServer.handle("status-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
+        if (shouldSkipHomeProjectMemory(dir)) return { error: "home project memory disabled" };
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
         const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
@@ -1512,6 +1522,7 @@ export function registerRpcHandlers(
     rpcServer.handle("embed-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
+        if (shouldSkipHomeProjectMemory(dir)) return { error: "home project memory disabled" };
         const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         try {

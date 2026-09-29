@@ -53,6 +53,7 @@ import {
 import {
 	isUsableProjectIdentity,
 	resolveProjectIdentityForSession,
+	setHomeProjectPermission,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
@@ -1081,6 +1082,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const bootProjectDir = process.cwd();
 	ensureConfigLocationsMigrated(bootProjectDir);
 	const bootConfig = loadPiConfig({ cwd: bootProjectDir });
+	setHomeProjectPermission(bootConfig.config.allow_home_project);
 	if (!bootConfig.config.enabled) {
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;

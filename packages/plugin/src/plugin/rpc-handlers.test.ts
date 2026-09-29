@@ -5,7 +5,12 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { MagicContextConfigSchema } from "../config/schema/magic-context";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import {
+    __resetProjectIdentityForTests,
+    __setProjectIdentityTestHooks,
+    resolveProjectIdentity,
+    setHomeProjectPermission,
+} from "../features/magic-context/memory/project-identity";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "../features/magic-context/migrations";
 import { upsertMural } from "../features/magic-context/mural/storage-mural";
 import {
@@ -69,6 +74,26 @@ function registeredRpcMethods(
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
+    __resetProjectIdentityForTests();
+});
+
+describe("home project sidebar", () => {
+    test("does not poll memory while gated and serves a snapshot after opt-in", () => {
+        const directory = process.cwd();
+        __setProjectIdentityTestHooks({ homeDirectory: () => directory });
+        const db = createTestDb();
+        try {
+            expect(buildSidebarSnapshotRpcResponse(db, "ses_home", directory)).toEqual({
+                error: "home project memory disabled",
+            });
+            setHomeProjectPermission(true);
+            const snapshot = buildSidebarSnapshotRpcResponse(db, "ses_home", directory);
+            expect(snapshot.error).toBeUndefined();
+            expect(snapshot).toHaveProperty("sessionId", "ses_home");
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });
 
 describe("debug RPC guard", () => {

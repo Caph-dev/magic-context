@@ -22,7 +22,10 @@ import {
     createFailClosedController,
     getLastHookInitFailure,
 } from "./features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentityForSession,
+    setHomeProjectPermission,
+} from "./features/magic-context/memory/project-identity";
 import { backfillSessionActivity } from "./features/magic-context/session-activity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
@@ -136,6 +139,7 @@ const server: Plugin = async (ctx) => {
     });
     const loadedPluginConfig = loadPluginConfigDetailed(ctx.directory);
     const pluginConfig = loadedPluginConfig.config;
+    setHomeProjectPermission(pluginConfig.allow_home_project);
     const liveConfigReader = pluginConfigReader(ctx.directory, pluginConfig);
     const dreamerCap = createDreamerOutputCapSampler(
         pluginConfig,
