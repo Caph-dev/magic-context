@@ -19,7 +19,10 @@ import {
     inspectRpcServerDiscovery,
 } from "@magic-context/core/features/magic-context/storage-db";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
-import { inspectLivePiProcesses } from "@magic-context/core/shared/rpc-utils";
+import {
+    inspectLivePiProcesses,
+    inspectWindowsProcessesSync,
+} from "@magic-context/core/shared/rpc-utils";
 import { Database, type Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
 import { type PromptIO, promptIO } from "../lib/prompts";
@@ -71,7 +74,8 @@ interface SalvageResult {
 }
 
 export function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
-    const rpc = inspectRpcServerDiscovery(storageDir);
+    const processes = process.platform === "win32" ? inspectWindowsProcessesSync() : undefined;
+    const rpc = inspectRpcServerDiscovery(storageDir, processes);
     if (rpc.state === "unreadable") {
         const arm = rpc.unreadableArm === "parse" ? "could not be parsed" : "could not be read";
         return {
@@ -83,7 +87,13 @@ export function defaultInspectHolders(storageDir: string): DatabaseHolderInspect
 
     const blockers =
         rpc.state === "live" ? rpc.serverPids.map((pid) => `OpenCode server (PID ${pid})`) : [];
-    const pi = inspectLivePiProcesses();
+    if (rpc.state === "inconclusive")
+        return {
+            safe: false,
+            blockers: [],
+            uncertainty: `RPC process liveness could not be determined (PID ${(rpc.inconclusivePids ?? []).join(", ")})`,
+        };
+    const pi = processes?.pi ?? inspectLivePiProcesses();
     if (pi.state === "unreadable" || pi.state === "inconclusive") {
         return {
             safe: false,

@@ -121,8 +121,6 @@ const WINDOWS_CIM_PROBE_TIMEOUT_MS = 5_000;
 const WINDOWS_PROCESS_SNAPSHOT_TTL_MS = 2_000;
 const MAX_ANCESTOR_WALK_DEPTH = 16;
 const OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
-const TASKLIST_NO_TASKS_PATTERN =
-    /^INFO:\s+No tasks are running which match the specified criteria\.?$/im;
 const WINDOWS_CIM_COMMAND =
     "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate | ConvertTo-Json -Compress";
 const PI_HARNESS_ARC_MARKERS = [
@@ -270,34 +268,39 @@ function parseCsvLine(line: string): string[] | null {
     return fields;
 }
 
-function parseTasklistOutput(output: string): ProcessListEntry[] | null {
+export function parseTasklistOutput(output: string): ProcessListEntry[] | null {
     const entries: ProcessListEntry[] = [];
-    let sawHeader = false;
+
     for (const rawLine of output.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line) continue;
-        if (TASKLIST_NO_TASKS_PATTERN.test(line)) return [];
+
         const fields = parseCsvLine(line);
         if (!fields) continue;
         if (fields[1]?.trim().toLowerCase() === "pid") {
-            sawHeader = true;
             continue;
         }
         const pid = Number(fields[1]);
         if (!Number.isInteger(pid) || pid <= 0 || !fields[0]) continue;
         entries.push({ pid, command: fields[0] });
     }
-    return entries.length > 0 || sawHeader ? entries : null;
+    // Successful tasklist commands return localized prose when no PID matches.
+    // Only CSV PID fields are evidence of a live process; failures are caught by the caller.
+    return entries;
 }
 
 function readWindowsProcess(pid: number): { state: PidLiveness; command?: string } {
     try {
-        const output = rpcIdentityExecFileSync("tasklist", ["/FO", "CSV", "/FI", `PID eq ${pid}`], {
-            encoding: "utf8",
-            timeout: PS_PROBE_TIMEOUT_MS,
-            stdio: ["ignore", "pipe", "pipe"],
-            windowsHide: true,
-        });
+        const output = rpcIdentityExecFileSync(
+            "tasklist",
+            ["/FO", "CSV", "/NH", "/FI", `PID eq ${pid}`],
+            {
+                encoding: "utf8",
+                timeout: PS_PROBE_TIMEOUT_MS,
+                stdio: ["ignore", "pipe", "pipe"],
+                windowsHide: true,
+            },
+        );
         const entries = parseTasklistOutput(String(output));
         if (entries === null) return { state: "inconclusive" };
         const process = entries.find((entry) => entry.pid === pid);
@@ -632,7 +635,11 @@ function tryReadWindowsCimSnapshot(exec: typeof execFileSync): ProcessSnapshot |
 
 function tryReadWindowsTasklistSnapshot(): ProcessSnapshot | null {
     try {
-        const output = execProcessList(rpcProcessListExecFileSync, "tasklist", ["/FO", "CSV"]);
+        const output = execProcessList(rpcProcessListExecFileSync, "tasklist", [
+            "/FO",
+            "CSV",
+            "/NH",
+        ]);
         const entries = parseTasklistOutput(output);
         if (entries === null) return null;
         const facts = entries.map((entry) => ({
@@ -921,7 +928,11 @@ export function inspectProcessesAsync(forceFresh = false): Promise<AsyncProcessI
                 }
                 if (!snapshot) {
                     const entries = parseTasklistOutput(
-                        await asyncProcessExec("tasklist", ["/FO", "CSV"], PS_PROBE_TIMEOUT_MS),
+                        await asyncProcessExec(
+                            "tasklist",
+                            ["/FO", "CSV", "/NH"],
+                            PS_PROBE_TIMEOUT_MS,
+                        ),
                     );
                     if (entries)
                         snapshot = snapshotFromFacts(
@@ -985,4 +996,22 @@ export function inspectProcessesAsync(forceFresh = false): Promise<AsyncProcessI
         asyncInspectionExpires = rpcIdentityNowMs() + WINDOWS_PROCESS_SNAPSHOT_TTL_MS;
     });
     return asyncInspection;
+}
+
+/** Take one fresh Windows process snapshot with command time limits for synchronous callers. */
+export function inspectWindowsProcessesSync(): AsyncProcessInspection {
+    const snapshot =
+        tryReadWindowsCimSnapshot(rpcProcessListExecFileSync) ?? tryReadWindowsTasklistSnapshot();
+    const byPid = new Map(snapshot?.facts.map((fact) => [fact.pid, fact]));
+    return {
+        pi: snapshot ? classifyLivePiSnapshot(snapshot) : { state: "unreadable", processIds: [] },
+        ...(snapshot
+            ? { processSnapshot: { source: snapshot.source, facts: snapshot.facts } }
+            : {}),
+        evidence: (pid) => ({
+            startTime: byPid.get(pid)?.startTime ?? null,
+            commandLine: byPid.get(pid)?.commandLine ?? byPid.get(pid)?.imageName ?? null,
+        }),
+        liveness: (pid) => (byPid.has(pid) ? "alive" : snapshot ? "dead" : "inconclusive"),
+    };
 }

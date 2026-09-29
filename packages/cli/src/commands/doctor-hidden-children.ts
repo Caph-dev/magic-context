@@ -7,6 +7,7 @@ import {
 } from "@magic-context/core/shared/rpc-utils";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { copyDatabaseBundle, defaultInspectHolders } from "./doctor-repair-db";
+import { assertWindowsStoresClosed } from "./doctor-windows-holders";
 
 const PREFIX = "opencode2_hidden_children:";
 const CASCADE_TABLES = [
@@ -35,44 +36,7 @@ export async function assertHiddenChildStoresClosed(
     processProbe: () => Promise<AsyncProcessInspection> = () => inspectProcessesAsync(true),
 ): Promise<void> {
     if (platform === "win32") {
-        const processes = await processProbe();
-        if (
-            processes.pi.state !== "known" ||
-            processes.pi.processIds.length > 0 ||
-            (processes.pi.inconclusivePids?.length ?? 0) > 0 ||
-            processes.processSnapshot?.source !== "cim"
-        ) {
-            throw new Error(
-                "Windows process probe could not rule out OpenCode, Pi or ck-mc holders",
-            );
-        }
-        const unknown = processes.processSnapshot.facts.filter(
-            ({ pid, imageName, commandLine }) =>
-                pid !== process.pid &&
-                ((!imageName && !commandLine) ||
-                    (/^(?:bun|node|deno)(?:\.exe)?$/i.test(imageName ?? "") && !commandLine)),
-        );
-        if (unknown.length)
-            throw new Error(
-                `Windows process identity is unavailable (PID ${unknown.map(({ pid }) => pid).join(", ")})`,
-            );
-        const blockers = processes.processSnapshot.facts.filter(
-            ({ pid, imageName, commandLine }) => {
-                if (pid === process.pid) return false;
-                const image =
-                    (imageName ?? "").toLowerCase().replaceAll("\\", "/").split("/").at(-1) ?? "";
-                return (
-                    /^(?:opencode|opencode2|pi|omp|ck-mc)(?:\.exe)?$/.test(image) ||
-                    /(?:^|[\\/\s"'])(?:ck-mc|opencode2?)(?:\.exe|\.js|\.mjs)?(?:$|[\s"'])/i.test(
-                        commandLine ?? "",
-                    )
-                );
-            },
-        );
-        if (blockers.length)
-            throw new Error(
-                `OpenCode, Pi or ck-mc process is running (PID ${blockers.map(({ pid }) => pid).join(", ")})`,
-            );
+        assertWindowsStoresClosed([contextDbPath, hostDbPath], await processProbe());
         return;
     }
     const inspection = defaultInspectHolders(dirname(contextDbPath));

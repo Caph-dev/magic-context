@@ -244,6 +244,8 @@ test("Windows doctor refuses either held database lock and repairs once both are
             held?.exec("ROLLBACK");
             held?.close();
             held = undefined;
+            // Backup names use millisecond timestamps; separate successive repair attempts.
+            await Bun.sleep(2);
             const host = new Database(files.hostDbPath, { readonly: true });
             try {
                 expect(host.prepare("SELECT COUNT(*) AS count FROM session_v2").get()).toEqual({
