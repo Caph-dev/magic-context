@@ -9123,6 +9123,54 @@ describe("proactive strip of thinking on busting passes", () => {
         initializeDatabase(db);
     };
 
+    it("a budget-shrink HARD strips thinking on the resizing pass and not the next replay", async () => {
+        openDb();
+        const sessionId = "ses-proactive-budget-shrink";
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 1,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "user-prefix",
+                endMessageId: "user-prefix",
+                title: "large history",
+                content: "",
+                p1: "history bytes ".repeat(500),
+                p2: "dense",
+                p3: "brief",
+                p4: "anchor",
+                importance: 100,
+            },
+        ]);
+        const pass = (messages: MessageLike[], historyBudgetTokens: number) =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    resolvedProviderID: "anthropic",
+                    thinkingBindingRecoveryEnabledForModel: true,
+                    fullFeatureMode: true,
+                    schedulerDecision: "defer",
+                    m0M1: {
+                        projectPath: "git:budget-shrink",
+                        projectDirectory: "/nonexistent",
+                        historyBudgetTokens,
+                        historyBudgetPolicyIdentity: "p0.15:percentage:40",
+                    },
+                }),
+            );
+        await pass(buildSession(sessionId), 12000);
+        const shrinking = appendTurn(buildSession(sessionId), sessionId, "shrink");
+        const result = await pass(shrinking, 1);
+        expect(result.materializeReason).toContain("render_config:budget_shrink(");
+        expect(result.bustedThisPass).toBe(true);
+        expect(result.proactiveThinkingStrip?.messageIds).toContain("assistant-shrink");
+        expect(reasoningCount(findMessage(shrinking, "assistant-shrink"))).toBe(0);
+        const replay = appendTurn(shrinking, sessionId, "after-shrink");
+        const next = await pass(replay, 1);
+        expect(next.materialized).toBe(false);
+        expect(next.proactiveThinkingStrip).toBeNull();
+        expect(reasoningCount(findMessage(replay, "assistant-after-shrink"))).toBe(1);
+    });
+
     it("strips every thinking block on a busting pass; the next defer pass keeps the shared prefix hash", async () => {
         openDb();
         const sessionId = "ses-proactive-bust";

@@ -9,15 +9,18 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { estimateTokens } from "../../plugin/src/hooks/magic-context/read-session-formatting";
 
-// Run with TMPDIR under a throwaway magic-context/issue-572 root.
-// configured uses a fixed 262144 window; fallback has no model limit; learned
-// records a ninfer overflow limit before restart; proven grows accepted input.
-// shrink lowers a configured window to 32768 after caching a large baseline,
-// with reported usage at 22000 and a growing, unreclaimable user-text tail.
-// The mock does not enforce a context wall; local token counts expose pressure.
-// In proven mode, baseline requires repeated render-config folds, while stable
-// requires frozen restart bytes and exactly one fold after a policy edit.
-// See docs/reports/issue-572-render-budget-plan.md for isolation and caveats.
+// CLI: bun packages/e2e-tests/scripts/issue-572-probe.ts <scenario> [gate].
+// Set TMPDIR to a throwaway magic-context/issue-572 root before running.
+// Scenarios: "configured" fixes the window at 262144; "fallback" omits a model
+// limit; "learned" records a ninfer overflow limit before restart; "proven"
+// increases accepted-input telemetry after restart; "shrink" caches large history
+// then restarts the same model with its configured window lowered to 32768.
+// Gates: "proven baseline" requires repeated render-config folds in the old
+// implementation; "proven stable" requires unchanged restart prefixes and one
+// fold after a policy edit; "shrink safe" requires one resize and a first request
+// within the smaller usable window. Later user-tail growth can independently
+// exhaust the window. The mock accepts all sizes; token counts are local estimates.
+// Additional isolation details: docs/reports/issue-572-render-budget-plan.md.
 if (!realpathSync(tmpdir()).includes("/magic-context/issue-572"))
 	throw new Error("Set TMPDIR to a throwaway magic-context/issue-572 root");
 const mode = Bun.argv[2] ?? "configured";
@@ -27,6 +30,8 @@ const records: Array<{
 	folds: string[];
 	identity: string;
 	hash: string;
+	m0Bytes: number;
+	localInputTokens?: number;
 }> = [];
 const wirePrefixes: string[] = [];
 const mock = new MockProvider();
@@ -48,7 +53,7 @@ const opts = {
 			git_commit_indexing: { enabled: false },
 		},
 	},
-	...((mode === "configured" || mode === "shrink")
+	...(mode === "configured" || mode === "shrink"
 		? {}
 		: {
 				openCodeConfigExtra: {
@@ -97,7 +102,9 @@ async function turn(id: string, n: number) {
 			? "decision result ".repeat(
 					Math.ceil(([261171, 270000, 280000, 280000][n - 1] * 4) / 16),
 				)
-			: mode === "shrink" && n >= 1 && n <= 3 ? "decision result ".repeat(5000) : "";
+			: mode === "shrink" && n >= 1 && n <= 3
+				? "decision result ".repeat(5000)
+				: "";
 	const result = await fetch(host.url + "/session/" + id + "/message", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
@@ -127,17 +134,28 @@ async function turn(id: string, n: number) {
 		cached_m0_bytes: Uint8Array;
 	};
 	console.log("M0_CHARS", n, row.cached_m0_bytes.byteLength);
+	let localInputTokens: number | undefined;
 	if (mode === "shrink") {
-		const request = mock.requests().slice(before).find((r) =>
-			JSON.stringify(r.body.input ?? r.body.messages).includes("turn " + n + " "),
+		const request = mock
+			.requests()
+			.slice(before)
+			.find((r) =>
+				JSON.stringify(r.body.input ?? r.body.messages).includes(
+					"turn " + n + " ",
+				),
+			);
+		if (!request) throw new Error("no shrink provider wire captured");
+		localInputTokens = estimateTokens(
+			JSON.stringify(request.body.input ?? request.body.messages),
 		);
-		if (request) console.log("SHRINK_WIRE_LOCAL_TOKENS", n,
-			estimateTokens(JSON.stringify(request.body.input ?? request.body.messages)));
+		console.log("SHRINK_WIRE_LOCAL_TOKENS", n, localInputTokens);
 	}
 	records.push({
 		turn: n,
 		identity: row.cached_m0_upgrade_state,
 		hash: createHash("sha256").update(row.cached_m0_bytes).digest("hex"),
+		m0Bytes: row.cached_m0_bytes.byteLength,
+		localInputTokens,
 		folds: readFileSync(logPath, "utf8")
 			.slice(logOffset)
 			.split("\n")
@@ -149,9 +167,14 @@ async function turn(id: string, n: number) {
 	});
 	snapshotDb.close();
 	if (mode === "proven" && n >= 1 && n <= 4) {
-		const request = mock.requests().slice(before).find((r) =>
-			JSON.stringify(r.body.input ?? r.body.messages).includes("turn " + n + " "),
-		);
+		const request = mock
+			.requests()
+			.slice(before)
+			.find((r) =>
+				JSON.stringify(r.body.input ?? r.body.messages).includes(
+					"turn " + n + " ",
+				),
+			);
 		if (!request) throw new Error("no main provider wire captured");
 		// Compare the actual serialized provider prefix before the current user
 		// text, not the database's cached m[0] blob. This includes system and m[1].
@@ -160,7 +183,12 @@ async function turn(id: string, n: number) {
 		if (end < 0) throw new Error("current user text absent from provider wire");
 		const prefix = wire.slice(0, end);
 		wirePrefixes.push(prefix);
-		console.log("WIRE_PREFIX", n, prefix.length, createHash("sha256").update(prefix).digest("hex"));
+		console.log(
+			"WIRE_PREFIX",
+			n,
+			prefix.length,
+			createHash("sha256").update(prefix).digest("hex"),
+		);
 	}
 	if (
 		!result.ok ||
@@ -196,7 +224,10 @@ try {
 				endMessageId: seedMessageId,
 				title: "Seed history",
 				content: "",
-				p1: mode === "shrink" ? "Remember the isolated fixture. ".repeat(1600) : "Remember the isolated fixture.",
+				p1:
+					mode === "shrink"
+						? "Remember the isolated fixture. ".repeat(1600)
+						: "Remember the isolated fixture.",
 				p2: "Fixture.",
 				p3: "Fixture.",
 				p4: "Fixture.",
@@ -213,7 +244,11 @@ try {
 		"UPDATE session_meta SET cached_m1_bytes = NULL WHERE session_id = ?",
 	).run(session.id);
 	db.close();
-	if (mode === "shrink") mock.setDefault({ text: "ok", usage: { input_tokens: 22000, output_tokens: 10 } });
+	if (mode === "shrink")
+		mock.setDefault({
+			text: "ok",
+			usage: { input_tokens: 22000, output_tokens: 10 },
+		});
 	await turn(session.id, 10);
 	if (mode === "learned") {
 		mock.script([
@@ -230,7 +265,11 @@ try {
 	}
 	const env = host.env;
 	await host.kill();
-	host = await spawnOpencode({ ...opts, ...(mode === "shrink" ? { modelContextLimit: 32768 } : {}), existingEnv: env });
+	host = await spawnOpencode({
+		...opts,
+		...(mode === "shrink" ? { modelContextLimit: 32768 } : {}),
+		existingEnv: env,
+	});
 	isolate();
 	for (let n = 1; n <= 3; n++) {
 		if (mode === "proven")
@@ -252,6 +291,32 @@ try {
 			.filter((s) => s.includes("reason=render_config")).length < 2
 	)
 		throw new Error("baseline did not reproduce repeated render-config folds");
+	if (mode === "shrink" && gate === "safe") {
+		const seed = records.find((r) => r.turn === 10)!;
+		const first = restartRecords[0];
+		if (
+			first.folds.length !== 1 ||
+			!first.folds[0].includes("render_config:budget_shrink(") ||
+			restartRecords.slice(1).some((r) => r.folds.length > 0)
+		)
+			throw new Error("shrinking window did not fold exactly once");
+		if (
+			first.localInputTokens === undefined ||
+			first.localInputTokens > 24576 ||
+			first.m0Bytes >= seed.m0Bytes
+		)
+			throw new Error(
+				"shrinking baseline did not fit first request in usable window",
+			);
+		if (new Set(restartRecords.map((r) => r.hash)).size !== 1)
+			throw new Error("resized prefix did not replay unchanged");
+		console.log(
+			"SHRINK_SAFETY_PASSED",
+			first.m0Bytes,
+			first.localInputTokens,
+			"<= 24576; later user-tail growth is independent",
+		);
+	}
 	if (gate === "stable") {
 		// Requests append conversation turns. The initial system/history prefix
 		// must remain a byte-identical prefix of every later request.
@@ -259,8 +324,14 @@ try {
 		if (!initial || wirePrefixes.some((wire) => !wire.startsWith(initial)))
 			throw new Error("provider shared prefix changed as proven input rose");
 		for (const [index, prefix] of wirePrefixes.entries())
-			console.log("SHARED_PREFIX_SHA256", index + 1, initial.length,
-				createHash("sha256").update(prefix.slice(0, initial.length)).digest("hex"));
+			console.log(
+				"SHARED_PREFIX_SHA256",
+				index + 1,
+				initial.length,
+				createHash("sha256")
+					.update(prefix.slice(0, initial.length))
+					.digest("hex"),
+			);
 		if (
 			restartRecords.some((r) => r.folds.length > 0) ||
 			new Set(restartRecords.map((r) => r.hash)).size !== 1

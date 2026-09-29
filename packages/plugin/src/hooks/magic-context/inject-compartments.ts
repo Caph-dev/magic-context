@@ -64,6 +64,8 @@ import {
     encodeCachedM0UpgradeIdentity,
     MEMORY_RENDER_FORMAT_EPOCH,
     renderBudgetIdentityChanged,
+    renderedBudgetShrinkReason,
+    renderedBudgetSnapshot,
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 import { historyLocalBudget } from "./decision-calibration";
@@ -836,6 +838,8 @@ export interface M0SnapshotMarkers {
     muralHash?: string | null;
     muralEnabled: boolean | null;
     renderBudgetIdentity: string | null;
+    /** Numeric allowances used by the cached render; absent on older baselines. */
+    renderedBudgets?: string | null;
 }
 
 /**
@@ -1554,6 +1558,10 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
                 args.historyBudgetTokens,
                 args.historyBudgetPolicyIdentity,
             ),
+            renderedBudgets: renderedBudgetSnapshot(
+                args.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+                args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+            ),
         },
     };
 }
@@ -1575,6 +1583,10 @@ function refreshVolatileMarkerInputs(
             args.memoryInjectionBudgetTokens,
             args.historyBudgetTokens,
             args.historyBudgetPolicyIdentity,
+        ),
+        renderedBudgets: renderedBudgetSnapshot(
+            args.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+            args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
         ),
     };
 }
@@ -1660,6 +1672,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         muralHash: state.cachedM0MuralHash ?? null,
         muralEnabled: cachedUpgradeIdentity.muralEnabled,
         renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity,
+        renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
     };
 }
 
@@ -1755,6 +1768,12 @@ export function mustMaterialize(args: {
             reason: `render_config:budget(${cachedUpgradeIdentity.renderBudgetIdentity}→${current.renderBudgetIdentity})`,
         };
     }
+
+    const budgetShrinkReason = renderedBudgetShrinkReason(
+        cachedUpgradeIdentity.renderedBudgets,
+        current.renderedBudgets,
+    );
+    if (budgetShrinkReason) return { value: true, reason: budgetShrinkReason };
 
     // ── HARD: provider-side cache eviction (the cache was already dead) ──
     // Folding m[1] into m[0] here is "free" — the prefix is being re-cached
@@ -2320,6 +2339,7 @@ function applyMarkersToState(
         markers.muralEnabled,
         markers.renderBudgetIdentity,
         markers.memoryRenderEpoch,
+        markers.renderedBudgets ?? null,
     );
     // Runtime markers must be mirrored into flat state because the next
     // mustMaterialize pass reads cachedM0SystemHash/ToolSetHash/ModelKey directly
@@ -2587,6 +2607,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             projectIdentity: projectPath ?? null,
             muralEnabled: snapshotMarkers.muralEnabled,
             renderBudgetIdentity: snapshotMarkers.renderBudgetIdentity,
+            renderedBudgets: snapshotMarkers.renderedBudgets,
         };
         // NOTE: maxMemoryId is deliberately EXCLUDED from this stale-check.
         // Additive memory writes (write/promote) do not invalidate the rendered
@@ -2649,6 +2670,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                 snapshotMarkers.muralEnabled,
                 snapshotMarkers.renderBudgetIdentity,
                 snapshotMarkers.memoryRenderEpoch,
+                snapshotMarkers.renderedBudgets ?? null,
             ),
             systemHash: snapshotMarkers.systemHash,
             toolSetHash: snapshotMarkers.toolSetHash,
@@ -3086,6 +3108,7 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         muralHash: row.cached_m0_mural_hash ?? null,
         muralEnabled: cachedUpgradeIdentity.muralEnabled,
         renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity,
+        renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
     };
 }
 
@@ -3141,6 +3164,7 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
         markers.muralEnabled,
         markers.renderBudgetIdentity,
         markers.memoryRenderEpoch,
+        markers.renderedBudgets ?? null,
     );
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ToolSetHash = markers.toolSetHash;

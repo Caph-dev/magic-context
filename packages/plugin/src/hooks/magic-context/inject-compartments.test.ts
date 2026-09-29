@@ -1160,53 +1160,119 @@ describe("m[0]/m[1] materialization", () => {
     it("review: legacy policy adoption survives restart until a natural HARD", () => {
         db = makeDb();
         const options = {
-            db, sessionId: SESSION_ID, projectPath: PROJECT_PATH,
-            projectDirectory: makeProjectDir(), historyBudgetTokens: 12000,
+            db,
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+            projectDirectory: makeProjectDir(),
+            historyBudgetTokens: 12000,
         };
         const first = injectM0M1({ ...options, state: readStateFromMeta() });
-        const legacy = readStateFromMeta().cachedM0UpgradeState;
+        const legacy =
+            readStateFromMeta().cachedM0UpgradeState?.split("|rendered-budgets:")[0] ?? null;
+        db.prepare("UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?").run(
+            legacy,
+            SESSION_ID,
+        );
+        clearInjectionCache(SESSION_ID);
         expect(legacy).toContain("-h12000");
-        const current = { ...options, historyBudgetTokens: 16000,
-            historyBudgetPolicyIdentity: "p0.15:percentage:40" };
+        const current = {
+            ...options,
+            historyBudgetTokens: 16000,
+            historyBudgetPolicyIdentity: "p0.15:percentage:40",
+        };
         for (let restart = 0; restart < 2; restart++) {
             clearInjectionCache(SESSION_ID);
-            const replay = injectM0M1({ ...current, state: readStateFromMeta(), isCacheBustingPass: false });
+            const replay = injectM0M1({
+                ...current,
+                historyBudgetTokens: restart === 0 ? 16000 : 1,
+                state: readStateFromMeta(),
+                isCacheBustingPass: false,
+            });
             expect(replay.m0RematerializedThisPass).toBe(false);
             expect(replay.m0Bytes).toEqual(first.m0Bytes);
             expect(readStateFromMeta().cachedM0UpgradeState).toBe(legacy);
         }
-        const hard = injectM0M1({ ...current, state: readStateFromMeta(),
-            hardSignals: { systemHash: "natural-hard", modelKey: "", cacheExpired: false, lastResponseTime: 0 } });
+        const hard = injectM0M1({
+            ...current,
+            state: readStateFromMeta(),
+            hardSignals: {
+                systemHash: "natural-hard",
+                modelKey: "",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
+        });
         expect(hard.decision.reason).toBe("system_hash");
         expect(hard.m0RematerializedThisPass).toBe(true);
         expect(readStateFromMeta().cachedM0UpgradeState).toContain("-hp0.15:percentage:40");
     });
 
-    it("review: shrinking history budget with empty m1 does not refold even on a priced pass", () => {
+    it("shrinking history budget refolds an oversized baseline once with empty m1", () => {
         db = makeDb();
         storeDatedCompartment();
         const options = {
-            db, sessionId: SESSION_ID, projectPath: PROJECT_PATH,
-            projectDirectory: makeProjectDir(), historyBudgetTokens: 12000,
-            hardSignals: { modelKey: "review/larger-model", systemHash: "", cacheExpired: false, lastResponseTime: 0 },
+            db,
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+            projectDirectory: makeProjectDir(),
+            historyBudgetTokens: 12000,
+            hardSignals: {
+                modelKey: "review/larger-model",
+                systemHash: "",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
             historyBudgetPolicyIdentity: "p0.15:percentage:40",
         };
-        const first = injectM0M1({ ...options, state: readStateFromMeta(), isCacheBustingPass: true });
+        const first = injectM0M1({
+            ...options,
+            state: readStateFromMeta(),
+            isCacheBustingPass: true,
+        });
         expect(first.m0Bytes?.toString()).toContain("dated compartment");
         const shrink = { ...options, historyBudgetTokens: 1 };
+        const resized = injectM0M1({ ...shrink, state: readStateFromMeta() });
+        expect(resized.m0RematerializedThisPass).toBe(true);
+        expect(resized.decision.reason).toBe("render_config:budget_shrink(m8000-h12000→m8000-h1)");
+        expect(resized.m0Bytes?.length).toBeLessThan(first.m0Bytes?.length ?? 0);
+        expect(readStateFromMeta().cachedM0UpgradeState).toContain("|rendered-budgets:m8000-h1");
         for (const isCacheBustingPass of [false, true, true]) {
-            const replay = injectM0M1({ ...shrink, state: readStateFromMeta(), isCacheBustingPass });
+            const replay = injectM0M1({
+                ...shrink,
+                state: readStateFromMeta(),
+                isCacheBustingPass,
+            });
             expect(replay.m0RematerializedThisPass).toBe(false);
-            expect(replay.m0Bytes).toEqual(first.m0Bytes);
-            expect(estimateTokens(replay.m0Bytes!.toString())).toBeGreaterThan(shrink.historyBudgetTokens);
+            expect(replay.m0Bytes).toEqual(resized.m0Bytes);
         }
-        const switched = injectM0M1({ ...shrink, state: readStateFromMeta(),
-            hardSignals: { modelKey: "review/smaller-model", systemHash: "", cacheExpired: false, lastResponseTime: 0 } });
+        const growth = injectM0M1({ ...options, state: readStateFromMeta() });
+        expect(growth.m0RematerializedThisPass).toBe(false);
+        expect(growth.m0Bytes).toEqual(resized.m0Bytes);
+        const switched = injectM0M1({
+            ...shrink,
+            state: readStateFromMeta(),
+            hardSignals: {
+                modelKey: "review/smaller-model",
+                systemHash: "",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
+        });
         expect(switched.decision.reason).toBe("model_change");
         expect(switched.m0RematerializedThisPass).toBe(true);
         expect(readStateFromMeta().cachedM0ModelKey).toBe("review/smaller-model");
-        expect(injectM0M1({ ...shrink, state: readStateFromMeta(),
-            hardSignals: { modelKey: "review/smaller-model", systemHash: "", cacheExpired: false, lastResponseTime: 0 } }).m0RematerializedThisPass).toBe(false);
+        expect(
+            injectM0M1({
+                ...shrink,
+                state: readStateFromMeta(),
+                hardSignals: {
+                    modelKey: "review/smaller-model",
+                    systemHash: "",
+                    cacheExpired: false,
+                    lastResponseTime: 0,
+                },
+            }).m0RematerializedThisPass,
+        ).toBe(false);
     });
 
     it("mustMaterialize returns true on first call", () => {
@@ -2354,7 +2420,14 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof row.cached_m0_materialized_at).toBe("number");
         expect(row.cached_m0_session_facts_version).toBe(0);
         expect(row.cached_m0_upgrade_state).toBe(
-            encodeCachedM0UpgradeIdentity("ready", COMPARTMENT_RENDER_EPOCH, false, "m8000-h60000"),
+            encodeCachedM0UpgradeIdentity(
+                "ready",
+                COMPARTMENT_RENDER_EPOCH,
+                false,
+                "m8000-h60000",
+                MEMORY_RENDER_FORMAT_EPOCH,
+                "m8000-h60000",
+            ),
         );
     });
 
@@ -2581,7 +2654,14 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof state.cachedM0MaterializedAt).toBe("number");
         expect(state.cachedM0SessionFactsVersion).toBe(0);
         expect(state.cachedM0UpgradeState).toBe(
-            encodeCachedM0UpgradeIdentity("ready", COMPARTMENT_RENDER_EPOCH, false, "m8000-h60000"),
+            encodeCachedM0UpgradeIdentity(
+                "ready",
+                COMPARTMENT_RENDER_EPOCH,
+                false,
+                "m8000-h60000",
+                MEMORY_RENDER_FORMAT_EPOCH,
+                "m8000-h60000",
+            ),
         );
         expect(state.snapshotMarkers?.maxMemoryId).toBe(0);
         expect(
