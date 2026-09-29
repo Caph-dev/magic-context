@@ -23,6 +23,7 @@ import {
     getLastHookInitFailure,
 } from "./features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
+import { backfillSessionActivity } from "./features/magic-context/session-activity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
@@ -487,6 +488,14 @@ const server: Plugin = async (ctx) => {
                             allowHomeProject: pluginConfig.allow_home_project,
                         },
                     );
+                    await backfillSessionActivity(db, "opencode", (sessionId) => {
+                        const row = ocDb
+                            .prepare(
+                                "SELECT MAX(time_created) AS time FROM message WHERE session_id = ?",
+                            )
+                            .get(sessionId) as { time: number | null } | undefined;
+                        return row?.time ?? undefined;
+                    });
                 } finally {
                     closeQuietly(ocDb);
                 }

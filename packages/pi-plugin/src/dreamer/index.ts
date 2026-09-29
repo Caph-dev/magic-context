@@ -303,12 +303,13 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		retinaHandoff: opts.retinaHandoff,
 		mural: opts.mural,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,
-		// SCHEDULED Pi retrospective must read Pi JSONL sessions, not opencode.db.
-		// Supply the Pi provider factory (db arg ignored — Pi reads JSONL by cwd),
-		// converging the scheduled path onto the same provider the manual
-		// /ctx-dream path already uses.
+		// Pi retrospectives read JSONL messages and context.db activity, not
+		// OpenCode's message store. Scheduled and manual runs use this provider.
 		retrospectiveRawProvider: () =>
-			new PiRetrospectiveRawProvider({ projectCwd: opts.projectDir }),
+			new PiRetrospectiveRawProvider({
+				projectCwd: opts.projectDir,
+				contextDb: opts.db,
+			}),
 		// SCHEDULED refresh-primers likewise needs the Pi JSONL factory so its
 		// open-book seed renders raw U:/TC: lines; without it the scheduled task
 		// silently ran closed-book (the manual /ctx-dream path already wires this).
@@ -382,6 +383,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				openOpenCodeDb,
 				retrospectiveRawProvider: new PiRetrospectiveRawProvider({
 					projectCwd: manualOpts.projectDir,
+					contextDb: manualOpts.db,
 				}),
 				primerRawProviderFactory: createPiPrimerRawProviderFactory(),
 				userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),

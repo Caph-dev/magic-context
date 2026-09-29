@@ -119,7 +119,6 @@ import {
 	hasTrustedAbsoluteWall,
 	reloadWindowOverlay,
 } from "@magic-context/core/shared/window-geometry";
-
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
@@ -167,6 +166,10 @@ import {
 	validatePiDreamerModels,
 } from "./dreamer";
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
+import {
+	backfillPiSessionActivity,
+	observePiMessageActivity,
+} from "./dreamer/session-activity-pi";
 import { registerPiDroppedInputGuard } from "./dropped-input-guard-pi";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
@@ -1215,6 +1218,19 @@ async function startPiMagicContextRuntime(
 							return sessions.slice(offset, offset + limit);
 						},
 					);
+					const api = await loadDefaultPiSessionApi();
+					const paths = new Map<string, string>();
+					for (const session of (await api.listSessions()) as Array<{
+						id?: unknown;
+						path?: unknown;
+					}>) {
+						if (
+							typeof session.id === "string" &&
+							typeof session.path === "string"
+						)
+							paths.set(session.id, session.path);
+					}
+					await backfillPiSessionActivity(database, PI_HARNESS_KIND, paths);
 				} catch (err) {
 					warn(`[session-projects] background runner failed: ${err}`);
 				}
@@ -2531,7 +2547,9 @@ async function startPiMagicContextRuntime(
 			const endedMsg = event.message as unknown as {
 				id?: string;
 				role?: string;
+				timestamp?: number;
 			};
+			observePiMessageActivity(db, sessionId, endedMsg?.timestamp);
 			if (
 				endedMsg?.role === "assistant" &&
 				typeof endedMsg.id === "string" &&

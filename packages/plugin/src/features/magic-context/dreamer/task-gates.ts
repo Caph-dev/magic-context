@@ -115,7 +115,10 @@ export function countProjectSessionsSince(
                   .get(projectPath)
             : db
                   .prepare<[string, number], { cnt: number }>(
-                      "SELECT COUNT(*) AS cnt FROM session_projects WHERE project_path = ? AND updated_at > ?",
+                      `SELECT COUNT(*) AS cnt FROM session_projects sp
+                        JOIN schema_migrations_meta activity
+                          ON activity.key = 'retrospective_activity:' || sp.session_id
+                       WHERE sp.project_path = ? AND CAST(activity.value AS INTEGER) > ?`,
                   )
                   .get(projectPath, since);
     return row?.cnt ?? 0;

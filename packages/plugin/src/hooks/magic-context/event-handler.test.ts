@@ -213,6 +213,41 @@ const LIVE_BINDING_400_BODY = {
 };
 
 describe("createEventHandler", () => {
+    it("observes both user and assistant message events without a transform pass", async () => {
+        useTempDataHome("context-event-activity-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "user-1",
+                        role: "user",
+                        sessionID: "activity-user",
+                    },
+                },
+            },
+        });
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "assistant-1",
+                        role: "assistant",
+                        sessionID: "activity-assistant",
+                    },
+                },
+            },
+        });
+        const read = (id: string) =>
+            deps.db
+                .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(`retrospective_activity:${id}`) as { value: string } | undefined;
+        expect(Number(read("activity-user")?.value)).toBeGreaterThan(0);
+        expect(Number(read("activity-assistant")?.value)).toBeGreaterThan(0);
+    });
     it("arms documented Fable 5.1 binding mismatch recovery and ignores other models", async () => {
         useTempDataHome("context-event-thinking-binding-");
         const deps = createDeps(new Map());
