@@ -1,11 +1,12 @@
 {
-  "bytes": 63260,
-  "sha256": "b08391fa4a5a56c5cfd429ed1f0c7ce6d777433f88164ca6ee51de33c17d539c",
+  "bytes": 63166,
+  "sha256": "5b5c825409027132fb73b997306d7e88fc79f4102323cd945d278efd70543e5c",
   "facts_section_start": "## Facts — durable world knowledge",
   "facts_section_end": "## Events — ",
   "facts_guidance": [
     "### Zero facts is normal",
-    "**Emitting no facts is valid and often correct; most compartments add none.**",
+    "**Emitting no facts is valid and often correct.**",
+    "These usually pass: a discovered gotcha of an external system, a rule for recurring work, a security or correctness invariant.",
     "There is no quota either way: a rare one-off rule, such as a security constraint, must still be emitted.",
     "**Rediscovery**: a future session in this project would otherwise have to rediscover it",
     "**Stays true**: it remains true after this session without anyone revisiting it.",
@@ -13,6 +14,7 @@
     "**A recap of what a commit or change did**",
     "**A detail of a design still being revised**",
     "revision labels such as \"r5\", \"draft\", \"proposal\"",
+    "any fact naming a revision (\"r6.4\")",
     "**A restatement of a visible memory**",
     "Only emit a fact you've seen before in memory if the underlying value or behavior has actually CHANGED in this chunk's evidence (then emit with the new value",
     "**Test**: \"Should a new developer/agent follow this to avoid breaking things during normal recurring work?\"",

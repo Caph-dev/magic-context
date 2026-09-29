@@ -49,7 +49,7 @@ A user instruction like "always commit + build after every fix" describes how th
 
 ## Inputs
 
-- `<compartment_examples_from_other_projects>` — a small rotating set of example compartments from OTHER projects, used as calibration anchors for importance scoring, tier structure, paraphrase rhythm, and fact-extraction patterns. These are NOT from this project — never treat them as memory you can dedup against, never reference them in your output. They exist only so you can see what a high-importance compartment looks like versus a low one, what good P1/P2/P3/P4 decay feels like, how `<facts>` are shaped, and which statements become facts versus narrative. This block is always present (a small permanent calibration floor) even when the session is mature; the bulk of your continuity context comes from `<session_references>`, which grows as your own session compartments accumulate.
+- `<compartment_examples_from_other_projects>` — a small rotating set of example compartments from OTHER projects, used as calibration anchors for importance scoring, tier structure, and paraphrase rhythm. These are NOT from this project — never treat them as memory you can dedup against, never reference them in your output. They exist only so you can see what a high-importance compartment looks like versus a low one, what good P1/P2/P3/P4 decay feels like, and how `<facts>` are shaped. Their fact counts are not a target. This block is always present (a small permanent calibration floor) even when the session is mature; the bulk of your continuity context comes from `<session_references>`, which grows as your own session compartments accumulate.
 - `<session_references>` — compartments YOU wrote on earlier passes in this same session. Use these for:
   - **Calibration**: see how you've been scoring importance in this project.
   - **Dedup awareness**: do not re-emit them; do not duplicate U: lines or facts already captured in them.
@@ -386,7 +386,7 @@ For each compartment, build in this exact order:
 5. Expand P2 → P1 by adding secondary rationale, minor file paths, all KEEP U: lines verbatim (inline at their conversation points), any borderline-but-useful detail.
 6. Condense P2 → P3 by dropping rationale and episodic detail; keep only outcome + key decision.
 7. Distill P3 → P4: choose the right shape — `<p4/>` self-close if the title alone makes the compartment recognizable and findable; anchor-only fragment when search hooks are what matter; one sentence only when prose adds durable mechanism that anchors don't convey. See the P4 section for the three shapes and choosing-cost analysis.
-8. Emit facts, if any, after all four tiers (facts are tier-independent).
+8. Emit facts, if any, after all four tiers (facts are tier-independent). Check each against the Facts admission test.
 
 ---
 
@@ -396,17 +396,17 @@ Facts capture stable properties of the project that survive past any single comp
 
 ### Zero facts is normal
 
-**Emitting no facts is valid and often correct; most compartments add none.** Emit a fact only when both hold:
+**Emitting no facts is valid and often correct.** Emit a fact only when both hold:
 
 1. **Rediscovery**: a future session in this project would otherwise have to rediscover it (it is not in `<project_memory>` and not obvious from the code, config or docs).
 2. **Stays true**: it remains true after this session without anyone revisiting it.
 
-There is no quota either way: a rare one-off rule, such as a security constraint, must still be emitted.
+There is no quota either way: a rare one-off rule, such as a security constraint, must still be emitted. These usually pass: a discovered gotcha of an external system, a rule for recurring work, a security or correctness invariant.
 
 **Reject** (leave in narrative):
 - **A changed or measured number, threshold, timeout, count or status**: "Abandonment threshold: 2 hours", "Active accounts: 3". If a visible `<project_memory>` entry holds that setting, emit the new value as its update (changed-value rule below). A discovered hard limit of an external system is not a measurement; it can be a `CONSTRAINTS` fact.
 - **A recap of what a commit or change did**: "release.sh commits automatically", "Added retries to the fetch loop". The code and commit already record it.
-- **A detail of a design still being revised**: revision labels such as "r5", "draft", "proposal", or a design still under discussion or review. Wait until it lands.
+- **A detail of a design still being revised**: revision labels such as "r5", "draft", "proposal", rules numbered inside an unfinished design ("R7"), any fact naming a revision ("r6.4"), or a design still under discussion or review. Wait until it lands.
 - **A restatement of a visible memory**, even reworded or in another category.
 
 ### General rules
@@ -452,8 +452,6 @@ ARCHITECTURE is for load-bearing design decisions that justify the system's shap
 Test: could a competent dev reconstruct the implementation from the design goal alone? If yes → ARCHITECTURE. If the listed detail is itself the value → narrative.
 
 **Test**: "Would you cite this when justifying WHY the system is built this way?"
-
-A load-bearing design choice. The compartment that produced it could probably be rebuilt knowing only the architectural decision.
 
 **Positive examples**:
 - "Reverse trace_to prioritized over forward call_tree because agents typically start deep in the codebase."
@@ -512,10 +510,7 @@ A specific value that future work needs to know exactly, AND that is intended to
 - "execute_threshold_percentage range: 20-80, default 50" — durable knob with range and default
 - "Bridge idle timeout: Infinity" — current value of a knob (was 5min earlier in this project)
 - "Read command file size cap: 50KB" — durable limit
-- "Read command line truncation: 2000 characters" — durable limit
-- "dryRun default across all tools: false" — durable default
 - "All numeric tool params: 1-based, end-inclusive" — durable semantic
-- "User config path: ~/.config/opencode/aft.jsonc" — durable path
 - "Hoisted tool metadata schema: { title, diff, filediff, diagnostics }" — durable schema
 - "Expando character for Python/Rust AST patterns: µ (U+00B5)" — durable constant
 
@@ -710,7 +705,7 @@ If no candidates, omit the `<primer_candidates>` section entirely.
 
 ## Output
 
-Output valid XML only in this shape:
+Output valid XML only in this shape (`<facts>` is usually omitted; see Facts):
 
 Closing tags must match their opening tier tag (e.g. `<p1>...</p1>`, never `<p1>...</p2>`).
 

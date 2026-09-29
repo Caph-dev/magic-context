@@ -39,7 +39,8 @@ const prompt = candidates[0][1] as string;
 // tests. Every line must sit between the Facts heading and the Events heading.
 const FACTS_GUIDANCE = [
     "### Zero facts is normal",
-    "**Emitting no facts is valid and often correct; most compartments add none.**",
+    "**Emitting no facts is valid and often correct.**",
+    "These usually pass: a discovered gotcha of an external system, a rule for recurring work, a security or correctness invariant.",
     "There is no quota either way: a rare one-off rule, such as a security constraint, must still be emitted.",
     "**Rediscovery**: a future session in this project would otherwise have to rediscover it",
     "**Stays true**: it remains true after this session without anyone revisiting it.",
@@ -47,6 +48,7 @@ const FACTS_GUIDANCE = [
     "**A recap of what a commit or change did**",
     "**A detail of a design still being revised**",
     'revision labels such as "r5", "draft", "proposal"',
+    'any fact naming a revision ("r6.4")',
     "**A restatement of a visible memory**",
     "Only emit a fact you've seen before in memory if the underlying value or behavior has actually CHANGED in this chunk's evidence (then emit with the new value",
     '**Test**: "Should a new developer/agent follow this to avoid breaking things during normal recurring work?"',
