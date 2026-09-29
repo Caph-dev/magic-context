@@ -59,6 +59,22 @@ afterEach(() => {
 });
 
 describe("findBoundaryUserMessage", () => {
+    it("skips a synthetic-only user row even when it already carries a marker", () => {
+        const dataHome = useTempDataHome("marker-synthetic-boundary-");
+        const db = createOpenCodeDb(dataHome);
+        insertMessage(db, "msg_001_prior_user", "user", 100);
+        insertMessage(db, "msg_002_synthetic", "user", 200);
+        insertMessage(db, "msg_003_target", "assistant", 300);
+        db.prepare(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, 'msg_002_synthetic', 'ses-1', 200, 200, ?)",
+        ).run("part_notice", JSON.stringify({ type: "text", text: "notice", synthetic: true }));
+        db.prepare(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, 'msg_002_synthetic', 'ses-1', 200, 200, ?)",
+        ).run("part_marker", JSON.stringify({ type: "compaction", auto: true }));
+        closeQuietly(db);
+
+        expect(findBoundaryUserMessage("ses-1", "msg_003_target")?.id).toBe("msg_001_prior_user");
+    });
     it("anchors by endMessageId after rows before the target were deleted", () => {
         const dataHome = useTempDataHome("marker-boundary-deleted-before-");
         const db = createOpenCodeDb(dataHome);

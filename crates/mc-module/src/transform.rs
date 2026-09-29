@@ -29546,6 +29546,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn synthetic_row_between_compartments_does_not_create_a_live_coverage_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "m1", "S1"), comp(2, 3, 3, "m3", "S2")],
+        )
+        .unwrap();
+        let mut notice = item("notice", 2, "synthetic notice");
+        notice.ck.meta.synthetic = true;
+        let messages = vec![
+            item("m1", 1, "covered one"),
+            notice,
+            item("m3", 3, "covered three"),
+            item("tail", 4, "tail"),
+        ];
+        let result = transform(
+            &s,
+            &req("ses", "cfg0", messages),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(result.action, "HARD");
+    }
+
+    #[test]
     fn interior_live_coverage_gap_fails_loud_not_silent_drop() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());

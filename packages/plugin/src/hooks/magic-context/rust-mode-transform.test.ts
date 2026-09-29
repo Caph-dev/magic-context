@@ -7782,6 +7782,7 @@ describe("raw fallback refusal copy and early abort", () => {
             expect(refusalLine).toBeDefined();
             expect(refusalLine).toContain("early_abort=true");
             expect(refusalLine).toContain("estimated=skipped");
+            expect(refusalLine).toContain("trusted=false");
             const passLine = logSpy.mock.calls
                 .map((call) => String(call[1] ?? ""))
                 .find((line) => line.startsWith("rust pass:"));
