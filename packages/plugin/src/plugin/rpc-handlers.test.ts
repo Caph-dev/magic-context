@@ -1,11 +1,16 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, mock, test } from "bun:test";
-
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MagicContextConfigSchema } from "../config/schema/magic-context";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
 import {
+    __clearProjectIdentityTransientCooldownForTests,
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
     resolveProjectIdentity,
@@ -25,6 +30,7 @@ import {
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
+import * as logger from "../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import { Database } from "../shared/sqlite";
@@ -209,6 +215,73 @@ describe("Rust session status reads", () => {
 });
 
 describe("sidebar snapshot RPC failures", () => {
+    test("unborn repo sidebar loads existing directory memories", () => {
+        const directory = mkdtempSync(join(tmpdir(), "sidebar-unborn-"));
+        const db = createTestDb();
+        try {
+            execFileSync("git", ["init", "-q", directory]);
+            const identity = `dir:${createHash("md5").update(directory).digest("hex").slice(0, 12)}`;
+            insertMemory(db, {
+                projectPath: identity,
+                category: "USER_DIRECTIVES",
+                content: "Existing unborn memory",
+            });
+            const snapshot = buildSidebarSnapshotRpcResponse(db, "ses_unborn", directory);
+            expect(snapshot.error).toBeUndefined();
+            expect(snapshot.memoryCount).toBe(1);
+        } finally {
+            closeQuietly(db);
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    test("paused sidebar logs once per directory and reason without stacks", () => {
+        const directory = mkdtempSync(join(tmpdir(), "sidebar-paused-"));
+        execFileSync("git", ["init", "-q", directory]);
+        const db = createTestDb();
+        const logged = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => {
+                    throw Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+                }) as typeof execFileSync,
+            });
+            for (let i = 0; i < 4; i++) {
+                expect(buildSidebarSnapshotRpcResponse(db, "ses_paused", directory)).toEqual({
+                    sessionId: "ses_paused",
+                    disabled: true,
+                    paused: true,
+                });
+            }
+            expect(logged).toHaveBeenCalledTimes(1);
+            expect(logged.mock.calls[0]).toEqual([
+                `[magic-context] memory features paused for ${directory}: git_timeout`,
+            ]);
+            __clearProjectIdentityTransientCooldownForTests(directory);
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => {
+                    throw new Error("other git failure");
+                }) as typeof execFileSync,
+            });
+            buildSidebarSnapshotRpcResponse(db, "ses_paused", directory);
+            expect(logged).toHaveBeenCalledTimes(2);
+            expect(logged.mock.calls[1]).toEqual([
+                `[magic-context] memory features paused for ${directory}: unknown`,
+            ]);
+            __clearProjectIdentityTransientCooldownForTests(directory);
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => {
+                    throw Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+                }) as typeof execFileSync,
+            });
+            buildSidebarSnapshotRpcResponse(db, "ses_paused", directory);
+            expect(logged).toHaveBeenCalledTimes(2);
+        } finally {
+            logged.mockRestore();
+            closeQuietly(db);
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
     test("returns an error envelope when snapshot construction hits SQLITE_BUSY", () => {
         const busyDb = {
             prepare() {

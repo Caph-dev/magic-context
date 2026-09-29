@@ -37,6 +37,7 @@ import {
 import {
     ProjectIdentityError,
     resolveProjectIdentity,
+    resolveProjectIdentityForSession,
     shouldSkipHomeProjectMemory,
 } from "../features/magic-context/memory/project-identity";
 import { getMessageIndexQueueHeapStats } from "../features/magic-context/message-index-async";
@@ -351,7 +352,13 @@ export function buildSidebarSnapshot(
     compactionEnabled = true,
 ): SidebarSnapshot {
     try {
-        const projectIdentity = resolveProjectIdentity(directory);
+        const projectIdentity = resolveProjectIdentityForSession(directory);
+        if (projectIdentity === undefined)
+            throw new ProjectIdentityError(
+                "git_identity_unavailable",
+                directory,
+                "Memory features paused while project identity is unavailable",
+            );
 
         const meta = db
             .prepare<[string], Record<string, unknown>>(
@@ -711,8 +718,7 @@ export function buildSidebarSnapshot(
         // last good breakdown instead of letting the bar flicker.
         return applyStickySnapshotCache(sessionId, fresh);
     } catch (err) {
-        if (!(err instanceof ProjectIdentityError && err.errorClass === "home_project_disabled"))
-            log("[rpc] sidebar-snapshot error:", err);
+        if (!(err instanceof ProjectIdentityError)) log("[rpc] sidebar-snapshot error:", err);
         throw err;
     }
 }
@@ -730,6 +736,8 @@ export function buildSidebarSnapshotRpcResponse(
     compactionEnabled = true,
 ): Record<string, unknown> {
     if (shouldSkipHomeProjectMemory(directory)) return { sessionId, disabled: true };
+    if (resolveProjectIdentityForSession(directory) === undefined)
+        return { sessionId, disabled: true, paused: true };
     try {
         return buildSidebarSnapshot(
             db,
@@ -1486,6 +1494,8 @@ export function registerRpcHandlers(
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
         if (shouldSkipHomeProjectMemory(dir)) return { sessionId, disabled: true };
+        if (resolveProjectIdentityForSession(dir) === undefined)
+            return { sessionId, disabled: true, paused: true };
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
         const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
@@ -1523,6 +1533,8 @@ export function registerRpcHandlers(
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
         if (shouldSkipHomeProjectMemory(dir)) return { sessionId, disabled: true };
+        if (resolveProjectIdentityForSession(dir) === undefined)
+            return { sessionId, disabled: true, paused: true };
         const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         try {
