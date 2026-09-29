@@ -56,6 +56,7 @@ import {
     type HistorianValidationChunk,
     validateHistorianOutput,
 } from "./compartment-runner-validation";
+import { resolveHistorianProducerLimits } from "./derive-budgets";
 import {
     historianProducerReserve,
     producerInputTokenLimit,
@@ -624,8 +625,16 @@ async function runHistorianPrompt(args: {
                                           { reservation: "none" },
                                       )
                                     : undefined;
+                                const producerLimits = selected
+                                    ? resolveHistorianProducerLimits(modelKey)
+                                    : {};
+                                const producerContext =
+                                    producerLimits.context ??
+                                    (producerLimits.input === undefined
+                                        ? contextLimitTokens
+                                        : undefined);
                                 const reserve = historianProducerReserve(
-                                    contextLimitTokens,
+                                    producerContext,
                                     args.maxOutputTokens,
                                     selected
                                         ? getSdkOutputLimit(selected.providerID, selected.modelID)
@@ -633,8 +642,11 @@ async function runHistorianPrompt(args: {
                                 );
                                 if (
                                     contextLimitTokens !== undefined &&
-                                    producerInputTokenLimit(contextLimitTokens, reserve) ===
-                                        undefined &&
+                                    producerInputTokenLimit(
+                                        producerContext,
+                                        reserve,
+                                        producerLimits.input,
+                                    ) === undefined &&
                                     modelKey &&
                                     !unknownProducerWindows.has(modelKey)
                                 ) {
@@ -649,7 +661,8 @@ async function runHistorianPrompt(args: {
                                     systemLocal: estimateTokens(system),
                                     toolsLocal: 0,
                                     modelKey,
-                                    contextLimitTokens,
+                                    contextLimitTokens: producerContext,
+                                    inputLimitTokens: producerLimits.input,
                                     maxOutputTokens: reserve,
                                 });
                                 if (failure) throw new Error(failure);

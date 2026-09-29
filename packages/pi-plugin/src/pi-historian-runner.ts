@@ -95,6 +95,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/compartment-runner-validation";
 import {
 	producerSourceLocalBudget,
+	resolveHistorianProducerLimits,
 	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import { renderHistorianMemoryBlock } from "@magic-context/core/hooks/magic-context/inject-compartments";
@@ -261,14 +262,19 @@ async function runHistorianSubagentWithTransientRetriesGuarded(args: {
 			const window =
 				args.resolveContextLimit?.(key) ??
 				resolveKnownHistorianContextLimit(key);
+			const limits = args.resolveContextLimit
+				? { context: window, input: undefined }
+				: resolveHistorianProducerLimits(key);
+			const context =
+				limits.context ?? (limits.input === undefined ? window : undefined);
 			const reserve = historianProducerReserve(
-				window,
+				context,
 				args.options.maxOutputTokens,
 				args.resolveOutputLimit?.(key),
 			);
 			if (
 				window !== undefined &&
-				producerInputTokenLimit(window, reserve) === undefined &&
+				producerInputTokenLimit(context, reserve, limits.input) === undefined &&
 				!loggedInconsistentWindows.has(key)
 			) {
 				loggedInconsistentWindows.add(key);
@@ -282,7 +288,8 @@ async function runHistorianSubagentWithTransientRetriesGuarded(args: {
 				systemLocal: estimateTokens(args.options.systemPrompt),
 				toolsLocal: 0,
 				modelKey: key,
-				contextLimitTokens: window,
+				contextLimitTokens: context,
+				inputLimitTokens: limits.input,
 				maxOutputTokens: reserve,
 			});
 			if (failure) throw new Error(failure);

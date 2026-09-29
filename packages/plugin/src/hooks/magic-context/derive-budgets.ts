@@ -17,7 +17,11 @@
  *     by its own context, not the main session's pressure math.
  */
 
-import { getSdkContextLimit } from "../../shared/models-dev-cache";
+import {
+    getSdkContextLimit,
+    getSdkInputLimit,
+    getSdkWindowGeometry,
+} from "../../shared/models-dev-cache";
 import { calibrationForModelKey, localBudget } from "./decision-calibration";
 
 // 5% of (main_context × execute_threshold) is the "working usable × 5%" basis.
@@ -101,6 +105,26 @@ export function resolveKnownHistorianContextLimit(
     if (!providerID || !modelID) return undefined;
     const limit = getSdkContextLimit(providerID, modelID, undefined, { reservation: "none" });
     return typeof limit === "number" && limit > 0 ? limit : undefined;
+}
+
+export function resolveHistorianProducerLimits(modelKey?: string): {
+    context?: number;
+    input?: number;
+} {
+    if (!modelKey?.includes("/")) return {};
+    const [provider, ...parts] = modelKey.split("/");
+    const model = parts.join("/");
+    if (!provider || !model) return {};
+    const input = getSdkInputLimit(provider, model);
+    const window = getSdkWindowGeometry(provider, model)?.derivation.window;
+    // The legacy resolver can return an input cap; only use it as a context
+    // fallback when no separate input cap was declared.
+    const context =
+        window ?? (input === undefined ? resolveKnownHistorianContextLimit(modelKey) : undefined);
+    return {
+        ...(context !== undefined ? { context } : {}),
+        ...(input !== undefined ? { input } : {}),
+    };
 }
 
 export function resolveHistorianContextLimit(historianModelOverride?: string): number {

@@ -7,7 +7,10 @@ import { modelBodyField } from "../../shared/resolve-fallbacks";
 import type { Database } from "../../shared/sqlite";
 import { createV1HiddenCompletionExecutor } from "./compartment-runner-historian";
 import type { HiddenCompletionExecutor } from "./compartment-runner-types";
-import { resolveKnownHistorianContextLimit } from "./derive-budgets";
+import {
+    resolveHistorianProducerLimits,
+    resolveKnownHistorianContextLimit,
+} from "./derive-budgets";
 import { historianProducerReserve, producerPromptFailureReason } from "./producer-window-guard";
 import { estimateTokens } from "./read-session-formatting";
 
@@ -662,13 +665,18 @@ export class HistorianHostRunner {
                                 provider && parts.length
                                     ? getSdkOutputLimit(provider, parts.join("/"))
                                     : undefined;
-                            const reserve = historianProducerReserve(window, undefined, output);
+                            const producerLimits = resolveHistorianProducerLimits(key);
+                            const context =
+                                producerLimits.context ??
+                                (producerLimits.input === undefined ? window : undefined);
+                            const reserve = historianProducerReserve(context, undefined, output);
                             const failure = producerPromptFailureReason({
                                 sourceLocal: estimateTokens(claim.user),
                                 systemLocal: estimateTokens(claim.system),
                                 toolsLocal: 0,
                                 modelKey: key,
-                                contextLimitTokens: window,
+                                contextLimitTokens: context,
+                                inputLimitTokens: producerLimits.input,
                                 maxOutputTokens: reserve,
                             });
                             if (failure) throw new Error(`${key}: ${failure}`);

@@ -30,6 +30,7 @@ export function clampProducerAtomChars(text: string, maxChars: number, marker: s
 export interface ProducerWindowFailureInput {
     producerSourceTokens: number;
     contextLimitTokens?: number;
+    inputLimitTokens?: number;
     maxOutputTokens: number;
 }
 
@@ -49,17 +50,23 @@ export interface FittedHistorianSource {
 export function producerInputTokenLimit(
     contextLimitTokens: number | undefined,
     maxOutputTokens: number,
+    inputLimitTokens?: number,
 ): number | undefined {
-    if (
-        typeof contextLimitTokens !== "number" ||
-        !Number.isFinite(contextLimitTokens) ||
-        contextLimitTokens <= 0 ||
-        !Number.isFinite(maxOutputTokens) ||
-        maxOutputTokens < 0
-    ) {
-        return undefined;
-    }
-    const usableInputTokens = Math.floor(contextLimitTokens - maxOutputTokens);
+    if (!Number.isFinite(maxOutputTokens) || maxOutputTokens < 0) return undefined;
+    const shared =
+        typeof contextLimitTokens === "number" &&
+        Number.isFinite(contextLimitTokens) &&
+        contextLimitTokens > 0
+            ? contextLimitTokens - maxOutputTokens
+            : undefined;
+    const input =
+        typeof inputLimitTokens === "number" &&
+        Number.isFinite(inputLimitTokens) &&
+        inputLimitTokens > 0
+            ? inputLimitTokens
+            : undefined;
+    if (shared === undefined && input === undefined) return undefined;
+    const usableInputTokens = Math.floor(Math.min(shared ?? Infinity, input ?? Infinity));
     if (usableInputTokens <= 0) return undefined;
     const limit = Math.floor(usableInputTokens * (1 - PRODUCER_WINDOW_REFUSAL_MARGIN));
     return limit > 0 ? limit : undefined;
@@ -75,20 +82,30 @@ export function historianProducerReserve(
 }
 
 export function producerWindowFailureReason(input: ProducerWindowFailureInput): string | null {
-    const { producerSourceTokens, contextLimitTokens, maxOutputTokens } = input;
-    const producerInputLimitTokens = producerInputTokenLimit(contextLimitTokens, maxOutputTokens);
+    const { producerSourceTokens, contextLimitTokens, inputLimitTokens, maxOutputTokens } = input;
+    const producerInputLimitTokens = producerInputTokenLimit(
+        contextLimitTokens,
+        maxOutputTokens,
+        inputLimitTokens,
+    );
     if (
         producerInputLimitTokens === undefined ||
-        typeof contextLimitTokens !== "number" ||
         !Number.isFinite(producerSourceTokens) ||
         producerSourceTokens <= 0
     ) {
         return null;
     }
-    const usableInputTokens = Math.max(0, Math.floor(contextLimitTokens - maxOutputTokens));
+    const usableInputTokens = Math.floor(
+        Math.min(
+            contextLimitTokens === undefined
+                ? Infinity
+                : Math.max(0, contextLimitTokens - maxOutputTokens),
+            inputLimitTokens ?? Infinity,
+        ),
+    );
     if (producerSourceTokens <= producerInputLimitTokens) return null;
 
-    return `producer_source_exceeds_window producer_source_tokens=${Math.round(producerSourceTokens)} usable_input_tokens=${usableInputTokens} producer_input_limit_tokens=${producerInputLimitTokens} context_limit_tokens=${Math.round(contextLimitTokens)} max_output_tokens=${Math.round(maxOutputTokens)} estimator_margin=${PRODUCER_WINDOW_REFUSAL_MARGIN}`;
+    return `producer_source_exceeds_window producer_source_tokens=${Math.round(producerSourceTokens)} usable_input_tokens=${usableInputTokens} producer_input_limit_tokens=${producerInputLimitTokens} context_limit_tokens=${contextLimitTokens === undefined ? "unknown" : Math.round(contextLimitTokens)} max_output_tokens=${Math.round(maxOutputTokens)} estimator_margin=${PRODUCER_WINDOW_REFUSAL_MARGIN}`;
 }
 
 function splitMarkerPair(): string {
@@ -105,11 +122,13 @@ export function fitAtomicHistorianSourceToProducerWindow(args: {
     text: string;
     resultBoundaries?: readonly HistorianResultBoundary[];
     contextLimitTokens?: number;
+    inputLimitTokens?: number;
     maxOutputTokens: number;
 }): FittedHistorianSource {
     const producerInputLimitTokens = producerInputTokenLimit(
         args.contextLimitTokens,
         args.maxOutputTokens,
+        args.inputLimitTokens,
     );
     const originalTokens = estimateTokens(args.text);
     if (
@@ -166,9 +185,14 @@ export function producerPromptFailureReason(input: {
     toolsLocal: number;
     modelKey: string | undefined;
     contextLimitTokens: number | undefined;
+    inputLimitTokens?: number;
     maxOutputTokens: number;
 }): string | null {
-    const limit = producerInputTokenLimit(input.contextLimitTokens, input.maxOutputTokens);
+    const limit = producerInputTokenLimit(
+        input.contextLimitTokens,
+        input.maxOutputTokens,
+        input.inputLimitTokens,
+    );
     const tokens = providerMass(
         { prose: input.sourceLocal, system: input.systemLocal, tools: input.toolsLocal },
         calibrationForModelKey(input.modelKey),
