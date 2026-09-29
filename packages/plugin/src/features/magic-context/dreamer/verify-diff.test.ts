@@ -12,7 +12,7 @@ afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 const git = (dir: string, ...args: string[]) =>
-    execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+    execFileSync("git", args, { cwd: dir, encoding: "utf8", windowsHide: true }).trim();
 function repo() {
     const dir = mkdtempSync(path.join(tmpdir(), "verify-diff-"));
     dirs.push(dir);
@@ -76,6 +76,7 @@ describe("incremental verify evidence", () => {
         writeFileSync(path.join(dir, "a.ts"), "new\n");
         execFileSync("git", ["commit", "-qam", "change"], {
             cwd: dir,
+            windowsHide: true,
             env: {
                 ...process.env,
                 GIT_COMMITTER_DATE: new Date(timestamp + 60_000).toISOString(),

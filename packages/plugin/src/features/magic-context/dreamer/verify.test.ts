@@ -535,6 +535,7 @@ describe("runVerify disposition", () => {
             const head = execFileSync("git", ["rev-parse", "HEAD"], {
                 cwd: dir,
                 encoding: "utf8",
+                windowsHide: true,
             }).trim();
             expect(JSON.parse(getMemoryById(db, first.id)?.metadataJson ?? "{}")).toMatchObject({
                 dreamerVerifiedAt: afterFirst.get(first.id)?.verifiedAt,

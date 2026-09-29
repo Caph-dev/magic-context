@@ -130,7 +130,7 @@ describe("docs proposals", () => {
     test("rename diff names both paths and captures hunks", () => {
         const dir = fixture();
         const git = (...args: string[]) =>
-            execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+            execFileSync("git", args, { cwd: dir, encoding: "utf8", windowsHide: true }).trim();
         git("init", "-q");
         git("config", "user.email", "test@example.com");
         git("config", "user.name", "Test");
