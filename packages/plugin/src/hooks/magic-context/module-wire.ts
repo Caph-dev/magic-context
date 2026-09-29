@@ -890,9 +890,15 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                     ? info.timeCompleted
                     : undefined;
         const parts = Array.isArray(raw.parts) ? raw.parts : [];
+        const syntheticParts = parts.filter(
+            (part) =>
+                part === null ||
+                typeof part !== "object" ||
+                (part as Record<string, unknown>).type !== "compaction",
+        );
         const synthetic =
-            parts.length > 0 &&
-            parts.every(
+            syntheticParts.length > 0 &&
+            syntheticParts.every(
                 (part) =>
                     part !== null &&
                     typeof part === "object" &&

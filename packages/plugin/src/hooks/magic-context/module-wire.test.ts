@@ -19,6 +19,30 @@ import { setRawMessageProvider } from "./read-session-chunk";
 import type { MessageLike } from "./transform-operations";
 
 describe("encodeOpenCodeMessagesToCk", () => {
+    it("keeps a synthetic-only row synthetic when an existing compaction marker is attached", () => {
+        const row = {
+            info: { id: "msg_synthetic_gap", role: "user" },
+            parts: [{ type: "text", text: "notice", synthetic: true }],
+        };
+        const [before] = encodeOpenCodeMessagesToCk([row]);
+        const [after] = encodeOpenCodeMessagesToCk([
+            { ...row, parts: [...row.parts, { type: "compaction", auto: true }] },
+        ]);
+        expect(before.ck.meta).toMatchObject({ synthetic: true });
+        expect(after.ck.meta).toMatchObject({ synthetic: true });
+        expect(after.ck.content).toEqual(before.ck.content);
+        expect(JSON.stringify(after.ck)).toBe(JSON.stringify(before.ck));
+        const append = {
+            info: { id: "msg_next", role: "user" },
+            parts: [{ type: "text", text: "next" }],
+        };
+        const priced = encodeOpenCodeMessagesToCk([row, append]);
+        const deferred = encodeOpenCodeMessagesToCk([
+            { ...row, parts: [...row.parts, { type: "compaction", auto: true }] },
+            append,
+        ]);
+        expect(JSON.stringify(deferred)).toBe(JSON.stringify(priced));
+    });
     it("marks a collapsed synthetic todo pair as synthetic CK ingress", () => {
         const [encoded] = encodeOpenCodeMessagesToCk([
             {

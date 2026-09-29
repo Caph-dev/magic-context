@@ -2602,7 +2602,7 @@ export function createRustModeTransform(
                 if (refusalTokens > contextLimit) {
                     sessionLog(
                         sessionId,
-                        `raw_fallback_over_context_limit estimated=${estimate?.tokens ?? (estimatorRan ? "unavailable" : "skipped")} ` +
+                        `raw_fallback_over_context_limit estimated=${estimate?.tokens ?? (estimatorRan ? "unavailable" : "skipped")} trusted=${estimate?.trusted ?? false} ` +
                             `proxy_bytes=${proxy?.bytes ?? "unavailable"} proxy_tokens=${proxyTokens} limit=${contextLimit}` +
                             (proxy?.aborted === true ? " early_abort=true" : ""),
                     );
