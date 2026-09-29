@@ -212,7 +212,9 @@ describe("Pi dreamer wiring", () => {
 		await expect(prompt).rejects.toThrow("abort");
 		await awaitInFlightDreamers(owner);
 		expect(() =>
-			execFileSync("ps", ["-p", String(pid), "-o", "pid="], { windowsHide: true }),
+			execFileSync("ps", ["-p", String(pid), "-o", "pid="], {
+				windowsHide: true,
+			}),
 		).toThrow();
 	});
 	test("manual dreamer uses the cap sampled for each child run", async () => {
