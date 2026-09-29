@@ -50,7 +50,6 @@ import {
     recordToolParameters,
 } from "../../hooks/magic-context/dropped-input-guard";
 import { EmergencyFailClosedError } from "../../hooks/magic-context/emergency-fail-closed";
-import { getSessionErrorInfo } from "../../hooks/magic-context/event-payloads";
 import { resolveContextLimit } from "../../hooks/magic-context/event-resolvers";
 import {
     createChatMessageHook,
@@ -113,6 +112,7 @@ import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
 import { startDreamTrigger } from "./dream-trigger";
 import { HiddenChildHook, registerHiddenChildAgents } from "./hidden-child";
+import { hiddenTerminalError } from "./hidden-terminal-error";
 import { V2LkgSystemReplay } from "./lkg-system";
 import { modelLimitCacheWarm, warmModelLimitCacheFromCatalog } from "./model-limit-cache";
 import { adaptPayload, HEAD_IDS } from "./payload";
@@ -657,6 +657,7 @@ export async function registerContext(context: V2Context) {
                 db: database,
                 projectIdentity:
                     resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
+                directory,
                 hook: hiddenChildHook,
                 keepSubagents: config.keep_subagents === true,
                 ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
@@ -928,11 +929,14 @@ export async function registerContext(context: V2Context) {
         try {
             for await (const value of context.event.subscribe({ signal: usageController.signal })) {
                 if (usageController.signal.aborted) break;
-                const event = value as { type?: string; data?: { sessionID?: string } };
+                const event = value as {
+                    type?: string;
+                    data?: { sessionID?: string; error?: unknown };
+                };
                 if (!event.data?.sessionID) continue;
                 const sessionID = event.data.sessionID;
-                if (event.type === "session.error") {
-                    const error = getSessionErrorInfo(event.data)?.error;
+                if (event.type === "session.error" || event.type === "session.execution.failed") {
+                    const error = hiddenTerminalError(event);
                     if (error !== undefined) hiddenSessionErrors.set(sessionID, error);
                     continue;
                 }

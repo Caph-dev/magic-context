@@ -89,6 +89,7 @@ export default {
 			{
 				db,
 				projectIdentity: root,
+                directory: root,
 				hook,
 				ensureAgent: () => (ready ??= context.agent.reload()),
 				openReader: () =>

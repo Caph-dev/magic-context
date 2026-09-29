@@ -64,6 +64,7 @@ export default {
                 {
                     db,
                     projectIdentity: context.location.directory,
+                    directory: context.location.directory,
                     hook,
                     ensureAgent: () => (agentsReady ??= context.agent.reload()),
                     openReader: () =>
