@@ -4039,6 +4039,29 @@ mod tests {
     }
 
     #[test]
+    fn historian_model_limits_wire_accepts_missing_input_and_ignores_extra_input_on_old_module() {
+        let old_plugin_limits: HistorianModelLimits =
+            serde_json::from_str(r#"{"context":400000,"output":128000}"#).unwrap();
+        assert_eq!(old_plugin_limits.input, None);
+        assert_eq!(
+            producer_input_token_limit_with_input(
+                old_plugin_limits.context,
+                old_plugin_limits.input,
+                128_000,
+            ),
+            Some(291_000)
+        );
+        #[derive(serde::Deserialize)]
+        struct OldModuleLimits {
+            context: usize,
+            output: u32,
+        }
+        let old_module: OldModuleLimits =
+            serde_json::from_str(r#"{"context":400000,"input":272000,"output":128000}"#).unwrap();
+        assert_eq!((old_module.context, old_module.output), (400_000, 128_000));
+    }
+
+    #[test]
     fn small_producer_window_reserves_only_allowed_output_and_still_refuses_oversize() {
         assert_eq!(
             producer_input_token_limit_with_input(Some(32_000), None, 32_000),
