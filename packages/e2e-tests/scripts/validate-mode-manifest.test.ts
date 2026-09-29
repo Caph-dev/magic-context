@@ -21,7 +21,7 @@ describe("mode manifest validator", () => {
         // Bump this with the manifest whenever a tests/**/*.test.ts file is added or
         // removed. Moving a file between excluded and ts-only changes the invocation
         // counts and excluded list below, but not the total number of files.
-        expect(validation.files.length).toBe(142);
+        expect(validation.files.length).toBe(143);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -64,6 +64,7 @@ describe("mode manifest validator", () => {
             "tests/dreamer-verify-budget.test.ts",
             "tests/dreamer-verify-slice-authority.test.ts",
             "tests/issue-538-engine-wall.test.ts",
+            "tests/issue-570-home-project.test.ts",
             "tests/opencode2/automatic-s3-paths.test.ts",
             "tests/opencode2/bounded-raw-reads.test.ts",
             "tests/opencode2/commands-s2-flush.test.ts",

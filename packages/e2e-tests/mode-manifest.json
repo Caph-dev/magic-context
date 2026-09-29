@@ -18,6 +18,14 @@
             ]
         },
         {
+            "path": "tests/issue-570-home-project.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "manual regression probe on OpenCode 1.18.30 with throwaway HOME and host PID lsof containment",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/issue-538-engine-wall.test.ts",
             "tier": "excluded",
             "invocation": {

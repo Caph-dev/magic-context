@@ -729,7 +729,7 @@ export function buildSidebarSnapshotRpcResponse(
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
 ): Record<string, unknown> {
-    if (shouldSkipHomeProjectMemory(directory)) return { error: "home project memory disabled" };
+    if (shouldSkipHomeProjectMemory(directory)) return { sessionId, disabled: true };
     try {
         return buildSidebarSnapshot(
             db,
@@ -1485,7 +1485,7 @@ export function registerRpcHandlers(
     rpcServer.handle("status-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        if (shouldSkipHomeProjectMemory(dir)) return { error: "home project memory disabled" };
+        if (shouldSkipHomeProjectMemory(dir)) return { sessionId, disabled: true };
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
         const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
@@ -1522,7 +1522,7 @@ export function registerRpcHandlers(
     rpcServer.handle("embed-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        if (shouldSkipHomeProjectMemory(dir)) return { error: "home project memory disabled" };
+        if (shouldSkipHomeProjectMemory(dir)) return { sessionId, disabled: true };
         const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         try {

@@ -84,7 +84,8 @@ describe("home project sidebar", () => {
         const db = createTestDb();
         try {
             expect(buildSidebarSnapshotRpcResponse(db, "ses_home", directory)).toEqual({
-                error: "home project memory disabled",
+                sessionId: "ses_home",
+                disabled: true,
             });
             setHomeProjectPermission(true);
             const snapshot = buildSidebarSnapshotRpcResponse(db, "ses_home", directory);
