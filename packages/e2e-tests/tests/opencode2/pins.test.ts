@@ -35,6 +35,10 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// session's latest message time so retrospective picks sessions by
 			// their own activity (7340ca7d11, "gate retrospective on per-session
 			// activity"); also v1.
+			// It was re-minted again when the v1 entry began applying the configured
+			// `allow_home_project` setting at startup, so every project-identity caller
+			// honours it (86a598a3a5, "honor home project permission across identity
+			// callers"); also v1.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")
