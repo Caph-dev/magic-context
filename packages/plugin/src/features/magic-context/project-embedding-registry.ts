@@ -52,6 +52,7 @@ import {
     saveEmbeddingIfHashMatches,
 } from "./memory/storage-memory-embeddings";
 import {
+    hasMisScopedCompartmentChunkEmbeddingsForProject,
     recordSessionProjectIdentity,
     repairMisScopedCompartmentChunkEmbeddingsForProject,
 } from "./session-project-storage";
@@ -928,6 +929,18 @@ function recordActiveEmbeddingIdentity(
         return;
     }
 
+    const scopes: Array<[EmbeddingIdentityScope, string]> = [["chunk", currentChunkIdentity]];
+    if (features.memoryEnabled) scopes.push(["memory", currentProviderIdentity]);
+    if (features.gitCommitEnabled) scopes.push(["commit", currentProviderIdentity]);
+    const active = db.prepare(
+        "SELECT 1 FROM embedding_identity_active WHERE project_path = ? AND scope = ? AND model_id = ?",
+    );
+    if (
+        scopes.every(([scope, model]) => active.get(projectIdentity, scope, model)) &&
+        !hasMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity)
+    )
+        return;
+
     const now = Date.now();
     const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
@@ -1257,7 +1270,16 @@ export function registerProjectEmbedding(
     };
 
     projectRegistrations.set(projectIdentity, registration);
-    persistPrimaryDescriptor(db, registration);
+    if (
+        generationChanged ||
+        !db
+            .prepare(
+                "SELECT 1 FROM embedding_registrations WHERE project_path = ? AND provider_identity = ? AND chunk_model_id = ? AND generation = ?",
+            )
+            .get(projectIdentity, providerIdentity, registration.chunkModelId, generation)
+    ) {
+        persistPrimaryDescriptor(db, registration);
+    }
 
     if (!canReuseProvider) {
         disposeProvider(prior?.provider ?? null);

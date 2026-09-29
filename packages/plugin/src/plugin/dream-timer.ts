@@ -61,6 +61,7 @@ import {
     retryPendingSessionCleanups,
     runSqliteOptimize,
 } from "../features/magic-context/storage";
+import { pruneStaleLkgSlots } from "../hooks/magic-context/lkg-persist";
 import type { RawMessageProvider } from "../hooks/magic-context/read-session-chunk";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
@@ -417,6 +418,12 @@ function persistTickOutcome(db: Database, failure: DreamerTickFailure | null): v
 }
 
 async function runMessageHistoryMaintenance(db: Database): Promise<void> {
+    try {
+        pruneStaleLkgSlots(db);
+    } catch (error) {
+        // A busy writer should not prevent unrelated maintenance from running.
+        log("[magic-context] LKG pruning deferred:", error);
+    }
     const cleanup = retryPendingSessionCleanups(db);
     if (cleanup.cleared > 0 || cleanup.failedSessionIds.length > 0) {
         log(

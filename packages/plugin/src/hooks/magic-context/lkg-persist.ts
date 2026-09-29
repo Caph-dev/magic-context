@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import type { LkgPersistenceBackend, LkgSlot } from "./lkg-slot";
@@ -152,7 +154,30 @@ export function parsePersistedLkgSlot(row: unknown): LkgSlot | undefined {
  * Persist a slot for the session, replacing any prior row. Best-effort: callers
  * treat a failure as "this process still has the in-memory slot" and log.
  */
+const persistedFingerprints = new WeakMap<Database, Map<string, string>>();
+
 export function saveLkgSlotToDb(db: Database, sessionId: string, slot: LkgSlot): boolean {
+    // capturedAt is the time of this capture, not part of the served request.
+    // Keep all replay fences and metadata in the fingerprint so a changed slot
+    // always replaces the durable one. Hash without reading the existing row.
+    const fingerprint = createHash("sha256")
+        .update(
+            JSON.stringify([
+                slot.jsonPrefix,
+                slot.inputIdSeq,
+                slot.inputContentDigests,
+                slot.inputContentSignatures,
+                slot.piOutputEntryIds,
+                slot.lastInputMessageId,
+                slot.modelKey,
+                slot.providerKey,
+                slot.rowVersion,
+                slot.captureSequence,
+            ]),
+        )
+        .digest("hex");
+    let saved = persistedFingerprints.get(db);
+    if (saved?.get(sessionId) === fingerprint) return true;
     try {
         db.prepare(
             `INSERT INTO lkg_slots (
@@ -192,6 +217,15 @@ export function saveLkgSlotToDb(db: Database, sessionId: string, slot: LkgSlot):
             slot.rowVersion ?? null,
             slot.captureSequence ?? null,
         );
+        if (!saved) {
+            saved = new Map();
+            persistedFingerprints.set(db, saved);
+        }
+        if (saved.size >= 1000) {
+            const oldest = saved.keys().next().value;
+            if (oldest !== undefined) saved.delete(oldest);
+        }
+        saved.set(sessionId, fingerprint);
         return true;
     } catch (error) {
         sessionLog(sessionId, "LKG snapshot persistence failed (in-memory slot retained):", error);
@@ -202,6 +236,7 @@ export function saveLkgSlotToDb(db: Database, sessionId: string, slot: LkgSlot):
 export function clearPersistedLkgSlot(db: Database, sessionId: string): void {
     try {
         db.prepare("DELETE FROM lkg_slots WHERE session_id = ?").run(sessionId);
+        persistedFingerprints.get(db)?.delete(sessionId);
     } catch (error) {
         sessionLog(sessionId, "LKG snapshot durable clear failed:", error);
     }
@@ -226,6 +261,27 @@ export function loadPersistedLkgSlot(db: Database, sessionId: string): LkgSlot |
     // Size admission is enforced by the slot store's own bound when the loaded
     // slot is installed; an oversized row simply declines to hydrate.
     return slot;
+}
+
+export function pruneStaleLkgSlots(db: Database, now = Date.now()): number {
+    // A zero-wait write transaction lets this maintenance pass yield to active
+    // writers. Sessions used within the last week retain their replay snapshots.
+    const previousTimeout = db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+    try {
+        db.exec("PRAGMA busy_timeout = 0");
+        const result = db
+            .prepare(
+                `DELETE FROM lkg_slots WHERE captured_at < ? AND NOT EXISTS (
+                SELECT 1 FROM session_projects sp
+                WHERE sp.session_id = lkg_slots.session_id AND sp.updated_at >= ?
+            )`,
+            )
+            .run(now - 7 * 24 * 60 * 60 * 1000, now - 7 * 24 * 60 * 60 * 1000);
+        if (result.changes) persistedFingerprints.delete(db);
+        return result.changes;
+    } finally {
+        db.exec(`PRAGMA busy_timeout = ${Number(previousTimeout.timeout) || 0}`);
+    }
 }
 
 /** Backend bound to one database handle, for registration with the slot store. */
