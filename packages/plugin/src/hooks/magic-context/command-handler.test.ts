@@ -1474,7 +1474,9 @@ describe("createMagicContextCommandHandler", () => {
                 panel
                     .split("\n")
                     .map((line) => /^\s*[-*]?\s*([a-z-]+):/.exec(line)?.[1])
-                    .filter((name): name is string => CANONICAL_DREAM_TASKS.includes(name as never));
+                    .filter((name): name is string =>
+                        CANONICAL_DREAM_TASKS.includes(name as never),
+                    );
             const beforeTasks = taskNames(before.split("Backlog before starting:")[1] ?? "");
             const afterTasks = taskNames(after.split("Backlog at run end:")[1] ?? "");
             expect(beforeTasks.length).toBe(CANONICAL_DREAM_TASKS.length);
