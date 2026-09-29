@@ -697,15 +697,6 @@ export function readRawSessionMessagePartsById(
     );
 }
 
-export function canVerifyRawSessionMessageById(sessionId: string): boolean {
-    const provider = sessionProviders.get(sessionId);
-    // A provider without indexed by-ID reads would require a session scan.
-    return provider
-        ? typeof provider.hasMessageById === "function" ||
-              typeof provider.readMessageById === "function"
-        : openCodeDbExists();
-}
-
 export function hasRawSessionMessageById(sessionId: string, messageId: string): boolean {
     const provider = sessionProviders.get(sessionId);
     if (provider?.hasMessageById) return provider.hasMessageById(messageId);
