@@ -87,6 +87,26 @@ describe("parseCompartmentOutput — v2 5-category facts", () => {
         });
     });
 
+    it("accepts a zero-fact output whether <facts> is omitted or empty", () => {
+        // The historian prompt makes "no facts" the normal result, so both shapes must
+        // still yield their compartments and an empty fact list, not a parse failure.
+        const compartment = `<compartments>
+<compartment start="1" end="4" title="Tuned retry backoff" episode_type="bug" importance="20">
+<p1>I raised the retry backoff and committed it.</p1><p2>Raised backoff.</p2><p3>Backoff tuned.</p3><p4/>
+</compartment>
+</compartments>`;
+        const meta = "<meta>\n<messages_processed>1-4</messages_processed>\n</meta>";
+        for (const facts of ["", "<facts>\n</facts>"]) {
+            const parsed = parseCompartmentOutput(
+                `<output>\n${compartment}\n${facts}\n${meta}\n</output>`,
+            );
+            expect(parsed.compartments).toHaveLength(1);
+            expect(parsed.compartments[0]?.title).toBe("Tuned retry backoff");
+            expect(parsed.facts).toEqual([]);
+            expect(parsed.droppedFacts).toBe(0);
+        }
+    });
+
     it("does NOT parse legacy 9-cat fact categories (they exited historian output)", () => {
         const parsed = parseCompartmentOutput(`
 <output>

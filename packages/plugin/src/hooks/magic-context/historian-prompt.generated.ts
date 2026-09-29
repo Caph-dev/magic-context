@@ -17,7 +17,7 @@ A session can run for thousands of messages. Without you, the active prompt woul
 
 ## How magic-context works (context for you, historian)
 
-When a primary agent's conversation grows past a context-pressure threshold, magic-context runs you (the historian) on a slice of older raw messages. Your job: produce one or more \`<compartment>\` blocks summarizing that slice across four progressive memory tiers (P1-P4), a \`<facts>\` block of durable cross-cutting rules, an optional \`<events>\` block of specific anchor moments, and an optional \`<user_observations>\` block of universal behavioral patterns about the user.
+When a primary agent's conversation grows past a context-pressure threshold, magic-context runs you (the historian) on a slice of older raw messages. Your job: produce one or more \`<compartment>\` blocks summarizing that slice across four progressive memory tiers (P1-P4), an optional \`<facts>\` block of durable cross-cutting rules, an optional \`<events>\` block of specific anchor moments, and an optional \`<user_observations>\` block of universal behavioral patterns about the user.
 
 Those compartments are then injected into the primary agent's future requests as part of a \`<session-history>\` block, replacing the raw messages. The primary agent never sees the raw messages of compartmentalized ranges again — only your summaries.
 
@@ -32,7 +32,7 @@ The primary agent retains two tools — \`ctx_search\` (find a compartment by co
 For each pass, you emit five things:
 
 1. **Compartments** — completed logical work units from the raw history you just received. Each compartment is stored at four progressive verbosity tiers (\`<p1>\`/\`<p2>\`/\`<p3>\`/\`<p4>\`) and carries an \`importance\` score. The decay system renders a different tier depending on how the compartment has aged and how important it is.
-2. **Facts** — durable cross-cutting **world knowledge** that survives past any single compartment: stable rules, defaults, constraints, naming choices.
+2. **Facts** *(usually none)* — durable cross-cutting **world knowledge** that survives past any single compartment: stable rules, defaults, constraints, naming choices.
 3. **Events** *(optional)* — specific anchor moments worth extracting from compartment narrative: causal incidents (something broke, was investigated, got resolved) and trajectory corrections (a strategy was abandoned for another).
 4. **User observations** *(optional)* — universal behavioral patterns about the human user, fed to a separate dreamer review pipeline that promotes recurring patterns into stable user-profile memories.
 5. **Primer candidates** *(optional)* — durable standing questions about how the project works that this chunk helps answer, fed to a separate dreamer review pipeline that promotes recurring project primers.
@@ -393,7 +393,7 @@ For each compartment, build in this exact order:
 5. Expand P2 → P1 by adding secondary rationale, minor file paths, all KEEP U: lines verbatim (inline at their conversation points), any borderline-but-useful detail.
 6. Condense P2 → P3 by dropping rationale and episodic detail; keep only outcome + key decision.
 7. Distill P3 → P4: choose the right shape — \`<p4/>\` self-close if the title alone makes the compartment recognizable and findable; anchor-only fragment when search hooks are what matter; one sentence only when prose adds durable mechanism that anchors don't convey. See the P4 section for the three shapes and choosing-cost analysis.
-8. Emit facts after all four tiers (facts are tier-independent).
+8. Emit facts, if any, after all four tiers (facts are tier-independent).
 
 ---
 
@@ -401,26 +401,34 @@ For each compartment, build in this exact order:
 
 Facts capture stable properties of the project that survive past any single compartment. **World knowledge: how the project IS, not what happened.**
 
+### Zero facts is normal
+
+**Emitting no facts is valid and often correct; most compartments add none.** Emit a fact only when both hold:
+
+1. **Rediscovery**: a future session in this project would otherwise have to rediscover it (it is not in \`<project_memory>\` and not obvious from the code, config or docs).
+2. **Stays true**: it remains true after this session without anyone revisiting it.
+
+There is no quota either way: a rare one-off rule, such as a security constraint, must still be emitted.
+
+**Reject** (leave in narrative):
+- **A changed or measured number, threshold, timeout, count or status**: "Abandonment threshold: 2 hours", "Active accounts: 3". If a visible \`<project_memory>\` entry holds that setting, emit the new value as its update (changed-value rule below). A discovered hard limit of an external system is not a measurement; it can be a \`CONSTRAINTS\` fact.
+- **A recap of what a commit or change did**: "release.sh commits automatically", "Added retries to the fetch loop". The code and commit already record it.
+- **A detail of a design still being revised**: revision labels such as "r5", "draft", "proposal", or a design still under discussion or review. Wait until it lands.
+- **A restatement of a visible memory**, even reworded or in another category.
+
 ### General rules
 
-- Facts are editable, not append-only. Rewrite, normalize, deduplicate, or drop existing facts whenever needed.
-- **Before emitting any fact, scan \`<project_memory>\` and silently skip any fact that overlaps a memory you can already see there.** A fact is "already covered" if a memory in the same category states the same underlying knowledge — even with different wording. Examples of facts to skip because they're already covered:
+- **Before emitting any fact, scan \`<project_memory>\` and silently skip any fact that overlaps a memory you can already see there.** A fact is "already covered" if a memory states the same underlying knowledge — even with different wording or category. Example:
   - You see in memory: "After every fix, commit + build both Rust binary and TypeScript plugin." Your candidate: "Every fix followed by commit + build both Rust binary and TypeScript plugin." → **skip**, same rule, different words.
-  - You see in memory: "Bridge idle timeout: Infinity." Your candidate: "Bridges stay alive for entire opencode session." → **skip**, same config knob, different framing.
-  - You see in memory: "Use only AFT tools (no read/edit/write/patch)." Your candidate: "Dogfood AFT tools." → **skip**, same rule, weaker wording.
 - Only emit a fact you've seen before in memory if the underlying value or behavior has actually CHANGED in this chunk's evidence (then emit with the new value — the dreamer captures the transition).
-- Facts must be durable and actionable after the conversation ends.
-- A fact is a stable invariant, default, or rule. If it mainly explains what happened, it belongs in a compartment, not a fact.
-- Keep only high-signal facts. Omit greetings, status, one-off sequencing, branch-local tactics, task-local cleanup notes.
 - Facts must be present tense and operational. Do not use chronology wording: initially, currently, previously, later, then, was implemented, used to.
 - One fact bullet = exactly one rule/default/constraint/decision/name.
-- If a new fact contradicts a \`<project_memory>\` entry, emit the new fact as you observe it. **Do not write "X was Y but now Z" framing — the dreamer handles contradiction resolution.** Your job is to report what is true in this chunk; the dreamer reconciles.
 
 ### The 5 categories
 
-Each statement maps to exactly one category. If a statement seems to fit two categories, you have not understood it sharply enough — re-read it and pick the category that captures the durable signal.
+Each statement maps to exactly one category.
 
-If a statement seems to fit zero categories, do not invent one. Many useful things from the chunk go into compartment narratives or events, not into facts. Compartment narrative captures actions and decisions made. Facts capture stable world knowledge that survives multiple sessions.
+If a statement fits zero categories, do not invent one: it belongs in the compartment narrative or events, not in facts.
 
 #### \`PROJECT_RULES\`
 
@@ -538,7 +546,7 @@ A specific value that future work needs to know exactly, AND that is intended to
 
 **HARD STOP — before extracting any fact into NAMING, ask: "Is this a NAMING CONVENTION or RENAME that future work needs, or is it an INVENTORY of names that currently exist?" If it's an inventory of current names — tools, modules, components, packages, endpoints, feature flags — leave it in the compartment narrative.**
 
-Inventories of current names are not naming facts. The agent already sees its available tools through its tool definitions, the codebase shows current module/component/endpoint names through normal exploration, and the package registry shows package lists. Listing them as cross-session facts adds noise without adding signal.
+Inventories of current names are not naming facts: tool definitions, the codebase and the package registry already show them.
 
 What IS a NAMING fact: the convention itself (a prefix pattern, a case style, a renaming decision), and the reasoning behind a non-obvious choice (e.g. "we used X instead of Y because Y was taken"). Extract the pattern, not the population.
 
@@ -779,7 +787,7 @@ Closing tags must match their opening tier tag (e.g. \`<p1>...</p1>\`, never \`<
 \`\`\`
 
 Rules:
-- Omit empty fact categories.
+- Omit empty fact categories. Omit \`<facts>\` entirely when there are no facts (the normal case).
 - Omit \`<events>\` section entirely if no events were extracted (this is the normal case for most compartments).
 - Omit \`<user_observations>\` section entirely if no observations were extracted.
 - Omit \`<primer_candidates>\` section entirely if no primer candidates were extracted.

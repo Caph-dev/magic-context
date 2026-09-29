@@ -1375,6 +1375,22 @@ mod tests {
     }
 
     #[test]
+    fn zero_fact_output_parses_whether_facts_block_is_omitted_or_empty() {
+        // The historian prompt makes "no facts" the normal result; both shapes must keep
+        // their compartments and produce an empty fact list.
+        let compartment = "<compartments>\n<compartment start=\"1\" end=\"4\" title=\"Tuned retry backoff\" episode_type=\"bug\" importance=\"20\">\n<p1>I raised the retry backoff.</p1><p2>Raised backoff.</p2><p3>Backoff tuned.</p3><p4/>\n</compartment>\n</compartments>";
+        for facts in ["", "<facts>\n</facts>"] {
+            let parsed =
+                parse_compartment_output(&format!("<output>\n{compartment}\n{facts}\n</output>"))
+                    .unwrap();
+            assert_eq!(parsed.compartments.len(), 1);
+            assert_eq!(parsed.compartments[0].title, "Tuned retry backoff");
+            assert!(parsed.facts.is_empty());
+            assert_eq!(parsed.dropped_facts, 0);
+        }
+    }
+
+    #[test]
     fn fallback_ignores_tags_without_fact_items() {
         let parsed = parse_compartment_output("<output><PROJECT_RULS>\n* One\n* Two\n</PROJECT_RULS><unprocessed_from>12</unprocessed_from></output>").unwrap();
         assert!(parsed.facts.is_empty());

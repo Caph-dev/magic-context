@@ -604,6 +604,77 @@ mod tests {
         }
     }
 
+    #[derive(Deserialize)]
+    struct SystemPromptGolden {
+        bytes: usize,
+        sha256: String,
+        facts_section_start: String,
+        facts_section_end: String,
+        facts_guidance: Vec<String>,
+        forbidden_facts_patterns: Vec<String>,
+    }
+
+    /// The golden is written from the TypeScript prompt by
+    /// gen/gen-historian-system-prompt.ts and checked by the TypeScript suite too, so a
+    /// match here means both lanes send the same bytes and keep the fact admission rules.
+    #[test]
+    fn historian_system_prompt_matches_typescript_golden() {
+        use sha2::{Digest, Sha256};
+
+        let golden: SystemPromptGolden = serde_json::from_str(include_str!(
+            "../testdata/historian-system-prompt-golden.json"
+        ))
+        .expect("parse historian-system-prompt-golden.json");
+        let prompt = HISTORIAN_SYSTEM_PROMPT;
+        assert_eq!(prompt.len(), golden.bytes, "system prompt byte length");
+        let digest = Sha256::digest(prompt.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, golden.sha256, "system prompt sha256");
+
+        let start = prompt
+            .find(&golden.facts_section_start)
+            .expect("Facts heading");
+        let end = start
+            + prompt[start..]
+                .find(&golden.facts_section_end)
+                .expect("Events heading after Facts");
+        let facts = &prompt[start..end];
+        let output_rules = &prompt[prompt.rfind("\nRules:\n").expect("output rules")..];
+        assert!(
+            !golden.facts_guidance.is_empty(),
+            "empty facts guidance golden"
+        );
+        for line in &golden.facts_guidance {
+            let scope = if line.starts_with("Omit `<facts>` entirely") {
+                output_rules
+            } else {
+                facts
+            };
+            assert!(
+                scope.contains(line.as_str()),
+                "missing facts guidance: {line}"
+            );
+        }
+        assert!(
+            !golden.forbidden_facts_patterns.is_empty(),
+            "empty forbidden patterns"
+        );
+        for pattern in &golden.forbidden_facts_patterns {
+            let re = regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .expect("forbidden pattern compiles");
+            assert!(
+                re.is_match("Emit at most 3 facts per compartment."),
+                "forbidden pattern cannot match a numeric cap: {pattern}"
+            );
+            assert!(
+                !re.is_match(facts),
+                "Facts section states a numeric cap: {pattern}"
+            );
+        }
+    }
+
     #[test]
     fn xml_escaping_matches_prompt_reference_order() {
         assert_eq!(escape_xml_attr("&\"'<>"), "&amp;&quot;&apos;&lt;&gt;");
