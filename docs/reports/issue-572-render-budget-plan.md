@@ -63,6 +63,9 @@ The next two turns were cache hits. The gate checks that no `render_config:` dia
 - OpenCode targeted materialization, mural, history policy/resolver, epoch and postprocess tests: 339 passed.
 - Pi targeted materialization, mural and history-budget tests: 77 passed.
 - Both package typechecks pass.
-- Regression non-vacuity controls, builds/lint and pure replay results are recorded in the delivery declaration.
+- Restoring the old volatile identity function makes exactly the new OpenCode regression fail; restoring the Pi equivalent makes exactly the new Pi regression fail. Both controls were staged first, showed a nonempty mutation diff, then restored to an empty diff. The restored tests pass.
+- OpenCode and Pi production builds pass; targeted lint passes (two existing non-null-assertion warnings in Pi mural tests).
+- E2E-wide `tsc --noEmit` has unrelated existing failures in retina import resolution, command-handler SDK types, issue-564 probe, Rust harness/replay and OpenCode 2 tests. After correcting the new probe's compartment-input shape, it has no diagnostics in that run. The changed runtime packages' authoritative typechecks both pass.
+- Pure replay against master reports `RESULT IDENTICAL defer_passes=4`: 588/754/920/1088 bytes, with equal message, system and tool hashes on each pass. The final master comparison uses master `7107b47a8f8e5a17b40fc3d6ab6a1f40a0cf5a2c`; the earlier host baseline intentionally remains the task's starting master snapshot `9859430857ff1ccb8bc6c6c6bbb5c05a0f4063b7`.
 
-The differential replay script actually lives at `packages/e2e-tests/scripts/pure-replay-differential.ts` (not the plugin scripts directory). It must report IDENTICAL against master before delivery.
+The differential replay script actually lives at `packages/e2e-tests/scripts/pure-replay-differential.ts` (not the plugin scripts directory). All replay hosts use the throwaway TMPDIR root. Replay isolation is audited concurrently with lsof, as well as by the probe's built-in isolation gate.
