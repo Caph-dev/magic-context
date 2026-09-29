@@ -53,7 +53,15 @@ export interface V2StorageGateOptions {
  * cause is gone.
  */
 export function createV2StorageGate(options: V2StorageGateOptions = {}): V2StorageGate {
-    const open = options.open ?? (() => openDatabaseAsync({ busyTimeoutMs: 0 }));
+    const open =
+        options.open ??
+        (async () => {
+            // Keep schema discovery non-blocking under contention, then give normal
+            // writes a native busy window before the foreground retry budget begins.
+            const opened = await openDatabaseAsync({ busyTimeoutMs: 0 });
+            opened?.exec("PRAGMA busy_timeout=5000");
+            return opened;
+        });
     const now = options.now ?? (() => Date.now());
     const interval = options.reopenIntervalMs ?? V2_STORAGE_REOPEN_INTERVAL_MS;
     let db: ContextDatabase | undefined;
