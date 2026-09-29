@@ -136,3 +136,34 @@ test("children of one project collapse to one line; only parks and refusals are 
     expect(alertUrgency([...alerts, { ...base, kind: "refusal", sessionId: "ses_head", name: "ALF", p90: 0, max: 0, moduleMax: 0 }])).toBe("high");
     expect(alertUrgency([{ ...base, kind: "park", sessionId: "ses_x", name: "CEREB", p90: 0, max: 0, moduleMax: 0 }])).toBe("high");
 });
+
+test("busy-storage markers count by session and hour, threshold and dedupe; lock holders report site statistics", async () => {
+    writeFileSync(path, readFileSync(join(import.meta.dir, "fixtures/transform-storage-busy.txt")));
+    const output: string[] = [];
+    const options = { files: [path], stateFile: join(root, "state.json"), db: "", connectionFile: "", send: false,
+        now: () => BASE + 100_000, load: () => [0, 0, 0], stdout: (value: string) => output.push(value), stderr: () => {} };
+    const first = await runLatencySentinel(options);
+    expect(first.alerts.map((alert) => alert.kind)).toEqual(["busy_refusal", "busy_replay", "long_lock"]);
+    expect(first.alerts[0]).toMatchObject({ sessionId: "unknown-session", busy: { refusals: 1, replays: 0 } });
+    expect(first.alerts[2]).toMatchObject({ sessionId: "unknown-session", lock: { site: "smart_note_commit", count: 2, max: 5100, p90: 5100 } });
+    expect(first.alerts[1]).toMatchObject({ sessionId: "ses_pi", busy: { refusals: 0, replays: 3 } });
+    expect(formatAlerts(first.alerts)).toContain("smart_note_commit max 5.1 s, p90 5.1 s");
+    expect(alertUrgency(first.alerts)).toBe("medium");
+    expect(output.filter((value) => JSON.parse(value).kind === "transform_latency_daily_summary")).toHaveLength(1);
+    appendFileSync(path, "[2026-09-28T18:00:10.000Z] [magic-context] storage-busy refusal stage=rust-mode-emergency: locked\n"
+        + "[2026-09-28T18:00:11.000Z] [magic-context] slow write transaction: site=smart_note_commit held=5200.0ms\n"
+        + "[2026-09-28T18:00:12.000Z] [magic-context][ses_pi] TRANSIENT STORAGE FAILURE sqlite_busy: LKG replay served 4 messages instead of raw 9\n");
+    expect((await runLatencySentinel(options)).alerts).toHaveLength(0);
+    expect(output.filter((value) => JSON.parse(value).kind === "transform_latency_daily_summary")).toHaveLength(1);
+    const next: string[] = [];
+    const following = await runLatencySentinel({ ...options, now: () => BASE + 24 * 3600_000 + 100_000, stdout: (value) => next.push(value) });
+    expect(following.alerts).toHaveLength(0);
+    expect(next.map((value) => JSON.parse(value))).toEqual([{
+        kind: "transform_latency_daily_summary", day: "2026-09-28",
+        busy: [
+            { sessionId: "unknown-session", hour: "2026-09-28T18:00:00.000Z", refusals: 2, replays: 0 },
+            { sessionId: "ses_busy", hour: "2026-09-28T18:00:00.000Z", refusals: 0, replays: 1 },
+            { sessionId: "ses_pi", hour: "2026-09-28T18:00:00.000Z", refusals: 0, replays: 4 },
+        ], holds: 4, longHolds: 2,
+    }]);
+});
