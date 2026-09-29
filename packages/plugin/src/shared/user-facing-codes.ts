@@ -38,6 +38,11 @@ export const USER_FACING_FAILURES = {
         sentence: "Memory maintenance stopped at its hidden agent step limit.",
         action: "This task needs less work per run; changing the model connection will not help.",
     },
+    dream_token_budget: {
+        code: "MC-D11",
+        sentence: "Memory maintenance reached its prompt-token budget.",
+        action: "The unfinished items will be retried on the next run.",
+    },
     dream_empty_completion: {
         code: "MC-D03",
         sentence: "Memory maintenance received no usable response.",
@@ -285,6 +290,7 @@ const DREAM_FAILURE_KEYS = {
     provider_timeout: "dream_provider_timeout",
     provider_error: "dream_provider_error",
     step_limit: "dream_step_limit",
+    token_budget: "dream_token_budget",
     empty_completion: "dream_empty_completion",
     no_models: "dream_no_models",
     child_aborted: "dream_child_aborted",

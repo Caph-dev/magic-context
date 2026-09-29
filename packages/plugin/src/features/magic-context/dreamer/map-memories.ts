@@ -44,6 +44,7 @@ import {
     type DreamerModuleRoute,
     getModuleMemoryIdentities,
 } from "./module-apply";
+import { DreamTokenBudgetExceeded } from "./token-budget";
 
 /**
  * map-memories: ONE-TIME-style backfill that locates the backing file(s) for
@@ -101,6 +102,8 @@ export interface MapMemoriesArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    tokenBudget?: number;
+    onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     moduleRoute?: DreamerModuleRoute;
     onProgress?: (processed: number) => void;
 }
@@ -343,6 +346,7 @@ async function mapOneBatch(
                 prompt,
                 title: "magic-context-dream-map-memories",
                 callContext: "dreamer:map-memories",
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 timeoutMs: sliceMs,
@@ -393,7 +397,10 @@ async function mapOneBatch(
             {
                 // Send without holding a request open for the whole batch, so the
                 // slice below is the only timer (see prompt-async-transport.ts).
-                transport: shared.createPromptAsyncTransport(client, agentSessionId),
+                transport: shared.createPromptAsyncTransport(client, agentSessionId, {
+                    tokenBudget: args.tokenBudget,
+                    onBudgetUpdate: args.onBudgetUpdate,
+                }),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,
@@ -448,7 +455,8 @@ async function mapOneBatch(
                 args.sessionDirectory,
             ),
         });
-        if (error instanceof DreamerModuleFailureError) throw error;
+        if (error instanceof DreamerModuleFailureError || error instanceof DreamTokenBudgetExceeded)
+            throw error;
         // Swallow per-batch failures: the batch's memories stay unmapped and are
         // retried next run. Only an abort/lease-loss should stop the whole task.
         if (signal.aborted) throw error;

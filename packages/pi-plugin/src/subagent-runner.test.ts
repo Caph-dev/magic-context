@@ -3468,3 +3468,173 @@ it("accepts provenance redirected to chunked stderr by Pi's output guard", async
 		log.mockRestore();
 	}
 });
+
+describe("Pi dreamer prompt-token budget", () => {
+	it("hard-stops at soft limit when the lean tool guard is unavailable", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation: { command: "pi-test", prefixArgs: [], targetHarness: "pi" },
+		});
+		const run = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			tokenBudget: 100,
+		});
+		for (let i = 0; i < 100 && spawnImpl.mock.calls.length === 0; i++)
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		expect(spawnImpl.mock.calls[0]?.[1]).toContain("json");
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		expect(await run).toMatchObject({
+			ok: false,
+			reason: "token_budget",
+			meta: { tokenBudget: { finalizeFired: false } },
+		});
+		expect(child.stdinText).not.toContain("dreamer-finalize");
+	});
+	const invocation = {
+		command: "pi-test",
+		prefixArgs: [],
+		targetHarness: "pi" as const,
+	};
+	async function started() {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation,
+			subagentExtensions: ["subagent-entry.js"],
+		});
+		const run = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			tokenBudget: 100,
+		});
+		for (
+			let i = 0;
+			i < 100 && !child.stdinText.includes("dreamer-initial");
+			i++
+		)
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		expect(child.stdinText).toContain("dreamer-initial");
+		expect(spawnImpl.mock.calls[0]?.[1]).toContain("rpc");
+		return { child, run, spawnImpl };
+	}
+
+	it("does not steer a completed under-budget child", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 50 },
+				stopReason: "stop",
+				content: [{ type: "text", text: "<mappings/>" }],
+			},
+		});
+		child.emitClose();
+		expect(await run).toMatchObject({ ok: true, assistantText: "<mappings/>" });
+		expect(child.stdinText).not.toContain("dreamer-finalize");
+	});
+
+	it("steers once at 80%, retains its tools, and accepts a final manifest", async () => {
+		const { child, run, spawnImpl } = await started();
+		const argsBefore = JSON.stringify(spawnImpl.mock.calls[0]?.[1]);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 20, cacheRead: 61, cacheWrite: 0 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(child.stdinText.match(/dreamer-finalize/g)).toHaveLength(1);
+		expect(child.stdinText).toContain("no more tool calls");
+		expect(JSON.stringify(spawnImpl.mock.calls[0]?.[1])).toBe(argsBefore);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 1 },
+				stopReason: "stop",
+				content: [{ type: "text", text: "<mappings/>" }],
+			},
+		});
+		child.emitClose();
+		const result = await run;
+		expect(result).toMatchObject({ ok: true, assistantText: "<mappings/>" });
+	});
+
+	it("hard-stops at 100% even after only one refused call", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		child.writeStdoutLine({
+			type: "tool_execution_end",
+			toolCallId: "blocked-1",
+			toolName: "read",
+			isError: true,
+			result: {
+				content: [
+					{
+						type: "text",
+						text: "Out of token budget: no more tool calls. Output your result now.",
+					},
+				],
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 19 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		expect(await run).toMatchObject({ ok: false, reason: "token_budget" });
+	});
+
+	it("hard-stops after two blocked post-finalize calls", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		for (let i = 0; i < 2; i++)
+			child.writeStdoutLine({
+				type: "tool_execution_end",
+				toolCallId: `blocked-${i}`,
+				toolName: "read",
+				isError: true,
+				result: {
+					content: [
+						{
+							type: "text",
+							text: "Out of token budget: no more tool calls. Output your result now.",
+						},
+					],
+				},
+			});
+		expect(await run).toMatchObject({ ok: false, reason: "token_budget" });
+	});
+});

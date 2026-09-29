@@ -1,3 +1,5 @@
+import { refuseBudgetedToolCall } from "../../features/magic-context/dreamer/token-budget";
+
 // The pre-fix truncated render kept at most five characters of the original
 // value before the sentinel, so a copied placeholder always has that exact
 // shape. Matching only that shape keeps a legitimate value that merely ends
@@ -251,6 +253,10 @@ export function createDroppedInputToolExecuteBeforeHook() {
     return async (input: unknown, output: unknown): Promise<void> => {
         const call = isRecord(input) ? (input as { tool?: unknown; sessionID?: unknown }) : {};
         const args = isRecord(output) ? (output as { args?: unknown }).args : undefined;
+        if (typeof call.sessionID === "string") {
+            const refusal = refuseBudgetedToolCall(call.sessionID);
+            if (refusal) throw new Error(refusal.message);
+        }
         assertExecutableToolInput(guard, {
             sessionID: typeof call.sessionID === "string" ? call.sessionID : undefined,
             toolName: typeof call.tool === "string" ? call.tool : undefined,

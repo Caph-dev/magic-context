@@ -40,6 +40,8 @@ export interface RefreshPrimersArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    tokenBudget?: number;
+    onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     language?: string;
     onProgress?: (processed: number) => void;
     /**
@@ -247,6 +249,7 @@ async function refreshOnePrimer(
                 prompt,
                 title: "magic-context-dream-refresh-primers",
                 callContext: "dreamer:refresh-primers",
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 language: args.language,
@@ -310,6 +313,10 @@ async function refreshOnePrimer(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:refresh-primers",
+                transport: shared.createPromptAsyncTransport(client, agentSessionId, {
+                    tokenBudget: args.tokenBudget,
+                    onBudgetUpdate: args.onBudgetUpdate,
+                }),
                 fetchOutput: async () => {
                     const messagesResponse = await client.session.messages({
                         path: { id: agentSessionId as string },

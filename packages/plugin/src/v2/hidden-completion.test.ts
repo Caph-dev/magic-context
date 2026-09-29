@@ -71,6 +71,10 @@ class Rows {
         );
     }
 
+    assistantSince(sessionID: string, afterSeq: number): StoreRow<"assistant">[] {
+        return (this.rows.get(sessionID) ?? []).filter((row) => row.seq > afterSeq);
+    }
+
     latestAssistant(sessionID: string): StoreRow<"assistant"> | undefined {
         this.latestAssistantCalls += 1;
         return this.rows.get(sessionID)?.at(-1);
@@ -1536,5 +1540,37 @@ describe("OpenCode 2 hidden child completion", () => {
         } finally {
             state.db.close();
         }
+    });
+});
+
+test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre-tool hook", async () => {
+    const fixture = await setup();
+    fixture.setDelayRow(1200);
+    const executor = fixture.executor;
+    let finalized: boolean | undefined;
+    const handle = await executor.open({
+        ...dreamerRun,
+        agent: HIDDEN_CURATE_AGENT,
+        timeoutMs: 3000,
+        metadata: {
+            tokenBudget: 130,
+            onBudgetUpdate: (state: { finalizeFired: boolean }) => {
+                finalized = state.finalizeFired;
+            },
+        },
+    });
+    const attempt = executor.attempt(handle, request());
+    await eventually(() => fixture.requests.length > 0);
+    // The fixture's assistant reports 101 input, 7 cache read and 5 cache write tokens.
+    fixture.rows.append(handle.id, "", { finish: "tool-calls" });
+    await expect(attempt).rejects.toMatchObject({ name: "DreamTokenBudgetExceeded" });
+    expect(fixture.interrupts).toContain(handle.id);
+    expect(fixture.requests).toHaveLength(1);
+    expect(finalized).toBe(false);
+    await executor.close(handle, {
+        promptSettled: false,
+        privacySensitive: true,
+        context: "test",
+        log: () => {},
     });
 });
