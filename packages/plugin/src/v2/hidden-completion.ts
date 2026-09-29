@@ -1066,6 +1066,7 @@ export async function createV2HiddenCompletionExecutor(
                                     !(row.data.content ?? []).some(
                                         (part) => part.type === "tool-call",
                                     ),
+                                false,
                             );
                             const onBudgetUpdate = run.identity.metadata?.onBudgetUpdate;
                             if (typeof onBudgetUpdate === "function")

@@ -48,12 +48,13 @@ export function createDreamTokenBudget(budget: number) {
     let spent = 0;
     let finalizeFired = false;
     let refusedCalls = 0;
+    let forcedStop = false;
     const snapshot = (): DreamTokenBudgetState => ({
         budget,
         spent,
         finalizeFired,
         refusedCalls,
-        hardStopped: spent >= budget || refusedCalls >= 2,
+        hardStopped: forcedStop || spent >= budget || refusedCalls >= 2,
     });
     return {
         snapshot,
@@ -63,6 +64,7 @@ export function createDreamTokenBudget(budget: number) {
             cacheRead: number,
             cacheWrite: number,
             completed = false,
+            canFinalize = true,
         ): "continue" | "finalize" | "stop" {
             for (const value of [input, cacheRead, cacheWrite]) {
                 if (!Number.isSafeInteger(value) || value < 0)
@@ -71,6 +73,10 @@ export function createDreamTokenBudget(budget: number) {
             spent += input + cacheRead + cacheWrite;
             if (spent >= budget) return "stop";
             if (!completed && !finalizeFired && spent >= budget * 0.8) {
+                if (!canFinalize) {
+                    forcedStop = true;
+                    return "stop";
+                }
                 finalizeFired = true;
                 return "finalize";
             }

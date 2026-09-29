@@ -1631,6 +1631,7 @@ export class PiSubagentRunner implements SubagentRunner {
 							usage?.cacheRead ?? 0,
 							usage?.cacheWrite ?? 0,
 							finished,
+							rpcBudget,
 						);
 						if (
 							decision === "stop" ||

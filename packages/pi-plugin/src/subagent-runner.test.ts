@@ -3492,7 +3492,11 @@ describe("Pi dreamer prompt-token budget", () => {
 				content: [{ type: "toolCall", name: "read" }],
 			},
 		});
-		expect(await run).toMatchObject({ ok: false, reason: "token_budget" });
+		expect(await run).toMatchObject({
+			ok: false,
+			reason: "token_budget",
+			meta: { tokenBudget: { finalizeFired: false } },
+		});
 		expect(child.stdinText).not.toContain("dreamer-finalize");
 	});
 	const invocation = {

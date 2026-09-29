@@ -43,6 +43,16 @@ describe("dreamer prompt-token budget", () => {
         expect(guard.refuseTool()).toMatchObject({ hardStopped: true });
     });
 
+    test("hard-stops at soft threshold without claiming a finalize when tools cannot be intercepted", () => {
+        const guard = createDreamTokenBudget(100);
+        expect(guard.charge(81, 0, 0, false, false)).toBe("stop");
+        expect(guard.snapshot()).toMatchObject({
+            spent: 81,
+            finalizeFired: false,
+            hardStopped: true,
+        });
+    });
+
     test("stops at 100 percent even without two refusals", () => {
         const guard = createDreamTokenBudget(100);
         expect(guard.charge(90, 0, 0)).toBe("finalize");
