@@ -85,12 +85,11 @@ describe("storage-meta", () => {
             clearSession(toDatabase(db), "session-1");
 
             //#then
-            // The shared deleter prepares and executes every table inside one
-            // encompassing transaction; message-index rows no longer need a
-            // separate nested cleanup transaction. The last statement removes the
-            // session's retrospective activity mark.
+            // clearSession deletes all owned tables inside one transaction.
+            // Retry marks are deleted before their compartment IDs disappear;
+            // the session activity mark is removed after the table rows.
             expect(db.transaction).toHaveBeenCalledTimes(1);
-            expect(db.prepare).toHaveBeenCalledTimes(32);
+            expect(db.prepare).toHaveBeenCalledTimes(33);
         });
     });
 });

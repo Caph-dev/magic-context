@@ -32,7 +32,11 @@ import {
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
-import { getEmbeddingCoverageStatus } from "../../features/magic-context/project-embedding-registry";
+import {
+    getAutoEmbeddingSessionCoverage,
+    getEmbeddingCoverageStatus,
+    getProjectEmbeddingSnapshot,
+} from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     getDatabasePersistenceError,
@@ -75,9 +79,11 @@ import {
 } from "./embed-history-runner";
 import {
     autoEmbedAttemptedBySession,
+    autoEmbedIdentityBySession,
     clearEmbedSessionState,
     embedPauseBySession,
     getEmbedDrainUiStatus,
+    invalidateAutoEmbedSession,
 } from "./embed-session-state";
 import { createEventHandler } from "./event-handler";
 import {
@@ -569,21 +575,32 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
 
     const maybeAutoEmbedSession = (sessionId: string): void => {
+        const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
+        const identity = resolveProjectIdentityForSession(
+            directory,
+            deps.config.allow_home_project,
+        );
+        const snapshot = identity ? getProjectEmbeddingSnapshot(identity) : undefined;
+        const embedIdentity = snapshot
+            ? JSON.stringify([
+                  snapshot.providerIdentity,
+                  snapshot.chunkModelId,
+                  snapshot.runtimeFingerprint,
+              ])
+            : "off";
+        if (autoEmbedIdentityBySession.get(sessionId) !== embedIdentity) {
+            invalidateAutoEmbedSession(sessionId);
+        }
         if (autoEmbedAttemptedBySession.has(sessionId)) return;
         if (embedPauseBySession.has(sessionId)) return;
         // No `memory.enabled` gate: history embedding runs whenever an embedding
         // provider is configured and not `off` (checked via coverage below).
         autoEmbedAttemptedBySession.add(sessionId);
-        const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
+        autoEmbedIdentityBySession.set(sessionId, embedIdentity);
         void (async () => {
-            // Latch discipline: early exits (no identity, provider off, nothing to
-            // embed yet) release the latch so a young session gets its drain once
-            // real work exists — those paths are silent and cost one coverage
-            // query. Once a drain reaches ANY terminal outcome (busy, stalled,
-            // success), the latch holds for the process lifetime: busy means the
-            // project-level passive backfill owns the backlog, and re-attempting
-            // per pass is the announce/busy livelock this shape replaced.
-            let drainReachedTerminal = false;
+            // The autoEmbedAttemptedBySession claim is cleared on compartment
+            // writes or embedding-identity changes, not when coverage is already
+            // complete or a scan fails. Rechecking then would scan every turn.
             try {
                 // Defer off the transform thread BEFORE any DB/config work.
                 // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
@@ -597,11 +614,21 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     directory,
                     deps.config.allow_home_project,
                 );
-                if (!sessionProjectIdentity) return;
+                if (!sessionProjectIdentity) {
+                    invalidateAutoEmbedSession(sessionId);
+                    return;
+                }
                 maybeSendProjectIdentitySessionWarning(sessionId, directory);
-                const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
-                if (!coverage.enabled) return;
-                const remaining = coverage.session.total - coverage.session.embedded;
+                const coverage = await getAutoEmbeddingSessionCoverage(
+                    db,
+                    sessionProjectIdentity,
+                    sessionId,
+                );
+                if (!coverage.enabled) {
+                    invalidateAutoEmbedSession(sessionId);
+                    return;
+                }
+                const remaining = coverage.total - coverage.embedded;
                 if (remaining <= 0) return;
                 // The auto lane is a silent bootstrap trigger: no pre-announce, no
                 // busy/zero-work chatter, and the once-per-process latch never
@@ -612,11 +639,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // the same count forever. Retries belong to the passive backfill;
                 // progress lives in /ctx-embed status and the sidebar.
                 await executeEmbedHistory(sessionId, { silent: true });
-                drainReachedTerminal = true;
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
-            } finally {
-                if (!drainReachedTerminal) autoEmbedAttemptedBySession.delete(sessionId);
             }
         })();
     };

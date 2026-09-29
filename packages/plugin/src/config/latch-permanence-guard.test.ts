@@ -23,6 +23,11 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "PUBLICATION",
         reason: "Correct: records that the one process-exit handler closing the shared database is installed, so /reload doesn't register a second one; it holds no failure or absence verdict.",
     },
+    "packages/plugin/src/features/magic-context/compartment-chunk-embedding.ts:cachedCoverageWindows":
+        {
+            classification: "VERDICT",
+            reason: "Bounded LRU keyed by compartment id, canonical transcript content hash, chunker version, embedding model and token budget; a content or identity change cannot reuse a prior classification.",
+        },
     "packages/plugin/src/features/magic-context/compaction-marker.ts:cachedSchemaCompatible": {
         classification: "VERDICT",
         reason: "DEFECT: a transient PRAGMA/read failure is cached as incompatible until the writable DB is closed.",

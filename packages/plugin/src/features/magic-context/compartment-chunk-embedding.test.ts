@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as formatting from "../../hooks/magic-context/read-session-formatting";
 import { estimateTokens, formatBlock } from "../../hooks/magic-context/read-session-formatting";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -13,10 +14,14 @@ import {
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
     countSessionCompartmentEmbedCoverage,
+    countSessionCompartmentEmbedCoveragePolite,
     countUnembeddedSessionCompartments,
+    countUnembeddedSessionCompartmentsPolite,
     loadCompartmentChunkEmbeddingsForSearch,
     loadUnembeddedCompartmentChunkCandidates,
     loadUnembeddedSessionChunkCandidates,
+    loadUnembeddedSessionChunkCandidatesPolite,
+    recordChunkEmbedBackoff,
     replaceCompartmentChunkEmbeddings,
 } from "./compartment-chunk-embedding";
 import { embedAndStoreCompartmentChunks } from "./compartment-embedding";
@@ -913,6 +918,129 @@ describe("compartment chunk embedding core", () => {
                     maxInputTokens,
                 ),
             ).toEqual({ embedded: 3, total: 3 });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("issue 564 coverage catch-up", () => {
+    test("steady-state coverage and count do not re-tokenize unchanged compartments", async () => {
+        const db = createDb();
+        const sessionId = "ses-coverage-memo";
+        const project = "/repo/coverage-memo";
+        const model = "mock:coverage-memo";
+        try {
+            recordSessionProjectIdentity(db, sessionId, project);
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "u1",
+                    endMessageId: "u1",
+                    title: "Memo",
+                    content: "Memo",
+                    p1: "Memo",
+                },
+            ]);
+            insertFtsRow(db, sessionId, 1, "user", "A unique message for the coverage memo");
+            const tokens = spyOn(formatting, "estimateTokens");
+            try {
+                expect(
+                    (
+                        await countSessionCompartmentEmbedCoveragePolite(
+                            db,
+                            project,
+                            sessionId,
+                            model,
+                        )
+                    ).total,
+                ).toBe(1);
+                expect(tokens.mock.calls.length).toBeGreaterThan(0);
+                tokens.mockClear();
+                expect(
+                    await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, model),
+                ).toBe(1);
+                expect(
+                    (
+                        await loadUnembeddedSessionChunkCandidatesPolite(
+                            db,
+                            project,
+                            sessionId,
+                            model,
+                            1,
+                        )
+                    ).length,
+                ).toBe(1);
+                expect(
+                    (
+                        await countSessionCompartmentEmbedCoveragePolite(
+                            db,
+                            project,
+                            sessionId,
+                            model,
+                        )
+                    ).embedded,
+                ).toBe(0);
+                expect(tokens).toHaveBeenCalledTimes(0);
+            } finally {
+                tokens.mockRestore();
+            }
+            // Replacing indexed message text must invalidate cached window hashes
+            // even when the owning compartment row remains unchanged.
+            insertFtsRow(db, sessionId, 1, "assistant", "New text");
+            expect(
+                (await countSessionCompartmentEmbedCoveragePolite(db, project, sessionId, model))
+                    .embedded,
+            ).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("issue 564 failed-compartment backoff", () => {
+    test("persists a content- and identity-scoped retry delay and removes it with the session", async () => {
+        const db = createDb();
+        const sessionId = "ses-backoff";
+        const project = "/repo/backoff";
+        try {
+            recordSessionProjectIdentity(db, sessionId, project);
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "u1",
+                    endMessageId: "u1",
+                    title: "Retry",
+                    content: "Retry",
+                    p1: "Retry",
+                },
+            ]);
+            insertFtsRow(db, sessionId, 1, "user", "Original text");
+            const candidate = getCompartments(db, sessionId)[0];
+            expect(
+                await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, "model:a"),
+            ).toBe(1);
+            recordChunkEmbedBackoff(db, candidate, project, "model:a");
+            expect(
+                await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, "model:a"),
+            ).toBe(0);
+            expect(
+                await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, "model:b"),
+            ).toBe(1);
+            insertFtsRow(db, sessionId, 1, "assistant", "Repaired text");
+            expect(
+                await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, "model:a"),
+            ).toBe(1);
+            clearSession(db, sessionId);
+            expect(
+                db
+                    .prepare("SELECT key FROM schema_migrations_meta WHERE key = ?")
+                    .get(`chunk_embed_backoff:${candidate.id}`),
+            ).toBeNull();
         } finally {
             closeQuietly(db);
         }
