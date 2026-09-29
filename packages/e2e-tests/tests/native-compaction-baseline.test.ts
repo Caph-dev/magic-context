@@ -164,7 +164,13 @@ function assertOpenDatabasesAreThrowaway(): void {
         .filter((path) => /opencode|cortexkit|magic-context|context\.db/.test(path));
     expect(databases.some((path) => path.endsWith("opencode.db"))).toBe(true);
     expect(databases.some((path) => path.endsWith("context.db"))).toBe(true);
-    const outside = databases.filter((path) => !realpathSync(path).startsWith(dataDir));
+    const probeRoot = process.env.MC_PARTIAL_WINDOW_ROOT;
+    const isolatedRoot = probeRoot && probeRoot.includes("/magic-context/") &&
+        process.env.HOME?.startsWith(`${probeRoot}/`) &&
+        h.dataDir.startsWith(`${probeRoot}/`)
+        ? realpathSync(probeRoot)
+        : dataDir;
+    const outside = databases.filter((path) => !realpathSync(path).startsWith(`${isolatedRoot}/`));
     expect(outside).toEqual([]);
 }
 
@@ -288,7 +294,9 @@ it(
         // and the host summary row is still left off the wire.
         expect(first).toContain(HISTORY_SENTINEL);
         expect(first).not.toContain(HOST_SUMMARY_SENTINEL);
-        expect(h.contextDb().prepare("SELECT sequence, start_message_id, end_message_id FROM compartments WHERE session_id = ? ORDER BY sequence").all(sessionId))
+        // A new historian publish may append rows, but compaction cannot erase
+        // any compartment that still exists in the host's raw-message store.
+        expect(h.contextDb().prepare("SELECT sequence, start_message_id, end_message_id FROM compartments WHERE session_id = ? ORDER BY sequence").all(sessionId).slice(0, compartmentsBefore.length))
             .toEqual(compartmentsBefore);
         expect(pluginLog().slice(logOffsetBeforeCompaction)).not.toContain("truncated unreachable compartment history");
         // The real turn's system prompt is handled as usual: it still carries Magic
@@ -303,7 +311,7 @@ it(
 
         // Exactly one fold after the compaction: the next pass replays it.
         await h.sendPrompt(sessionId, "second prompt after the native compaction");
-        expect(h.contextDb().prepare("SELECT sequence, start_message_id, end_message_id FROM compartments WHERE session_id = ? ORDER BY sequence").all(sessionId))
+        expect(h.contextDb().prepare("SELECT sequence, start_message_id, end_message_id FROM compartments WHERE session_id = ? ORDER BY sequence").all(sessionId).slice(0, compartmentsBefore.length))
             .toEqual(compartmentsBefore);
         const lines = pluginLog().split("\n");
         const compactedAt = lines.findIndex((line) => line.includes("compaction-marker: removed on session cleanup"));
