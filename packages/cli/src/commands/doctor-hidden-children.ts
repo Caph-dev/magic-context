@@ -88,6 +88,7 @@ export async function assertHiddenChildStoresClosed(
         encoding: "utf8",
         timeout: 30_000,
         maxBuffer: 32 * 1024 * 1024,
+        windowsHide: true,
     });
     if (
         result.error ||

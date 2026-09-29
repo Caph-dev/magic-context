@@ -633,7 +633,7 @@ describe("isPidIdentityPlausible", () => {
                 args: [
                     "-NoProfile",
                     "-Command",
-                    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress",
+                    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate | ConvertTo-Json -Compress",
                 ],
             },
         ]);

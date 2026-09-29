@@ -23,7 +23,7 @@ describe("mode manifest validator", () => {
         // list below and nothing else, because tier "excluded" never enters a TS or
         // Rust invocation list. A ts-only OpenCode 2 file also moves the TS and
         // opencode2 counts in the next test.
-        expect(validation.files.length).toBe(138);
+        expect(validation.files.length).toBe(140);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -34,13 +34,13 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(45);
+        expect(ts).toHaveLength(46);
         expect(rust).toHaveLength(55);
         expect(rust).toContain("tests/subagent-behavior.test.ts");
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(3);
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(36);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(26);
-        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(25);
+        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(26);
         // These four OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
         // OpenCode 2 host lane runs them; the other host lanes never select them.
         for (const path of [
@@ -100,6 +100,7 @@ describe("mode manifest validator", () => {
             "tests/opencode2/session-project-binding.test.ts",
             "tests/opencode2/sidebar-component.test.ts",
             "tests/opencode2/status-dialog.test.ts",
+            "tests/opencode2/storage-busy.test.ts",
             "tests/opencode2/storage-refusal-reason.test.ts",
             "tests/opencode2/store-directories.test.ts",
             "tests/opencode2/store-generation-conversion.test.ts",
