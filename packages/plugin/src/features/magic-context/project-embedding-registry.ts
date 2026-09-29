@@ -13,11 +13,13 @@ import {
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
     countSessionCompartmentEmbedCoverage,
-    countUnembeddedSessionCompartments,
+    countSessionCompartmentEmbedCoveragePolite,
+    countUnembeddedSessionCompartmentsPolite,
     loadUnembeddedCompartmentChunkCandidatesPolite,
-    loadUnembeddedSessionChunkCandidates,
+    loadUnembeddedSessionChunkCandidatesPolite,
     loadUnembeddedShadowChunkCandidates,
     normalizeCompartmentChunkMaxInputTokens,
+    recordChunkEmbedBackoff,
     replaceCompartmentChunkEmbeddings,
     type SaveCompartmentChunkEmbeddingInput,
 } from "./compartment-chunk-embedding";
@@ -2844,6 +2846,7 @@ async function embedCandidateChunkBatch(
         if (mappedText === null) continue;
         const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
         if (canonicalText.length === 0) {
+            recordChunkEmbedBackoff(db, candidate, projectIdentity, modelId);
             noWork.push(candidate.id);
             continue;
         }
@@ -2915,6 +2918,7 @@ async function embedCandidateChunkBatch(
         const persistedIds = new Set<number>();
         for (let attempt = 0; attempt < EMBED_SLICE_RETRY_ATTEMPTS; attempt++) {
             if (signal?.aborted) break;
+            await new Promise<void>((resolve) => setTimeout(resolve, 15));
             let result: Awaited<ReturnType<typeof embedItemsForProject>> = null;
             const attemptStart = Date.now();
             try {
@@ -2936,6 +2940,7 @@ async function embedCandidateChunkBatch(
                 if (failure) failureReasons.push(failure);
             }
             if (result) {
+                let writeSliceStarted = performance.now();
                 for (const item of slice) {
                     if (persistedIds.has(item.candidate.id)) continue;
                     const vectors = item.windows.map((window) =>
@@ -2959,6 +2964,10 @@ async function embedCandidateChunkBatch(
                     enqueueShadowEmbeddingItems(projectIdentity, "chunk", [
                         String(item.candidate.id),
                     ]);
+                    if (performance.now() - writeSliceStarted >= 35) {
+                        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                        writeSliceStarted = performance.now();
+                    }
                 }
             }
             if (persistedIds.size === slice.length) break; // whole slice done
@@ -2982,7 +2991,10 @@ async function embedCandidateChunkBatch(
         // Skip on abort — those simply didn't get their turn and re-queue naturally.
         if (!signal?.aborted) {
             for (const item of slice) {
-                if (!persistedIds.has(item.candidate.id)) failed.push(item.candidate.id);
+                if (!persistedIds.has(item.candidate.id)) {
+                    recordChunkEmbedBackoff(db, item.candidate, projectIdentity, modelId);
+                    failed.push(item.candidate.id);
+                }
             }
         }
     }
@@ -3098,7 +3110,7 @@ export async function embedSessionCompartmentChunks(
     // this session look already embedded forever.
     recordSessionProjectIdentity(db, sessionId, projectIdentity);
     const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
-    const total = countUnembeddedSessionCompartments(
+    const total = await countUnembeddedSessionCompartmentsPolite(
         db,
         projectIdentity,
         sessionId,
@@ -3157,7 +3169,7 @@ export async function embedSessionCompartmentChunks(
                 aborted = true;
                 break;
             }
-            const candidates = loadUnembeddedSessionChunkCandidates(
+            const candidates = await loadUnembeddedSessionChunkCandidatesPolite(
                 db,
                 projectIdentity,
                 sessionId,
@@ -3213,7 +3225,7 @@ export async function embedSessionCompartmentChunks(
             options?.onProgress?.({ embedded: Math.min(embedded, total), total });
             // Yield to the event loop so the burst stays interruptible and the
             // host process can serve other work between batches.
-            await new Promise((resolve) => setTimeout(resolve, 0));
+            await new Promise((resolve) => setTimeout(resolve, 15));
         }
     } finally {
         clearInterval(renewal);
@@ -3234,14 +3246,14 @@ export async function embedSessionCompartmentChunks(
     // compartments, not a stall).
     if (providerDown || failedIds.length > 0) {
         const remaining = Math.max(
-            0,
-            countUnembeddedSessionCompartments(
+            failedIds.length,
+            (await countUnembeddedSessionCompartmentsPolite(
                 db,
                 projectIdentity,
                 sessionId,
                 snapshot.chunkModelId,
                 maxInputTokens,
-            ) - skipIds.length,
+            )) - skipIds.length,
         );
         if (remaining > 0) {
             return {
@@ -3332,6 +3344,29 @@ export function getEmbeddingCoverageStatus(
         commits,
         shadowBackfillStalls: listShadowBackfillStalls(db, projectIdentity),
     };
+}
+
+// Automatic embedding only needs this session's history coverage, not status
+// for project memories, commits or secondary embedding providers. The caller
+// defers it until after the message transform; counting yields between groups
+// of compartments so a cold session does not block one long host turn.
+export async function getAutoEmbeddingSessionCoverage(
+    db: Database,
+    projectIdentity: string,
+    sessionId: string,
+): Promise<{ enabled: boolean; embedded: number; total: number }> {
+    const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+    if (!snapshot?.historyEnabled || snapshot.chunkModelId === "off") {
+        return { enabled: false, embedded: 0, total: 0 };
+    }
+    const coverage = await countSessionCompartmentEmbedCoveragePolite(
+        db,
+        projectIdentity,
+        sessionId,
+        snapshot.chunkModelId,
+        getProjectEmbeddingMaxInputTokens(projectIdentity),
+    );
+    return { enabled: true, ...coverage };
 }
 
 export async function sweepAllRegisteredProjects(

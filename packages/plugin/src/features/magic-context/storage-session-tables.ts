@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
 import { deleteSessionActivity } from "./session-activity";
 
 export interface SessionScopedTableDefinition {
@@ -86,6 +87,7 @@ export function deleteSessionScopedRows(
     if (deletableSessionIds.length === 0) return 0;
     const placeholders = deletableSessionIds.map(() => "?").join(", ");
 
+    for (const sessionId of deletableSessionIds) deleteChunkEmbedBackoffForSession(db, sessionId);
     for (const definition of SESSION_SCOPED_TABLES) {
         if (definition.table === "message_history_fts") {
             db.prepare(

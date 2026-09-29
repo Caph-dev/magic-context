@@ -540,7 +540,7 @@ describe("magic-context hook", () => {
 
         try {
             await runTransform();
-            await waitUntil(() => !autoEmbedAttemptedBySession.has(sessionId));
+            await waitUntil(() => autoEmbedAttemptedBySession.has(sessionId));
 
             for (let i = 1; i <= 7; i++) {
                 appendCompartments(db, sessionId, [
@@ -575,7 +575,8 @@ describe("magic-context hook", () => {
             expect(prompts.promptAsync).not.toHaveBeenCalled();
             const calls = embedBatch.mock.calls.length;
             expect(calls).toBeGreaterThan(0);
-            // Leave new work eligible: without the latch a second transform would drain it.
+            // Appending a compartment after a completed drain allows automatic
+            // embedding to process that new compartment on the next transform.
             appendCompartments(db, sessionId, [
                 {
                     sequence: 7,
@@ -592,11 +593,15 @@ describe("magic-context hook", () => {
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             ).run(sessionId, 8, "u8", "user", "Later source text");
             await runTransform();
-            await new Promise((resolve) => setTimeout(resolve, 30));
-            expect(embedBatch.mock.calls.length).toBe(calls);
+            await waitUntil(
+                () =>
+                    getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded ===
+                    8,
+            );
+            expect(embedBatch.mock.calls.length).toBeGreaterThan(calls);
             expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
                 total: 8,
-                embedded: 7,
+                embedded: 8,
             });
             expect(userRows()).toEqual([]);
         } finally {

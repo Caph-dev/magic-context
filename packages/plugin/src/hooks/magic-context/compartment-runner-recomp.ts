@@ -1,4 +1,5 @@
 import { HISTORIAN_RECOMP_AGENT } from "../../agents/historian";
+import { deleteChunkEmbedBackoffForSession } from "../../features/magic-context/compartment-chunk-embedding";
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import {
@@ -39,6 +40,7 @@ import {
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { invalidateAutoEmbedSession } from "./embed-session-state";
 import { clearInjectionCache } from "./inject-compartments";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -114,6 +116,7 @@ export function promoteRecompStagingWithM0Mutation(
             return null;
         }
 
+        deleteChunkEmbedBackoffForSession(db, sessionId);
         db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
         // v2 faithful facts: recomp does NOT write session_facts. Facts are a
         // promoted-memory concern now, and recomp must not emit facts at all
@@ -134,6 +137,7 @@ export function promoteRecompStagingWithM0Mutation(
 
         db.exec("COMMIT");
         finished = true;
+        invalidateAutoEmbedSession(sessionId);
         logSlowWriteTransaction("historian-publish:recomp", transactionStartedAt);
         return { compartments: staging.compartments, facts: staging.facts };
     } finally {

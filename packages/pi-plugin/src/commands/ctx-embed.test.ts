@@ -183,7 +183,7 @@ describe("Pi /ctx-embed progress", () => {
 		}
 	});
 
-	it("re-arms after a zero-work pass and latches only after the later drain succeeds", async () => {
+	it("latches a zero-work pass until a compartment is published", async () => {
 		_setTestProviderFactoryForProject(() => new FakeEmbeddingProvider());
 		const db = createTestDb();
 		const project = "pi-auto-embed-project";
@@ -205,7 +205,7 @@ describe("Pi /ctx-embed progress", () => {
 				"/tmp/pi-embed",
 				project,
 			);
-			await waitUntil(() => !autoEmbedAttemptedBySession.has(sessionId));
+			await waitUntil(() => autoEmbedAttemptedBySession.has(sessionId));
 
 			seedCompartments(db, sessionId, 1);
 			expect(getEmbeddingCoverageStatus(db, project, sessionId)).toMatchObject({
