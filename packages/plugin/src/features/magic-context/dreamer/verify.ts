@@ -25,6 +25,7 @@ import {
     invalidateMemory,
     type Memory,
     normalizeVerificationFiles,
+    readGitHead,
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
@@ -46,6 +47,7 @@ import {
     providerOutputFailureFromInvalidManifest,
 } from "./provider-output-failure";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
+import { buildVerifyDiffEvidence } from "./verify-diff";
 import { partitionVerifyScope } from "./verify-gate";
 import {
     buildVerifyPrompt,
@@ -205,8 +207,14 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
     }
 
     const batches: VerifyPromptMemory[][] = [];
-    for (let i = 0; i < gate.inScope.length; i += VERIFY_BATCH_SIZE) {
-        batches.push(gate.inScope.slice(i, i + VERIFY_BATCH_SIZE));
+    const groups =
+        !args.forceBroad && gate.mode === "incremental"
+            ? [gate.inScope.filter((m) => m.verifiedAt), gate.inScope.filter((m) => !m.verifiedAt)]
+            : [gate.inScope];
+    for (const group of groups) {
+        for (let i = 0; i < group.length; i += VERIFY_BATCH_SIZE) {
+            batches.push(group.slice(i, i + VERIFY_BATCH_SIZE));
+        }
     }
 
     const abortController = new AbortController();
@@ -312,7 +320,12 @@ async function verifyOneBatch(
     let promptSettled = false;
     const startedAt = Date.now();
     try {
-        const prompt = buildVerifyPrompt(args.projectIdentity, batch);
+        const headAtPrompt = await readGitHead(args.sessionDirectory);
+        const evidence =
+            !args.forceBroad && batch.every((m) => m.verifiedAt)
+                ? await buildVerifyDiffEvidence(args.sessionDirectory, batch)
+                : null;
+        const prompt = buildVerifyPrompt(args.projectIdentity, batch, evidence);
         if (args.hiddenCompletionExecutor) {
             const run = await runHiddenSingleShotPrompt({
                 executor: args.hiddenCompletionExecutor,
@@ -338,7 +351,12 @@ async function verifyOneBatch(
                 status: "completed",
                 messages: run.completion.messages ?? [],
             });
-            return applyParsedVerifyManifest(args, batch, run.validated);
+            return applyParsedVerifyManifest(
+                args,
+                batch,
+                run.validated,
+                evidence?.head ?? headAtPrompt,
+            );
         }
         const client = args.client;
         if (!client) throw new Error("verify requires a client or hidden completion executor");
@@ -409,7 +427,12 @@ async function verifyOneBatch(
         promptSettled = true;
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
-        return await applyParsedVerifyManifest(args, batch, run.validated);
+        return await applyParsedVerifyManifest(
+            args,
+            batch,
+            run.validated,
+            evidence?.head ?? headAtPrompt,
+        );
     } catch (error) {
         const desc = describeError(error);
         const providerFailure =
@@ -501,6 +524,7 @@ async function applyParsedVerifyManifest(
     args: VerifyArgs,
     batch: VerifyPromptMemory[],
     parsed: ParsedVerifyManifest,
+    headAtPrompt?: string | null,
 ): Promise<VerifyVerdictCounts> {
     const batchIds = new Set(batch.map((m) => m.id));
     const batchById = new Map(batch.map((memory) => [memory.id, memory]));
@@ -538,6 +562,8 @@ async function applyParsedVerifyManifest(
         return { verified: 0, updated: 0, archived: 0, skipped: 0, refused: 0 };
     }
     const now = Date.now();
+    const verifiedHead =
+        headAtPrompt === undefined ? await readGitHead(args.sessionDirectory) : headAtPrompt;
 
     // Pre-normalize files OUTSIDE the transaction (git/realpath I/O). For each
     // affected id, the COMPLETE backing set the agent reports.
@@ -677,6 +703,7 @@ async function applyParsedVerifyManifest(
             if (!isPrimaryMutable(memory)) continue;
             if (w.kind === "verify") {
                 recordMemoryVerifications(args.db, w.id, w.files, now);
+                if (verifiedHead) recordVerifiedCommit(args.db, memory, now, verifiedHead);
                 verified += 1;
             } else if (w.kind === "update") {
                 rewriteMemoryContent(args.db, memory, w.content, w.hash);
@@ -700,6 +727,21 @@ async function applyParsedVerifyManifest(
         }
     });
     return { verified, updated, archived, skipped, refused };
+}
+
+function recordVerifiedCommit(db: Database, memory: Memory, at: number, head: string): void {
+    let metadata: Record<string, unknown> = {};
+    try {
+        const parsed: unknown = JSON.parse(memory.metadataJson ?? "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+            metadata = parsed as Record<string, unknown>;
+    } catch {
+        /* Preserve verification even when old metadata is malformed. */
+    }
+    db.prepare("UPDATE memories SET metadata_json = ? WHERE id = ?").run(
+        JSON.stringify({ ...metadata, dreamerVerifiedAt: at, dreamerVerifiedCommit: head }),
+        memory.id,
+    );
 }
 
 async function normalizeFiles(args: VerifyArgs, rawFiles: readonly string[]): Promise<string[]> {
