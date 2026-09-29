@@ -4788,6 +4788,10 @@ pub struct ModuleMeta {
     /// cache-busting pass. A genuinely new physical tail renders its tag immediately.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub pending_tag_block_ids: BTreeSet<String>,
+    /// User rows whose synthetic treatment was corrected on a priced pass. Old tag rows
+    /// remain addressable by ctx_reduce, but must no longer select legacy wire rendering.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reclassified_synthetic_mids: BTreeSet<String>,
     /// Auto-search decisions targeting a previously served block remain hidden until an
     /// independent cache-busting pass. A genuinely new physical tail renders immediately and
     /// never enters this set.
@@ -9647,6 +9651,34 @@ impl McStore {
                 params![session_id, block_id, candidate],
             )?;
             Ok(changed > 0)
+        })?)
+    }
+
+    /// Probe only the supplied block IDs through the session/block index, without reading
+    /// tag payloads or scanning the session's tag history.
+    pub fn tagged_block_ids_among(
+        &self,
+        session_id: &str,
+        candidates: &[String],
+    ) -> Result<HashSet<String>, McStoreError> {
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        Ok(self.inner.with_conn(|conn| {
+            let mut found = HashSet::new();
+            for chunk in candidates.chunks(400) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT block_id FROM mc_tags WHERE session_id = ? AND block_id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let params = std::iter::once(session_id).chain(chunk.iter().map(String::as_str));
+                let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| row.get(0))?;
+                for row in rows {
+                    found.insert(row?);
+                }
+            }
+            Ok(found)
         })?)
     }
 
@@ -22048,6 +22080,47 @@ mod tests {
         assert_eq!(
             snapshot.tag_count,
             store.load_tags_for_session(session_id).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn tagged_block_probe_is_bounded_to_candidates_without_payload_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let tags = (0..600)
+            .map(|index| TagMintInput {
+                block_id: format!("row-{index}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: vec![b'x'; 1024],
+            })
+            .collect::<Vec<_>>();
+        store.mint_or_get_tags("ses", &tags, 100).unwrap();
+        store.reset_tag_payload_query_count_for_test();
+        assert!(store.tagged_block_ids_among("ses", &[]).unwrap().is_empty());
+        assert_eq!(store.tag_payload_query_count_for_test(), 0);
+        let mut candidates = (0..401)
+            .map(|index| format!("absent-{index}#0"))
+            .collect::<Vec<_>>();
+        candidates.push("row-599#0".to_string());
+        assert_eq!(
+            store.tagged_block_ids_among("ses", &candidates).unwrap(),
+            HashSet::from(["row-599#0".to_string()]),
+        );
+        assert_eq!(store.tag_payload_query_count_for_test(), 0);
+        let plan: String = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "EXPLAIN QUERY PLAN SELECT block_id FROM mc_tags WHERE session_id = ? AND block_id IN (?, ?)",
+                    params!["ses", "row-599#0", "missing#0"],
+                    |row| row.get(3),
+                )
+            })
+            .unwrap();
+        assert!(
+            plan.contains("INDEX") && plan.contains("block_id"),
+            "{plan}"
         );
     }
 

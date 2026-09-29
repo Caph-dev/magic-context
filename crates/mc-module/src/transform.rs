@@ -2356,25 +2356,42 @@ fn previously_tagged_synthetic_rows(
     store: &McStore,
     req: &TransformRequest,
 ) -> Result<Option<TransformRequest>, TransformError> {
-    if !req
-        .messages
-        .iter()
-        .any(|message| message.ck.meta.synthetic && message.ck.role == "user")
-    {
+    if !req.messages.iter().any(|message| {
+        message.ck.meta.synthetic && message.ck.role == "user" && !message.ck.content.is_empty()
+    }) {
         return Ok(None);
     }
-    let tagged: HashSet<String> = store
-        .load_tags_for_session(&req.session_id)?
-        .into_iter()
-        .filter_map(|row| split_block_id(&row.block_id).map(|(mid, _)| mid.to_string()))
+    let reclassified = store
+        .load(&req.session_id)?
+        .meta
+        .reclassified_synthetic_mids;
+    let candidate_blocks: Vec<String> = req
+        .messages
+        .iter()
+        .filter(|message| {
+            message.ck.meta.synthetic
+                && message.ck.role == "user"
+                && !reclassified.contains(&message.mid)
+        })
+        .flat_map(|message| {
+            (0..message.ck.content.len()).map(|index| format!("{}#{index}", message.mid))
+        })
         .collect();
+    if candidate_blocks.is_empty() {
+        return Ok(None);
+    }
+    let tagged = store.tagged_block_ids_among(&req.session_id, &candidate_blocks)?;
     if tagged.is_empty() {
         return Ok(None);
     }
     let mut legacy = req.clone();
     let mut changed = false;
     for message in &mut legacy.messages {
-        if message.ck.meta.synthetic && message.ck.role == "user" && tagged.contains(&message.mid) {
+        if message.ck.meta.synthetic
+            && !reclassified.contains(&message.mid)
+            && (0..message.ck.content.len())
+                .any(|index| tagged.contains(&format!("{}#{index}", message.mid)))
+        {
             message.ck.meta.synthetic = false;
             changed = true;
         }
@@ -2399,6 +2416,13 @@ fn apply_once_with_estimator_and_projection(
     } else {
         None
     };
+    let reclassified_on_bust: BTreeSet<String> = legacy_req
+        .as_ref()
+        .into_iter()
+        .flat_map(|legacy| legacy.messages.iter().zip(&req.messages))
+        .filter(|(legacy, ingress)| !legacy.ck.meta.synthetic && ingress.ck.meta.synthetic)
+        .map(|(_, ingress)| ingress.mid.clone())
+        .collect();
     let mut replay_legacy_treatment = legacy_req.is_some();
     loop {
         let mut boundary_divergence_detected = false;
@@ -2422,6 +2446,7 @@ fn apply_once_with_estimator_and_projection(
             &mut boundary_divergence_detected,
             incremental_history,
             replay_legacy_treatment,
+            &reclassified_on_bust,
         ) {
             Err(TransformError::SyntheticTreatmentBust | TransformError::CoverageGap(_))
                 if replay_legacy_treatment =>
@@ -3459,6 +3484,7 @@ fn apply_once(
     boundary_divergence_detected: &mut bool,
     incremental_history: bool,
     replay_legacy_treatment: bool,
+    reclassified_on_bust: &BTreeSet<String>,
 ) -> Result<TransformWithProjection, TransformError> {
     *boundary_divergence_detected = false;
     if !ctx.compaction_enabled {
@@ -4947,6 +4973,10 @@ fn apply_once(
     let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;
     if replay_legacy_treatment && is_provider_prefix_mutation_pass {
         return Err(TransformError::SyntheticTreatmentBust);
+    }
+    if is_provider_prefix_mutation_pass {
+        meta.reclassified_synthetic_mids
+            .extend(reclassified_on_bust.iter().cloned());
     }
     // A defer replays previously served provider bytes even in a subagent: its tool loop
     // has an Anthropic cached prefix too. Hold overlays first discovered on served blocks
@@ -29608,6 +29638,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn synthetic_reclassification_probe_never_reads_full_tag_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = active_opencode_req("probe", "cfg0", vec![item("plain", 1, "plain")]);
+        s.reset_tag_payload_query_count_for_test();
+        assert!(previously_tagged_synthetic_rows(&s, &request)
+            .unwrap()
+            .is_none());
+        assert_eq!(s.tag_payload_query_count_for_test(), 0);
+        request.messages[0].ck.meta.synthetic = true;
+        assert!(previously_tagged_synthetic_rows(&s, &request)
+            .unwrap()
+            .is_none());
+        assert_eq!(s.tag_payload_query_count_for_test(), 0);
+    }
+
+    #[test]
     fn previously_tagged_synthetic_notice_keeps_priced_prefix_on_append_defer() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -29662,6 +29709,37 @@ pub(crate) mod tests {
             .unwrap();
         assert!(notice.meta.synthetic);
         assert!(!serde_json::to_string(notice).unwrap().contains("§2§"));
+        let busted_prefix = busted.messages().to_vec();
+        let durable = s.load("synthetic-defer").unwrap();
+        assert!(durable.meta.reclassified_synthetic_mids.contains("notice"));
+        assert!(s
+            .load_tags_for_session("synthetic-defer")
+            .unwrap()
+            .iter()
+            .any(|row| row.block_id == "notice#0"));
+        bust_request
+            .messages
+            .push(item("later", 5, "second appended user"));
+        let after_bust = run(&s, &bust_request, &spine());
+        assert_eq!(after_bust.action, "SOFT+");
+        let shared_after_bust = &after_bust.messages()[..busted_prefix.len()];
+        assert_eq!(
+            serde_json::to_vec(shared_after_bust).unwrap(),
+            serde_json::to_vec(&busted_prefix).unwrap(),
+            "the first defer after the bust must preserve the corrected CK prefix"
+        );
+        assert_eq!(
+            serde_json::to_vec(&native(shared_after_bust)).unwrap(),
+            serde_json::to_vec(&native(&busted_prefix)).unwrap(),
+            "the first defer after the bust must preserve corrected native bytes"
+        );
+        assert_eq!(
+            s.load("synthetic-defer")
+                .unwrap()
+                .meta
+                .reclassified_synthetic_mids,
+            durable.meta.reclassified_synthetic_mids
+        );
     }
 
     #[test]
