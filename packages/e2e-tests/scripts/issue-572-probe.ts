@@ -7,10 +7,14 @@ import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { estimateTokens } from "../../plugin/src/hooks/magic-context/read-session-formatting";
 
 // Run with TMPDIR under a throwaway magic-context/issue-572 root.
 // configured uses a fixed 262144 window; fallback has no model limit; learned
 // records a ninfer overflow limit before restart; proven grows accepted input.
+// shrink lowers a configured window to 32768 after caching a large baseline,
+// with reported usage at 22000 and a growing, unreclaimable user-text tail.
+// The mock does not enforce a context wall; local token counts expose pressure.
 // In proven mode, baseline requires repeated render-config folds, while stable
 // requires frozen restart bytes and exactly one fold after a policy edit.
 // See docs/reports/issue-572-render-budget-plan.md for isolation and caveats.
@@ -24,6 +28,7 @@ const records: Array<{
 	identity: string;
 	hash: string;
 }> = [];
+const wirePrefixes: string[] = [];
 const mock = new MockProvider();
 const { baseURL } = await mock.start();
 const normal = { text: "ok", usage: { input_tokens: 1000, output_tokens: 10 } };
@@ -43,7 +48,7 @@ const opts = {
 			git_commit_indexing: { enabled: false },
 		},
 	},
-	...(mode === "configured"
+	...((mode === "configured" || mode === "shrink")
 		? {}
 		: {
 				openCodeConfigExtra: {
@@ -92,7 +97,7 @@ async function turn(id: string, n: number) {
 			? "decision result ".repeat(
 					Math.ceil(([261171, 270000, 280000, 280000][n - 1] * 4) / 16),
 				)
-			: "";
+			: mode === "shrink" && n >= 1 && n <= 3 ? "decision result ".repeat(5000) : "";
 	const result = await fetch(host.url + "/session/" + id + "/message", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
@@ -121,6 +126,14 @@ async function turn(id: string, n: number) {
 		cached_m0_upgrade_state: string;
 		cached_m0_bytes: Uint8Array;
 	};
+	console.log("M0_CHARS", n, row.cached_m0_bytes.byteLength);
+	if (mode === "shrink") {
+		const request = mock.requests().slice(before).find((r) =>
+			JSON.stringify(r.body.input ?? r.body.messages).includes("turn " + n + " "),
+		);
+		if (request) console.log("SHRINK_WIRE_LOCAL_TOKENS", n,
+			estimateTokens(JSON.stringify(request.body.input ?? request.body.messages)));
+	}
 	records.push({
 		turn: n,
 		identity: row.cached_m0_upgrade_state,
@@ -135,6 +148,20 @@ async function turn(id: string, n: number) {
 			),
 	});
 	snapshotDb.close();
+	if (mode === "proven" && n >= 1 && n <= 4) {
+		const request = mock.requests().slice(before).find((r) =>
+			JSON.stringify(r.body.input ?? r.body.messages).includes("turn " + n + " "),
+		);
+		if (!request) throw new Error("no main provider wire captured");
+		// Compare the actual serialized provider prefix before the current user
+		// text, not the database's cached m[0] blob. This includes system and m[1].
+		const wire = JSON.stringify(request.body.input ?? request.body.messages);
+		const end = wire.indexOf("turn " + n + " ");
+		if (end < 0) throw new Error("current user text absent from provider wire");
+		const prefix = wire.slice(0, end);
+		wirePrefixes.push(prefix);
+		console.log("WIRE_PREFIX", n, prefix.length, createHash("sha256").update(prefix).digest("hex"));
+	}
 	if (
 		!result.ok ||
 		(response.info?.error && n !== 98) ||
@@ -169,7 +196,7 @@ try {
 				endMessageId: seedMessageId,
 				title: "Seed history",
 				content: "",
-				p1: "Remember the isolated fixture.",
+				p1: mode === "shrink" ? "Remember the isolated fixture. ".repeat(1600) : "Remember the isolated fixture.",
 				p2: "Fixture.",
 				p3: "Fixture.",
 				p4: "Fixture.",
@@ -186,6 +213,7 @@ try {
 		"UPDATE session_meta SET cached_m1_bytes = NULL WHERE session_id = ?",
 	).run(session.id);
 	db.close();
+	if (mode === "shrink") mock.setDefault({ text: "ok", usage: { input_tokens: 22000, output_tokens: 10 } });
 	await turn(session.id, 10);
 	if (mode === "learned") {
 		mock.script([
@@ -202,7 +230,7 @@ try {
 	}
 	const env = host.env;
 	await host.kill();
-	host = await spawnOpencode({ ...opts, existingEnv: env });
+	host = await spawnOpencode({ ...opts, ...(mode === "shrink" ? { modelContextLimit: 32768 } : {}), existingEnv: env });
 	isolate();
 	for (let n = 1; n <= 3; n++) {
 		if (mode === "proven")
@@ -225,6 +253,14 @@ try {
 	)
 		throw new Error("baseline did not reproduce repeated render-config folds");
 	if (gate === "stable") {
+		// Requests append conversation turns. The initial system/history prefix
+		// must remain a byte-identical prefix of every later request.
+		const initial = wirePrefixes[0];
+		if (!initial || wirePrefixes.some((wire) => !wire.startsWith(initial)))
+			throw new Error("provider shared prefix changed as proven input rose");
+		for (const [index, prefix] of wirePrefixes.entries())
+			console.log("SHARED_PREFIX_SHA256", index + 1, initial.length,
+				createHash("sha256").update(prefix.slice(0, initial.length)).digest("hex"));
 		if (
 			restartRecords.some((r) => r.folds.length > 0) ||
 			new Set(restartRecords.map((r) => r.hash)).size !== 1

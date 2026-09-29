@@ -1157,6 +1157,58 @@ describe("m[0]/m[1] materialization", () => {
         expect(state.cachedM0UpgradeState).toContain("hp0.15:percentage:40");
     });
 
+    it("review: legacy policy adoption survives restart until a natural HARD", () => {
+        db = makeDb();
+        const options = {
+            db, sessionId: SESSION_ID, projectPath: PROJECT_PATH,
+            projectDirectory: makeProjectDir(), historyBudgetTokens: 12000,
+        };
+        const first = injectM0M1({ ...options, state: readStateFromMeta() });
+        const legacy = readStateFromMeta().cachedM0UpgradeState;
+        expect(legacy).toContain("-h12000");
+        const current = { ...options, historyBudgetTokens: 16000,
+            historyBudgetPolicyIdentity: "p0.15:percentage:40" };
+        for (let restart = 0; restart < 2; restart++) {
+            clearInjectionCache(SESSION_ID);
+            const replay = injectM0M1({ ...current, state: readStateFromMeta(), isCacheBustingPass: false });
+            expect(replay.m0RematerializedThisPass).toBe(false);
+            expect(replay.m0Bytes).toEqual(first.m0Bytes);
+            expect(readStateFromMeta().cachedM0UpgradeState).toBe(legacy);
+        }
+        const hard = injectM0M1({ ...current, state: readStateFromMeta(),
+            hardSignals: { systemHash: "natural-hard", modelKey: "", cacheExpired: false, lastResponseTime: 0 } });
+        expect(hard.decision.reason).toBe("system_hash");
+        expect(hard.m0RematerializedThisPass).toBe(true);
+        expect(readStateFromMeta().cachedM0UpgradeState).toContain("-hp0.15:percentage:40");
+    });
+
+    it("review: shrinking history budget with empty m1 does not refold even on a priced pass", () => {
+        db = makeDb();
+        storeDatedCompartment();
+        const options = {
+            db, sessionId: SESSION_ID, projectPath: PROJECT_PATH,
+            projectDirectory: makeProjectDir(), historyBudgetTokens: 12000,
+            hardSignals: { modelKey: "review/larger-model", systemHash: "", cacheExpired: false, lastResponseTime: 0 },
+            historyBudgetPolicyIdentity: "p0.15:percentage:40",
+        };
+        const first = injectM0M1({ ...options, state: readStateFromMeta(), isCacheBustingPass: true });
+        expect(first.m0Bytes?.toString()).toContain("dated compartment");
+        const shrink = { ...options, historyBudgetTokens: 1 };
+        for (const isCacheBustingPass of [false, true, true]) {
+            const replay = injectM0M1({ ...shrink, state: readStateFromMeta(), isCacheBustingPass });
+            expect(replay.m0RematerializedThisPass).toBe(false);
+            expect(replay.m0Bytes).toEqual(first.m0Bytes);
+            expect(estimateTokens(replay.m0Bytes!.toString())).toBeGreaterThan(shrink.historyBudgetTokens);
+        }
+        const switched = injectM0M1({ ...shrink, state: readStateFromMeta(),
+            hardSignals: { modelKey: "review/smaller-model", systemHash: "", cacheExpired: false, lastResponseTime: 0 } });
+        expect(switched.decision.reason).toBe("model_change");
+        expect(switched.m0RematerializedThisPass).toBe(true);
+        expect(readStateFromMeta().cachedM0ModelKey).toBe("review/smaller-model");
+        expect(injectM0M1({ ...shrink, state: readStateFromMeta(),
+            hardSignals: { modelKey: "review/smaller-model", systemHash: "", cacheExpired: false, lastResponseTime: 0 } }).m0RematerializedThisPass).toBe(false);
+    });
+
     it("mustMaterialize returns true on first call", () => {
         db = makeDb();
         const decision = mustMaterialize({
