@@ -49,7 +49,7 @@ esac
         (self.bin / "ck-mc").write_bytes(deployed.read_bytes())
         (self.bin / "ck-mc").chmod(0o755)
         for name, body in {
-            "codesign": '#!/bin/sh\ncase "$1" in --verify) exit 0;; -dv) printf "Executable=x\\nIdentifier=ck-mc\\nFormat=Mach-O\\n" >&2;; esac\n',
+            "codesign": '#!/bin/sh\ncase "$1" in --verify) exit 0;; -dv) if [ "${FAKE_UNHARDENED:-}" = 1 ]; then f="0x2(adhoc)"; else f="0x10002(adhoc,runtime)"; fi; printf "Executable=x\\nIdentifier=ck-mc\\nFormat=Mach-O\\nCodeDirectory v=20500 size=1 flags=$f hashes=1+0 location=embedded\\n" >&2;; esac\n',
             "ck": '''#!/bin/sh
 case "$*" in
   'module restart magic-context') exit 0 ;;
@@ -146,6 +146,16 @@ python3 -c 'import os; p=os.environ["FAKE_DEPLOYED"]; print("i" + str(os.stat(p)
         self.assertIn("cp ", run.stderr)
         self.assertIn("ck module restart magic-context", run.stderr)
         self.assertNotEqual((self.bin / "ck-mc").read_bytes(), before)
+
+    def test_unhardened_build_is_refused_before_anything_moves(self):
+        before = (self.bin / "ck-mc").read_bytes()
+        env = dict(self.env, FAKE_UNHARDENED="1")
+        run = subprocess.run(["bash", str(SCRIPT), str(self.staged)], env=env,
+                             cwd=ROOT, capture_output=True, text=True)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("not signed with hardened runtime", run.stderr)
+        self.assertEqual((self.bin / "ck-mc").read_bytes(), before)
+        self.assertFalse((self.bin / "staging").exists())
 
     def test_dry_run_never_writes(self):
         def snapshot():

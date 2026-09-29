@@ -28,6 +28,18 @@ cd "$root"
 codesign --verify --strict "$staged" >/dev/null 2>&1 || die "invalid staged code signature"
 signature=$(codesign -dv --verbose=2 "$staged" 2>&1) || die "cannot read staged signature"
 [[ "$signature" == *$'\nIdentifier=ck-mc\n'* ]] || die "staged signature identifier is not ck-mc"
+# Hardened runtime is what stops another same-user process attaching a debugger to
+# read the module's launch code. Sign with `codesign --force --sign - --options runtime
+# --identifier ck-mc`; a build without it, or with get-task-allow, is refused.
+require_hardened() {
+    local sig
+    sig=$(codesign -dv --verbose=2 "$1" 2>&1) || die "cannot read signature of $1"
+    [[ "$sig" =~ flags=0x[[:xdigit:]]+\(([^\)]*)\) && ",${BASH_REMATCH[1]}," == *,runtime,* ]] ||
+        die "$1 is not signed with hardened runtime (re-sign with --options runtime)"
+    ! codesign -d --entitlements - "$1" 2>/dev/null | grep -q get-task-allow ||
+        die "$1 carries the get-task-allow entitlement"
+}
+require_hardened "$staged"
 sha_from() {
     local line sha
     line=$("$1" --version) || die "cannot read $1 --version"
@@ -141,6 +153,8 @@ for line in sys.stdin:
 [[ "$running_inode" == "$(stat -f %i "$deployed")" ]] || { echo "running inode $running_inode differs from placed inode $(stat -f %i "$deployed")" >&2; false; }
 [[ "$(sha_from "$deployed")" == "$staged_sha" ]] || false
 [[ "$(shasum -a 256 "$deployed" | cut -d' ' -f1)" == "$staged_digest" ]] || false
+# Check the placed file itself, not only the staged one: a later re-sign would strip it.
+require_hardened "$deployed"
 # Health reads "unknown" until the new process answers its first probe; allow it to settle.
 health_ok=0
 for _ in $(seq 1 30); do
