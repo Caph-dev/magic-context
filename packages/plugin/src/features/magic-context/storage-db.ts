@@ -530,8 +530,17 @@ function classifyJunkDiscovery(
 export function inspectRpcServerDiscovery(
     storageDir: string,
     processes?: AsyncProcessInspection,
+    options?: {
+        /** Give up after this many milliseconds. Only interactive CLI callers set it. */
+        deadlineMs?: number;
+        /** Report progress on long scans. Plugin hosts pass nothing, so nothing reaches their stderr. */
+        onProgress?: (checked: number, total: number) => void;
+    },
 ): RpcServerDiscovery {
-    const deadline = Date.now() + 15_000;
+    const deadline =
+        options?.deadlineMs === undefined
+            ? Number.POSITIVE_INFINITY
+            : Date.now() + options.deadlineMs;
     let progressAt = Date.now() + 3_000;
     const rpcRoot = join(storageDir, "rpc");
     let projectEntries: Dirent[];
@@ -573,12 +582,10 @@ export function inspectRpcServerDiscovery(
     for (const [index, portFile] of portFiles.entries()) {
         if (Date.now() >= deadline)
             throw new Error(
-                "RPC holder inspection timed out after 15 seconds; no merge was applied. Close hosts and retry.",
+                `RPC holder inspection timed out after ${Math.round((options?.deadlineMs ?? 0) / 1000)} seconds (${index}/${portFiles.length} records checked). Close OpenCode and Pi, then retry.`,
             );
-        if (Date.now() >= progressAt) {
-            console.error(
-                `Inspecting RPC database holders: ${index}/${portFiles.length} records checked`,
-            );
+        if (options?.onProgress && Date.now() >= progressAt) {
+            options.onProgress(index, portFiles.length);
             progressAt = Date.now() + 3_000;
         }
         let raw: string;

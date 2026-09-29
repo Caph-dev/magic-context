@@ -75,7 +75,11 @@ interface SalvageResult {
 
 export function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
     const processes = process.platform === "win32" ? inspectWindowsProcessesSync() : undefined;
-    const rpc = inspectRpcServerDiscovery(storageDir, processes);
+    const rpc = inspectRpcServerDiscovery(storageDir, processes, {
+        deadlineMs: 15_000,
+        onProgress: (checked, total) =>
+            console.error(`Inspecting RPC database holders: ${checked}/${total} records checked`),
+    });
     if (rpc.state === "unreadable") {
         const arm = rpc.unreadableArm === "parse" ? "could not be parsed" : "could not be read";
         return {

@@ -1449,20 +1449,36 @@ it("RPC holder inspection reports slow progress and refuses after its deadline",
         liveness: () => "inconclusive" as const,
         evidence: () => ({ startTime: null, commandLine: null }),
     };
+    const cliOptions = (onProgress: (checked: number, total: number) => void) => ({
+        deadlineMs: 15_000,
+        onProgress,
+    });
+    const progress: string[] = [];
     let ticks = 0;
     const clock = spyOn(Date, "now").mockImplementation(() => (++ticks <= 2 ? 0 : 4000));
-    const report = spyOn(console, "error").mockImplementation(() => {});
     try {
-        expect(inspectRpcServerDiscovery(storage, processes).state).toBe("inconclusive");
-        expect(report).toHaveBeenCalledWith("Inspecting RPC database holders: 0/1 records checked");
+        expect(
+            inspectRpcServerDiscovery(
+                storage,
+                processes,
+                cliOptions((checked, total) => progress.push(`${checked}/${total}`)),
+            ).state,
+        ).toBe("inconclusive");
+        expect(progress).toEqual(["0/1"]);
         ticks = 0;
         clock.mockImplementation(() => (++ticks <= 2 ? 0 : 16000));
-        expect(() => inspectRpcServerDiscovery(storage, processes)).toThrow(
-            "timed out after 15 seconds",
-        );
+        expect(() =>
+            inspectRpcServerDiscovery(
+                storage,
+                processes,
+                cliOptions(() => {}),
+            ),
+        ).toThrow("timed out after 15 seconds");
         expect(existsSync(join(rpc, "port-100000.json"))).toBe(true);
+        // Plugin hosts pass no options: a slow scan neither reports nor gives up.
+        ticks = 0;
+        expect(inspectRpcServerDiscovery(storage, processes).state).toBe("inconclusive");
     } finally {
         clock.mockRestore();
-        report.mockRestore();
     }
 });
