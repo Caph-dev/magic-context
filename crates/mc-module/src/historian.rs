@@ -2454,6 +2454,7 @@ where
             harness: request.harness,
             awaiting,
             output: output.clone(),
+            max_output_tokens: Some(crate::historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
             observed_chunk_fingerprint: request.observed_chunk_fingerprint,
             validation_chunk: request.validation_chunk,
             chunk_transcript: request.chunk_transcript,
@@ -2700,6 +2701,7 @@ pub async fn run_historian_firing_on_host(
         harness: request.harness,
         awaiting: claimed.clone(),
         output,
+        max_output_tokens: None,
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
@@ -2844,6 +2846,7 @@ pub fn adopt_historian_run_on_host(
         harness: request.harness,
         awaiting,
         output,
+        max_output_tokens: None,
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
@@ -3025,6 +3028,7 @@ where
         harness: request.harness,
         awaiting,
         output,
+        max_output_tokens: None,
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
@@ -3055,6 +3059,7 @@ struct PublishOutputRequest<'a> {
     harness: &'a str,
     awaiting: HistorianDurableState,
     output: ProducerOutput,
+    max_output_tokens: Option<u32>,
     observed_chunk_fingerprint: &'a str,
     validation_chunk: &'a HistorianChunk,
     chunk_transcript: &'a str,
@@ -3079,6 +3084,7 @@ fn publish_output_from_awaiting(
         harness,
         awaiting,
         output,
+        max_output_tokens,
         observed_chunk_fingerprint,
         validation_chunk,
         chunk_transcript,
@@ -3093,8 +3099,11 @@ fn publish_output_from_awaiting(
         publication_fence,
     } = request;
     // The host report does not carry usage; omitted values must not look like zero spend.
-    let tokens =
-        crate::historian_producer::producer_token_log(output.usage, None, output.length_capped);
+    let tokens = crate::historian_producer::producer_token_log(
+        output.usage,
+        max_output_tokens,
+        output.length_capped,
+    );
     tracing::info!(
         session_id,
         response_chars = output.text.chars().count(),
