@@ -87,9 +87,10 @@ describe("storage-meta", () => {
             //#then
             // The shared deleter prepares and executes every table inside one
             // encompassing transaction; message-index rows no longer need a
-            // separate nested cleanup transaction.
+            // separate nested cleanup transaction. The last statement removes the
+            // session's retrospective activity mark.
             expect(db.transaction).toHaveBeenCalledTimes(1);
-            expect(db.prepare).toHaveBeenCalledTimes(31);
+            expect(db.prepare).toHaveBeenCalledTimes(32);
         });
     });
 });
