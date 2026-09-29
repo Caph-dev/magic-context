@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
 	getTagsBySession,
@@ -163,7 +164,7 @@ for (const latchControl of [false, true]) {
 		const childDb = process.env.MC_NATIVE_EPISODE_RESTART_DB;
 		const directory = childDb
 			? dirname(childDb)
-			: mkdtempSync(join(import.meta.dir, ".native-episode-"));
+			: mkdtempSync(join(tmpdir(), "pi-native-episode-"));
 		const dbPath = childDb ?? join(directory, "context.db");
 		const f = fixture(sessionId, dbPath);
 		try {
