@@ -1,4 +1,5 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import * as https from "node:https";
 
 import {
@@ -227,6 +228,47 @@ describe("createPinnedLookup", () => {
 });
 
 describe("guarded HTTPS request agent", () => {
+    test("reports the URL and observed bytes at the hard body ceiling", async () => {
+        const response = new EventEmitter() as EventEmitter & {
+            statusCode: number;
+            destroy: () => void;
+        };
+        response.statusCode = 200;
+        response.destroy = () => {};
+        const request = new EventEmitter() as EventEmitter & {
+            end: () => void;
+            destroy: () => void;
+        };
+        request.destroy = () => {};
+        request.end = () => {
+            queueMicrotask(() => response.emit("data", Buffer.alloc(65_537)));
+        };
+        const spy = spyOn(https, "request").mockImplementation(((
+            _options: unknown,
+            callback: (response: typeof response) => void,
+        ) => {
+            callback(response);
+            return request;
+        }) as typeof https.request);
+        try {
+            const error = await requestValidatedAddress(
+                {
+                    url: new URL("https://example.test/CHANGELOG.md"),
+                    hostname: "example.test",
+                    addresses: [],
+                },
+                { address: "93.184.216.34", family: 4, classification: "global" },
+                { signal, timeoutMs: 100, bodyLimitBytes: 65_536 },
+            ).catch((caught: unknown) => caught);
+            expect(error).toBeInstanceOf(SmartNoteNetworkError);
+            expect(error.message).toMatch(
+                /example\.test\/CHANGELOG\.md \(received at least 65537 bytes; limit 65536\)/,
+            );
+            expect(error.persistent).toBe(true);
+        } finally {
+            spy.mockRestore();
+        }
+    });
     test("does not use a pre-seeded keep-alive global agent", async () => {
         // Intercept at addRequest: every request routed through an Agent must
         // enter addRequest, and it exists on every supported runtime — bun's

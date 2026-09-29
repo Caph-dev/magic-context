@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { createSmartNoteCapabilities, type SmartNoteCapabilityApi } from "./capabilities";
 import {
+    dryRunSmartNoteCheck,
     manifestAdvisoryWarnings,
     normalizeCompiledCheck,
     normalizeCron,
@@ -12,6 +13,7 @@ import {
     parseCompilerOutput,
 } from "./compiler";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { SmartNoteNetworkError } from "./types";
 
 const fakeCap: SmartNoteCapabilityApi = {
     readFile: async (filePath) => (filePath === "ready.txt" ? "ready" : null),
@@ -99,6 +101,66 @@ describe("smart-note compiler runtime boundary", () => {
 
         const result = await runCompiledSmartNoteCheck({ compiledCheck, capabilities: fakeCap });
         expect(result).toEqual({ ok: true, result: { met: true } });
+    });
+});
+
+describe("smart-note compiler dry-run sources", () => {
+    const check = `function check(cap) {
+        var first = cap.httpGet("https://raw.githubusercontent.com/cortexkit/claustrum/main/CHANGELOG.md");
+        if (first.status === 200 && first.body.includes("credential_categories")) return { met: true };
+        var second = cap.httpGet("https://raw.githubusercontent.com/cortexkit/claustrum/main/schema.sql");
+        return { met: second.status === 200 && second.body.includes("credential_categories") };
+    }`;
+
+    test("keeps all-404 sources compilable and reports an advisory", async () => {
+        const result = await dryRunSmartNoteCheck(check, () => ({
+            ...fakeCap,
+            httpGet: async () => ({ status: 404, body: "404: Not Found" }),
+        }));
+        expect(result).toMatchObject({ ok: true, result: { met: false } });
+        expect(result.advisories[0]).toContain("CHANGELOG.md (HTTP 404)");
+        expect(result.advisories[0]).toContain("schema.sql (HTTP 404)");
+    });
+
+    test("retains a large-response network error instead of treating it as unmet", async () => {
+        const url = "https://raw.githubusercontent.com/cortexkit/claustrum/main/CHANGELOG.md";
+        const result = await dryRunSmartNoteCheck(check, () => ({
+            ...fakeCap,
+            httpGet: async () => {
+                throw new SmartNoteNetworkError(
+                    `SMART_NOTE_NETWORK: response body too large at ${url} (received at least 65537 bytes; limit 65536)`,
+                    { terminal: true, persistent: true },
+                );
+            },
+        }));
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+            expect(result.error).toContain(url);
+            expect(result.error).toContain("65537 bytes");
+            expect(result.persistent).toBe(true);
+        }
+    });
+
+    test("a reachable source prevents an all-inaccessible failure", async () => {
+        const result = await dryRunSmartNoteCheck(check, () => ({
+            ...fakeCap,
+            httpGet: async (url) => ({
+                status: url.endsWith("schema.sql") ? 200 : 404,
+                body: "no category yet",
+            }),
+        }));
+        expect(result).toEqual({ ok: true, result: { met: false }, advisories: [] });
+    });
+
+    test("a terminal timeout does not become a persistent compilation failure", async () => {
+        const result = await dryRunSmartNoteCheck(check, () => ({
+            ...fakeCap,
+            httpGet: async () => {
+                throw new SmartNoteNetworkError("request timed out", { terminal: true });
+            },
+        }));
+        expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.persistent).toBe(false);
     });
 });
 

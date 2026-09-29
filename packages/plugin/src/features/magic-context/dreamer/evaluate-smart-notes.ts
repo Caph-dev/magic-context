@@ -328,6 +328,8 @@ async function compileNote(
                         note.id,
                         now,
                         MAX_COMPILATION_FAILURES,
+                        result.error,
+                        result.persistent,
                     );
                 },
             });

@@ -18318,8 +18318,17 @@ fn format_note_body(note: &StoredNote, now_ms: i64) -> String {
             .as_deref()
             .unwrap_or("No condition recorded")
     };
+    let failure = if note.status == "pending" {
+        note.ready_reason
+            .as_deref()
+            .filter(|reason| reason.starts_with("Condition can't be checked:"))
+            .map(|reason| format!("\n  {reason}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     format!(
-        "{head}\n  {}: {condition}",
+        "{head}\n  {}: {condition}{failure}",
         if note.status == "ready" {
             "Condition met"
         } else {
@@ -29656,6 +29665,20 @@ mod tests {
                     "updated_at": 4
                 }),
             },
+            AuthoritySeedRow {
+                source_row_id: 44,
+                snapshot: json!({
+                    "type": "smart",
+                    "project_path": "/repo",
+                    "session_id": "session",
+                    "content": "uncheckable condition",
+                    "status": "pending",
+                    "surface_condition": "when private source changes",
+                    "ready_reason": "Condition can't be checked: HTTP 404; rewrite it",
+                    "created_at": 5,
+                    "updated_at": 6
+                }),
+            },
         ];
         store
             .seed_authority_rows("context-db", "/repo", "notes", &rows)
@@ -29688,6 +29711,15 @@ mod tests {
         assert!(output.contains("## Notes"));
         assert!(output.contains("seeded before migration 52"));
         assert!(output.contains("seeded after migration 52"));
+        let body = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "read", "note_ids": [3]}),
+            )
+            .await,
+        );
+        assert!(body.contains("Condition can't be checked: HTTP 404; rewrite it"));
 
         drop(handler);
         drop(store);

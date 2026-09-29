@@ -16,7 +16,7 @@ import { runHiddenSingleShotPrompt } from "../dreamer/hidden-single-shot";
 import { recordChildInvocation } from "../subagent-token-capture";
 import type { SmartNoteCapabilityFactory } from "./capabilities";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./compiler-prompt";
-import { runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { type RunCompiledSmartNoteCheckResult, runCompiledSmartNoteCheck } from "./sandbox-runner";
 import {
     SMART_NOTE_CHECK_CEILING_MS,
     type SmartNoteCapabilityName,
@@ -54,6 +54,7 @@ export interface CompileSmartNoteFailure {
     ok: false;
     cancelled: boolean;
     error: string;
+    persistent: boolean;
 }
 
 export type CompileSmartNoteResult = CompileSmartNoteSuccess | CompileSmartNoteFailure;
@@ -74,7 +75,12 @@ export async function compileSmartNoteCheck(
     args: CompileSmartNoteArgs,
 ): Promise<CompileSmartNoteResult> {
     if (!args.note.surfaceCondition) {
-        return { ok: false, cancelled: false, error: "note has no surface condition" };
+        return {
+            ok: false,
+            cancelled: false,
+            error: "note has no surface condition",
+            persistent: false,
+        };
     }
     const prompt = `Compile this smart note condition into a sandbox check.
 
@@ -199,15 +205,17 @@ Remember: output only the JSON object described by the system prompt.`;
         const compiledCheck = normalizeCompiledCheck(response.compiled_check);
         const manifest = normalizeManifest(response.manifest);
         const checkCron = normalizeCron(response.check_cron);
-        for (const warning of manifestAdvisoryWarnings(compiledCheck, manifest)) {
+        const dryRun = await dryRunSmartNoteCheck(
+            compiledCheck,
+            args.capabilityFactory,
+            args.signal,
+        );
+        for (const warning of [
+            ...manifestAdvisoryWarnings(compiledCheck, manifest),
+            ...dryRun.advisories,
+        ]) {
             log(`[dreamer] smart note #${args.note.id}: manifest advisory — ${warning}`);
         }
-        const dryRun = await runCompiledSmartNoteCheck({
-            compiledCheck,
-            capabilityFactory: args.capabilityFactory,
-            signal: args.signal,
-            timeoutMs: 2_000,
-        });
         if (!dryRun.ok) {
             const error = boundedError(`dry-run failed: ${dryRun.error}`);
             recordInvocation({
@@ -215,7 +223,12 @@ Remember: output only the JSON object described by the system prompt.`;
                 messages: outputMessages,
                 error,
             });
-            return { ok: false, cancelled: dryRun.cancelled, error };
+            return {
+                ok: false,
+                cancelled: dryRun.cancelled,
+                error,
+                persistent: !dryRun.cancelled && dryRun.persistent,
+            };
         }
         recordInvocation({ status: "completed", messages: outputMessages });
         return {
@@ -230,7 +243,7 @@ Remember: output only the JSON object described by the system prompt.`;
         const cancelled = args.signal.aborted;
         const message = boundedError(error instanceof Error ? error.message : String(error));
         recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
-        return { ok: false, cancelled, error: message };
+        return { ok: false, cancelled, error: message, persistent: false };
     } finally {
         // The carrier branch closes its own run; only the child-session branch
         // leaves a session behind to tear down.
@@ -246,6 +259,41 @@ Remember: output only the JSON object described by the system prompt.`;
             });
         }
     }
+}
+
+export async function dryRunSmartNoteCheck(
+    compiledCheck: string,
+    capabilityFactory: SmartNoteCapabilityFactory,
+    signal?: AbortSignal,
+): Promise<RunCompiledSmartNoteCheckResult & { advisories: string[] }> {
+    const responses: Array<{ url: string; status: number }> = [];
+    const dryRun = await runCompiledSmartNoteCheck({
+        compiledCheck,
+        capabilityFactory: (runSignal) => {
+            const capabilities = capabilityFactory(runSignal);
+            return {
+                ...capabilities,
+                httpGet: async (url) => {
+                    const response = await capabilities.httpGet(url);
+                    responses.push({ url, status: response.status });
+                    return response;
+                },
+            };
+        },
+        signal,
+        timeoutMs: 2_000,
+    });
+    // A note can wait for a release artifact that does not exist yet, so
+    // inaccessible HTTP sources are advisory rather than compilation errors.
+    const advisories =
+        dryRun.ok &&
+        responses.length > 0 &&
+        responses.every(({ status }) => status === 401 || status === 403 || status === 404)
+            ? [
+                  `all HTTP sources currently return 401/403/404: ${responses.map(({ url, status }) => `${url} (HTTP ${status})`).join(", ")}`,
+              ]
+            : [];
+    return { ...dryRun, advisories };
 }
 
 export function parseCompilerOutput(output: string | null): CompilerResponse {
