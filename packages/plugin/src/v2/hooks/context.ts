@@ -639,8 +639,18 @@ export async function registerContext(context: V2Context) {
                 // child reaches the host's delete route directly — through the registration
                 // the child recorded when it was created, never through whichever service
                 // happens to be registered now.
-                remove: (input: { sessionID: string; owner?: HostServiceOwner }) =>
-                    removeHostSession(input.sessionID, input.owner),
+                remove: (input: {
+                    sessionID: string;
+                    owner?: HostServiceOwner;
+                    directory?: string;
+                }) =>
+                    removeHostSession(
+                        input.sessionID,
+                        input.owner,
+                        process.env,
+                        fetch,
+                        input.directory,
+                    ),
             },
             {
                 db: database,

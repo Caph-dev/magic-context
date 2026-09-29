@@ -124,7 +124,7 @@ const OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
 const TASKLIST_NO_TASKS_PATTERN =
     /^INFO:\s+No tasks are running which match the specified criteria\.?$/im;
 const WINDOWS_CIM_COMMAND =
-    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress";
+    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate | ConvertTo-Json -Compress";
 const PI_HARNESS_ARC_MARKERS = [
     "pi-coding-agent",
     "oh-my-pi",
@@ -595,7 +595,12 @@ function parseWindowsCimOutput(output: string): ProcessFacts[] | null {
             pid,
             parentPid: Number.isInteger(parentPid) && parentPid > 0 ? parentPid : null,
             commandLine,
-            imageName: commandLine ? executableName(commandTokens(commandLine)[0]) : null,
+            imageName:
+                typeof record.Name === "string"
+                    ? record.Name
+                    : commandLine
+                      ? executableName(commandTokens(commandLine)[0])
+                      : null,
             startTime: parseWindowsCreationDate(record.CreationDate),
         });
     }
@@ -859,6 +864,11 @@ function isValidPort(port: number): boolean {
 /** One bounded, shared process scan for asynchronous storage opens. */
 export interface AsyncProcessInspection {
     pi: PiProcessDiscovery;
+    /** Includes process names and commands so offline maintenance can rule out live store users. */
+    processSnapshot?: {
+        source: ProcessSnapshotSource;
+        facts: Array<{ pid: number; imageName: string | null; commandLine: string | null }>;
+    };
     evidence(pid: number): ProcessProbeEvidence;
     liveness(pid: number): PidLiveness;
 }
@@ -890,8 +900,9 @@ export function __setAsyncProcessProbeForTests(probe?: typeof execProcessListAsy
     lastAsyncSnapshot = null;
 }
 
-export function inspectProcessesAsync(): Promise<AsyncProcessInspection> {
-    if (asyncInspection && rpcIdentityNowMs() < asyncInspectionExpires) return asyncInspection;
+export function inspectProcessesAsync(forceFresh = false): Promise<AsyncProcessInspection> {
+    if (!forceFresh && asyncInspection && rpcIdentityNowMs() < asyncInspectionExpires)
+        return asyncInspection;
     asyncInspectionExpires = Number.POSITIVE_INFINITY;
     asyncInspection = (async () => {
         let snapshot: ProcessSnapshot | null = null;
@@ -961,6 +972,9 @@ export function inspectProcessesAsync(): Promise<AsyncProcessInspection> {
             pi: snapshot
                 ? classifyLivePiSnapshot(snapshot, false)
                 : { state: "unreadable", processIds: [] },
+            ...(fresh && snapshot
+                ? { processSnapshot: { source: snapshot.source, facts: snapshot.facts } }
+                : {}),
             evidence: (pid: number) => ({
                 startTime: byPid.get(pid)?.startTime ?? null,
                 commandLine: byPid.get(pid)?.commandLine ?? byPid.get(pid)?.imageName ?? null,

@@ -72,6 +72,31 @@ test("async Windows inspection bypasses slow synchronous probes and shares a bou
     expect(synchronousCalls).toBe(0);
 });
 
+test("offline process inspection can bypass a cached snapshot", async () => {
+    __setRpcIdentityTestHooks({ platform: "win32" });
+    let calls = 0;
+    __setAsyncProcessProbeForTests(async () => {
+        calls++;
+        return JSON.stringify([
+            {
+                ProcessId: calls + 100,
+                ParentProcessId: 1,
+                Name: "opencode.exe",
+                CommandLine: null,
+                CreationDate: "2026-09-28T00:00:00Z",
+            },
+        ]);
+    });
+    const cached = await inspectProcessesAsync();
+    expect((await inspectProcessesAsync()).processSnapshot).toBe(cached.processSnapshot);
+    const fresh = await inspectProcessesAsync(true);
+    expect(fresh.processSnapshot?.source).toBe("cim");
+    expect(fresh.processSnapshot?.facts).toContainEqual(
+        expect.objectContaining({ pid: 102, imageName: "opencode.exe", commandLine: null }),
+    );
+    expect(calls).toBe(2);
+});
+
 test("async Windows inspection bounds CIM and tasklist fallback and caches failure", async () => {
     __setRpcIdentityTestHooks({ platform: "win32" });
     const calls: Array<[string, number]> = [];

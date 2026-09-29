@@ -108,7 +108,7 @@ test("OpenCode 2 hidden historian retires a child after a provider error and del
 
         const command = async (
             seq: number,
-            options: { temperature?: number; maxOutputTokens?: number; generation?: string } = {},
+            options: { temperature?: number; maxOutputTokens?: number; generation?: string; keepSubagents?: boolean; dreamer?: boolean } = {},
         ) => {
             const resultPath = join(host.cwd, `hidden-child-result-${seq}.json`);
             writeFileSync(
@@ -294,9 +294,105 @@ test("OpenCode 2 hidden historian retires a child after a provider error and del
         expect(
             host.mock.requests().filter((request) => request.body.model === "mock-model-user"),
         ).toHaveLength(0);
+
+        // A successful hidden child can serve later runs. When a new generation retires it,
+        // keep_subagents preserves its host session instead of deleting it.
+        const kept = await command(6, {
+            generation: "ga-proof-generation-5",
+            keepSubagents: true,
+        });
+        expect(kept.ok).toBe(true);
+        const next = await command(7, {
+            generation: "ga-proof-generation-6",
+            keepSubagents: true,
+        });
+        expect(next.ok).toBe(true);
+        expect(storedSession(storePath, kept.childID).exists).toBe(true);
+        const keptRoots = await client.session.list({ directory: host.cwd, parentID: null });
+        expect(keptRoots.data.some((session) => session.id === kept.childID)).toBe(true);
+
+        const dreamerFirst = await command(8, { dreamer: true });
+        expect(dreamerFirst.ok).toBe(true);
+        const dreamerSecond = await command(9, { dreamer: true });
+        expect(dreamerSecond.ok).toBe(true);
+        expect(dreamerSecond.childID).toBe(dreamerFirst.childID);
+        const dreamerThird = await command(10, {
+            dreamer: true,
+            generation: "ga-proof-generation-7",
+        });
+        expect(dreamerThird.ok).toBe(true);
+        await eventually(() => !storedSession(storePath, dreamerFirst.childID).exists);
+        const dreamerRoots = await client.session.list({ directory: host.cwd, parentID: null });
+        expect(dreamerRoots.data.some((session) => session.id === dreamerFirst.childID)).toBe(false);
     } catch (error) {
         console.error(host.stdout(), host.stderr(), JSON.stringify(host.mock.requests()));
         throw error;
+    } finally {
+        await host.stop();
+        rmSync(bundleDir, { recursive: true, force: true });
+    }
+}, 120_000);
+
+
+test("OpenCode 2 bare serve records hidden children for offline doctor cleanup", async () => {
+    const bundleDir = mkdtempSync(join(tmpdir(), "mc-bare-hidden-child-"));
+    const build = await Bun.build({
+        entrypoints: [join(import.meta.dir, "hidden-child-ga-probe.ts")],
+        outdir: bundleDir,
+        naming: "index.js",
+        target: "node",
+        format: "esm",
+        define: { "process.env.NODE_ENV": '"production"' },
+        external: ["bun:sqlite", "node:sqlite"],
+    });
+    if (!build.success) throw new Error(build.logs.join("\n"));
+    const host = await spawnOpencode2({
+        probePlugin: bundleDir,
+        includeMagicContext: false,
+        defaultModelID: "mock-model-user",
+        additionalModelIDs: ["mock-model-cheap"],
+    });
+    try {
+        const client = OpenCode.make({
+            baseUrl: host.url,
+            headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` },
+        });
+        await waitForPluginActive(client, host.cwd, "mc-hidden-child-ga-proof");
+        await waitForFile(join(host.cwd, "hidden-child-ready"));
+        expect(existsSync(serviceRegistrationPath(host.env))).toBe(false);
+        const user = await client.session.create({
+            title: "user session",
+            location: { directory: host.cwd },
+            model: { providerID: "openai", id: "mock-model-user" },
+        });
+        const command = async (seq: number, generation: string) => {
+            writeFileSync(
+                join(host.cwd, "hidden-child-command.json"),
+                JSON.stringify({ seq, parentSessionID: user.id, generation }),
+            );
+            const resultPath = join(host.cwd, `hidden-child-result-${seq}.json`);
+            await waitForFile(resultPath);
+            return JSON.parse(readFileSync(resultPath, "utf8")) as { ok: boolean; childID: string; owner: unknown };
+        };
+        const first = await command(1, "bare-generation-1");
+        const second = await command(2, "bare-generation-2");
+        expect(first.ok).toBe(true);
+        expect(second.ok).toBe(true);
+        expect(first.owner).toBeNull();
+        const storePath = gaDatabasePath(host.env.XDG_DATA_HOME!, "latest", host.env);
+        expect(storedSession(storePath, first.childID).exists).toBe(true);
+        const roots = await client.session.list({ directory: host.cwd, parentID: null });
+        expect(roots.data.some((session) => session.id === first.childID)).toBe(true);
+        const context = new Database(join(host.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"), {
+            readonly: true,
+            fileMustExist: true,
+        });
+        try {
+            const rows = context.prepare("SELECT value FROM schema_migrations_meta WHERE key LIKE 'opencode2_hidden_children:%'").all() as Array<{ value: string }>;
+            expect(rows.some(({ value }) => JSON.parse(value).retired_children.some((child: { id: string }) => child.id === first.childID))).toBe(true);
+        } finally {
+            context.close();
+        }
     } finally {
         await host.stop();
         rmSync(bundleDir, { recursive: true, force: true });
