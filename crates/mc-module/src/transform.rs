@@ -29690,6 +29690,10 @@ pub(crate) mod tests {
         messages[1].ck.meta.synthetic = true;
         let healed = run(&s, &active_opencode_req("ses", "cfg0", messages), &spine());
         assert_eq!(healed.action, "HARD");
+        assert!(
+            healed.first_divergence.is_some(),
+            "the coverage fold must price a prefix bust"
+        );
         assert_eq!(healed.coverage_ordinal, Some(3));
         assert!(healed
             .messages()
