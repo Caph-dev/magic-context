@@ -137,9 +137,21 @@ describe("Pi context project identity cache", () => {
 			};
 
 			const firstHash = await pass();
+			const binding = () =>
+				db
+					.prepare(
+						"SELECT project_path, updated_at FROM session_projects WHERE session_id = ? AND harness = 'pi'",
+					)
+					.get(sessionId) as {
+					project_path: string;
+					updated_at: number;
+				} | null;
+			const firstBinding = binding();
+			expect(firstBinding?.project_path).toMatch(/^dir:[0-9a-f]{12}$/);
 			expect(probes).toBeGreaterThan(0);
 			probes = 0;
 			expect(await pass()).toBe(firstHash);
+			expect(binding()).toEqual(firstBinding);
 			expect(probes).toBe(0);
 			expect(usageReads).toBe(2);
 		} finally {
@@ -147,6 +159,51 @@ describe("Pi context project identity cache", () => {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 			rmSync(project, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("Pi project binding retry", () => {
+	it("retries a failed first write without adding steady-state writes", () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-retry-binding";
+		const schema = (
+			db
+				.prepare(
+					"SELECT sql FROM sqlite_master WHERE name = 'session_projects'",
+				)
+				.get() as { sql: string }
+		).sql;
+		try {
+			db.exec("DROP TABLE session_projects");
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:retry",
+				db,
+			);
+			db.exec(schema);
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:retry",
+				db,
+			);
+			const binding = () =>
+				db
+					.prepare(
+						"SELECT project_path, updated_at FROM session_projects WHERE session_id = ? AND harness = 'pi'",
+					)
+					.get(sessionId);
+			const first = binding();
+			expect(first).toMatchObject({ project_path: "git:retry" });
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:retry",
+				db,
+			);
+			expect(binding()).toEqual(first);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
 		}
 	});
 });

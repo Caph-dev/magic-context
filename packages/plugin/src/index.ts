@@ -451,35 +451,42 @@ const server: Plugin = async (ctx) => {
                 const ocDb = openOpenCodeDb();
                 if (!ocDb) return;
                 try {
-                    await runSessionProjectBackfill(db, (afterSessionId, limit) => {
-                        const rows = (
-                            afterSessionId === null
-                                ? ocDb
-                                      .prepare(
-                                          `SELECT id, COALESCE(directory, '') AS directory
+                    await runSessionProjectBackfill(
+                        db,
+                        (afterSessionId, limit) => {
+                            const rows = (
+                                afterSessionId === null
+                                    ? ocDb
+                                          .prepare(
+                                              `SELECT id, COALESCE(directory, '') AS directory
                                        FROM session
                                        ORDER BY id ASC
                                        LIMIT ?`,
-                                      )
-                                      .all(limit)
-                                : ocDb
-                                      .prepare(
-                                          `SELECT id, COALESCE(directory, '') AS directory
+                                          )
+                                          .all(limit)
+                                    : ocDb
+                                          .prepare(
+                                              `SELECT id, COALESCE(directory, '') AS directory
                                        FROM session
                                        WHERE id > ?
                                        ORDER BY id ASC
                                        LIMIT ?`,
-                                      )
-                                      .all(afterSessionId, limit)
-                        ) as Array<{
-                            id: string;
-                            directory: string;
-                        }>;
-                        return rows.map((session) => ({
-                            sessionId: session.id,
-                            directory: session.directory,
-                        }));
-                    });
+                                          )
+                                          .all(afterSessionId, limit)
+                            ) as Array<{
+                                id: string;
+                                directory: string;
+                            }>;
+                            return rows.map((session) => ({
+                                sessionId: session.id,
+                                directory: session.directory,
+                            }));
+                        },
+                        {
+                            leaseKey: "opencode:session-projects-creation-v2",
+                            allowHomeProject: pluginConfig.allow_home_project,
+                        },
+                    );
                 } finally {
                     closeQuietly(ocDb);
                 }

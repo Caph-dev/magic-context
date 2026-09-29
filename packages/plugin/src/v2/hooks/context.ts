@@ -788,7 +788,11 @@ export async function registerContext(context: V2Context) {
     if (db && isDatabasePersisted(db)) {
         const backfillDb = db;
         scheduleAfterBootQuiet(() => {
-            runV2SessionProjectBackfill(backfillDb, openStoreReader).catch((error: unknown) =>
+            runV2SessionProjectBackfill(
+                backfillDb,
+                openStoreReader,
+                config.allow_home_project,
+            ).catch((error: unknown) =>
                 log("[session-project-backfill] OpenCode 2 backfill failed:", error),
             );
         });

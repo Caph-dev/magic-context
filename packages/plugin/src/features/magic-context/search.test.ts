@@ -141,6 +141,77 @@ describe("unifiedSearch", () => {
         }
     });
 
+    it("recovers identifier-bearing questions without embeddings while preserving exact-hit output", async () => {
+        const memory = insertMemory(db, {
+            projectPath: "git:recall",
+            category: "CONSTRAINTS",
+            content: "Set cache_timeout in src/config.json for worker retries",
+        });
+        rawMessagesBySession.set("ses-recall", [
+            {
+                ordinal: 1,
+                id: "m-recall",
+                role: "assistant",
+                parts: [
+                    {
+                        type: "text",
+                        text: "cache_timeout in src/config.json controls worker retries",
+                    },
+                ],
+            },
+            {
+                ordinal: 2,
+                id: "m-other",
+                role: "assistant",
+                parts: [{ type: "text", text: "unrelated orange banana" }],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-recall", readMessages);
+        const options: UnifiedSearchOptions = {
+            sources: ["memory", "message"],
+            limit: 50,
+            embeddingEnabled: false,
+            explicitSearch: true,
+            isEmbeddingRuntimeEnabled: () => false,
+            countRetrievals: false,
+            measurementDisabled: true,
+        };
+        const exact = await unifiedSearch(
+            db,
+            "ses-recall",
+            "git:recall",
+            "cache_timeout config.json",
+            options,
+        );
+        expect(exact.map((hit) => ({ source: hit.source, content: hit.content }))).toEqual([
+            {
+                source: "message",
+                content: "cache_timeout in src/config.json controls worker retries",
+            },
+            {
+                source: "memory",
+                content: "Set cache_timeout in src/config.json for worker retries",
+            },
+        ]);
+        const question = await unifiedSearch(
+            db,
+            "ses-recall",
+            "git:recall",
+            "Where does cache_timeout get configured in src/config.json when embeddings are offline?",
+            options,
+        );
+        expect(question.map((hit) => hit.source)).toEqual(["message", "memory"]);
+        expect(question.some((hit) => hit.source === "memory" && hit.memoryId === memory.id)).toBe(
+            true,
+        );
+        expect(
+            question.some((hit) => hit.source === "message" && hit.messageId === "m-recall"),
+        ).toBe(true);
+        expect(
+            question.some((hit) => hit.source === "message" && hit.messageId === "m-other"),
+        ).toBe(false);
+    });
+
     it("returns ranked results across memories and messages (no facts)", async () => {
         const memory = insertMemory(db, {
             projectPath: "/repo/project",
@@ -165,7 +236,12 @@ describe("unifiedSearch", () => {
                 ordinal: 1,
                 id: "m1",
                 role: "user",
-                parts: [{ type: "text", text: "Can you add ranked search across the history?" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "Can you add ranked search across the history?",
+                    },
+                ],
             },
             {
                 ordinal: 2,
@@ -380,7 +456,12 @@ describe("unifiedSearch", () => {
                 ordinal: 1,
                 id: "m1",
                 role: "user",
-                parts: [{ type: "text", text: "delete all entries in the ranked_search table" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "delete all entries in the ranked_search table",
+                    },
+                ],
             },
             {
                 ordinal: 2,
@@ -1118,7 +1199,12 @@ describe("unifiedSearch", () => {
                 ordinal: 2,
                 id: "m2",
                 role: "user",
-                parts: [{ type: "text", text: "unrelated chatter about something else entirely" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "unrelated chatter about something else entirely",
+                    },
+                ],
             },
         ]);
         ensureMessagesIndexed(db, "ses-probe", readMessages);
@@ -1249,7 +1335,12 @@ describe("unifiedSearch", () => {
             ordinal: i + 1,
             id: `f${i}`,
             role: "assistant",
-            parts: [{ type: "text", text: `CommonTerm appears here in filler message ${i}` }],
+            parts: [
+                {
+                    type: "text",
+                    text: `CommonTerm appears here in filler message ${i}`,
+                },
+            ],
         }));
         const rare = {
             ordinal: 31,
@@ -1341,7 +1432,12 @@ describe("unifiedSearch", () => {
                 ordinal: 4,
                 id: "a2",
                 role: "assistant",
-                parts: [{ type: "text", text: "The indexed ticket search now supports history." }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "The indexed ticket search now supports history.",
+                    },
+                ],
             },
         ]);
         ensureMessagesIndexed(db, "ses-2", readMessages);
@@ -1542,7 +1638,10 @@ describe("unifiedSearch", () => {
 
         expect(results.some((result) => result.source === "message")).toBe(false);
         const compartment = results.find((result) => result.source === "compartment");
-        expect(compartment).toMatchObject({ source: "compartment", matchType: "hybrid" });
+        expect(compartment).toMatchObject({
+            source: "compartment",
+            matchType: "hybrid",
+        });
         expect(compartment && "snippet" in compartment ? compartment.snippet : "").toContain(
             "bounded drains",
         );
@@ -1552,8 +1651,18 @@ describe("unifiedSearch", () => {
     // keeps the compartment lane; only turning embedding off removes it.
     it("respects message watermark cutoff for compartment chunks and ignores memory.enabled", async () => {
         rawMessagesBySession.set("ses-cutoff", [
-            { ordinal: 1, id: "u1", role: "user", parts: [{ type: "text", text: "first" }] },
-            { ordinal: 2, id: "a2", role: "assistant", parts: [{ type: "text", text: "second" }] },
+            {
+                ordinal: 1,
+                id: "u1",
+                role: "user",
+                parts: [{ type: "text", text: "first" }],
+            },
+            {
+                ordinal: 2,
+                id: "a2",
+                role: "assistant",
+                parts: [{ type: "text", text: "second" }],
+            },
         ]);
         ensureMessagesIndexed(db, "ses-cutoff", readMessages);
         seedCompartmentChunkEmbedding(db, "ses-cutoff", "/repo/cutoff", new Float32Array([0, 1]));

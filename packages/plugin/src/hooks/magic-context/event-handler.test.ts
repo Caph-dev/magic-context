@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { recordMessageFtsRowid } from "../../features/magic-context/message-fts-rowid-map";
 import {
     __resetMessageIndexAsyncForTests,
@@ -575,6 +575,38 @@ describe("createEventHandler", () => {
         });
 
         expect(getOrCreateSessionMeta(openDatabase(), "ses-root").isSubagent).toBe(false);
+    });
+
+    it("binds host-created children without a transform and does not bind directoryless events", async () => {
+        useTempDataHome("context-event-binding-");
+        const handler = createEventHandler(createDeps(new Map()));
+        const directory = mkdtempSync(join(tmpdir(), "context-child-project-"));
+        tempDirs.push(directory);
+        for (const [id, parentID] of [
+            ["ses-parent", ""],
+            ["ses-child", "ses-parent"],
+        ]) {
+            await handler({
+                event: {
+                    type: "session.created",
+                    properties: { info: { id, parentID, directory } },
+                },
+            });
+        }
+        await handler({
+            event: {
+                type: "session.created",
+                properties: { info: { id: "ses-no-dir", parentID: "ses-parent" } },
+            },
+        });
+        const rows = openDatabase()
+            .prepare("SELECT session_id, project_path FROM session_projects ORDER BY session_id")
+            .all() as Array<{ session_id: string; project_path: string }>;
+        const identity = resolveProjectIdentityForSession(directory);
+        expect(rows).toEqual([
+            { session_id: "ses-child", project_path: identity },
+            { session_id: "ses-parent", project_path: identity },
+        ]);
     });
 
     it("marks child sessions as subagents", async () => {

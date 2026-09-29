@@ -1,4 +1,5 @@
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
     detectOverflow,
@@ -6,6 +7,7 @@ import {
     isPrefixBoundThinkingModel,
 } from "../../features/magic-context/overflow-detection";
 import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     armThinkingBindingRecovery,
     clearDetectedContextLimit,
@@ -111,6 +113,7 @@ export interface EventHandlerDeps {
     onRustWireInvalidated?: (sessionId: string) => void;
     onSessionDeleted?: (sessionId: string) => Promise<void> | void;
     rustSessionCleanup?: boolean;
+    allowHomeProject?: boolean;
     config: {
         clear_reasoning_age?: number;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
@@ -309,6 +312,14 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             try {
+                // The host's creation directory also covers children that never run a transform.
+                if (info.directory) {
+                    recordSessionProjectIdentity(
+                        deps.db,
+                        info.id,
+                        resolveProjectIdentityForSession(info.directory, deps.allowHomeProject),
+                    );
+                }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
                 updateSessionMeta(deps.db, info.id, {
                     isSubagent: info.parentID.length > 0,

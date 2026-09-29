@@ -386,6 +386,7 @@ function logPiLkgRecovery(sessionId: string, message: string): void {
 }
 
 export const __test = {
+	updateSessionProjectTracking,
 	isPiHardCacheExpired,
 	adoptPiFallbackTags,
 	buildEntryFingerprintMap,
@@ -556,6 +557,7 @@ const deferredHistoryRefreshSessions = new Set<string>();
 const deferredMaterializationSessions = new Set<string>();
 const sessionsByProject = new Map<string, Set<string>>();
 const lastSeenProjectIdentityBySession = new Map<string, string>();
+const persistedProjectIdentityBySession = new Map<string, string>();
 const rawMessageProviderUnregistersBySession = new Map<string, () => void>();
 const activeContextHandlerSessions = new Set<string>();
 const lastHeuristicsTurnIdBySession = new Map<string, string>();
@@ -932,19 +934,18 @@ function updateSessionProjectTracking(
 		if (prevSessions?.size === 0) sessionsByProject.delete(prev);
 		clearPiSystemPromptSession(sessionId);
 	}
-	// Persist the session→project ownership binding so the project-scoped
-
-	// session's compartments to the right project. ctx.cwd is the authoritative
-	// session directory in Pi (no SDK/launch-dir ambiguity), so every observation
-	// is host-safe. Guarded to the once-per-(session,identity) transition — only
-	// on first sight or an actual identity change — so steady-state passes carry
-	// no per-pass DB write. embedSessionCompartmentChunks also self-records, so
-	// this only widens coverage to passively-published sessions.
-	if (db && prev !== projectIdentity) {
+	// Pi's session cwd is host-owned, so persist its project binding even for
+	// sessions that never embed chunks. Retry failed writes on later observations;
+	// successful bindings do not write on steady-state passes.
+	if (
+		db &&
+		persistedProjectIdentityBySession.get(sessionId) !== projectIdentity
+	) {
 		try {
 			recordSessionProjectIdentity(db, sessionId, projectIdentity);
+			persistedProjectIdentityBySession.set(sessionId, projectIdentity);
 		} catch {
-			// best-effort; backfill re-records on demand from the session command
+			// Retry on the next observation; tracking a session is not proof of persistence.
 		}
 	}
 	trackSessionForProject(projectIdentity, sessionId);
@@ -7543,6 +7544,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	lastHeuristicsTurnIdBySession.delete(sessionId);
 	routinePressureAppliedBySession.delete(sessionId);
 	lastSeenProjectIdentityBySession.delete(sessionId);
+	persistedProjectIdentityBySession.delete(sessionId);
 	for (const [projectIdentity, sessions] of sessionsByProject) {
 		sessions.delete(sessionId);
 		if (sessions.size === 0) sessionsByProject.delete(projectIdentity);
