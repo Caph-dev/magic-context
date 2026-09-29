@@ -113,11 +113,13 @@ import {
 import type { LiveModelBySession } from "./hook-handlers";
 import {
     capturePrefixTrimSourceOrder,
+    clearInjectionCache,
     findHostCompactionWindow,
     type HostCompactionWindow,
     mustMaterialize,
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
+    resetPrefixTrimFallbackState,
     selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
 import { saveLkgSlotToDb } from "./lkg-persist";
@@ -133,6 +135,7 @@ import {
     recordHighPressureNoEligibleHead,
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
+import { truncateUnreachableCompartmentHistory } from "./reachable-compartment-history";
 import { readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
@@ -1126,6 +1129,34 @@ export function createTransform(deps: TransformDeps) {
                 sessionId,
                 spawnAgentFromMessages(messages),
             );
+        }
+
+        // If an earlier stored message ID is present but a later compartment's
+        // start or end ID is absent, delete that obsolete range before rendering
+        // its summary or trimming messages at its boundary. Host compaction can
+        // hide earlier messages without deleting them, so skip that window.
+        if (!hostCompaction && deps.transformMode !== "rust") {
+            const reachable = new Set(
+                messages
+                    .map((message) => message.info.id)
+                    .filter((id): id is string => typeof id === "string" && id.length > 0),
+            );
+            if (truncateUnreachableCompartmentHistory(db, sessionId, reachable)) {
+                clearInjectionCache(sessionId);
+                resetPrefixTrimFallbackState(sessionId);
+                dropSlot(sessionId, "covered-history-revert");
+                sessionMeta = {
+                    ...sessionMeta,
+                    cachedM0Bytes: null,
+                    cachedM1Bytes: null,
+                    cachedM0MuralDataUrl: null,
+                    cachedM0MuralHash: null,
+                };
+                sessionLog(
+                    sessionId,
+                    "truncated unreachable compartment history; rebuilding the baseline",
+                );
+            }
         }
 
         // Rust mode is an authority adapter, not a second implementation of the
