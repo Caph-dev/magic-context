@@ -141,7 +141,7 @@ it("Pi content marker contention declines only the new decision and retries afte
 	}
 });
 
-it("Node Pi bootstrap retains its timeout and async admission waits out a short pending-op writer", async () => {
+it("Node Pi bootstrap retains its 5s timeout and waits out a short pending-op writer", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-node-admission-"));
 	const path = join(dir, "context.db");
 	const db = createTestDb(path);
@@ -164,13 +164,11 @@ it("Node Pi bootstrap retains its timeout and async admission waits out a short 
 			`
 import { openDatabase } from ${JSON.stringify(storage)};
 import { applyPendingOperations } from ${JSON.stringify(operations)};
-import { withAsyncPrivilegedWriter } from ${JSON.stringify(new URL("../../plugin/src/shared/sqlite.ts", import.meta.url).pathname)};
 const db = openDatabase(${JSON.stringify(path)});
 process.stdout.write('READY ' + db.prepare('PRAGMA busy_timeout').get().timeout + '\\n');
 await new Promise(resolve => process.stdin.once('data', resolve));
 process.stdout.write('ADMITTING\\n');
 const start = performance.now();
-await withAsyncPrivilegedWriter(db, () => undefined);
 const changed = applyPendingOperations('node-wait', db, new Map([[1, { setContent: () => true }]]), new Set());
 process.stdout.write(JSON.stringify({ changed, elapsed: performance.now() - start }) + '\\n');
 db.close();

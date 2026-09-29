@@ -229,7 +229,7 @@ function servedText(messages: MessageLike[]): string[] {
 }
 
 describe("Rust-mode compaction target recording under cross-process write contention", () => {
-    it("yields for a lock released within the foreground budget, serves the module output and records the target once", async () => {
+    it("waits for a lock released within busy_timeout, serves the module output and records the target once", async () => {
         const { db, dbPath } = openFileDb();
         expect(busyTimeoutMs(db)).toBe(5000);
         const sessionId = "ses_lock_released";
@@ -257,8 +257,8 @@ describe("Rust-mode compaction target recording under cross-process write conten
 
     it("serves the module output and skips recording when the lock outlasts bounded acquisition retries", async () => {
         const { db, dbPath } = openFileDb();
-        // The foreground admission has its own budget; this connection's normal
-        // timeout must be restored even when the separate locker outlasts it.
+        // A short timeout stands in for the production 5 s so the test stays fast;
+        // the lock is held well past it.
         db.exec("PRAGMA busy_timeout = 300");
         const sessionId = "ses_lock_held";
         const sessionLog = spyOn(logger, "sessionLog");
@@ -271,11 +271,12 @@ describe("Rust-mode compaction target recording under cross-process write conten
                 db,
                 dbPath,
                 sessionId,
-                lockHoldMs: 20000,
+                lockHoldMs: 10000,
                 decision: "SOFT+",
             });
-            // The async admission exhausts before the lock releases.
-            expect(result.elapsedSinceLockMs).toBeLessThan(19500);
+            // Three short busy timeouts plus acquisition backoff must still give
+            // up before the long-held lock releases, without discarding module output.
+            expect(result.elapsedSinceLockMs).toBeLessThan(9000);
             const skipCall = sessionLog.mock.calls.find(
                 ([loggedSession, message]) =>
                     loggedSession === sessionId &&
@@ -290,7 +291,7 @@ describe("Rust-mode compaction target recording under cross-process write conten
         } finally {
             sessionLog.mockRestore();
         }
-    }, 30_000);
+    }, 20_000);
 
     it("leaves a newer pending target unchanged", async () => {
         const { db, dbPath } = openFileDb();

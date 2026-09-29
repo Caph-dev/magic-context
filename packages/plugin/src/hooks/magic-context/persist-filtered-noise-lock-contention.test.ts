@@ -62,7 +62,7 @@ function persistNoiseHead(db: Database, sessionId: string): boolean {
 }
 
 describe("persistFilteredNoise write lock", () => {
-    it("refuses promptly under a write lock without a partial append, then succeeds on retry", async () => {
+    it("waits for another process's write lock instead of failing the read-then-append", async () => {
         mkdirSync(TEST_ROOT, { recursive: true });
         const directory = mkdtempSync(join(TEST_ROOT, "run-"));
         cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -75,14 +75,15 @@ describe("persistFilteredNoise write lock", () => {
 
         const locker = await startSqliteWriteLocker(dbPath, 800);
         const startedAt = performance.now();
+        let saved: boolean;
         try {
-            expect(() => persistNoiseHead(db, sessionId)).toThrow();
-            expect(performance.now() - startedAt).toBeLessThan(250);
-            expect(getCompartments(db, sessionId)).toHaveLength(1);
+            saved = persistNoiseHead(db, sessionId);
         } finally {
             await locker.exited;
         }
-        expect(persistNoiseHead(db, sessionId)).toBe(true);
+
+        expect(performance.now() - startedAt).toBeGreaterThanOrEqual(700);
+        expect(saved).toBe(true);
         expect(getCompartments(db, sessionId).map((row) => row.endMessageId)).toEqual(["m1", "m2"]);
     }, 20_000);
 

@@ -1,47 +1,70 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
     Database,
     isTransientSqliteError,
-    withAsyncPrivilegedWriter,
-    withPrivilegedWriter,
+    withSqliteTransformPass,
+    withPrivilegedWriter as writePrivileged,
 } from "./sqlite";
 
-describe("writer acquisition", () => {
-    test("exhausted async admission preserves the foreground budget and never invokes the callback", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-writer-budget-"));
-        const path = join(dir, "context.db");
-        const blocker = new Database(path);
-        blocker.exec(
-            "CREATE TABLE context_privilege_state(id INTEGER PRIMARY KEY, enabled INTEGER)",
-        );
-        const db = new Database(path);
-        db.exec("PRAGMA busy_timeout=5000");
-        blocker.exec("BEGIN IMMEDIATE");
-        let calls = 0;
-        let ticks = 0;
-        const timer = setInterval(() => ticks++, 50);
-        const started = performance.now();
-        try {
-            await expect(withAsyncPrivilegedWriter(db, () => calls++)).rejects.toThrow(
-                "acquisition remained busy",
-            );
-            expect(performance.now() - started).toBeGreaterThanOrEqual(16_500);
-            expect(performance.now() - started).toBeLessThan(17_500);
-            expect(ticks).toBeGreaterThan(100);
-            expect(calls).toBe(0);
-            expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
-        } finally {
-            clearInterval(timer);
-            blocker.exec("ROLLBACK");
-            blocker.close();
-            db.close();
-            rmSync(dir, { recursive: true, force: true });
-        }
-    }, 30000);
+const withPrivilegedWriter = <T>(db: Database, operation: () => T): T =>
+    withSqliteTransformPass(() => writePrivileged(db, operation));
 
+const wait = spyOn(Atomics, "wait");
+afterEach(() => wait.mockClear());
+afterAll(() => wait.mockRestore());
+
+describe("writer acquisition backoff", () => {
+    for (const clearsOn of [2, 3]) {
+        test(`acquisition clears on attempt ${clearsOn} and invokes callback exactly once`, () => {
+            const db = new Database(":memory:");
+            db.exec(
+                "CREATE TABLE context_privilege_state(id INTEGER PRIMARY KEY, enabled INTEGER); CREATE TABLE result(value TEXT)",
+            );
+            const exec = db.exec.bind(db);
+            let attempts = 0;
+            let callbacks = 0;
+            const delays: number[] = [];
+            wait.mockImplementation((_array, _index, _value, timeout) => {
+                delays.push(timeout!);
+                return "timed-out";
+            });
+            const intercepted = spyOn(db, "exec").mockImplementation((sql) => {
+                if (sql === "BEGIN IMMEDIATE" && ++attempts < clearsOn)
+                    throw Object.assign(new Error("locked"), { code: "SQLITE_BUSY" });
+                return exec(sql);
+            });
+            try {
+                const result = withPrivilegedWriter(db, () => {
+                    callbacks++;
+                    db.prepare("INSERT INTO result VALUES (?)").run("managed");
+                    return JSON.stringify(db.prepare("SELECT * FROM result").all());
+                });
+                expect(result).toBe('[{"value":"managed"}]');
+                expect(attempts).toBe(clearsOn);
+                expect(callbacks).toBe(1);
+                expect(delays).toEqual([500, 1000].slice(0, clearsOn - 1));
+            } finally {
+                intercepted.mockRestore();
+                db.close();
+            }
+        });
+    }
+    test("exhausted acquisition never invokes callback", () => {
+        const db = new Database(":memory:");
+        let calls = 0;
+        wait.mockImplementation(() => "timed-out");
+        const exec = spyOn(db, "exec").mockImplementation(() => {
+            throw Object.assign(new Error("original lock"), { code: "SQLITE_LOCKED" });
+        });
+        try {
+            expect(() => withPrivilegedWriter(db, () => calls++)).toThrow("after 3 attempts");
+            expect(exec).toHaveBeenCalledTimes(3);
+            expect(calls).toBe(0);
+        } finally {
+            exec.mockRestore();
+            db.close();
+        }
+    });
     test("busy callback rolls back without retrying mutations", () => {
         const db = new Database(":memory:");
         db.exec(
@@ -58,11 +81,11 @@ describe("writer acquisition", () => {
             ).toThrow("after acquisition");
             expect(calls).toBe(1);
             expect(db.prepare("SELECT * FROM result").all()).toEqual([]);
+            expect(wait).not.toHaveBeenCalled();
         } finally {
             db.close();
         }
     });
-
     test("recognizes Bun extended and Node numeric contention codes only", () => {
         expect(isTransientSqliteError({ code: "SQLITE_BUSY_SNAPSHOT" })).toBe(true);
         expect(isTransientSqliteError({ code: "ERR_SQLITE_ERROR", errcode: 5 })).toBe(true);

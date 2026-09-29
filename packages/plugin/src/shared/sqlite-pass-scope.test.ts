@@ -1,125 +1,182 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-    beginSqliteWriterAsync,
     Database,
-    SqliteAcquisitionBusyError,
-    withAsyncPrivilegedWriter,
+    withoutSqliteTransformPass,
     withPrivilegedWriter,
     withSqliteTransformPass,
 } from "./sqlite";
-import { startSqliteWriteLocker } from "./sqlite-write-locker-test-support";
 
-function fixture() {
-    const dir = mkdtempSync(join(tmpdir(), "mc-busy-yield-"));
+test("background privileged acquisition attempts once without backoff", () => {
+    const db = new Database(":memory:");
+    const error = Object.assign(new Error("original busy"), { code: "SQLITE_BUSY" });
+    const exec = spyOn(db, "exec").mockImplementation(() => {
+        throw error;
+    });
+    const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    let callbacks = 0;
+    try {
+        expect(() => withPrivilegedWriter(db, () => callbacks++)).toThrow("original busy");
+        expect(exec).toHaveBeenCalledTimes(1);
+        expect(wait).not.toHaveBeenCalled();
+        expect(callbacks).toBe(0);
+    } finally {
+        exec.mockRestore();
+        wait.mockRestore();
+        db.close();
+    }
+});
+
+test("background transaction exhausts one five-second busy timeout", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mc-background-busy-"));
     const path = join(dir, "context.db");
-    const db = new Database(path);
-    db.exec(
-        "PRAGMA journal_mode=WAL; CREATE TABLE context_privilege_state(id INTEGER PRIMARY KEY, enabled INTEGER)",
-    );
-    db.exec("PRAGMA busy_timeout=5000");
-    return {
-        db,
-        path,
-        close: () => {
-            db.close();
-            rmSync(dir, { recursive: true, force: true });
-        },
-    };
-}
-
-test("background acquisition yields quickly and restores the original timeout", () => {
-    const { db, path, close } = fixture();
     const blocker = new Database(path);
+    const writer = new Database(path);
+    blocker.exec("PRAGMA journal_mode=WAL; CREATE TABLE result(value TEXT)");
+    writer.exec("PRAGMA busy_timeout=5000");
     blocker.exec("BEGIN IMMEDIATE");
-    let calls = 0;
+    let callbacks = 0;
     try {
         const start = performance.now();
-        expect(() => db.transaction(() => calls++)()).toThrow();
-        expect(performance.now() - start).toBeLessThan(250);
-        expect(calls).toBe(0);
-        expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+        expect(() => writer.transaction(() => callbacks++)()).toThrow();
+        const elapsed = performance.now() - start;
+        expect(callbacks).toBe(0);
+        expect(elapsed).toBeGreaterThanOrEqual(4500);
+        expect(elapsed).toBeLessThan(7500);
     } finally {
         blocker.exec("ROLLBACK");
         blocker.close();
-        close();
-    }
-});
-
-test("foreground admission keeps the loop ticking while a separate writer holds the lock", async () => {
-    const { db, path, close } = fixture();
-    const locker = await startSqliteWriteLocker(path, 650);
-    let timerFired = false;
-    let calls = 0;
-    try {
-        setTimeout(() => {
-            timerFired = true;
-        }, 100);
-        await withSqliteTransformPass(() =>
-            withAsyncPrivilegedWriter(db, () => {
-                calls++;
-            }),
-        );
-        expect(timerFired).toBe(true);
-        expect(calls).toBe(1);
-        expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
-    } finally {
-        await locker.exited;
-        close();
+        writer.close();
+        rmSync(dir, { recursive: true, force: true });
     }
 }, 30000);
 
-test("a foreground in-pass writer has bounded 250ms tolerance and restores its timeout", () => {
-    const { db, path, close } = fixture();
-    const blocker = new Database(path);
-    blocker.exec("BEGIN IMMEDIATE");
-    try {
-        const start = performance.now();
-        expect(() =>
-            withSqliteTransformPass(() => withPrivilegedWriter(db, () => undefined)),
-        ).toThrow(SqliteAcquisitionBusyError);
-        expect(performance.now() - start).toBeGreaterThanOrEqual(200);
-        expect(performance.now() - start).toBeLessThan(400);
-        expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
-    } finally {
-        blocker.exec("ROLLBACK");
-        blocker.close();
-        close();
-    }
-});
-
-test("ready background publication retries on a timer and retains its write", async () => {
-    const { db, path, close } = fixture();
-    const locker = await startSqliteWriteLocker(path, 650);
-    let ticked = false;
-    try {
-        setTimeout(() => {
-            ticked = true;
-        }, 100);
-        await beginSqliteWriterAsync(db, "historian-publish");
-        db.prepare("INSERT INTO context_privilege_state(id, enabled) VALUES (1, 0)").run();
-        db.exec("COMMIT");
-        expect(ticked).toBe(true);
-        expect(db.prepare("SELECT COUNT(*) AS count FROM context_privilege_state").get()).toEqual({
-            count: 1,
+test("foreground retry scope crosses awaits, nests and excludes detached maintenance", async () => {
+    const db = new Database(":memory:");
+    const error = Object.assign(new Error("busy"), { code: "SQLITE_BUSY" });
+    const exec = spyOn(db, "exec").mockImplementation(() => {
+        throw error;
+    });
+    const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    const acquire = () =>
+        withPrivilegedWriter(db, () => {
+            throw new Error("callback must not run");
         });
-        expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
-    } finally {
-        await locker.exited;
-        close();
-    }
-}, 30000);
-
-test("an in-pass BEGIN tolerates a sibling writer that releases within 250ms", async () => {
-    const { db, path, close } = fixture();
-    const locker = await startSqliteWriteLocker(path, 150);
+    let late: Promise<void> | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+        release = resolve;
+    });
     try {
-        withSqliteTransformPass(() => withPrivilegedWriter(db, () => undefined));
-        expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+        await withSqliteTransformPass(async () => {
+            await Promise.resolve();
+            expect(() => withSqliteTransformPass(acquire)).toThrow("after 3 attempts");
+            expect(exec).toHaveBeenCalledTimes(3);
+            exec.mockClear();
+            wait.mockClear();
+            withoutSqliteTransformPass(() => {
+                expect(acquire).toThrow("busy");
+                expect(exec).toHaveBeenCalledTimes(1);
+                expect(wait).not.toHaveBeenCalled();
+            });
+            exec.mockClear();
+            expect(acquire).toThrow("after 3 attempts");
+            expect(exec).toHaveBeenCalledTimes(3);
+            late = (async () => {
+                await gate;
+                exec.mockClear();
+                wait.mockClear();
+                expect(acquire).toThrow("busy");
+                expect(exec).toHaveBeenCalledTimes(1);
+                expect(wait).not.toHaveBeenCalled();
+            })();
+        });
+        release();
+        await late;
+        exec.mockClear();
+        expect(acquire).toThrow("busy");
+        expect(exec).toHaveBeenCalledTimes(1);
     } finally {
-        await locker.exited;
-        close();
+        release();
+        exec.mockRestore();
+        wait.mockRestore();
+        db.close();
     }
-}, 30000);
+});
+
+test("throwing foreground passes cannot leak retry policy to later work", async () => {
+    const db = new Database(":memory:");
+    const exec = spyOn(db, "exec").mockImplementation(() => {
+        throw Object.assign(new Error("busy"), { code: "SQLITE_BUSY" });
+    });
+    const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    try {
+        await expect(
+            withSqliteTransformPass(async () => {
+                throw new Error("pass failed");
+            }),
+        ).rejects.toThrow("pass failed");
+        expect(() => withPrivilegedWriter(db, () => undefined)).toThrow("busy");
+        expect(exec).toHaveBeenCalledTimes(1);
+        expect(wait).not.toHaveBeenCalled();
+    } finally {
+        exec.mockRestore();
+        wait.mockRestore();
+        db.close();
+    }
+});
+
+test("explicit deferred reads on a writable handle do not contend with the writer", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mc-deferred-read-"));
+    const path = join(dir, "context.db");
+    const writer = new Database(path);
+    const reader = new Database(path);
+    writer.exec(
+        "PRAGMA journal_mode=WAL; CREATE TABLE result(value TEXT); INSERT INTO result VALUES ('committed')",
+    );
+    reader.exec("PRAGMA busy_timeout=0");
+    writer.exec("BEGIN IMMEDIATE");
+    writer.exec("INSERT INTO result VALUES ('uncommitted')");
+    try {
+        const rows = withSqliteTransformPass(() =>
+            reader.transaction(() => reader.prepare("SELECT value FROM result").all()).deferred(),
+        );
+        expect(rows).toEqual([{ value: "committed" }]);
+    } finally {
+        writer.exec("ROLLBACK");
+        writer.close();
+        reader.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("an explicitly started foreground pass owns its lifetime independently", async () => {
+    const db = new Database(":memory:");
+    const exec = spyOn(db, "exec").mockImplementation(() => {
+        throw Object.assign(new Error("busy"), { code: "SQLITE_BUSY" });
+    });
+    const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+        release = resolve;
+    });
+    let child!: Promise<void>;
+    try {
+        await withSqliteTransformPass(async () => {
+            child = withSqliteTransformPass(async () => {
+                await gate;
+                expect(() => withPrivilegedWriter(db, () => undefined)).toThrow("after 3 attempts");
+                expect(exec).toHaveBeenCalledTimes(3);
+            });
+        });
+        release();
+        await child;
+    } finally {
+        release();
+        exec.mockRestore();
+        wait.mockRestore();
+        db.close();
+    }
+});
