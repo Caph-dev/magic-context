@@ -278,7 +278,10 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 memoryInjectionBudgetTokens: 8_000,
                 historyBudgetTokens: 60_000,
             });
-            expect(disabled.decision).toEqual({ value: true, reason: "render_config" });
+            expect(disabled.decision).toEqual({
+                value: true,
+                reason: "render_config:mural(true→false)",
+            });
             expect(disabled.m0RematerializedThisPass).toBe(true);
             expect(imageUrl(disabledMessages)).toBeUndefined();
             expect(disabled.m0Bytes?.toString("utf8")).not.toContain("<memory-mural>");
@@ -330,7 +333,10 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 memoryInjectionBudgetTokens: 1_001,
                 historyBudgetTokens: 2_000,
             });
-            expect(changed.decision).toEqual({ value: true, reason: "render_config" });
+            expect(changed.decision).toEqual({
+                value: true,
+                reason: "render_config:budget(m1000-h2000→m1001-h2000)",
+            });
             expect(changed.m0RematerializedThisPass).toBe(true);
 
             const unchanged = injectM0M1({

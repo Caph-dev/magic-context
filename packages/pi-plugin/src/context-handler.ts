@@ -163,6 +163,7 @@ import {
 import { EmergencyFailClosedError } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import {
 	DEFAULT_CONTEXT_LIMIT,
+	historyBudgetPolicyIdentity,
 	resolveExecuteThreshold,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
@@ -3303,6 +3304,12 @@ export function registerPiContextHandler(
 							// v2 decay rendering needs the HISTORY budget (~60K), not the
 							// memory injection budget (~4K). Compute it from live usage +
 							// historian config, mirroring OpenCode's decayPressure budget.
+							historyBudgetPolicyIdentity: historyBudgetPolicyIdentity(
+								options.historian?.historyBudgetPercentage,
+								options.historian?.executeThresholdPercentage,
+								liveModelBySession.get(sessionId),
+								options.historian?.executeThresholdTokens,
+							),
 							historyBudgetTokens: resolveHistoryBudgetTokensForPi({
 								historyBudgetPercentage:
 									options.historian?.historyBudgetPercentage,
@@ -4891,6 +4898,7 @@ interface RunPipelineArgs {
 		/** v2 decay-render history budget (~60K), distinct from the memory
 		 *  injection budget. Drives compartment tier demotion in renderM0Pi. */
 		historyBudgetTokens?: number;
+		historyBudgetPolicyIdentity?: string;
 		temporalAwareness?: boolean;
 		/** mural.enabled — when enabled, generate a deterministic image of memories that did not fit the context budget whenever the system performs a full (HARD) context fold. */
 		muralEnabled?: boolean;
@@ -5122,6 +5130,7 @@ async function runCompactionOffPipeline(
 				injectDocs: args.injection.injectDocs,
 				injectionBudgetTokens: args.injection.injectionBudgetTokens,
 				historyBudgetTokens: args.injection.historyBudgetTokens,
+				historyBudgetPolicyIdentity: args.injection.historyBudgetPolicyIdentity,
 				muralEnabled: args.injection.muralEnabled === true,
 				compactionOff: true,
 			},
@@ -5349,6 +5358,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					injectDocs: args.injection.injectDocs,
 					injectionBudgetTokens: args.injection.injectionBudgetTokens,
 					historyBudgetTokens: args.injection.historyBudgetTokens,
+					historyBudgetPolicyIdentity:
+						args.injection.historyBudgetPolicyIdentity,
 					hardSignals: piHardSignals,
 					muralEnabled: args.injection.muralEnabled === true,
 					freezePrefixForPass: true,

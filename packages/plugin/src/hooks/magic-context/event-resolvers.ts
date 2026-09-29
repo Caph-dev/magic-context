@@ -522,3 +522,28 @@ export function resolveSessionId(
 
     return undefined;
 }
+
+/**
+ * Identify the configured history fraction and selected execute threshold used
+ * to size history. Catalog refreshes and accepted-input measurements can change
+ * the available window without a user config edit, so they must not invalidate
+ * the cached m[0] prefix. Actual rendering still budgets against that live window.
+ */
+export function historyBudgetPolicyIdentity(
+    historyBudgetPercentage: number | undefined,
+    executeThresholdPercentage: ExecuteThresholdConfig | undefined,
+    modelKey: string | undefined,
+    executeThresholdTokens?: ExecuteThresholdTokensConfig,
+): string {
+    if (!historyBudgetPercentage) return "pdefault";
+    // Select the configured token override with the existing per-model lookup,
+    // but avoid the resolver's window-dependent cap in this config identity.
+    // History rendering and pressure checks apply that cap using the real limit.
+    const threshold = resolveExecuteThresholdDetail(
+        executeThresholdPercentage ?? 65,
+        modelKey,
+        65,
+        { tokensConfig: executeThresholdTokens, contextLimit: Number.MAX_SAFE_INTEGER },
+    );
+    return `p${historyBudgetPercentage}:${threshold.mode}:${threshold.absoluteTokens ?? threshold.percentage}`;
+}

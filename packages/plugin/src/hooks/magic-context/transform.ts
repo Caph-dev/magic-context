@@ -100,6 +100,7 @@ import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
+    historyBudgetPolicyIdentity,
     resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveModelKey,
@@ -1645,6 +1646,12 @@ export function createTransform(deps: TransformDeps) {
         const boundaryUsageForProtectedTail = persistedUsageFreshForBoundary ?? contextUsageEarly;
         const boundaryUsageSource = persistedUsageFreshForBoundary ? "persisted" : "live";
 
+        const historyPolicyIdentity = historyBudgetPolicyIdentity(
+            deps.historyBudgetPercentage,
+            deps.executeThresholdPercentage,
+            currentModelKeyForBoundary,
+            deps.executeThresholdTokens,
+        );
         const historyBudgetTokens = resolveHistoryBudgetTokens(
             deps.historyBudgetPercentage,
             contextUsageEarly,
@@ -2513,6 +2520,7 @@ export function createTransform(deps: TransformDeps) {
                 muralEnabled: deps.muralEnabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
+                historyBudgetPolicyIdentity: historyPolicyIdentity,
                 hardSignals: m0HardSignals,
             }).value;
         const protectionCacheBustingPass =
@@ -2711,6 +2719,7 @@ export function createTransform(deps: TransformDeps) {
                 memoryEnabled: deps.memoryConfig?.enabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
+                historyBudgetPolicyIdentity: historyPolicyIdentity,
                 temporalAwareness: deps.experimentalTemporalAwareness,
                 hardSignals: m0HardSignals,
                 muralEnabled: deps.muralEnabled,

@@ -239,7 +239,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 				undefined,
 				false,
 			);
-			expect(disabled.m0Reason).toBe("render_config");
+			expect(disabled.m0Reason).toBe("render_config:mural(true→false)");
 			expect(disabled.m0Materialized).toBe(true);
 			expect(findM0Image(disabledMessages)).toBeNull();
 			expect(textOf(disabledMessages[0])).not.toContain("<memory-mural>");
@@ -292,7 +292,9 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 				undefined,
 				false,
 			);
-			expect(changed.m0Reason).toBe("render_config");
+			expect(changed.m0Reason).toBe(
+				"render_config:budget(m1000-h2000→m1001-h2000)",
+			);
 			expect(changed.m0Materialized).toBe(true);
 
 			const unchanged = injectM0M1Pi(

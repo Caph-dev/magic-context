@@ -2360,7 +2360,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 				mustMaterializePi({ ...state, muralEnabled: undefined }, db),
 			).toEqual({
 				value: true,
-				reason: "render_config",
+				reason: "render_config:mural(true→false)",
 				mismatch: { signal: "muralEnabled", cached: true, current: false },
 			});
 		} finally {
@@ -2781,6 +2781,117 @@ it("Fable HARD history uses the real-token budget in Pi", () => {
 				[],
 			),
 		);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi keeps policy-identified m0 frozen as live budgets rise and folds a policy edit once", () => {
+	const db = createTestDb();
+	try {
+		const state = {
+			...piState("ses-pi-policy", ""),
+			historyBudgetTokens: 13762,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+		};
+		const first = injectM0M1Pi(
+			state,
+			db,
+			[userMessage("seed", 1)] as never,
+			undefined,
+			false,
+		);
+		expect(first.m0Materialized).toBe(true);
+		const baseline = getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes;
+		for (const historyBudgetTokens of [15670, 16200, 16800]) {
+			const replay = injectM0M1Pi(
+				{ ...state, historyBudgetTokens },
+				db,
+				[userMessage("grow", 2)] as never,
+				undefined,
+				false,
+			);
+			expect(replay.m0Materialized).toBe(false);
+			expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes).toEqual(
+				baseline,
+			);
+		}
+		const edited = {
+			...state,
+			historyBudgetTokens: 22400,
+			historyBudgetPolicyIdentity: "p0.2:percentage:40",
+		};
+		expect(mustMaterializePi(edited, db).reason).toContain(
+			"render_config:budget(",
+		);
+		expect(
+			injectM0M1Pi(
+				edited,
+				db,
+				[userMessage("edit", 3)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(true);
+		expect(
+			injectM0M1Pi(
+				edited,
+				db,
+				[userMessage("replay", 4)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(false);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi adopts legacy numeric history silently and retains absolute memory-budget edits", () => {
+	const db = createTestDb();
+	try {
+		const state = {
+			...piState("ses-pi-legacy-policy", ""),
+			historyBudgetTokens: 12000,
+			injectionBudgetTokens: 4000,
+		};
+		injectM0M1Pi(
+			state,
+			db,
+			[userMessage("legacy", 1)] as never,
+			undefined,
+			false,
+		);
+		const current = {
+			...state,
+			historyBudgetTokens: 16000,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+		};
+		expect(mustMaterializePi(current, db).value).toBe(false);
+		expect(
+			mustMaterializePi({ ...current, injectionBudgetTokens: 5000 }, db).reason,
+		).toBe("render_config:budget(m4000-h12000→m5000-hp0.15:percentage:40)");
+		const hard = {
+			...current,
+			hardSignals: {
+				systemHash: "new-system",
+				modelKey: "",
+				cacheExpired: false,
+				lastResponseTime: 0,
+			},
+		};
+		expect(
+			injectM0M1Pi(
+				hard,
+				db,
+				[userMessage("hard", 2)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(true);
+		expect(
+			getOrCreateSessionMeta(db, state.sessionId).cachedM0UpgradeState,
+		).toContain("hp0.15:percentage:40");
 	} finally {
 		closeQuietly(db);
 	}

@@ -77,3 +77,16 @@ export function decodeCachedM0UpgradeIdentity(value: string | null): CachedM0Upg
         renderBudgetIdentity: component(value, BUDGET_COMPONENT_PREFIX),
     };
 }
+
+/** Compare recorded render budgets while lazily adopting older numeric history identities. */
+export function renderBudgetIdentityChanged(cached: string, current: string): boolean {
+    const legacy = /^(m[^-]+)-h\d+$/.exec(cached);
+    if (legacy && current.startsWith("m") && current.includes("-hp")) {
+        // Older history numbers include the observed model window, not just user
+        // config. They cannot identify a policy edit. Record the new history policy
+        // when another trigger rebuilds m[0]; a changed absolute memory budget must
+        // still rebuild immediately.
+        return legacy[1] !== current.slice(0, current.indexOf("-h"));
+    }
+    return cached !== current;
+}

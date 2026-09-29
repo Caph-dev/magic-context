@@ -1082,6 +1082,81 @@ describe("m[0]/m[1] materialization", () => {
         expect(JSON.stringify(secondMessages)).toBe(JSON.stringify(firstMessages));
     });
 
+    it("keeps policy-identified m0 frozen as proven-input budgets rise and folds a policy edit once", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const state = readStateFromMeta();
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            historyBudgetPolicyIdentity: "p0.15:percentage:40",
+            historyBudgetTokens: 13762,
+        };
+        const first = injectM0M1({ ...options, messages: [userMessage("m1", "seed")] });
+        expect(first.m0RematerializedThisPass).toBe(true);
+        for (const historyBudgetTokens of [15670, 16200, 16800]) {
+            const replay = injectM0M1({
+                ...options,
+                historyBudgetTokens,
+                messages: [userMessage("m2", "grow")],
+            });
+            expect(replay.m0RematerializedThisPass).toBe(false);
+            expect(replay.m0Bytes).toEqual(first.m0Bytes);
+            expect(replay.m0Bytes?.toString()).not.toContain("render_config");
+        }
+        const edited = {
+            ...options,
+            historyBudgetPolicyIdentity: "p0.2:percentage:40",
+            historyBudgetTokens: 22400,
+        };
+        const fold = injectM0M1({ ...edited, messages: [userMessage("m3", "edit")] });
+        expect(fold.decision.reason).toBe(
+            "render_config:budget(m8000-hp0.15:percentage:40→m8000-hp0.2:percentage:40)",
+        );
+        expect(fold.m0RematerializedThisPass).toBe(true);
+        expect(
+            injectM0M1({ ...edited, messages: [userMessage("m4", "replay")] })
+                .m0RematerializedThisPass,
+        ).toBe(false);
+    });
+
+    it("adopts legacy numeric history silently but still detects memory-budget and mural edits", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const state = readStateFromMeta();
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            historyBudgetTokens: 12000,
+        };
+        const first = injectM0M1({ ...options, messages: [userMessage("m1", "legacy")] });
+        const current = {
+            ...options,
+            historyBudgetTokens: 16000,
+            historyBudgetPolicyIdentity: "p0.15:percentage:40",
+        };
+        expect(mustMaterialize(current).value).toBe(false);
+        expect(state.cachedM0Bytes).toEqual(first.m0Bytes);
+        expect(mustMaterialize({ ...current, memoryInjectionBudgetTokens: 9000 }).reason).toBe(
+            "render_config:budget(m8000-h12000→m9000-hp0.15:percentage:40)",
+        );
+        expect(mustMaterialize({ ...current, muralEnabled: true }).reason).toBe(
+            "render_config:mural(false→true)",
+        );
+        injectM0M1({
+            ...current,
+            hardSignals: { systemHash: "new-system", modelKey: "" },
+            messages: [userMessage("m2", "hard")],
+        });
+        expect(state.cachedM0UpgradeState).toContain("hp0.15:percentage:40");
+    });
+
     it("mustMaterialize returns true on first call", () => {
         db = makeDb();
         const decision = mustMaterialize({
@@ -2569,7 +2644,7 @@ describe("m[0]/m[1] materialization", () => {
             // one-request replay of the memory-bearing cache.
             hardSignals: { systemHash: "memory-guidance-on", modelKey: "test/model" },
         });
-        expect(transition.decision.reason).toBe("render_config");
+        expect(transition.decision.reason).toBe("render_config:memory_disabled");
         expect(transition.m0RematerializedThisPass).toBe(true);
         expect(renderedText(off[0])).not.toContain("transition profile fact");
         const suppressedBytes = transition.m0Bytes?.toString("utf8");
