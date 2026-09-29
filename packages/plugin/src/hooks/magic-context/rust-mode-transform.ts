@@ -64,7 +64,9 @@ import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/
 import { createPromptSurfaceGuidanceEpochCache } from "../../shared/prompt-surface-runtime";
 import {
     isTransientSqliteError,
+    withAsyncPrivilegedWriter,
     withoutSqliteTransformPass,
+    withSqliteBackgroundWriter,
     withSqliteTransformPass,
 } from "../../shared/sqlite";
 import type { WindowGeometryResult } from "../../shared/window-geometry";
@@ -3911,6 +3913,15 @@ export function createRustModeTransform(
                 // LKG captures postprocessed output, so running postprocess again would stop the
                 // fallback artifact from being an exact replay.
                 if (!replayedFrozenRepresentation) {
+                    if (materializedBoundary && !deps.compactionOff) {
+                        try {
+                            await withAsyncPrivilegedWriter(deps.db, () => undefined);
+                        } catch (error) {
+                            // Postprocess can still serve a safe SOFT replay when its
+                            // optional host-store marker cannot acquire the writer.
+                            if (!isTransientSqliteError(error)) throw error;
+                        }
+                    }
                     const postprocess = runRustModePostprocess({
                         db: deps.db,
                         sessionId,
@@ -4240,7 +4251,9 @@ export function createRustModeTransform(
                             // Memories the module wrote straight into context.db never
                             // pass through the mirror, so the invalidation set above
                             // cannot know about them. Their high-water mark can.
-                            await drainSingleStoreEmbeddingWatermarks(deps.db);
+                            await withSqliteBackgroundWriter(() =>
+                                drainSingleStoreEmbeddingWatermarks(deps.db),
+                            );
                             if (mirrorDrain.complete) {
                                 state.memoryMirrorProjectionKey = projectionKey;
                             } else if (mirrorDrain.budgetExhausted) {

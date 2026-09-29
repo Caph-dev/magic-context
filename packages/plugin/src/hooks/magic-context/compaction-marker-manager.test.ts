@@ -539,8 +539,9 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             const startedAt = Date.now();
             const outcome = applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome);
             expect(outcome.kind).toBe("retryable-failure");
-            // This standalone/background call gets one host-store busy timeout.
-            expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
+            // This OpenCode-owned handle is not routed by the shared SQLite wrapper.
+            // Its native timeout expires before the deferred marker is retried.
+            expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4500);
         } finally {
             locker.exec("ROLLBACK");
             closeQuietly(locker);
