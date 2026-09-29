@@ -31,6 +31,10 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// It was re-minted again when the v1 entry's session-project backfill
 			// took a lease key and the home-project setting, so sessions whose rows
 			// an earlier pass missed are discovered once; also v1.
+			// It was re-minted again when the v1 entry began backfilling each
+			// session's latest message time so retrospective picks sessions by
+			// their own activity (7340ca7d11, "gate retrospective on per-session
+			// activity"); also v1.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")
