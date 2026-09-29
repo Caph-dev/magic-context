@@ -107,6 +107,10 @@ describe.skipIf(!rustPrereqs.ok)("rust classify producer", () => {
 
         const contextDbPath = join(h.env.dataDir, "cortexkit", "magic-context", "context.db");
         const seedDb = new Database(contextDbPath);
+        // The host is still running and its post-turn background work (session
+        // project backfill, indexing) writes to the same store, so wait for the
+        // write lock instead of failing on the first busy attempt.
+        seedDb.exec("PRAGMA busy_timeout = 15000");
         try {
             const projectRow = seedDb
                 .prepare("SELECT project_path FROM memories ORDER BY id LIMIT 1")
@@ -137,7 +141,7 @@ describe.skipIf(!rustPrereqs.ok)("rust classify producer", () => {
                         now,
                     );
                 }
-            })();
+            }).immediate();
             const uuidRow = seedDb
                 .prepare("SELECT value FROM context_store_meta WHERE key = 'store_uuid'")
                 .get() as { value?: string } | undefined;
