@@ -2,6 +2,7 @@ import {
     type BackfillResult,
     runSessionProjectBackfill,
 } from "../../features/magic-context/session-project-backfill";
+import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
 import type { V2StoreReader } from "../store-reader";
 
@@ -18,13 +19,18 @@ import type { V2StoreReader } from "../store-reader";
 export function runV2SessionProjectBackfill(
     db: Database,
     openStoreReader: () => Pick<V2StoreReader, "sessionDirectoryPage" | "close">,
+    allowHomeProject = false,
 ): Promise<BackfillResult> {
-    return runSessionProjectBackfill(db, (afterSessionId, limit) => {
-        const reader = openStoreReader();
-        try {
-            return reader.sessionDirectoryPage(afterSessionId, limit);
-        } finally {
-            reader.close();
-        }
-    });
+    return runSessionProjectBackfill(
+        db,
+        (afterSessionId, limit) => {
+            const reader = openStoreReader();
+            try {
+                return reader.sessionDirectoryPage(afterSessionId, limit);
+            } finally {
+                reader.close();
+            }
+        },
+        { leaseKey: `${getHarness()}:session-projects-creation-v2`, allowHomeProject },
+    );
 }

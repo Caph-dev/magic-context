@@ -20,7 +20,7 @@ import {
 } from "./memory";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
-import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
+import { relaxedFtsQuery, sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import { recordShadowMeasurement } from "./search-measurement";
 import { getNotes, type Note } from "./storage-notes";
@@ -1180,6 +1180,7 @@ function searchMessages(args: {
     /** Literal probes to additionally query (multi-probe recall). Empty = the
      * original single-query behavior (unchanged for NL queries / hot path). */
     probes?: string[];
+    relaxedRecall?: boolean;
     diagnostics?: UnifiedSearchDiagnostics;
     dateRange: InclusiveDateRange | null;
 }): MessageSearchResult[] {
@@ -1217,7 +1218,20 @@ function searchMessages(args: {
         if (args.diagnostics) {
             args.diagnostics.suppressedLiveMessageMatches = outcome.suppressedCount;
         }
-        const filtered = outcome.rows.slice(0, args.limit);
+        // Exact conjunctions remain the ranking authority; only empty searches
+        // need a disjunction to recover a relevant term from a long question.
+        const rows =
+            outcome.rows.length > 0 || !args.relaxedRecall
+                ? outcome.rows
+                : runMessageFtsQuery(
+                      args.db,
+                      args.sessionId,
+                      relaxedFtsQuery(args.query),
+                      fetchLimit,
+                      cutoff,
+                      args.dateRange,
+                  );
+        const filtered = rows.slice(0, args.limit);
         return filtered.map((row, rank) => ({
             source: "message" as const,
             content: previewText(row.content),
@@ -2031,6 +2045,7 @@ export async function unifiedSearch(
               limit: tierLimit,
               maxOrdinal: options.maxMessageOrdinal,
               probes: messageProbes,
+              relaxedRecall: options.explicitSearch,
               diagnostics: options.diagnostics,
               dateRange,
           })

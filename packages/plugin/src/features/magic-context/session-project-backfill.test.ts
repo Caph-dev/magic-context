@@ -113,6 +113,22 @@ describe("runSessionProjectBackfill", () => {
         expect(getStoredProjectPath(db, "ses-unmapped-2")).toBe("git:shared");
     });
 
+    it("runs a bounded replacement discovery after an older pass was completed", async () => {
+        const db = createDb();
+        const directory = makeTempDir("session-project-new-pass-");
+        await runSessionProjectBackfill(db, [], { now: () => 1000 });
+        const sessions = [{ sessionId: "ses-child", directory }];
+        const options = {
+            leaseKey: "opencode:session-projects-creation-v2",
+            resolveIdentity: () => "git:child",
+        };
+        const first = await runSessionProjectBackfill(db, sessions, options);
+        const second = await runSessionProjectBackfill(db, sessions, options);
+        expect(first.backfilledSessions).toBe(1);
+        expect(second.status).toBe("already_completed");
+        expect(getStoredProjectPath(db, "ses-child")).toBe("git:child");
+    });
+
     it("skips dead-directory sessions and leaves them unmapped", async () => {
         const db = createDb();
         const liveDirectory = makeTempDir("session-project-backfill-live-");

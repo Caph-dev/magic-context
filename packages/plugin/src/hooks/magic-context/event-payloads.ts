@@ -17,6 +17,7 @@ export type MagicContextEvent = {
 export interface SessionCreatedInfo {
     id: string;
     parentID: string;
+    directory?: string;
     providerID?: string;
     modelID?: string;
     /**
@@ -99,6 +100,7 @@ export function getSessionCreatedInfo(properties: unknown): SessionCreatedInfo |
     return {
         id: info.id,
         parentID: info.parentID,
+        directory: typeof info.directory === "string" ? info.directory : undefined,
         providerID: typeof info.providerID === "string" ? info.providerID : undefined,
         modelID: typeof info.modelID === "string" ? info.modelID : undefined,
         title: typeof info.title === "string" ? info.title : undefined,

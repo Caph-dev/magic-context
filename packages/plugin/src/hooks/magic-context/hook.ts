@@ -807,6 +807,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         contextUsageMap,
         compactionHandler: deps.compactionHandler,
         config: deps.config,
+        allowHomeProject: deps.config.allow_home_project,
         compactionOff,
         thinkingBindingRecoveryEnabled: deps.config.transform_mode !== "rust",
         tagger: deps.tagger,
