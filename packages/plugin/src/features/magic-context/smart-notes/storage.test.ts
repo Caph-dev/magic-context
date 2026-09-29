@@ -17,6 +17,7 @@ import {
     commitSmartNoteState,
     getSmartNotesNeedingCompilation,
     markCompiledCheckFalse,
+    markSmartNoteCompilationFailure,
     storeCompiledSmartNoteCheck,
 } from "./storage";
 import { SMART_NOTE_CHECK_POLICY_VERSION } from "./types";
@@ -71,6 +72,46 @@ describe("smart-note compilation selection", () => {
             expect(getSmartNotesNeedingCompilation(db, PROJECT, now, 10).map((n) => n.id)).toEqual([
                 due.id,
             ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("persistent compilation failure", () => {
+    test.each([
+        "dry-run failed: SMART_NOTE_NETWORK: response body too large at https://example.com/CHANGELOG.md",
+        "dry-run failed: all HTTP sources inaccessible: https://example.com/schema.sql (HTTP 404)",
+    ])("records reason and does not retry nightly: %s", (error) => {
+        const db = freshDb();
+        try {
+            const note = addNote(db, "smart", {
+                projectPath: PROJECT,
+                content: "waiting for public source",
+                surfaceCondition: "when schema changes",
+            });
+            const now = Date.now();
+            markSmartNoteCompilationFailure(db, note.id, now, 3, error);
+            const stored = getNotes(db, { projectPath: PROJECT, type: "smart" })[0];
+            expect(stored?.readyReason).toBe(`Condition can't be checked: ${error}; rewrite it`);
+            expect(stored?.checkStatus).toBe("uncompiled");
+            expect(stored?.checkNextDueAt).toBe(now + 7 * 24 * 60 * 60 * 1_000);
+            expect(
+                getSmartNotesNeedingCompilation(db, PROJECT, now + 6 * 24 * 60 * 60 * 1_000, 10),
+            ).toEqual([]);
+            expect(
+                getSmartNotesNeedingCompilation(db, PROJECT, now + 7 * 24 * 60 * 60 * 1_000, 10),
+            ).toHaveLength(1);
+            updateNote(
+                db,
+                note.id,
+                { surfaceCondition: "when local schema changes" },
+                { projectPath: PROJECT },
+            );
+            expect(getSmartNotesNeedingCompilation(db, PROJECT, Date.now(), 10)).toHaveLength(1);
+            expect(
+                getNotes(db, { projectPath: PROJECT, type: "smart" })[0]?.readyReason,
+            ).toBeNull();
         } finally {
             closeQuietly(db);
         }

@@ -16,7 +16,7 @@ import { runHiddenSingleShotPrompt } from "../dreamer/hidden-single-shot";
 import { recordChildInvocation } from "../subagent-token-capture";
 import type { SmartNoteCapabilityFactory } from "./capabilities";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./compiler-prompt";
-import { runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { type RunCompiledSmartNoteCheckResult, runCompiledSmartNoteCheck } from "./sandbox-runner";
 import {
     SMART_NOTE_CHECK_CEILING_MS,
     type SmartNoteCapabilityName,
@@ -202,12 +202,11 @@ Remember: output only the JSON object described by the system prompt.`;
         for (const warning of manifestAdvisoryWarnings(compiledCheck, manifest)) {
             log(`[dreamer] smart note #${args.note.id}: manifest advisory — ${warning}`);
         }
-        const dryRun = await runCompiledSmartNoteCheck({
+        const dryRun = await dryRunSmartNoteCheck(
             compiledCheck,
-            capabilityFactory: args.capabilityFactory,
-            signal: args.signal,
-            timeoutMs: 2_000,
-        });
+            args.capabilityFactory,
+            args.signal,
+        );
         if (!dryRun.ok) {
             const error = boundedError(`dry-run failed: ${dryRun.error}`);
             recordInvocation({
@@ -246,6 +245,45 @@ Remember: output only the JSON object described by the system prompt.`;
             });
         }
     }
+}
+
+export async function dryRunSmartNoteCheck(
+    compiledCheck: string,
+    capabilityFactory: SmartNoteCapabilityFactory,
+    signal?: AbortSignal,
+): Promise<RunCompiledSmartNoteCheckResult> {
+    const responses: Array<{ url: string; status: number }> = [];
+    const dryRun = await runCompiledSmartNoteCheck({
+        compiledCheck,
+        capabilityFactory: (runSignal) => {
+            const capabilities = capabilityFactory(runSignal);
+            return {
+                ...capabilities,
+                httpGet: async (url) => {
+                    const response = await capabilities.httpGet(url);
+                    responses.push({ url, status: response.status });
+                    return response;
+                },
+            };
+        },
+        signal,
+        timeoutMs: 2_000,
+    });
+    // A check that sees only inaccessible HTTP sources cannot distinguish an
+    // unmet trigger from a trigger it was never able to observe.
+    if (
+        dryRun.ok &&
+        responses.length > 0 &&
+        responses.every(({ status }) => status === 401 || status === 403 || status === 404)
+    ) {
+        return {
+            ok: false,
+            cancelled: false,
+            network: false,
+            error: `all HTTP sources inaccessible: ${responses.map(({ url, status }) => `${url} (HTTP ${status})`).join(", ")}`,
+        };
+    }
+    return dryRun;
 }
 
 export function parseCompilerOutput(output: string | null): CompilerResponse {

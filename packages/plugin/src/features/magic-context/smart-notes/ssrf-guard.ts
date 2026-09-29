@@ -279,7 +279,7 @@ export function requestValidatedAddress(
                         // promise is already settled with the typed error.
                         reject(
                             new SmartNoteNetworkError(
-                                "SMART_NOTE_NETWORK: response body too large",
+                                `SMART_NOTE_NETWORK: response body too large at ${url.href} (received at least ${bytes} bytes; limit ${options.bodyLimitBytes})`,
                                 { terminal: true },
                             ),
                         );

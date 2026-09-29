@@ -214,6 +214,7 @@ export function storeCompiledSmartNoteCheck(
              check_failure_count = 0,
              check_network_failure_count = 0,
              check_quarantined_until = NULL,
+             ready_reason = NULL,
              check_next_due_at = ?,
              check_compiled_at = ?,
              check_false_since_at = COALESCE(check_false_since_at, ?),
@@ -315,17 +316,32 @@ export function markSmartNoteCompilationFailure(
     noteId: number,
     now: number,
     maxFailures: number,
+    error: string,
 ): void {
     const failureCount = readFailureCount(db, noteId, "check_failure_count") + 1;
-    const status: NoteCheckStatus = failureCount >= maxFailures ? "fallback" : "uncompiled";
+    const persistent = /response body too large|all HTTP sources inaccessible/.test(error);
+    const status: NoteCheckStatus = persistent
+        ? "uncompiled"
+        : failureCount >= maxFailures
+          ? "fallback"
+          : "uncompiled";
+    const nextDueAt = now + (persistent ? 7 * 24 * 60 * 60 * 1_000 : backoffMs(failureCount));
     db.prepare(
         `UPDATE notes
          SET check_failure_count = ?,
              check_status = ?,
              check_next_due_at = ?,
+             ready_reason = ?,
              updated_at = ?
          WHERE id = ? AND type = 'smart'`,
-    ).run(failureCount, status, now + backoffMs(failureCount), now, noteId);
+    ).run(
+        failureCount,
+        status,
+        nextDueAt,
+        `Condition can't be checked: ${error}; rewrite it`,
+        now,
+        noteId,
+    );
 }
 
 function readFailureCount(db: Database, noteId: number, column: string): number {
