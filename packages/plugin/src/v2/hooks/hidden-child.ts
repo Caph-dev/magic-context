@@ -21,7 +21,7 @@ const READ_TOOLS = ["read", "grep", "glob"] as const;
 const AGENT_TOOLS: Record<string, readonly string[]> = {
     [HIDDEN_HISTORIAN_AGENT]: [],
     [HIDDEN_DREAMER_AGENT]: [],
-    [HIDDEN_CURATE_AGENT]: ["ctx_memory", "ctx_memory_list"],
+    [HIDDEN_CURATE_AGENT]: ["ctx_memory"],
     [DREAMER_MEMORY_MAPPER_AGENT]: READ_TOOLS,
     [DREAMER_PRIMER_INVESTIGATOR_AGENT]: [...READ_TOOLS, "ctx_search"],
     [DREAMER_RETROSPECTIVE_AGENT]: ["ctx_search"],
