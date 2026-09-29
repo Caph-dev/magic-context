@@ -67,6 +67,7 @@ try {
     let catchupPhase = false;
     let healthCalls = 0;
     let stop = false;
+    let drainElapsedMs = 0;
     const poll = (async () => {
         while (!stop) {
             const start = performance.now();
@@ -82,7 +83,15 @@ try {
     try {
         await h.sendPrompt(sessionId, "A new message after archived history", { timeoutMs: 120_000 });
         catchupPhase = true;
-        await Bun.sleep(30_000);
+        const drainStart = performance.now();
+        while (performance.now() - drainStart < 90_000) {
+            await Bun.sleep(1_000);
+            const probe = new Database(h.contextDbPath(), { readonly: true });
+            const row = probe.prepare("SELECT COUNT(DISTINCT compartment_id) AS n FROM compartment_chunk_embeddings WHERE session_id = ?").get(sessionId) as { n: number };
+            probe.close();
+            if (row.n >= 1500) break;
+        }
+        drainElapsedMs = performance.now() - drainStart;
     } finally {
         stop = true;
         await poll;
@@ -91,7 +100,7 @@ try {
     const mapping = inspection.prepare("SELECT session_id, project_path FROM session_projects WHERE session_id = ?").all(sessionId);
     const counts = inspection.prepare("SELECT (SELECT COUNT(*) FROM compartments WHERE session_id = ?) AS compartments, (SELECT COUNT(*) FROM compartment_chunk_embeddings WHERE session_id = ?) AS vectors").get(sessionId, sessionId);
     inspection.close();
-    console.log(JSON.stringify({ hostPid: pid, healthCalls, maxHealthMs, catchupMaxHealthMs, embeddedChunks: embedded.length, mapping, counts }));
+    console.log(JSON.stringify({ hostPid: pid, healthCalls, maxHealthMs, catchupMaxHealthMs, drainElapsedMs, embeddedChunks: embedded.length, mapping, counts }));
 } finally {
     await h?.dispose();
     server.stop(true);
