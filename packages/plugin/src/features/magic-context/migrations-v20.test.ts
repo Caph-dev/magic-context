@@ -20,7 +20,7 @@ describe("migration v20", () => {
             openDatabase();
         } finally {
             closeDatabase();
-            process.env.XDG_DATA_HOME = undefined;
+            process.env.XDG_DATA_HOME = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {

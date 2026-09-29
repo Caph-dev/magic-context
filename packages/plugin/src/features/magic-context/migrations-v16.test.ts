@@ -22,7 +22,7 @@ afterEach(() => {
         }
     }
     tempDirs.length = 0;
-    process.env.XDG_DATA_HOME = undefined;
+    process.env.XDG_DATA_HOME = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 });
 
 describe("migration v16 — context-limit cache regression sentinels", () => {

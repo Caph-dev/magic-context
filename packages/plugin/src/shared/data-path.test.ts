@@ -29,7 +29,7 @@ const savedEnv = {
 describe("data-path", () => {
     beforeEach(() => {
         process.env.XDG_CACHE_HOME = undefined;
-        process.env.XDG_DATA_HOME = undefined;
+        process.env.XDG_DATA_HOME = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         delete process.env.NODE_ENV;
         process.env.LOCALAPPDATA = undefined;
