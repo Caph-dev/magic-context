@@ -532,6 +532,20 @@ describe("strip-content", () => {
             for (const text of markerParity.negative) expect(isMarkerOnlyText(text)).toBe(false);
         });
 
+        it("neutralizes the shared blank and marker part combinations", () => {
+            for (const parts of markerParity.positivePartCombinations) {
+                const assistant = message(
+                    "mixed",
+                    "assistant",
+                    parts.map((text) => ({ type: "text", text })),
+                );
+                expect(
+                    stripDroppedPlaceholderMessages([assistant], "openai-compatible").sentineledIds,
+                ).toEqual(["mixed"]);
+                expect(assistant.parts).toEqual([WHOLE_MESSAGE_SENTINEL]);
+            }
+        });
+
         it("neutralizes only marker-only non-metadata parts and keeps tools and users", () => {
             const assistant = message("a", "assistant", [
                 { type: "text", text: "§672§ [dropped §672§]" },

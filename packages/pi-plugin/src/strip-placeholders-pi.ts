@@ -44,7 +44,8 @@ function messageIsPlaceholderOnly(message: unknown): boolean {
 	// entries here — never all-[dropped] — making this a safe parity guard.
 	if (msg.role !== "assistant") return false;
 
-	if (typeof msg.content === "string") return isPiMarkerOnlyText(msg.content);
+	if (typeof msg.content === "string")
+		return msg.content.trim().length === 0 || isPiMarkerOnlyText(msg.content);
 	if (!Array.isArray(msg.content)) return false;
 	if (msg.content.length === 0) return false;
 
@@ -55,9 +56,8 @@ function messageIsPlaceholderOnly(message: unknown): boolean {
 		const text =
 			p.type === "text" ? p.text : p.type === "thinking" ? p.thinking : null;
 		if (typeof text !== "string") return false;
-		if (text.trim().length === 0) continue;
-		if (!isPiMarkerOnlyText(text)) return false;
 		sawVisibleContent = true;
+		if (text.trim().length > 0 && !isPiMarkerOnlyText(text)) return false;
 	}
 	return sawVisibleContent;
 }

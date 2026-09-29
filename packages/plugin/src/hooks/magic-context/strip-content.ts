@@ -187,7 +187,7 @@ export function stripDroppedPlaceholderMessages(
         // Skip messages already reduced to a lone sentinel — idempotent on replay
         if (msg.parts.length === 1 && isSentinel(msg.parts[0])) continue;
 
-        let hasMarkerPart = false;
+        let hasContentPart = false;
         let hasNonDroppedContent = false;
 
         for (const part of msg.parts) {
@@ -206,17 +206,18 @@ export function stripDroppedPlaceholderMessages(
                 break;
             }
 
-            // Only complete markers count; blank companion parts do not make an empty message eligible.
+            // Blank parts and complete markers both qualify; the sentinel below uses
+            // empty text only for Anthropic and [dropped] for other providers.
             if (
                 (partType === "text" || partType === "reasoning") &&
                 typeof part.text === "string"
             ) {
+                hasContentPart = true;
                 if (part.text.trim().length === 0) continue;
                 if (!isMarkerOnlyText(part.text)) {
                     hasNonDroppedContent = true;
                     break;
                 }
-                hasMarkerPart = true;
                 continue;
             }
 
@@ -225,7 +226,7 @@ export function stripDroppedPlaceholderMessages(
             break;
         }
 
-        if (hasMarkerPart && !hasNonDroppedContent) {
+        if (hasContentPart && !hasNonDroppedContent) {
             msg.parts.length = 0;
             msg.parts.push(makeWholeMessageSentinel(providerID));
             stripped++;

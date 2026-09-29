@@ -16,6 +16,44 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 			expect(isPiMarkerOnlyText(text)).toBe(false);
 	});
 
+	it("removes shared blank and marker part combinations", () => {
+		const db = createTestDb();
+		try {
+			for (const [
+				index,
+				parts,
+			] of markerParity.positivePartCombinations.entries()) {
+				const assistant = assistantMessage("marker", index + 2, {
+					content: parts.map((text) => ({ type: "text", text })),
+				});
+				const messages = [userMessage("continue", 1), assistant];
+				expect(
+					stripPiDroppedPlaceholderMessages({
+						db,
+						sessionId: `ses-mixed-${index}`,
+						messages,
+						isCacheBusting: true,
+					}),
+				).toEqual({ removed: 1, discovered: 1 });
+				expect(messages).not.toContain(assistant);
+			}
+			const messages = [
+				userMessage("continue", 1),
+				assistantMessage("blank", 2, { content: " \t" }),
+			];
+			expect(
+				stripPiDroppedPlaceholderMessages({
+					db,
+					sessionId: "ses-blank-string",
+					messages,
+					isCacheBusting: true,
+				}),
+			).toEqual({ removed: 1, discovered: 1 });
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("removes marker-only text and thinking but retains tool-bearing replies", () => {
 		const db = createTestDb();
 		try {
