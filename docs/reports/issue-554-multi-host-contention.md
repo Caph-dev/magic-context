@@ -40,7 +40,9 @@ The follow-up branch merged the harness and replaced synchronous SQLite writer w
 
 | Plugin | OpenCode | steady (fail / polls; p95 ms) | stopped (expected fail) | wake (fail / polls; p95 ms) | lock (fail / polls; p95 ms) | released (fail / polls) | longest recorded lock gap |
 |---|---|---:|---:|---:|---:|---:|---:|
-| short acquisition | 2.0.18 | 0/110; 347 | 330/330 | 0/110; 118 | 0/110; 102 | 0/77 | <150 ms |
-| short acquisition | pinned 2.0.15 | 4/110; 596 | 330/330 | 0/110; 139 | 0/110; 56 | 0/77 | <150 ms |
+| short acquisition | 2.0.18 | 0/110; 375 | 330/330 | 0/110; 811 | 0/110; 101 | 0/77 | <150 ms |
+| short acquisition | pinned 2.0.15 | 6/110; 902 | 330/330 | 0/110; 165 | 0/110; 66 | 0/77 | <150 ms |
 
-Evidence roots: `$TMPDIR/magic-context/issue-554/1790690297419-77434` (2.0.18) and `1790690126341-69831` (2.0.15). Both runs logged seven foreground acquisition waits and zero synchronous SQLite calls exceeding the harness's 150 ms instrumentation threshold. As in the original report, this is a macOS injected-lock experiment, not a Windows reproduction or proof of the original report's lock owner.
+Final evidence roots: `$TMPDIR/magic-context/issue-554/1790692689195-54052` (2.0.18) and `1790692585134-68402` (2.0.15). Both runs have zero lock-phase heartbeat gaps exceeding 150 ms; steady/wake latency varies independently of the injected lock. Earlier runs of the same fix (`1790690297419-77434` and `1790690126341-69831`) also had zero lock-phase failures and seven logged foreground acquisition waits each. As in the original report, this is a macOS injected-lock experiment, not a Windows reproduction or proof of the original report's lock owner.
+
+The requested `pure-replay-differential.ts --ts-only` comparison produced identical four defer-pass message hashes and tool hashes between base `d38f6b1` and the fix, but its full verdict was `DIVERGENT` because system prompt hashes differed. A `HEAD HEAD` control also reported `DIVERGENT` with identical message/tool hashes and different system hashes, so this runner cannot prove system-byte equality across its independently created scratch roots in this environment. Do not represent this as a green differential gate.
