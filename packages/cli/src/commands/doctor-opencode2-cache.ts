@@ -31,15 +31,15 @@
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
-import { inspectWindowsProcessesSync } from "@magic-context/core/shared/rpc-utils";
-import { assertWindowsStoresClosed } from "./doctor-windows-holders";
 import { compareSemverCore } from "@magic-context/core/hooks/auto-update-checker/semver";
+import { inspectWindowsProcessesSync } from "@magic-context/core/shared/rpc-utils";
 import {
     getOpenCodeV2PluginCacheSlot,
     isOpenCodePluginDistTag,
     readConfiguredOpenCodePluginSpec,
     readOpenCodeV2CachedPluginVersion,
 } from "../lib/opencode-plugin-cache";
+import { assertWindowsStoresClosed } from "./doctor-windows-holders";
 
 export type HostUseProbe =
     | { status: "free" }

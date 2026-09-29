@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import type { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+    __resetRpcIdentityTestHooks,
+    __setRpcIdentityTestHooks,
+} from "@magic-context/core/shared/rpc-utils";
+import { Database } from "@magic-context/core/shared/sqlite";
 import {
     getOpenCodeV2PluginCacheSlot,
     OPENCODE_PLUGIN_NAME,
@@ -14,13 +20,6 @@ import {
     probeHostProcessesUsing,
     reportOpenCodeV2PluginCache,
 } from "./doctor-opencode2-cache";
-
-import type { execFileSync } from "node:child_process";
-import {
-    __setRpcIdentityTestHooks,
-    __resetRpcIdentityTestHooks,
-} from "@magic-context/core/shared/rpc-utils";
-import { Database } from "@magic-context/core/shared/sqlite";
 
 const tempDirs: string[] = [];
 afterEach(() => {
