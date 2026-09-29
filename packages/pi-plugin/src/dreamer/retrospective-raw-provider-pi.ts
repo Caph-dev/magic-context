@@ -1,11 +1,12 @@
 import { join, resolve } from "node:path";
-
 import type {
 	RetrospectiveProjectSession,
 	RetrospectiveRawMessage,
 	RetrospectiveRawProvider,
 	RetrospectiveSinceRead,
 } from "@magic-context/core/features/magic-context/dreamer/retrospective-raw-provider";
+import { readSessionActivity } from "@magic-context/core/features/magic-context/session-activity";
+import type { Database } from "@magic-context/core/shared/sqlite";
 import { sessionEntries, sessionHeaders } from "./bounded-session-reader";
 import { resolvePiCodingAgentModule } from "./pi-session-api";
 
@@ -30,6 +31,7 @@ interface PiUserMessageLike {
 
 export interface PiRetrospectiveRawProviderDeps {
 	projectCwd: string;
+	contextDb?: Database;
 	sessionDir?: string;
 	listSessions?: (sessionDir?: string) => unknown[] | Promise<unknown[]>;
 	loadEntriesFromFile?: (filePath: string) => unknown[] | Promise<unknown[]>;
@@ -68,12 +70,17 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 			if (typeof info.cwd !== "string" || resolve(info.cwd) !== projectCwd)
 				continue;
 
+			const activity = this.deps.contextDb
+				? readSessionActivity(this.deps.contextDb, info.id)
+				: typeof info.modified === "number"
+					? info.modified
+					: undefined;
+			if (this.deps.contextDb && activity === undefined) continue;
 			this.sessionPathById.set(info.id, info.path);
 			result.push({
 				sessionId: info.id,
 				path: info.path,
-				updatedAt:
-					typeof info.modified === "number" ? info.modified : undefined,
+				updatedAt: activity,
 			});
 		}
 

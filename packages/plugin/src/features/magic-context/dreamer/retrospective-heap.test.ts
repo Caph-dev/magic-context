@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeOpenCodeV1FixtureStore } from "../../../hooks/magic-context/opencode-v1-store-fixture";
 import { Database } from "../../../shared/sqlite";
+import { advanceSessionActivity } from "../session-activity";
 import {
     assertRetrospectiveHeap,
     measureRetrospective,
@@ -44,13 +45,14 @@ function fixture(turns: number, huge = false) {
         );
     const contextDb = new Database(":memory:");
     contextDb.exec(
-        "CREATE TABLE session_projects(session_id TEXT, harness TEXT, project_path TEXT, updated_at INTEGER); CREATE TABLE session_meta(session_id TEXT, is_subagent INTEGER)",
+        "CREATE TABLE session_projects(session_id TEXT, harness TEXT, project_path TEXT, updated_at INTEGER); CREATE TABLE session_meta(session_id TEXT, is_subagent INTEGER); CREATE TABLE schema_migrations_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     );
     contextDb
         .prepare(
             "INSERT INTO session_projects VALUES ('ses_retro', 'opencode', 'git:retro-heap', ?)",
         )
         .run(Date.now());
+    advanceSessionActivity(contextDb, "ses_retro", start + turns * 1000);
     const provider = new OpenCodeRetrospectiveRawProvider({ contextDb, opencodeDb: db });
     return { db, contextDb, provider };
 }

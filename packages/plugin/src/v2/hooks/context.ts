@@ -19,6 +19,7 @@ import {
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { detectOverflow } from "../../features/magic-context/overflow-detection";
 import { createScheduler } from "../../features/magic-context/scheduler";
+import { backfillSessionActivity } from "../../features/magic-context/session-activity";
 import {
     clearSession,
     getOrCreateSessionMeta,
@@ -788,13 +789,20 @@ export async function registerContext(context: V2Context) {
     if (db && isDatabasePersisted(db)) {
         const backfillDb = db;
         scheduleAfterBootQuiet(() => {
-            runV2SessionProjectBackfill(
-                backfillDb,
-                openStoreReader,
-                config.allow_home_project,
-            ).catch((error: unknown) =>
-                log("[session-project-backfill] OpenCode 2 backfill failed:", error),
-            );
+            runV2SessionProjectBackfill(backfillDb, openStoreReader, config.allow_home_project)
+                .then(() =>
+                    backfillSessionActivity(backfillDb, "opencode", (sessionId) => {
+                        const reader = openStoreReader();
+                        try {
+                            return reader.latestMessageTime(sessionId);
+                        } finally {
+                            reader.close();
+                        }
+                    }),
+                )
+                .catch((error: unknown) =>
+                    log("[session-project-backfill] OpenCode 2 backfill failed:", error),
+                );
         });
     }
     const readAllForConversion = (sessionID: string) =>

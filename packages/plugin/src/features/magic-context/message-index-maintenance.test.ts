@@ -14,6 +14,7 @@ import {
     sweepOrphanedOpenCodeMessageIndexes,
 } from "./message-index";
 import { runMigrations } from "./migrations";
+import { advanceSessionActivity, readSessionActivity } from "./session-activity";
 import { initializeDatabase } from "./storage-db";
 
 const tempDirectories: string[] = [];
@@ -88,6 +89,39 @@ afterEach(() => {
 });
 
 describe("message history orphan maintenance", () => {
+    test("removes activity for a missing host session but retains the live session and backfill marker", () => {
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
+        seedSessionScopedRows(db, "missing", old);
+        seedSessionScopedRows(db, "live", old);
+        advanceSessionActivity(db, "missing", old);
+        advanceSessionActivity(db, "live", old);
+        db.prepare(
+            "INSERT INTO schema_migrations_meta(key, value) VALUES ('retrospective_activity_backfill:opencode:v1', 'completed')",
+        ).run();
+        const hostPath = createOpenCodeDb(["live"]);
+        try {
+            expect(
+                sweepOrphanedOpenCodeMessageIndexes(
+                    db,
+                    () => new Database(hostPath, { readonly: true }),
+                    { now },
+                ),
+            ).toMatchObject({ status: "swept", deleted: 1 });
+            expect(readSessionActivity(db, "missing")).toBeUndefined();
+            expect(readSessionActivity(db, "live")).toBe(old);
+            expect(
+                db
+                    .prepare(
+                        "SELECT value FROM schema_migrations_meta WHERE key = 'retrospective_activity_backfill:opencode:v1'",
+                    )
+                    .get(),
+            ).toEqual({ value: "completed" });
+        } finally {
+            closeQuietly(db);
+        }
+    });
     test("sweeps every old orphan row while retaining live, young, and Pi rows", () => {
         const db = createStoreDb();
         const now = 2_000_000_000_000;
@@ -139,6 +173,7 @@ describe("message history orphan maintenance", () => {
         const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
         const sessionId = "ses-rust-cleanup-orphan";
         seedSessionScopedRows(db, sessionId, old);
+        advanceSessionActivity(db, sessionId, old);
         db.prepare(
             "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', 'git:rust-cleanup-orphan', ?)",
         ).run(sessionId, old);
@@ -155,6 +190,7 @@ describe("message history orphan maintenance", () => {
             );
 
             expect(result).toMatchObject({ status: "swept", scanned: 1, deleted: 0 });
+            expect(readSessionActivity(db, sessionId)).toBe(old);
             for (const table of [
                 "message_history_fts",
                 "message_history_index",

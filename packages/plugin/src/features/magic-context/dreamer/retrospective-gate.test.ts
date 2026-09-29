@@ -436,6 +436,18 @@ describe("readRetrospectiveScanWindow", () => {
         expect(win.maxScannedTs).toBe(129);
     });
 
+    test("advances past observed assistant-only activity when no user message remains", async () => {
+        const provider: RetrospectiveRawProvider = {
+            listProjectSessions: () => [{ sessionId: "s", updatedAt: 300 }],
+            readOldestMessageTimesSince: () => new Map(),
+            readUserMessagesSince: () => ({ messages: [], truncated: false }),
+            readUserMessagesBefore: () => [],
+        };
+        const win = await readRetrospectiveScanWindow(provider, "proj", 200, 0);
+        expect(win.maxScannedTs).toBe(300);
+        expect(win.messages).toEqual([]);
+    });
+
     test("session cap drains oldest eligible sessions without skipping older backlog", async () => {
         const sessionIds = Array.from({ length: 25 }, (_, i) => `s${25 - i}`);
         const rows = new Map(

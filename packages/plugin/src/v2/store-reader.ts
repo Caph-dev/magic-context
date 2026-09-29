@@ -406,6 +406,13 @@ export class V2StoreReader {
         return rows.map((row) => ({ sessionId: row.id, directory: row.directory }));
     }
 
+    latestMessageTime(sessionID: string): number | undefined {
+        const row = this.db
+            .prepare("SELECT MAX(time_created) AS time FROM session_message WHERE session_id = ?")
+            .get(sessionID) as { time: number | null } | undefined;
+        return row?.time ?? undefined;
+    }
+
     storedMessageCount(sessionID: string): number {
         return trackDecodeOperation("storedMessageCount", () => {
             const row = this.db

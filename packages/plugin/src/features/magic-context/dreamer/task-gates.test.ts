@@ -11,6 +11,7 @@ import {
     setMemoryClassification,
 } from "../memory";
 import { runMigrations } from "../migrations";
+import { advanceSessionActivity } from "../session-activity";
 import { initializeDatabase } from "../storage-db";
 import { evaluateTaskGate, getDreamTaskBacklog } from "./task-gates";
 import { formatDreamTaskBacklogs, processedDreamTaskItems } from "./task-registry";
@@ -189,6 +190,8 @@ describe("dream task backlog probes", () => {
         db.prepare(
             "INSERT INTO task_schedule_state (project_path, task, retrospective_watermark_ms, last_run_at) VALUES (?, ?, ?, ?)",
         ).run(project, "retrospective", 200, null);
+        advanceSessionActivity(db, "old", 100);
+        advanceSessionActivity(db, "new", 300);
         expect(getDreamTaskBacklog(db, project, "retrospective").pending).toBe(1);
         expect(
             getDreamTaskBacklog(db, project, "retrospective", { retrospectiveWatermarkMs: null })
@@ -290,6 +293,7 @@ describe("evaluateTaskGate", () => {
         db.prepare(
             "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
         ).run("s1", "opencode", projectIdentity, 200);
+        advanceSessionActivity(db, "s1", 200);
 
         // Never scanned → runs.
         expect(
@@ -301,8 +305,7 @@ describe("evaluateTaskGate", () => {
                 promotionThreshold: 3,
             }),
         ).toBe(true);
-        // Session newer than watermark → runs (even if lastRunAt is newer — the
-        // session was updated mid-run, so its content hasn't been scanned).
+        // Message activity newer than watermark runs even if lastRunAt is newer.
         expect(
             evaluateTaskGate("retrospective", {
                 db,
@@ -312,7 +315,7 @@ describe("evaluateTaskGate", () => {
                 promotionThreshold: 3,
             }),
         ).toBe(true);
-        // Watermark at/after the session update → nothing new → skip.
+        // Watermark at/after the last message → nothing new → skip.
         expect(
             evaluateTaskGate("retrospective", {
                 db,
