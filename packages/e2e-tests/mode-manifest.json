@@ -18,6 +18,14 @@
             ]
         },
         {
+            "path": "tests/issue-574-unborn-project.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "manual regression probe on OpenCode 1.18.30: a git repo with no commits keeps its dir: identity and existing memories, and sidebar refreshes log no identity errors; throwaway root with host PID lsof containment",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/issue-570-home-project.test.ts",
             "tier": "excluded",
             "invocation": { "ts": false, "rust": false },
