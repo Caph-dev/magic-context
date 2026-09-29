@@ -150,7 +150,7 @@ Compaction off (`compaction.enabled: false`, user config, restart required) keep
 ## Failure handling
 
 - **Fail closed on storage.** If storage cannot be opened or migrated, the transform refuses loudly on every pass instead of letting the prompt grow unmanaged (`fail_closed_blocking`).
-- **Fail open per turn.** Ordinary per-turn handlers log and continue. Transient `SQLITE_BUSY` returns the messages unmodified.
+- **Fail open per turn.** Ordinary per-turn handlers log and continue. A busy database (`SQLITE_BUSY`) never lets a turn through unmanaged while compaction is on: the turn being sent retries the lock briefly, then replays the last good request, and otherwise refuses the turn. Background work tries once and picks up again on its next run.
 - **Provider limits.** Context-overflow errors are parsed and the learned limit is persisted for later passes.
 - **Hidden agents** have step caps and are aborted on timeout.
 
