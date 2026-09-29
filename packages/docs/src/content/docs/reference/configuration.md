@@ -205,21 +205,33 @@ Off-hours maintenance through Dreamer.
 | `dreamer.omp.tasks` **Live** | map<string, object> | — | OMP task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes. |
 | `dreamer.tasks` | object | — | Harness-independent task metadata. schedule, promotion_threshold, and other task metadata remain here; execution settings live under dreamer.opencode.tasks, dreamer.pi.tasks, or dreamer.omp.tasks. |
 | `dreamer.tasks.map-memories.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.map-memories.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.verify.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.verify.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.verify-broad.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.verify-broad.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.curate.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.curate.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.compress-cues.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.compress-cues.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.classify-memories.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.classify-memories.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.retrospective.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.retrospective.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.retrospective.recency_days` **Live** | integer (1–3650) | `30` | retrospective: collect source messages from only the most recent N days |
 | `dreamer.tasks.maintain-docs.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.maintain-docs.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.maintain-docs.max_tokens` | integer (–9007199254740991) | `12000` | Maximum combined token count of proposed ARCHITECTURE.md and STRUCTURE.md |
 | `dreamer.tasks.evaluate-smart-notes.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.evaluate-smart-notes.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.review-user-memories.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.review-user-memories.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.review-user-memories.promotion_threshold` **Live** | number (2–20) | `3` | review-user-memories: min candidate observations before promotion is considered (default: 3) |
 | `dreamer.tasks.promote-primers.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.promote-primers.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.promote-primers.promotion_threshold` **Live** | number (2–20) | `2` | promote-primers: min recurring source days before promotion is considered (default: 2) |
 | `dreamer.tasks.refresh-primers.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.refresh-primers.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true) |
 
 ## Advanced

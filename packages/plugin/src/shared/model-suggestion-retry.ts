@@ -115,6 +115,7 @@ export type PromptFailureClass =
     | "provider_timeout"
     | "provider_error"
     | "step_limit"
+    | "token_budget"
     | "empty_completion"
     | "no_models"
     | "child_aborted"

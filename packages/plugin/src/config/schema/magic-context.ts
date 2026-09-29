@@ -484,6 +484,14 @@ const CronScheduleSchema = z
 const DreamTaskBaseConfigSchema = z
     .object({
         schedule: CronScheduleSchema.default(""),
+        token_budget: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+                "Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task.",
+            ),
     })
     .strict();
 
