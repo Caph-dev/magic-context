@@ -113,12 +113,30 @@ export async function partitionVerifyScope(args: {
     // excluded — see the doc comment.
     const candidates = active.filter((m) => (verById.get(m.id)?.files.length ?? 0) > 0);
 
-    const toPrompt = (m: (typeof active)[number]): VerifyPromptMemory => ({
-        id: m.id,
-        category: m.category,
-        content: m.content,
-        mappedFiles: verById.get(m.id)?.files ?? [],
-    });
+    const toPrompt = (m: (typeof active)[number]): VerifyPromptMemory => {
+        const verifiedAt = verById.get(m.id)?.verifiedAt ?? 0;
+        let verifiedCommit: string | null = null;
+        try {
+            const metadata = JSON.parse(m.metadataJson ?? "{}") as Record<string, unknown>;
+            if (
+                metadata.dreamerVerifiedAt === verifiedAt &&
+                typeof metadata.dreamerVerifiedCommit === "string" &&
+                /^[0-9a-f]{40}$/i.test(metadata.dreamerVerifiedCommit)
+            ) {
+                verifiedCommit = metadata.dreamerVerifiedCommit;
+            }
+        } catch {
+            /* Malformed metadata leaves the commit unknown; the timestamp fallback still applies. */
+        }
+        return {
+            id: m.id,
+            category: m.category,
+            content: m.content,
+            mappedFiles: verById.get(m.id)?.files ?? [],
+            verifiedAt,
+            verifiedCommit,
+        };
+    };
 
     if (args.forceBroad) {
         const broadCycleStartAt = ensureBroadCycleStart({
