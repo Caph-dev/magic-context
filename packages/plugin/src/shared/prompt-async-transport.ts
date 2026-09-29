@@ -34,8 +34,12 @@ export interface PromptAsyncWaitOptions {
     pollIntervalMs?: number;
     startGraceMs?: number;
     tokenBudget?: number;
+    /** Shared across retries of one child session. */
+    budgetGuard?: ReturnType<typeof createDreamTokenBudget>;
     onBudgetUpdate?: (
-        state: ReturnType<ReturnType<typeof createDreamTokenBudget>["snapshot"]>,
+        state: ReturnType<ReturnType<typeof createDreamTokenBudget>["snapshot"]> & {
+            sessionId: string;
+        },
     ) => void;
 }
 
@@ -71,8 +75,12 @@ export function createPromptAsyncTransport(
     options: PromptAsyncWaitOptions = {},
 ): PromptTransport | undefined {
     if (!supportsPromptAsync(client)) return undefined;
+    const budgetGuard = options.tokenBudget
+        ? createDreamTokenBudget(options.tokenBudget)
+        : undefined;
     return Object.assign(
-        (request: PromptArgs) => promptAsyncAndWaitForIdle(client, request, options),
+        (request: PromptArgs) =>
+            promptAsyncAndWaitForIdle(client, request, { ...options, budgetGuard }),
         { childSessionId },
     );
 }
@@ -100,6 +108,23 @@ function isSettledAssistant(message: unknown): boolean {
     const info = infoOf(message);
     if (info.role !== "assistant") return false;
     return info.time?.completed != null || info.error != null || info.finish != null;
+}
+
+function isTerminalAssistant(message: unknown): boolean {
+    const info = infoOf(message);
+    return (
+        isSettledAssistant(message) &&
+        info.finish !== "tool-calls" &&
+        info.finish !== "tool_use" &&
+        !(
+            message &&
+            typeof message === "object" &&
+            Array.isArray((message as { parts?: unknown[] }).parts) &&
+            (message as { parts: Array<{ type?: string }> }).parts.some(
+                (part) => part.type === "tool",
+            )
+        )
+    );
 }
 
 function unwrapData(response: unknown): unknown {
@@ -196,7 +221,11 @@ export async function promptAsyncAndWaitForIdle(
     const signal = request.signal;
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const startGraceMs = options.startGraceMs ?? DEFAULT_START_GRACE_MS;
-    const budget = options.tokenBudget ? createDreamTokenBudget(options.tokenBudget) : undefined;
+    const budget =
+        options.budgetGuard ??
+        (options.tokenBudget ? createDreamTokenBudget(options.tokenBudget) : undefined);
+    if (budget?.snapshot().finalizeFired)
+        throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
     const seenUsage = new Set<string>();
     let finalizing = false;
     let completionBaseline = new Set(
@@ -232,8 +261,9 @@ export async function promptAsyncAndWaitForIdle(
                         tokens.input,
                         tokens.cacheRead,
                         tokens.cacheWrite,
+                        isTerminalAssistant(message),
                     );
-                    options.onBudgetUpdate?.(budget.snapshot());
+                    options.onBudgetUpdate?.({ ...budget.snapshot(), sessionId });
                     if (decision === "stop") {
                         await session.abort?.({ path: { id: sessionId } });
                         throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
@@ -241,7 +271,9 @@ export async function promptAsyncAndWaitForIdle(
                     if (decision === "finalize") {
                         finalizing = true;
                         registerBudgetFinalizeChild(sessionId, budget);
-                        await session.abort?.({ path: { id: sessionId } });
+                        if (!session.abort)
+                            throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
+                        await session.abort({ path: { id: sessionId } });
                         // Wait for the cancelled generation to become idle before
                         // submitting a new user turn in the same session.
                         const abortDeadline = Date.now() + startGraceMs;
@@ -259,13 +291,21 @@ export async function promptAsyncAndWaitForIdle(
                                 .map(messageId)
                                 .filter((value): value is string => value !== null),
                         );
-                        await session.promptAsync?.({
+                        const finalizeResponse = await session.promptAsync?.({
                             ...request,
                             body: {
                                 ...request.body,
                                 parts: [{ type: "text", text: TOKEN_BUDGET_FINALIZE_MESSAGE }],
                             },
                         });
+                        if (
+                            finalizeResponse &&
+                            typeof finalizeResponse === "object" &&
+                            "error" in finalizeResponse &&
+                            finalizeResponse.error
+                        ) {
+                            throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
+                        }
                         sentAt = Date.now();
                         sawBusy = false;
                         break;

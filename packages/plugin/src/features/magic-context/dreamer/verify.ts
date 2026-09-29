@@ -128,6 +128,7 @@ export interface VerifyArgs {
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
     tokenBudget?: number;
+    onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     language?: string;
     moduleRoute?: DreamerModuleRoute;
     onProgress?: (processed: number, refused: number) => void;
@@ -325,6 +326,7 @@ async function verifyOneBatch(
                 prompt,
                 title: "magic-context-dream-verify",
                 callContext: "dreamer:verify",
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 language: args.language,
@@ -378,6 +380,7 @@ async function verifyOneBatch(
                 // slice below is the only timer (see prompt-async-transport.ts).
                 transport: shared.createPromptAsyncTransport(client, agentSessionId, {
                     tokenBudget: args.tokenBudget,
+                    onBudgetUpdate: args.onBudgetUpdate,
                 }),
                 timeoutMs: sliceMs,
                 signal,

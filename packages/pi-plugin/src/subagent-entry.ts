@@ -51,7 +51,9 @@
  *                                     action surface. Off by default.
  */
 
+import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { TOKEN_BUDGET_TOOL_REFUSAL } from "@magic-context/core/features/magic-context/dreamer/token-budget";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
@@ -78,6 +80,20 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 		type: "boolean",
 		default: false,
 	});
+
+	const budgetGuardFile = process.env.MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE;
+	if (budgetGuardFile) {
+		pi.on("tool_call", () => {
+			try {
+				if (readFileSync(budgetGuardFile, "utf8") === "finalize") {
+					return { block: true, reason: TOKEN_BUDGET_TOOL_REFUSAL };
+				}
+			} catch {
+				return { block: true, reason: TOKEN_BUDGET_TOOL_REFUSAL };
+			}
+			return undefined;
+		});
+	}
 
 	pi.on("session_start", async () => {
 		try {

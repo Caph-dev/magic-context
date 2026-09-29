@@ -62,6 +62,7 @@ export function createDreamTokenBudget(budget: number) {
             input: number,
             cacheRead: number,
             cacheWrite: number,
+            completed = false,
         ): "continue" | "finalize" | "stop" {
             for (const value of [input, cacheRead, cacheWrite]) {
                 if (!Number.isSafeInteger(value) || value < 0)
@@ -69,7 +70,7 @@ export function createDreamTokenBudget(budget: number) {
             }
             spent += input + cacheRead + cacheWrite;
             if (spent >= budget) return "stop";
-            if (!finalizeFired && spent >= budget * 0.8) {
+            if (!completed && !finalizeFired && spent >= budget * 0.8) {
                 finalizeFired = true;
                 return "finalize";
             }

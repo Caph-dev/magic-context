@@ -654,6 +654,17 @@ export class V2StoreReader {
         return typeof row?.seq === "number" ? row.seq : -1;
     }
 
+    assistantSince(sessionID: string, afterSeq: number): StoreRow<"assistant">[] {
+        return trackDecodeOperation("assistantSince", () => {
+            const rows = this.db
+                .prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
+                    WHERE session_id = ? AND type = 'assistant' AND seq > ?
+                    ORDER BY seq ASC`)
+                .all(sessionID, afterSeq) as RawRow[];
+            return rows.map((row) => decode(row) as StoreRow<"assistant">);
+        });
+    }
+
     latestAssistant(sessionID: string): StoreRow<"assistant"> | undefined {
         return trackDecodeOperation("latestAssistant", () => {
             const row = this.db

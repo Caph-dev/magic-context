@@ -103,6 +103,7 @@ export interface MapMemoriesArgs {
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
     tokenBudget?: number;
+    onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     moduleRoute?: DreamerModuleRoute;
     onProgress?: (processed: number) => void;
 }
@@ -345,6 +346,7 @@ async function mapOneBatch(
                 prompt,
                 title: "magic-context-dream-map-memories",
                 callContext: "dreamer:map-memories",
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 timeoutMs: sliceMs,
@@ -397,6 +399,7 @@ async function mapOneBatch(
                 // slice below is the only timer (see prompt-async-transport.ts).
                 transport: shared.createPromptAsyncTransport(client, agentSessionId, {
                     tokenBudget: args.tokenBudget,
+                    onBudgetUpdate: args.onBudgetUpdate,
                 }),
                 timeoutMs: sliceMs,
                 signal,

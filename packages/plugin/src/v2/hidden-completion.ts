@@ -1,3 +1,7 @@
+import {
+    createDreamTokenBudget,
+    DreamTokenBudgetExceeded,
+} from "../features/magic-context/dreamer/token-budget";
 import type {
     HiddenCompletion,
     HiddenCompletionExecutor,
@@ -117,6 +121,7 @@ export interface HiddenChildHost {
 export interface HiddenChildRows {
     latestSequence(sessionID: string): number;
     latestAssistant(sessionID: string): StoreRow<"assistant"> | undefined;
+    assistantSince?(sessionID: string, afterSeq: number): StoreRow<"assistant">[];
     latestIdle(sessionID: string): StoreRow<"idle"> | undefined;
 }
 
@@ -150,6 +155,7 @@ export interface V2HiddenCompletionOptions {
 
 interface RunState {
     identity: HiddenRunIdentity;
+    budget?: ReturnType<typeof createDreamTokenBudget>;
     role: HiddenChildRole;
     child: PersistedHiddenChild;
     releaseRole: () => void;
@@ -970,8 +976,12 @@ export async function createV2HiddenCompletionExecutor(
                 }
                 openedChild = active;
                 const handle = { id: active.id, childSessionId: active.id };
+                const tokenBudget = identity.metadata?.tokenBudget;
                 const run: RunState = {
                     identity,
+                    ...(hiddenToolLoop(identity) && typeof tokenBudget === "number"
+                        ? { budget: createDreamTokenBudget(tokenBudget) }
+                        : {}),
                     role,
                     child: active,
                     releaseRole,
@@ -1022,6 +1032,65 @@ export async function createV2HiddenCompletionExecutor(
             };
             options.hook.registerAttempt(marker, attempt);
             const deadline = Date.now() + run.identity.timeoutMs;
+            const budget = run.budget;
+            if (budget?.snapshot().finalizeFired) {
+                throw new DreamTokenBudgetExceeded(run.child.id, budget.snapshot().spent);
+            }
+            let usageSeq = baseline;
+            let budgetPoll: ReturnType<typeof setInterval> | undefined;
+            let budgetReject!: (error: Error) => void;
+            const budgetStopped = new Promise<never>((_resolve, reject) => {
+                budgetReject = reject;
+            });
+            if (budget) {
+                budgetPoll = setInterval(() => {
+                    try {
+                        const fresh = withReader(
+                            options.openReader,
+                            (reader) =>
+                                reader.assistantSince?.(run.child.id, usageSeq) ??
+                                (() => {
+                                    const latest = reader.latestAssistant(run.child.id);
+                                    return latest ? [latest] : [];
+                                })(),
+                        );
+                        for (const row of fresh) {
+                            if (row.seq <= usageSeq) continue;
+                            usageSeq = row.seq;
+                            const tokens = row.data.tokens;
+                            const decision = budget.charge(
+                                Math.max(0, tokens?.input ?? 0),
+                                Math.max(0, tokens?.cache?.read ?? 0),
+                                Math.max(0, tokens?.cache?.write ?? 0),
+                                row.data.finish === "stop" &&
+                                    !(row.data.content ?? []).some(
+                                        (part) => part.type === "tool-call",
+                                    ),
+                            );
+                            const onBudgetUpdate = run.identity.metadata?.onBudgetUpdate;
+                            if (typeof onBudgetUpdate === "function")
+                                onBudgetUpdate({ ...budget.snapshot(), sessionId: run.child.id });
+                            if (decision !== "continue") {
+                                if (budgetPoll) clearInterval(budgetPoll);
+                                // This host exposes context shaping but no pre-tool execution
+                                // hook for hidden children. Stop at the soft threshold instead
+                                // of allowing another investigation call to execute.
+                                attempt.budgetExceeded = new DreamTokenBudgetExceeded(
+                                    run.child.id,
+                                    budget.snapshot().spent,
+                                );
+                                void interruptAndRetire(run, "token-budget").finally(() =>
+                                    budgetReject(attempt.budgetExceeded as Error),
+                                );
+                                return;
+                            }
+                        }
+                    } catch (error) {
+                        if (budgetPoll) clearInterval(budgetPoll);
+                        budgetReject(error instanceof Error ? error : new Error(String(error)));
+                    }
+                }, POLL_INTERVAL_MS);
+            }
             let abortReject!: (error: Error) => void;
             const aborted = new Promise<never>((_resolve, reject) => {
                 abortReject = reject;
@@ -1044,8 +1113,13 @@ export async function createV2HiddenCompletionExecutor(
                 await Promise.race([
                     host.prompt({ sessionID: run.child.id, text: marker }),
                     aborted,
+                    ...(budget ? [budgetStopped] : []),
                 ]);
-                await Promise.race([host.wait({ sessionID: run.child.id }), aborted]);
+                await Promise.race([
+                    host.wait({ sessionID: run.child.id }),
+                    aborted,
+                    ...(budget ? [budgetStopped] : []),
+                ]);
                 const row = await Promise.race([
                     awaitAssistantRow(
                         options.openReader,
@@ -1067,6 +1141,7 @@ export async function createV2HiddenCompletionExecutor(
                         request.signal,
                     ),
                     aborted,
+                    ...(budget ? [budgetStopped] : []),
                 ]);
                 if (!attempt.shaped) {
                     throw new HiddenCompletionRefusal(
@@ -1124,7 +1199,7 @@ export async function createV2HiddenCompletionExecutor(
                 // Recorded for `keep_subagents` retention: this child now holds a settled run.
                 if (!run.child.ever_settled) run.child = store.markEverSettled(run.child);
             } catch (caught) {
-                const error = attempt.stepLimit ?? caught;
+                const error = attempt.budgetExceeded ?? attempt.stepLimit ?? caught;
                 run.failed = true;
                 if (!(error instanceof HiddenProviderError)) {
                     run.unsettledFailure = true;
@@ -1156,6 +1231,7 @@ export async function createV2HiddenCompletionExecutor(
                 throw error;
             } finally {
                 clearTimeout(deadlineTimer);
+                if (budgetPoll) clearInterval(budgetPoll);
                 request.signal?.removeEventListener("abort", onAbort);
                 options.hook.releaseAttempt(marker);
             }
