@@ -489,6 +489,7 @@ export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
 const transformPassScope = new AsyncLocalStorage<{ active: boolean } | undefined>();
+const admissionScope = new AsyncLocalStorage<boolean>();
 
 /** Only an awaited foreground transform may spend the extra acquisition budget.
  * The mutable lease also expires for detached descendants when that pass ends. */
@@ -537,6 +538,7 @@ export class SqliteAcquisitionBusyError extends Error {
 }
 
 const SHORT_BUSY_TIMEOUT_MS = 25;
+const FOREGROUND_IN_PASS_BUSY_TIMEOUT_MS = 250;
 const FOREGROUND_ACQUISITION_BUDGET_MS = 16_500;
 
 /** The connection is never handed back to another caller with a shortened timeout. */
@@ -545,7 +547,14 @@ function acquireShort(db: Database, acquire: () => unknown, site: string): void 
     const previous = pragmaNumber(db, "busy_timeout");
     let acquired = false;
     try {
-        db.exec(`PRAGMA busy_timeout=${SHORT_BUSY_TIMEOUT_MS}`);
+        // Async admission retries after yielding, so each of its BEGIN attempts
+        // stays short. An ordinary BEGIN inside a transform pass cannot yield;
+        // give that single attempt enough time for a brief writer to finish.
+        const timeout =
+            transformPassScope.getStore()?.active && !admissionScope.getStore()
+                ? FOREGROUND_IN_PASS_BUSY_TIMEOUT_MS
+                : SHORT_BUSY_TIMEOUT_MS;
+        db.exec(`PRAGMA busy_timeout=${timeout}`);
         acquire();
         acquired = true;
     } catch (error) {
@@ -557,7 +566,7 @@ function acquireShort(db: Database, acquire: () => unknown, site: string): void 
         const elapsed = performance.now() - started;
         if (elapsed >= 250)
             console.warn(
-                `[magic-context] sqlite acquisition site=${site} lane=${transformPassScope.getStore()?.active ? "foreground" : "background"} elapsed=${Math.round(elapsed)}ms attempts=1 outcome=${acquired ? "acquired" : "busy"}`,
+                `[${new Date().toISOString()}] [magic-context] sqlite acquisition site=${site} lane=${transformPassScope.getStore()?.active ? "foreground" : "background"} elapsed=${Math.round(elapsed)}ms attempts=1 outcome=${acquired ? "acquired" : "busy"}`,
             );
     }
 }
@@ -574,7 +583,7 @@ export async function beginSqliteWriterAsync(db: Database, site: string): Promis
             const elapsed = performance.now() - started;
             if (elapsed >= 250)
                 console.warn(
-                    `[magic-context] sqlite acquisition site=${site} lane=background elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=acquired`,
+                    `[${new Date().toISOString()}] [magic-context] sqlite acquisition site=${site} lane=background elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=acquired`,
                 );
             return;
         } catch (error) {
@@ -582,7 +591,7 @@ export async function beginSqliteWriterAsync(db: Database, site: string): Promis
             const elapsed = performance.now() - started;
             if (elapsed >= FOREGROUND_ACQUISITION_BUDGET_MS) {
                 console.warn(
-                    `[magic-context] sqlite acquisition site=${site} lane=background elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=busy`,
+                    `[${new Date().toISOString()}] [magic-context] sqlite acquisition site=${site} lane=background elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=busy`,
                 );
                 throw error;
             }
@@ -606,11 +615,13 @@ export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () =
     for (;;) {
         attempts++;
         try {
-            const result = withSqliteTransformPass(() => withPrivilegedWriter(db, operation));
+            const result = admissionScope.run(true, () =>
+                withSqliteTransformPass(() => withPrivilegedWriter(db, operation)),
+            );
             const elapsed = performance.now() - started;
             if (elapsed >= 250)
                 console.warn(
-                    `[magic-context] sqlite acquisition site=privileged_writer lane=foreground elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=acquired`,
+                    `[${new Date().toISOString()}] [magic-context] sqlite acquisition site=privileged_writer lane=foreground elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=acquired`,
                 );
             return result;
         } catch (error) {
@@ -620,7 +631,7 @@ export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () =
             if (elapsed >= FOREGROUND_ACQUISITION_BUDGET_MS) {
                 if (elapsed >= 250)
                     console.warn(
-                        `[magic-context] sqlite acquisition site=privileged_writer lane=foreground elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=busy`,
+                        `[${new Date().toISOString()}] [magic-context] sqlite acquisition site=privileged_writer lane=foreground elapsed=${Math.round(elapsed)}ms attempts=${attempts} outcome=busy`,
                     );
                 throw error instanceof SqliteAcquisitionBusyError
                     ? error

@@ -71,7 +71,7 @@ test("foreground admission keeps the loop ticking while a separate writer holds 
     }
 }, 30000);
 
-test("a foreground synchronous writer refuses busy without blocking the loop", () => {
+test("a foreground in-pass writer has bounded 250ms tolerance and restores its timeout", () => {
     const { db, path, close } = fixture();
     const blocker = new Database(path);
     blocker.exec("BEGIN IMMEDIATE");
@@ -80,7 +80,8 @@ test("a foreground synchronous writer refuses busy without blocking the loop", (
         expect(() =>
             withSqliteTransformPass(() => withPrivilegedWriter(db, () => undefined)),
         ).toThrow(SqliteAcquisitionBusyError);
-        expect(performance.now() - start).toBeLessThan(250);
+        expect(performance.now() - start).toBeGreaterThanOrEqual(200);
+        expect(performance.now() - start).toBeLessThan(400);
         expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
     } finally {
         blocker.exec("ROLLBACK");
@@ -104,6 +105,18 @@ test("ready background publication retries on a timer and retains its write", as
         expect(db.prepare("SELECT COUNT(*) AS count FROM context_privilege_state").get()).toEqual({
             count: 1,
         });
+        expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+    } finally {
+        await locker.exited;
+        close();
+    }
+}, 30000);
+
+test("an in-pass BEGIN tolerates a sibling writer that releases within 250ms", async () => {
+    const { db, path, close } = fixture();
+    const locker = await startSqliteWriteLocker(path, 150);
+    try {
+        withSqliteTransformPass(() => withPrivilegedWriter(db, () => undefined));
         expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
     } finally {
         await locker.exited;
