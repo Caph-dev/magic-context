@@ -1013,6 +1013,14 @@
             ]
         },
         {
+            "path": "tests/opencode2/hidden-child-two-directories.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Real OpenCode 2 host dispatches hidden runs from two git worktrees with shared project identity to their respective directory hooks; dedicated v2 lane",
+            "contract_refs": ["R44"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/opencode2/hidden-child-unbound.test.ts",
             "tier": "excluded",
             "invocation": {

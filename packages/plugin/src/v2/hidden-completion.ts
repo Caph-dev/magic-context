@@ -1,4 +1,8 @@
 import {
+    historianOrphanStaleMs,
+    retrospectiveOrphanStaleMs,
+} from "../features/magic-context/dreamer/retrospective-orphan-sweep";
+import {
     createDreamTokenBudget,
     DreamTokenBudgetExceeded,
 } from "../features/magic-context/dreamer/token-budget";
@@ -111,6 +115,7 @@ export interface HiddenChildHost {
      * because the host surface this adapter is handed does not always carry it; when it is missing,
      * a retired child keeps its entry in the retired list and the next boot sweep tries again.
      */
+    status?(input: { directory: string }): Promise<Record<string, { type: string }> | undefined>;
     remove?(input: {
         sessionID: string;
         owner?: HostServiceOwner;
@@ -128,6 +133,7 @@ export interface HiddenChildRows {
 export interface V2HiddenCompletionOptions {
     db: Database;
     projectIdentity: string;
+    directory: string;
     hook: HiddenChildHook;
     openReader: () => HiddenChildRows & { close?: () => void };
     ensureAgent?(): Promise<void>;
@@ -181,8 +187,10 @@ const REMOVAL_SPACING_MS = 250;
 const RETIRED_CHILDREN_LIMIT = 200;
 const LEGACY_CLEANUP_BOOT_LIMIT = 5;
 
-export function hiddenChildrenMetaKey(projectIdentity: string): string {
-    return `${META_PREFIX}${projectIdentity}`;
+export function hiddenChildrenMetaKey(projectIdentity: string, directory?: string): string {
+    return directory === undefined
+        ? `${META_PREFIX}${projectIdentity}`
+        : `${META_PREFIX}${JSON.stringify([projectIdentity, directory])}`;
 }
 
 function emptyMeta(): HiddenChildrenMeta {
@@ -275,8 +283,59 @@ class HiddenChildStateStore {
     constructor(
         private readonly db: Database,
         projectIdentity: string,
+        directory: string,
     ) {
-        this.key = hiddenChildrenMetaKey(projectIdentity);
+        this.key = hiddenChildrenMetaKey(projectIdentity, directory);
+        this.legacyKey = hiddenChildrenMetaKey(projectIdentity);
+    }
+
+    private readonly legacyKey: string;
+
+    migrateStale(isStale: (child: PersistedHiddenChild) => boolean): void {
+        this.db
+            .transaction(() => {
+                const legacyRow = this.db
+                    .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                    .get(this.legacyKey) as { value: string } | undefined;
+                if (!legacyRow) return;
+                const legacy = parseMeta(legacyRow.value);
+                const scoped = this.read();
+                for (const role of ["historian", "dreamer"] as const) {
+                    const child = legacy.active[role];
+                    if (!child || !isStale(child)) continue;
+                    scoped.retired_children.push({
+                        ...child,
+                        retired_at: Date.now(),
+                        reason: "legacy-directory-scope",
+                    });
+                    delete legacy.active[role];
+                }
+                const remaining: RetiredHiddenChild[] = [];
+                for (const child of legacy.retired_children) {
+                    if (isStale(child)) scoped.retired_children.push(child);
+                    else remaining.push(child);
+                }
+                legacy.retired_children = remaining;
+                const excess = scoped.retired_children.length - RETIRED_CHILDREN_LIMIT;
+                if (excess > 0) scoped.retired_children.splice(0, excess);
+                this.db
+                    .prepare(`INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+                    .run(this.key, JSON.stringify(scoped));
+                if (
+                    Object.keys(legacy.active).length === 0 &&
+                    legacy.retired_children.length === 0
+                ) {
+                    this.db
+                        .prepare("DELETE FROM schema_migrations_meta WHERE key = ?")
+                        .run(this.legacyKey);
+                } else {
+                    this.db
+                        .prepare("UPDATE schema_migrations_meta SET value = ? WHERE key = ?")
+                        .run(JSON.stringify(legacy), this.legacyKey);
+                }
+            })
+            .immediate();
     }
 
     read(): HiddenChildrenMeta {
@@ -564,6 +623,15 @@ async function sleepUntilPoll(signal: AbortSignal | undefined, deadline: number)
     });
 }
 
+function isProviderFailure(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const type = (error as { type?: unknown }).type;
+    return (
+        typeof type === "string" &&
+        (type.startsWith("provider.") || type.toLowerCase().includes("provider"))
+    );
+}
+
 async function awaitAssistantRow(
     openReader: () => HiddenChildRows & { close?: () => void },
     readSessionError: () => Promise<unknown>,
@@ -591,10 +659,8 @@ async function awaitAssistantRow(
                     `terminal_row=${errorText(newIdle)}`,
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
-                throw sessionError === undefined
-                    ? new Error(
-                          `Hidden completion failed without a provider error: ${details.join("; ")}`,
-                      )
+                throw sessionError === undefined || !isProviderFailure(sessionError)
+                    ? new Error(`Hidden completion failed: ${details.join("; ")}`)
                     : new HiddenProviderError(details.join("; "));
             }
             if (outcome === "succeeded" && newAssistant) return newAssistant;
@@ -608,10 +674,8 @@ async function awaitAssistantRow(
                     `terminal_row=${errorText(newAssistant)}`,
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
-                throw sessionError === undefined
-                    ? new Error(
-                          `Hidden completion failed without a provider error: ${details.join("; ")}`,
-                      )
+                throw sessionError === undefined || !isProviderFailure(sessionError)
+                    ? new Error(`Hidden completion failed: ${details.join("; ")}`)
                     : new HiddenProviderError(details.join("; "));
             }
             if (newAssistant.data.error !== undefined) {
@@ -668,10 +732,51 @@ export async function createV2HiddenCompletionExecutor(
     options: V2HiddenCompletionOptions,
 ): Promise<HiddenCompletionExecutor> {
     const runs = new WeakMap<HiddenRunHandle, RunState>();
-    const store = new HiddenChildStateStore(options.db, options.projectIdentity);
+    const store = new HiddenChildStateStore(options.db, options.projectIdentity, options.directory);
     const generation = options.generation ?? "opencode2";
     const roleTails = new Map<HiddenChildRole, Promise<void>>();
 
+    const legacy = options.db
+        .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+        .get(hiddenChildrenMetaKey(options.projectIdentity)) as { value: string } | undefined;
+    if (legacy) {
+        const children = parseMeta(legacy.value);
+        const statuses = new Map<string, Record<string, { type: string }> | undefined>();
+        for (const child of [...Object.values(children.active), ...children.retired_children]) {
+            if (!child || !host.status) continue;
+            const directory = child.directory ?? options.directory;
+            if (!statuses.has(directory)) {
+                try {
+                    statuses.set(directory, await host.status({ directory }));
+                } catch {
+                    statuses.set(directory, undefined);
+                }
+            }
+        }
+        store.migrateStale((child) => {
+            const directory = child.directory ?? options.directory;
+            const state = statuses.get(directory);
+            if (
+                host.status &&
+                (!state || state[child.id]?.type === "busy" || state[child.id]?.type === "retry")
+            )
+                return false;
+            const last = Math.max(
+                child.created_at,
+                withReader(options.openReader, (reader) =>
+                    Math.max(
+                        reader.latestAssistant(child.id)?.data.time?.created ?? 0,
+                        reader.latestIdle(child.id)?.data.time?.created ?? 0,
+                    ),
+                ),
+            );
+            const staleMs =
+                child.role === "historian"
+                    ? historianOrphanStaleMs(20 * 60_000, 3)
+                    : retrospectiveOrphanStaleMs(undefined);
+            return Date.now() - last > staleMs;
+        });
+    }
     const persisted = store.read();
     for (const child of [...Object.values(persisted.active), ...persisted.retired_children]) {
         if (child) options.hook.registerChild(child.id);

@@ -172,6 +172,8 @@ test("OpenCode 2 hidden historian survives a retried and a terminal provider fai
         const failed = await failedRun;
         expect(failed.ok).toBe(false);
         expect(failed.error).toContain("outcome=failed");
+        expect(failed.error).toContain("provider.invalid-request");
+        expect(failed.error).toContain("forced hidden failure 400");
         expect(failed.childID).toBe(first.childID);
 
         // The next run gets a clean child while the user session keeps taking turns.

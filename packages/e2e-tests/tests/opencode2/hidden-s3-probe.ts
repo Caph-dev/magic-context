@@ -43,6 +43,7 @@ export default {
         const executor = await createV2HiddenCompletionExecutor(context.session, {
             db: hiddenDb,
             projectIdentity: context.location.directory,
+            directory: context.location.directory,
             hook: hiddenHook,
             ensureAgent: () => (agentsReady ??= context.agent.reload()),
             openReader: () => new V2StoreReader(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest")),
