@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { recordDreamerTickFailure } from "@magic-context/core/features/magic-context/dreamer/tick-failure";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
@@ -32,6 +32,7 @@ import {
 	type StatusDialogDetail,
 	showStatusDialog,
 	statusViewSourceFromPiDetail,
+	stopStatusDialogRefresh,
 } from "./status-dialog";
 
 /**
@@ -77,6 +78,40 @@ function fullStatusDetail(sessionId: string) {
 }
 
 describe("Pi status dialog", () => {
+	it("shutdown closes the dialog and clears its refresh interval", async () => {
+		const db = createTestDb();
+		try {
+			let finished = false;
+			let component: { dispose(): void } | undefined;
+			const ctx = {
+				...fakeContext("ses-status-shutdown"),
+				ui: {
+					custom: async (
+						factory: (...args: never[]) => { dispose(): void },
+					) => {
+						component = factory({ requestRender() {} }, {}, {}, () => {
+							finished = true;
+						});
+					},
+				},
+			};
+			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
+				db,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+			});
+			const cleared = spyOn(globalThis, "clearInterval");
+			try {
+				stopStatusDialogRefresh();
+				expect(finished).toBe(true);
+				expect(cleared).toHaveBeenCalledTimes(1);
+			} finally {
+				cleared.mockRestore();
+				component?.dispose();
+			}
+		} finally {
+			closeQuietly(db);
+		}
+	});
 	it("displays usage against the output-reserved safe window", () => {
 		const db = createTestDb();
 		try {

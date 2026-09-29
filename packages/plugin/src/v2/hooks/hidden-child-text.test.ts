@@ -63,7 +63,7 @@ describe("newestUserText", () => {
         ).toBe("mc:hidden:input");
     });
 
-    it("gives the Curate child only ctx_memory and ctx_memory_list", () => {
+    it("gives the Curate child only ctx_memory", () => {
         const hook = new HiddenChildHook();
         hook.registerAttempt("mc:hidden:curate", {
             childSessionId: "ses-child",
@@ -90,7 +90,7 @@ describe("newestUserText", () => {
         };
 
         expect(hook.apply(candidate)).toBe(true);
-        expect(Object.keys(candidate.tools).sort()).toEqual(["ctx_memory", "ctx_memory_list"]);
+        expect(Object.keys(candidate.tools).sort()).toEqual(["ctx_memory"]);
     });
 
     it("matches an attempt after v2 ordinal prefixes", () => {

@@ -72,6 +72,7 @@ export interface RegisterCtxWrapupDeps {
 	wrapupLeaseWaitTimeoutMs?: number;
 	resolveRuntimeDeps?: (ctx: { cwd: string }) => CtxWrapupRuntimeDeps;
 	compactionOff?: boolean;
+	shutdownSignal?: AbortSignal;
 }
 
 export type CtxWrapupRuntimeDeps = Omit<
@@ -135,7 +136,10 @@ export function registerCtxWrapupCommand(
 				});
 				return;
 			}
-			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
+			const currentDeps = {
+				...(deps.resolveRuntimeDeps?.(ctx) ?? deps),
+				shutdownSignal: deps.shutdownSignal,
+			};
 			if (currentDeps.compactionOff) {
 				sendStatus({
 					title: "/ctx-wrapup",
@@ -305,6 +309,8 @@ export async function runPiWrapup(
 				);
 			}
 		}, 60_000);
+		const stopRenewal = () => clearInterval(renewal);
+		deps.shutdownSignal?.addEventListener("abort", stopRenewal, { once: true });
 		try {
 			sendStatus({
 				title: "/ctx-wrapup",
@@ -399,6 +405,7 @@ export async function runPiWrapup(
 					sessionId,
 					renewWrapupMarker,
 					resolveWrapupLeaseWaitTimeout(deps),
+					deps.shutdownSignal,
 				);
 				if (!leaseResult.ok) {
 					failure = ownershipLost
@@ -419,6 +426,10 @@ export async function runPiWrapup(
 						);
 					}
 				}, COMPARTMENT_LEASE_RENEWAL_MS);
+				const stopLeaseRenewal = () => clearInterval(leaseRenewal);
+				deps.shutdownSignal?.addEventListener("abort", stopLeaseRenewal, {
+					once: true,
+				});
 				try {
 					const runHistorian = deps.runPiHistorianForWrapup ?? runPiHistorian;
 					await runHistorian({
@@ -427,6 +438,7 @@ export async function runPiWrapup(
 						directory: ctx.cwd,
 						provider,
 						runner: deps.runner,
+						signal: deps.shutdownSignal,
 						historianModel: deps.historianModel as string,
 						fallbackModels: deps.historianFallbacks,
 						fallbackModelId: modelKey,
@@ -477,6 +489,7 @@ export async function runPiWrapup(
 					});
 				} finally {
 					clearInterval(leaseRenewal);
+					deps.shutdownSignal?.removeEventListener("abort", stopLeaseRenewal);
 					releaseCompartmentLeaseBestEffort(
 						deps.db,
 						sessionId,
@@ -514,6 +527,7 @@ export async function runPiWrapup(
 			return `## Magic Wrapup\n\nWrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments. The compacted history is queued and materializes on your next message.`;
 		} finally {
 			clearInterval(renewal);
+			deps.shutdownSignal?.removeEventListener("abort", stopRenewal);
 			releaseWrapupInProgress(deps.db, sessionId, holderId);
 		}
 	} finally {
@@ -551,19 +565,28 @@ async function acquireCompartmentLeaseEventually(
 		updates: Parameters<typeof updateWrapupInProgress>[3],
 	) => boolean,
 	maxWaitMs: number,
+	signal?: AbortSignal,
 ): Promise<LeaseAcquireResult> {
 	const waitStartedAt = Date.now();
 	const remainingMs = (): number =>
 		Math.max(0, waitStartedAt + maxWaitMs - Date.now());
 	for (;;) {
+		if (signal?.aborted) return { ok: false, reason: "ownership_lost" };
 		if (remainingMs() <= 0) return { ok: false, reason: "timeout" };
 		const holderId = crypto.randomUUID();
 		const lease = acquireCompartmentLease(db, sessionId, holderId);
 		if (lease) return { ok: true, holderId };
 		if (!renewWrapupMarker({})) return { ok: false, reason: "ownership_lost" };
-		await new Promise((resolve) =>
-			setTimeout(resolve, Math.min(LEASE_WAIT_MS, remainingMs())),
-		);
+		await new Promise<void>((resolve) => {
+			const finish = () => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", finish);
+				resolve();
+			};
+			const timer = setTimeout(finish, Math.min(LEASE_WAIT_MS, remainingMs()));
+			signal?.addEventListener("abort", finish, { once: true });
+			if (signal?.aborted) finish();
+		});
 	}
 }
 

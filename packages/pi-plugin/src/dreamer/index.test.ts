@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -30,6 +31,7 @@ import { __setPiHarnessKindForTesting } from "../pi-harness-kind";
 import { PiSubagentRunner } from "../subagent-runner";
 import {
 	__test,
+	abortInFlightDreamers,
 	awaitInFlightDreamers,
 	registerPiDreamerProject,
 	runPiDreamForProject,
@@ -156,6 +158,63 @@ afterEach(() => {
 });
 
 describe("Pi dreamer wiring", () => {
+	test("shutdown aborts an owner-bound dreamer child and ps finds no survivor", async () => {
+		db = createDb();
+		const owner = {};
+		const identity = "git:pi-dream-shutdown-child";
+		let client!: CapturedDreamClient;
+		let pid = 0;
+		__test.setStartDreamScheduleTimerFactory(async (registration) => {
+			client = registration.client as CapturedDreamClient;
+			return () => {};
+		});
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: ({ signal }: { signal: AbortSignal }) =>
+						new Promise((resolve) => {
+							const child = spawn(
+								process.execPath,
+								["-e", "setInterval(() => {}, 1000)"],
+								{ stdio: "ignore" },
+							);
+							pid = child.pid ?? 0;
+							signal.addEventListener("abort", () => child.kill("SIGTERM"), {
+								once: true,
+							});
+							child.once("close", () =>
+								resolve({ ok: false, reason: "abort", error: "cancelled" }),
+							);
+						}),
+				}) as never,
+		);
+		registerPiDreamerProject(
+			dreamerOptions({
+				database: db,
+				projectIdentity: identity,
+				projectDir: process.cwd(),
+				registrationOwner: owner,
+				config: DreamerConfigSchema.parse({
+					pi: { model: "test/model" },
+					tasks: { curate: { schedule: "0 4 * * *" } },
+				}),
+			}),
+		);
+		await flushMicrotasks();
+		const session = (await client.session.create({})) as { id: string };
+		const prompt = client.session.prompt({
+			path: { id: session.id },
+			body: { parts: [{ text: "dream" }] },
+		});
+		await flushMicrotasks();
+		expect(pid).toBeGreaterThan(0);
+		abortInFlightDreamers(owner);
+		await expect(prompt).rejects.toThrow("abort");
+		await awaitInFlightDreamers(owner);
+		expect(() =>
+			execFileSync("ps", ["-p", String(pid), "-o", "pid="]),
+		).toThrow();
+	});
 	test("manual dreamer uses the cap sampled for each child run", async () => {
 		db = createDb();
 		const identity = "git:pi-live-dreamer-cap";

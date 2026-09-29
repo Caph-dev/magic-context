@@ -7,9 +7,14 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	acquireCompartmentLease,
+	releaseCompartmentLease,
+} from "@magic-context/core/features/magic-context/compartment-lease";
 import {
 	clearSession,
 	getOrCreateSessionMeta,
@@ -102,6 +107,8 @@ function createCountingPi() {
 		registerTool: mock((tool: { name?: string }) => {
 			tools.push(tool.name ?? "<unnamed>");
 		}),
+		getActiveTools: () => [],
+		setActiveTools: () => {},
 		registerFlag: mock((name: string) => {
 			flags.push(name);
 		}),
@@ -196,6 +203,31 @@ describe("Pi in-process child guard (#247)", () => {
 		]);
 	}, 15_000);
 
+	it("headless Pi does not register scheduled dreamer children", async () => {
+		const configHome = isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const configDir = join(configHome, "cortexkit");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "magic-context.jsonc"),
+			JSON.stringify({ dreamer: { pi: { model: "test/dreamer" } } }),
+		);
+		const scheduled = mock(async () => () => {});
+		dreamerTest.setStartDreamScheduleTimerFactory(scheduled);
+		const runtime = createCountingPi();
+		await magicContextPiExtension(runtime.pi);
+		const ctx = {
+			cwd: process.cwd(),
+			hasUI: false,
+			sessionManager: { getSessionId: () => "ses-print" },
+			ui: { setStatus() {} },
+		};
+		await runtime.emitPiEvent("session_start", {}, ctx);
+		await runtime.emitPiEvent("before_agent_start", {}, ctx);
+		expect(scheduled).not.toHaveBeenCalled();
+		await runtime.emitPiEvent("session_shutdown", {}, ctx);
+	}, 20_000);
+
 	it("keeps session B historian and Dreamer live when session A shuts down", async () => {
 		const configHome = isolateXdgEnv();
 		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
@@ -251,6 +283,14 @@ describe("Pi in-process child guard (#247)", () => {
 		const runtimeB = createCountingPi();
 		await magicContextPiExtension(runtimeA.pi);
 		await magicContextPiExtension(runtimeB.pi);
+		const startCtx = {
+			cwd: process.cwd(),
+			hasUI: true,
+			ui: { notify: () => undefined, setStatus: () => undefined },
+			sessionManager: { getSessionId: () => "ses-live-b" },
+		};
+		await runtimeA.emitPiEvent("session_start", {}, startCtx);
+		await runtimeB.emitPiEvent("session_start", {}, startCtx);
 		await Promise.resolve();
 		expect(scheduledClients).toHaveLength(1);
 
@@ -277,7 +317,7 @@ describe("Pi in-process child guard (#247)", () => {
 			percent: number,
 		) => ({
 			cwd: process.cwd(),
-			hasUI: false,
+			hasUI: true,
 			model: {
 				provider: "test",
 				id: "model",
@@ -346,6 +386,147 @@ describe("Pi in-process child guard (#247)", () => {
 				{},
 				shutdownCtx("ses-live-b"),
 			);
+		}
+	}, 20_000);
+
+	it("shutdown terminates a real historian child and releases its compartment lease", async () => {
+		const configHome = isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const configDir = join(configHome, "cortexkit");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "magic-context.jsonc"),
+			JSON.stringify({
+				historian: { pi: { model: "test/historian" } },
+				protected_tags: 1,
+			}),
+		);
+		const sessionId = "ses-historian-shutdown-child";
+		const db = openDatabase();
+		let started!: (pid: number) => void;
+		const childStarted = new Promise<number>((resolve) => {
+			started = resolve;
+		});
+		let childPid = 0;
+		let startTimeout: ReturnType<typeof setTimeout> | undefined;
+		const children = new Set<ReturnType<typeof spawn>>();
+		const historianRun = spyOn(
+			PiSubagentRunner.prototype,
+			"run",
+		).mockImplementation(
+			(options) =>
+				new Promise((resolve) => {
+					const child = spawn(
+						process.execPath,
+						["-e", "setInterval(() => {}, 1000)"],
+						{ stdio: "ignore" },
+					);
+					children.add(child);
+					childPid = child.pid ?? 0;
+					options.signal?.addEventListener(
+						"abort",
+						() => child.kill("SIGTERM"),
+						{ once: true },
+					);
+					child.once("close", () => {
+						children.delete(child);
+						resolve({
+							ok: false,
+							reason: "abort",
+							error: "shutdown",
+							durationMs: 0,
+						});
+					});
+					started(childPid);
+				}) as never,
+		);
+		const runtime = createCountingPi();
+		try {
+			await magicContextPiExtension(runtime.pi);
+			const makeMessages = (count: number) =>
+				Array.from({ length: count }, (_, index) => {
+					const role = index % 2 === 0 ? "user" : "assistant";
+					return {
+						role,
+						content: [
+							{
+								type: "text",
+								text: `${role} ${index} ${"history detail ".repeat(200)}`,
+							},
+						],
+						timestamp: Date.now() + index,
+					};
+				});
+			const context = (
+				messages: ReturnType<typeof makeMessages>,
+				percent: number,
+			) => ({
+				cwd: process.cwd(),
+				hasUI: true,
+				model: {
+					provider: "test",
+					id: "model",
+					contextWindow: 100_000,
+					maxTokens: 4096,
+				},
+				sessionManager: {
+					getSessionId: () => sessionId,
+					getBranch: () =>
+						messages.map((message, index) => ({
+							type: "message",
+							id: `entry-${index + 1}`,
+							message,
+						})),
+				},
+				getContextUsage: () => ({
+					tokens: Math.round(percent * 1000),
+					percent,
+					contextWindow: 100_000,
+				}),
+				ui: { setStatus() {}, notify() {} },
+			});
+			const prime = makeMessages(1);
+			await runtime.emitPiEvent(
+				"context",
+				{ messages: prime },
+				context(prime, 1),
+			);
+			const live = makeMessages(50);
+			await runtime.emitPiEvent(
+				"context",
+				{ messages: live },
+				context(live, 90),
+			);
+			const pid = await Promise.race([
+				childStarted,
+				new Promise<never>((_, reject) => {
+					startTimeout = setTimeout(
+						() => reject(new Error("historian did not start")),
+						3000,
+					);
+				}),
+			]);
+			expect(pid).toBeGreaterThan(0);
+			await runtime.emitPiEvent(
+				"session_shutdown",
+				{},
+				{
+					sessionManager: { getSessionId: () => sessionId },
+					ui: { setStatus() {} },
+				},
+			);
+			await awaitInFlightHistorians(sessionId);
+			expect(() =>
+				execFileSync("ps", ["-p", String(pid), "-o", "pid="]),
+			).toThrow();
+			expect(
+				acquireCompartmentLease(db, sessionId, "next-process"),
+			).not.toBeNull();
+			releaseCompartmentLease(db, sessionId, "next-process");
+		} finally {
+			if (startTimeout) clearTimeout(startTimeout);
+			for (const child of children) child.kill("SIGKILL");
+			historianRun.mockRestore();
 		}
 	}, 20_000);
 
@@ -443,7 +624,7 @@ describe("Pi in-process child guard (#247)", () => {
 		expect(notifications).toBe(0);
 	});
 
-	it("aborts a recomp only after the five-second shutdown drain expires", async () => {
+	it("aborts a recomp before waiting for the bounded shutdown drain", async () => {
 		isolateXdgEnv();
 		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
 		const runtime = createCountingPi();
@@ -506,7 +687,7 @@ describe("Pi in-process child guard (#247)", () => {
 			}
 			const timeout = timers.findLast((timer) => timer.active);
 			expect(timeout?.delay).toBe(5_000);
-			expect(observedSignal?.aborted).toBe(false);
+			expect(observedSignal?.aborted).toBe(true);
 
 			timeout?.callback();
 			await shutdown;

@@ -64,7 +64,7 @@ function git(projectDir: string, args: string[]): string {
 export function docsChangeSet(
     projectDir: string,
     storedAnchor?: string,
-): { head: string; text: string } | null {
+): { head: string; text: string; unchanged: boolean; relevant: boolean } | null {
     try {
         if (
             realpathSync(git(projectDir, ["rev-parse", "--show-toplevel"])) !==
@@ -72,14 +72,85 @@ export function docsChangeSet(
         )
             return null;
         const head = git(projectDir, ["rev-parse", "HEAD"]);
+        const recorded = Boolean(storedAnchor);
         let anchor = storedAnchor;
         if (
-            !anchor ||
-            !/^[a-f0-9]{40}$/.test(anchor) ||
-            !git(projectDir, ["cat-file", "-t", anchor]).includes("commit")
+            anchor &&
+            (!/^[a-f0-9]{40}$/.test(anchor) ||
+                git(projectDir, ["cat-file", "-t", anchor]) !== "commit")
         )
-            anchor = git(projectDir, ["log", "-1", "--format=%H", "--", ...FILES]);
+            throw new Error("maintain-docs checkpoint is not a git commit");
+        if (!anchor) anchor = git(projectDir, ["log", "-1", "--format=%H", "--", ...FILES]);
         if (!anchor) return null;
+        if (recorded && anchor === head)
+            return { head, text: "", unchanged: true, relevant: false };
+        if (recorded) {
+            const changed = git(projectDir, [
+                "diff",
+                "-M",
+                "--name-status",
+                `${anchor}..HEAD`,
+                "--",
+                ".",
+            ])
+                .split("\n")
+                .filter(Boolean)
+                .map((line) => line.split("\t").slice(1));
+            const files = [
+                ...new Set(
+                    changed
+                        .flat()
+                        .filter(
+                            (file) =>
+                                file !== "ARCHITECTURE.md" &&
+                                file !== "STRUCTURE.md" &&
+                                !/(?:^|[./-])(test|spec)(?:[./-]|$)/.test(file) &&
+                                !file.endsWith(".lock"),
+                        ),
+                ),
+            ];
+            const docs = FILES.map((file) =>
+                existsSync(join(projectDir, file))
+                    ? readFileSync(join(projectDir, file), "utf8")
+                    : "",
+            ).join("\n");
+            const relevant = files.some((file) => {
+                const directory = file.split("/").slice(0, -1).join("/");
+                return docs.includes(file) || (directory.length > 2 && docs.includes(directory));
+            });
+            if (!relevant) return { head, text: "", unchanged: false, relevant: false };
+            const stat = git(projectDir, [
+                "diff",
+                "-M",
+                "--stat",
+                `${anchor}..HEAD`,
+                "--",
+                ...files,
+            ]);
+            const patch = git(projectDir, [
+                "diff",
+                "-M",
+                "--unified=3",
+                `${anchor}..HEAD`,
+                "--",
+                ...files,
+            ]);
+            const budget = 32000;
+            const text = `Changed files:\n${files.join("\n")}\n\nStat:\n${stat}\n\nHunks:\n${patch}`;
+            if (text.length <= budget) return { head, text, unchanged: false, relevant: true };
+            const ranges = [...patch.matchAll(/^\+\+\+ b\/(.+)$|^@@ .* \+(\d+)(?:,(\d+))? @@/gm)];
+            return {
+                head,
+                unchanged: false,
+                relevant: true,
+                text: `Changed files and ranges (diff exceeds prompt budget):\n${files.join("\n")}\n${ranges
+                    .map((match) =>
+                        match[1] ? `file: ${match[1]}` : `line: ${match[2]} +${match[3] ?? 1}`,
+                    )
+                    .join("\n")
+                    .slice(0, budget)}\n\nStat:\n${stat}`,
+            };
+        }
         const excluded = [
             "ARCHITECTURE.md",
             "STRUCTURE.md",
@@ -108,9 +179,12 @@ export function docsChangeSet(
         const text = raw.slice(0, 24000);
         return {
             head,
+            unchanged: false,
+            relevant: true,
             text: `${text}${raw.length > text.length ? `\n[cut ${raw.length - text.length} bytes]` : ""}${commits.length > 201 ? "\n[cut commits beyond newest 200]" : ""}`,
         };
-    } catch {
+    } catch (error) {
+        if (storedAnchor) throw error;
         return null;
     }
 }

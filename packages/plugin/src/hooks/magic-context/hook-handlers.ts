@@ -1,4 +1,5 @@
 import type { MagicContextConfig } from "../../config/schema/magic-context";
+import { capDreamerReadOutput } from "../../features/magic-context/dreamer/verify-read-cap";
 import {
     clearSessionTracking,
     scheduleIncrementalIndex,
@@ -622,6 +623,8 @@ export function createToolExecuteAfterHook(args: {
         if (!typedInput.sessionID || !typedInput.tool) {
             return;
         }
+
+        capDreamerReadOutput(typedInput, output);
 
         // `tool.execute.after` is the next existing host event after a tool
         // boundary. The queue helper re-checks the read-only mid-turn signal,

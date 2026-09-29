@@ -8,6 +8,9 @@ export interface CuratePromptMemory {
     content: string;
     mappedFiles: string[];
     hasNoFileSentinel: boolean;
+    importance: number;
+    retrievalCount: number;
+    seenCount: number;
 }
 
 // ── System Prompt ──────────────────────────────────────────────────────────
@@ -37,7 +40,7 @@ Project memory uses exactly 5 categories. Every memory belongs to one:
 export const CURATE_SYSTEM_PROMPT = `You are a memory-pool curator for the magic-context system. You run during a scheduled dream window to keep a project's cross-session memory store lean and well-formed.
 
 ## Memory operations
-- \`ctx_memory_list(category="...")\` — browse active memories, optionally filter by category
+- The scoped category snapshot arrives in the first message. Do not list or get it again; track mutation deltas.
 - \`action="merge", ids=[N,M,...], content="...", category="..."\` — consolidate duplicates into one canonical memory
 - \`action="update", ids=[N], content="...", superseded_by=M\` — rewrite content; name where removed detail survives when cutting more than half
 - \`action="write", category="...", content="..."\` — create a memory (SPLITS ONLY — never mint new facts)
@@ -86,7 +89,7 @@ function renderMemoryList(memories: CuratePromptMemory[]): string {
             const files = memory.mappedFiles.length
                 ? memory.mappedFiles.join(", ")
                 : "(none mapped yet)";
-            return `[${memory.id}] ${memory.category}\nContent: ${memory.content}\nMapped files: ${files}${memory.hasNoFileSentinel ? " (file-independent)" : ""}`;
+            return `[${memory.id}] ${memory.category} importance=${memory.importance} retrieval_count=${memory.retrievalCount} seen_count=${memory.seenCount}\nContent: ${memory.content}\nMapped files: ${files}${memory.hasNoFileSentinel ? " (file-independent)" : ""}`;
         })
         .join("\n\n");
 }
@@ -95,6 +98,7 @@ export function buildCuratePrompt(args: {
     projectPath: string;
     category: CurateMemoryCategory;
     memories: CuratePromptMemory[];
+    crossChunkCandidates?: string[];
 }): string {
     // adapted from validated shadow-trial prompt; further tuning happens in the harness
     return `## Task: Curate Project Memory Pool (hygiene)
@@ -117,8 +121,51 @@ Rewrite narrative/historical → operational present tense ("X uses Y because Z"
 Archive a redundant memory only when a better ACTIVE memory in the same project and category preserves its information; name that survivor with \`superseded_by\`. A bare "redundant" verdict is deletion and will be refused. Leave standalone low-value or stale entries unchanged for a human to review. The global user profile describes the operator and is never a substitute for project knowledge, so it cannot justify an archive.
 KEEP (overrides archive): constraint/rule language (must/never/always) · explains WHY (because/so that/to prevent) · EXTERNAL-system limit (CONSTRAINTS: archive only if word-for-word duplicated) · path/config WITH context · retrieval_count>0 · priority/philosophy.
 
-### Memory pool
+### Cross-chunk duplicate candidates (normalized content matches)
+${args.crossChunkCandidates?.join("\n") || "(none)"}
+
+### Category snapshot (do not re-enumerate)
 ${renderMemoryList(args.memories)}`;
+}
+
+export function chunkCurateMemories(
+    memories: CuratePromptMemory[],
+    maxCharacters: number,
+): Array<{ memories: CuratePromptMemory[]; crossChunkCandidates: string[] }> {
+    const chunks: CuratePromptMemory[][] = [];
+    let current: CuratePromptMemory[] = [];
+    let size = 0;
+    for (const memory of memories) {
+        const length = renderMemoryList([memory]).length + 2;
+        if (current.length && size + length > maxCharacters) {
+            chunks.push(current);
+            current = [];
+            size = 0;
+        }
+        current.push(memory);
+        size += length;
+    }
+    if (current.length) chunks.push(current);
+    const keys = new Map<string, Array<{ id: number; chunk: number }>>();
+    chunks.forEach((chunk, index) => {
+        chunk.forEach((memory) => {
+            const key = memory.content
+                .toLowerCase()
+                .replace(/[^\p{L}\p{N}]+/gu, " ")
+                .trim();
+            keys.set(key, [...(keys.get(key) ?? []), { id: memory.id, chunk: index }]);
+        });
+    });
+    return chunks.map((chunk, index) => ({
+        memories: chunk,
+        crossChunkCandidates: [...keys.values()]
+            .filter(
+                (matches) =>
+                    matches.some((match) => match.chunk === index) &&
+                    matches.some((match) => match.chunk !== index),
+            )
+            .map((matches) => `IDs ${matches.map((match) => match.id).join(", ")}`),
+    }));
 }
 
 // ── Retrospective ───────────────────────────────────────────────────────────
@@ -209,6 +256,7 @@ export function buildMaintainDocsPrompt(
     existingDocs: { architecture: boolean; structure: boolean },
     budget = 12000,
     currentTokens = 0,
+    currentDocs?: { architecture: string; structure: string },
 ): string {
     return `## Task: Propose documentation corrections
 
@@ -216,10 +264,16 @@ Project: ${projectPath}
 Existing docs: ARCHITECTURE.md ${existingDocs.architecture ? "exists" : "missing"}; STRUCTURE.md ${existingDocs.structure ? "exists" : "missing"}.
 Current combined token count: ${currentTokens}. Combined budget: ${budget} tokens.
 
-Host-collected code changes (commit subjects and changed files, not documentation history):
+Host-collected code changes (diff stat and hunks, or file/line ranges when oversized):
 ${changeSet}
 
-Read the docs and relevant source with read-only tools. These files are short maps read by every agent in every session. Describe how the system works now, never what changed or when: no change log, dates, or commit lists. One short paragraph per subsystem at most. Mechanism detail belongs in docs/architecture/; you may name a docs page for it but never move that detail into these two files. Propose a change only when code contradicts the docs or a major piece is missing. Prefer rewriting a stale sentence to adding one. Propose nothing when nothing is wrong. Keep both files within the combined budget. Never touch protected regions (<!-- mc:protected START ... --> through <!-- mc:protected END -->); preserve their bytes.
+Current ARCHITECTURE.md:
+${currentDocs?.architecture ?? "(read from project)"}
+
+Current STRUCTURE.md:
+${currentDocs?.structure ?? "(read from project)"}
+
+Find claims in these sections that the diff makes wrong or incomplete. Propose one focused change per claim or section. Do not investigate unrelated areas. Read the docs and relevant source with read-only tools. These files are short maps read by every agent in every session. Describe how the system works now, never what changed or when: no change log, dates, or commit lists. One short paragraph per subsystem at most. Mechanism detail belongs in docs/architecture/; you may name a docs page for it but never move that detail into these two files. Propose a change only when code contradicts the docs or a major piece is missing. Prefer rewriting a stale sentence to adding one. Propose nothing when nothing is wrong. Keep both files within the combined budget. Never touch protected regions (<!-- mc:protected START ... --> through <!-- mc:protected END -->); preserve their bytes.
 
 Return ONLY a JSON array (or []), with each entry {"file":"ARCHITECTURE.md"|"STRUCTURE.md","action":"replace"|"add"|"remove","heading":"## Exact section heading","text":"## Full replacement section including heading and body (empty for remove)","reason":"one-line reason"}. A replacement includes the entire section, including its heading. Additions are appended at the end of the file. Do not include any unmodified sections. No file writes.`;
 }
@@ -233,9 +287,11 @@ export function buildDreamTaskPrompt(
         docsChangeSet?: string;
         docsBudget?: number;
         docsCurrentTokens?: number;
+        docsContents?: { architecture: string; structure: string };
         curate?: {
             category: CurateMemoryCategory;
             memories: CuratePromptMemory[];
+            crossChunkCandidates?: string[];
         };
     },
 ): string {
@@ -245,6 +301,7 @@ export function buildDreamTaskPrompt(
                 projectPath: args.projectPath,
                 category: args.curate?.category ?? "PROJECT_RULES",
                 memories: args.curate?.memories ?? [],
+                crossChunkCandidates: args.curate?.crossChunkCandidates,
             });
         case "maintain-docs":
             return buildMaintainDocsPrompt(
@@ -253,6 +310,7 @@ export function buildDreamTaskPrompt(
                 args.existingDocs ?? { architecture: false, structure: false },
                 args.docsBudget,
                 args.docsCurrentTokens,
+                args.docsContents,
             );
     }
 }

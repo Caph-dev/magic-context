@@ -532,6 +532,15 @@ describe("runVerify disposition", () => {
             expect(firstRun).toMatchObject({ verified: 1, remaining: 1, complete: false });
             const afterFirst = getMemoryVerifications(db, [first.id, silent.id]);
             expect(afterFirst.get(first.id)?.verifiedAt).toBeGreaterThan(1_000);
+            const head = execFileSync("git", ["rev-parse", "HEAD"], {
+                cwd: dir,
+                encoding: "utf8",
+                windowsHide: true,
+            }).trim();
+            expect(JSON.parse(getMemoryById(db, first.id)?.metadataJson ?? "{}")).toMatchObject({
+                dreamerVerifiedAt: afterFirst.get(first.id)?.verifiedAt,
+                dreamerVerifiedCommit: head,
+            });
             expect(afterFirst.get(silent.id)?.verifiedAt).toBe(1_000);
 
             const resumed = scriptedVerifyClient((_call, ids) => {

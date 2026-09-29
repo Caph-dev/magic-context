@@ -1461,7 +1461,7 @@ describe("OpenCode 2 hidden child completion", () => {
         for (const [id, agent] of agents) {
             expect(agent.hidden).toBe(true);
             const tools: Record<string, string[]> = {
-                [HIDDEN_CURATE_AGENT]: ["ctx_memory", "ctx_memory_list"],
+                [HIDDEN_CURATE_AGENT]: ["ctx_memory"],
                 "dreamer-memory-mapper": ["read", "grep", "glob"],
                 "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
                 "dreamer-retrospective": ["ctx_search"],

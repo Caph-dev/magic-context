@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 import {
     DREAMER_AGENT,
@@ -109,6 +109,7 @@ import {
     buildRetrospectivePrompt,
     CURATE_SYSTEM_PROMPT,
     type CuratePromptMemory,
+    chunkCurateMemories,
     FRICTION_GATE_SYSTEM_PROMPT,
     MAINTAIN_DOCS_SYSTEM_PROMPT,
     RETROSPECTIVE_SYSTEM_PROMPT,
@@ -273,6 +274,9 @@ function toCuratePromptMemory(
         content: memory.content,
         mappedFiles: verification?.files ?? [],
         hasNoFileSentinel: verification?.hasSentinel ?? false,
+        importance: memory.importance,
+        retrievalCount: memory.retrievalCount,
+        seenCount: memory.seenCount,
     };
 }
 
@@ -331,9 +335,16 @@ function inspectCurateMemoryOperations(messages: unknown): CurateMemoryOperation
             summary.totalCalls += 1;
             if (!isRecord(part.state) || part.state.status !== "completed") continue;
             const input = isRecord(part.state.input) ? part.state.input : null;
-            summary.completedActions.push(
-                typeof input?.action === "string" ? input.action : "unknown",
-            );
+            const action = input?.action;
+            const output = typeof part.state.output === "string" ? part.state.output : "";
+            if (
+                (output === "completed" &&
+                    (action === "merge" || action === "archive" || action === "update")) ||
+                (action === "merge" && output.startsWith("Merged memories")) ||
+                (action === "archive" && output.startsWith("Archived memor")) ||
+                (action === "update" && output.startsWith("Updated memory"))
+            )
+                summary.completedActions.push(action);
         }
     }
 
@@ -1817,162 +1828,241 @@ async function runAgenticTask(
             }
         }
 
-        if (task === "maintain-docs" && (hasCurrentDocsProposal(docsDir) || !changes)) {
-            const reason = hasCurrentDocsProposal(docsDir)
-                ? "pending proposal matches current docs"
-                : "no relevant commits or no git repository";
-            log(`[dreamer] maintain-docs skipped: ${reason}`);
+        if (task === "maintain-docs" && !changes) {
+            const reason = "no relevant commits or no git repository";
             helpers.recordRun("completed", null, { progress: reason });
             return { status: "completed", detail: reason };
         }
-        const taskPrompt = buildDreamTaskPrompt(task, {
-            projectPath: projectIdentity,
-            lastDreamAt: lastRunAt ? String(lastRunAt) : null,
-            existingDocs,
-            docsChangeSet: changes?.text,
-            docsBudget: config.docsMaxTokens ?? 12000,
-            docsCurrentTokens: maintainDocsSnapshot
-                ? Math.ceil([...maintainDocsSnapshot.values()].join("").length / 3.5)
-                : 0,
-            curate:
-                curateMemories && curateCategory
-                    ? { category: curateCategory, memories: curateMemories }
-                    : undefined,
-        });
-        let run: { output: unknown[]; validated: string | CurateValidatedOutput };
-        if (deps.hiddenCompletionExecutor) {
-            const hidden = await runHiddenSingleShotPrompt({
-                executor: deps.hiddenCompletionExecutor,
-                parentSessionId: parent ?? undefined,
-                sessionDirectory: docsDir,
-                agent: task === "maintain-docs" ? DREAMER_DOCS_AGENT : DREAMER_AGENT,
-                system:
-                    task === "maintain-docs" ? MAINTAIN_DOCS_SYSTEM_PROMPT : CURATE_SYSTEM_PROMPT,
-                prompt: taskPrompt,
-                title: `magic-context-dream-${task}`,
-                callContext: `dreamer:${task}`,
-                metadata: { tokenBudget: config.tokenBudget, onBudgetUpdate },
-                allowEmpty: task === "curate",
-                model: config.model,
-                fallbackModels: config.fallbackModels,
-                language: task === "curate" ? (config.language ?? deps.language) : undefined,
-                timeoutMs: Math.min(
-                    Math.max(0, deadline - Date.now()),
-                    config.timeoutMinutes * 60 * 1000,
-                ),
-                signal: abortController.signal,
-                parse: (text, completion): string | CurateValidatedOutput => {
-                    if (task !== "curate") return text;
-                    const memoryOperations = inspectCurateMemoryOperations(completion.messages);
-                    if (text) validateCurateAssistantText(text);
-                    if (
-                        memoryOperations.totalCalls > 0 &&
-                        memoryOperations.completedActions.length === 0
-                    )
-                        throw new Error("Curate returned no completed ctx_memory tool result.");
-                    if (!text && memoryOperations.completedActions.length === 0)
-                        throw new Error("Dreamer returned no assistant output.");
-                    return { text: text || null, memoryOperations };
-                },
-            });
-            childSessionId = hidden.childSessionId;
-            run = { output: hidden.completion.messages ?? [], validated: hidden.validated };
-            promptSettled = true;
-        } else {
-            const createResponse = await createChildSessionWithFence({
-                client: requireDreamClient(deps.client),
-                db,
-                parentSessionId: parent ?? undefined,
-                title: `magic-context-dream-${task}`,
-                directory: docsDir,
-            });
-            const created = shared.normalizeSDKResponse(
-                createResponse,
-                null as { id?: string } | null,
-                {
-                    preferResponseOnMissingData: true,
-                },
-            );
-            childSessionId = typeof created?.id === "string" ? created.id : null;
-            if (!childSessionId) throw new Error("Dreamer could not create its child session.");
-            const sessionId = childSessionId;
-
-            const remainingMs = Math.max(0, deadline - Date.now());
-            run = await shared.promptSyncWithValidatedOutputRetry(
-                requireDreamClient(deps.client),
-                {
-                    path: { id: sessionId },
-                    query: { directory: docsDir },
-                    body: {
-                        // Each agentic task gets its OWN scoped agent + system prompt so
-                        // it never sees another task's tools/rules: curate runs on the
-                        // base `dreamer` (ctx_memory only, no codebase tools);
-                        // maintain-docs uses a locked read-only agent; the host validates final text.
-                        agent: task === "maintain-docs" ? DREAMER_DOCS_AGENT : DREAMER_AGENT,
-                        system:
-                            task === "maintain-docs"
-                                ? MAINTAIN_DOCS_SYSTEM_PROMPT
-                                : withContentLanguageDirective(
-                                      CURATE_SYSTEM_PROMPT,
-                                      config.language ?? deps.language,
-                                  ),
-                        ...modelBodyField(config.model),
-                        parts: [{ type: "text", text: taskPrompt, synthetic: true }],
-                    },
-                },
-                {
-                    timeoutMs: Math.min(remainingMs, config.timeoutMinutes * 60 * 1000),
-                    signal: abortController.signal,
-                    fallbackModels: config.fallbackModels,
-                    callContext: `dreamer:${task}`,
-                    transport: shared.createPromptAsyncTransport(
-                        requireDreamClient(deps.client),
-                        sessionId,
-                        { tokenBudget: config.tokenBudget, onBudgetUpdate },
-                    ),
-                    fetchOutput: async () => {
-                        const messagesResponse = await requireDreamClient(
-                            deps.client,
-                        ).session.messages({
-                            path: { id: sessionId },
-                            query: {
-                                directory: docsDir,
-                                // Curate can use up to 150 steps, so its applied-operation
-                                // count must not be truncated to the newest 50 messages.
-                                ...(task === "curate" ? {} : { limit: 50 }),
-                            },
-                        });
-                        return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                            preferResponseOnMissingData: true,
-                        });
-                    },
-                    validateOutput: (messages): string | CurateValidatedOutput => {
-                        const text = extractLatestAssistantText(messages);
-                        if (task !== "curate") {
-                            if (!text) throw new Error("Dreamer returned no assistant output.");
-                            return text;
-                        }
-
-                        const memoryOperations = inspectCurateMemoryOperations(messages);
-                        if (text) validateCurateAssistantText(text);
-                        if (memoryOperations.completedActions.length > 0) {
-                            return { text, memoryOperations };
-                        }
-                        if (!text) throw new Error("Dreamer returned no assistant output.");
-                        if (memoryOperations.totalCalls > 0) {
-                            throw new Error("Curate returned no completed ctx_memory tool result.");
-                        }
-                        return { text, memoryOperations };
-                    },
-                },
-            );
-            promptSettled = true;
+        if (task === "maintain-docs" && changes && (changes.unchanged || !changes.relevant)) {
+            const reason = changes.unchanged
+                ? "no commits since last run"
+                : "diff does not describe a documented area";
+            helpers.recordRun("completed", null, { progress: reason });
+            return {
+                status: "completed",
+                detail: reason,
+                schedulePatch: { taskStateJson: JSON.stringify({ head: changes.head }) },
+            };
         }
+        if (task === "maintain-docs" && hasCurrentDocsProposal(docsDir)) {
+            const reason = "pending proposal matches current docs";
+            helpers.recordRun("completed", null, { progress: reason });
+            return {
+                status: "completed",
+                detail: reason,
+                ...(changes
+                    ? { schedulePatch: { taskStateJson: JSON.stringify({ head: changes.head }) } }
+                    : {}),
+            };
+        }
+        const curateChunks = curateMemories
+            ? chunkCurateMemories(
+                  curateMemories,
+                  Math.max(
+                      4000,
+                      Math.floor(resolveRetrospectiveUsableInputTokens(config, deps) * 2),
+                  ),
+              )
+            : [];
+        const batches =
+            task === "curate"
+                ? curateChunks
+                : [{ memories: [] as CuratePromptMemory[], crossChunkCandidates: [] as string[] }];
+        const completedActions: string[] = [];
+        let curateRefused = 0;
+        let run: { output: unknown[]; validated: string | CurateValidatedOutput } = {
+            output: [],
+            validated: "",
+        };
+        for (const batch of batches) {
+            const taskPrompt = buildDreamTaskPrompt(task, {
+                projectPath: projectIdentity,
+                lastDreamAt: lastRunAt ? String(lastRunAt) : null,
+                existingDocs,
+                docsChangeSet: changes?.text,
+                docsContents:
+                    task === "maintain-docs"
+                        ? {
+                              architecture: existingDocs?.architecture
+                                  ? readFileSync(`${docsDir}/ARCHITECTURE.md`, "utf8")
+                                  : "(missing)",
+                              structure: existingDocs?.structure
+                                  ? readFileSync(`${docsDir}/STRUCTURE.md`, "utf8")
+                                  : "(missing)",
+                          }
+                        : undefined,
+                docsBudget: config.docsMaxTokens ?? 12000,
+                docsCurrentTokens: maintainDocsSnapshot
+                    ? Math.ceil([...maintainDocsSnapshot.values()].join("").length / 3.5)
+                    : 0,
+                curate:
+                    curateMemories && curateCategory
+                        ? {
+                              category: curateCategory,
+                              memories: batch.memories,
+                              crossChunkCandidates: batch.crossChunkCandidates,
+                          }
+                        : undefined,
+            });
+            if (deps.hiddenCompletionExecutor) {
+                const hidden = await runHiddenSingleShotPrompt({
+                    executor: deps.hiddenCompletionExecutor,
+                    parentSessionId: parent ?? undefined,
+                    sessionDirectory: docsDir,
+                    agent: task === "maintain-docs" ? DREAMER_DOCS_AGENT : DREAMER_AGENT,
+                    system:
+                        task === "maintain-docs"
+                            ? MAINTAIN_DOCS_SYSTEM_PROMPT
+                            : CURATE_SYSTEM_PROMPT,
+                    prompt: taskPrompt,
+                    title: `magic-context-dream-${task}`,
+                    callContext: `dreamer:${task}`,
+                    metadata: { tokenBudget: config.tokenBudget, onBudgetUpdate },
+                    allowEmpty: task === "curate",
+                    model: config.model,
+                    fallbackModels: config.fallbackModels,
+                    language: task === "curate" ? (config.language ?? deps.language) : undefined,
+                    timeoutMs: Math.min(
+                        Math.max(0, deadline - Date.now()),
+                        config.timeoutMinutes * 60 * 1000,
+                    ),
+                    signal: abortController.signal,
+                    parse: (text, completion): string | CurateValidatedOutput => {
+                        if (task !== "curate") return text;
+                        const memoryOperations = inspectCurateMemoryOperations(completion.messages);
+                        if (text) validateCurateAssistantText(text);
+                        if (
+                            memoryOperations.totalCalls > 0 &&
+                            memoryOperations.completedActions.length === 0
+                        )
+                            throw new Error("Curate returned no completed ctx_memory tool result.");
+                        if (!text && memoryOperations.completedActions.length === 0)
+                            throw new Error("Dreamer returned no assistant output.");
+                        return { text: text || null, memoryOperations };
+                    },
+                });
+                childSessionId = hidden.childSessionId;
+                run = { output: hidden.completion.messages ?? [], validated: hidden.validated };
+                promptSettled = true;
+            } else {
+                const createResponse = await createChildSessionWithFence({
+                    client: requireDreamClient(deps.client),
+                    db,
+                    parentSessionId: parent ?? undefined,
+                    title: `magic-context-dream-${task}`,
+                    directory: docsDir,
+                });
+                const created = shared.normalizeSDKResponse(
+                    createResponse,
+                    null as { id?: string } | null,
+                    {
+                        preferResponseOnMissingData: true,
+                    },
+                );
+                childSessionId = typeof created?.id === "string" ? created.id : null;
+                if (!childSessionId) throw new Error("Dreamer could not create its child session.");
+                const sessionId = childSessionId;
+
+                const remainingMs = Math.max(0, deadline - Date.now());
+                run = await shared.promptSyncWithValidatedOutputRetry(
+                    requireDreamClient(deps.client),
+                    {
+                        path: { id: sessionId },
+                        query: { directory: docsDir },
+                        body: {
+                            // Each agentic task gets its OWN scoped agent + system prompt so
+                            // it never sees another task's tools/rules: curate runs on the
+                            // base `dreamer` (ctx_memory only, no codebase tools);
+                            // maintain-docs uses a locked read-only agent; the host validates final text.
+                            agent: task === "maintain-docs" ? DREAMER_DOCS_AGENT : DREAMER_AGENT,
+                            system:
+                                task === "maintain-docs"
+                                    ? MAINTAIN_DOCS_SYSTEM_PROMPT
+                                    : withContentLanguageDirective(
+                                          CURATE_SYSTEM_PROMPT,
+                                          config.language ?? deps.language,
+                                      ),
+                            ...modelBodyField(config.model),
+                            parts: [{ type: "text", text: taskPrompt, synthetic: true }],
+                        },
+                    },
+                    {
+                        timeoutMs: Math.min(remainingMs, config.timeoutMinutes * 60 * 1000),
+                        signal: abortController.signal,
+                        fallbackModels: config.fallbackModels,
+                        callContext: `dreamer:${task}`,
+                        transport: shared.createPromptAsyncTransport(
+                            requireDreamClient(deps.client),
+                            sessionId,
+                            { tokenBudget: config.tokenBudget, onBudgetUpdate },
+                        ),
+                        fetchOutput: async () => {
+                            const messagesResponse = await requireDreamClient(
+                                deps.client,
+                            ).session.messages({
+                                path: { id: sessionId },
+                                query: {
+                                    directory: docsDir,
+                                    // Curate can use up to 150 steps, so its applied-operation
+                                    // count must not be truncated to the newest 50 messages.
+                                    ...(task === "curate" ? {} : { limit: 50 }),
+                                },
+                            });
+                            return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
+                                preferResponseOnMissingData: true,
+                            });
+                        },
+                        validateOutput: (messages): string | CurateValidatedOutput => {
+                            const text = extractLatestAssistantText(messages);
+                            if (task !== "curate") {
+                                if (!text) throw new Error("Dreamer returned no assistant output.");
+                                return text;
+                            }
+
+                            const memoryOperations = inspectCurateMemoryOperations(messages);
+                            if (text) validateCurateAssistantText(text);
+                            if (memoryOperations.completedActions.length > 0) {
+                                return { text, memoryOperations };
+                            }
+                            if (!text) throw new Error("Dreamer returned no assistant output.");
+                            if (memoryOperations.totalCalls > 0) {
+                                throw new Error(
+                                    "Curate returned no completed ctx_memory tool result.",
+                                );
+                            }
+                            return { text, memoryOperations };
+                        },
+                    },
+                );
+                promptSettled = true;
+            }
+            if (task === "curate") {
+                completedActions.push(
+                    ...(run.validated as CurateValidatedOutput).memoryOperations.completedActions,
+                );
+                curateRefused += takeCurateSafetyRefusalCount(childSessionId ?? "");
+            }
+            if (childSessionId && !deps.hiddenCompletionExecutor) {
+                await teardownChildSession({
+                    client: requireDreamClient(deps.client),
+                    sessionId: childSessionId,
+                    sessionDirectory: docsDir,
+                    promptSettled,
+                    privacySensitive: true,
+                    context: `[dreamer] ${task}`,
+                    log,
+                });
+                childSessionId = null;
+            }
+        }
+        if (task === "curate")
+            run.validated = {
+                text: null,
+                memoryOperations: { totalCalls: completedActions.length, completedActions },
+            };
 
         if (leaseLost) throw new Error("Dream lease lost during task");
 
-        const curateRefused =
-            task === "curate" ? takeCurateSafetyRefusalCount(childSessionId ?? "") : 0;
         if (curateRefused > 0) {
             helpers.reportProgress(curateRefused, curateRefused);
             log(`[dreamer] curate safety summary: refused=${curateRefused}`);
@@ -1995,7 +2085,11 @@ async function runAgenticTask(
             try {
                 if (run.validated === "[]") {
                     helpers.recordRun("completed", null, { progress: "no corrections proposed" });
-                    return { status: "completed", detail: "no corrections proposed" };
+                    return {
+                        status: "completed",
+                        detail: "no corrections proposed",
+                        schedulePatch: { taskStateJson: JSON.stringify({ head: changes.head }) },
+                    };
                 }
                 const path = writeDocsProposal(
                     docsDir,

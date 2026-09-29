@@ -6,6 +6,7 @@ import {
     detectThinkingBindingMismatch,
     isPrefixBoundThinkingModel,
 } from "../../features/magic-context/overflow-detection";
+import { observeSessionActivity } from "../../features/magic-context/session-activity";
 import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
@@ -460,6 +461,27 @@ export function createEventHandler(deps: EventHandlerDeps) {
         }
 
         if (input.event.type === "message.updated") {
+            const message = getMessageUpdatedInfo(input.event.properties);
+            if (message?.sessionID) {
+                try {
+                    const rawInfo = properties?.info;
+                    const time =
+                        rawInfo && typeof rawInfo === "object" && "time" in rawInfo
+                            ? (rawInfo.time as { created?: unknown } | undefined)?.created
+                            : undefined;
+                    observeSessionActivity(
+                        deps.db,
+                        message.sessionID,
+                        typeof time === "number" ? time : Date.now(),
+                    );
+                } catch (error) {
+                    sessionLog(
+                        message.sessionID,
+                        "event message.updated activity persistence failed:",
+                        error,
+                    );
+                }
+            }
             const info = getMessageUpdatedAssistantInfo(input.event.properties);
             if (!info) {
                 const genericInfo = getMessageUpdatedInfo(input.event.properties);

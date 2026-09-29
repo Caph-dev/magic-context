@@ -252,6 +252,12 @@ interface StatusDialogProps {
  *  - rebuilds detail and re-renders on a 1s timer so live values stay current
  *  - cleans up timer on close
  */
+const openStatusDialogs = new Set<StatusDialogComponent>();
+
+export function stopStatusDialogRefresh(): void {
+	for (const dialog of openStatusDialogs) dialog.close();
+}
+
 class StatusDialogComponent implements Component {
 	private readonly props: StatusDialogProps;
 	private detail: StatusDialogDetail;
@@ -266,6 +272,7 @@ class StatusDialogComponent implements Component {
 			props.deps,
 			props.sessionId,
 		);
+		openStatusDialogs.add(this);
 		this.refreshTimer = setInterval(() => {
 			if (this.closed) return;
 			try {
@@ -292,13 +299,9 @@ class StatusDialogComponent implements Component {
 		}
 	}
 
-	private close(): void {
+	close(): void {
 		if (this.closed) return;
-		this.closed = true;
-		if (this.refreshTimer) {
-			clearInterval(this.refreshTimer);
-			this.refreshTimer = null;
-		}
+		this.dispose();
 		this.props.done(undefined);
 	}
 
@@ -321,6 +324,8 @@ class StatusDialogComponent implements Component {
 	}
 
 	dispose(): void {
+		this.closed = true;
+		openStatusDialogs.delete(this);
 		if (this.refreshTimer) {
 			clearInterval(this.refreshTimer);
 			this.refreshTimer = null;

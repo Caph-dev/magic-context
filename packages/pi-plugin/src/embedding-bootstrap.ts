@@ -7,6 +7,7 @@ import {
 	type EmbeddingFeatures,
 	registerProjectEmbedding,
 	registerProjectShadowEmbedding,
+	unregisterProjectEmbedding,
 	unregisterProjectShadowEmbedding,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
@@ -28,6 +29,7 @@ const registrationFingerprintsByDatabase = new WeakMap<
 	object,
 	Map<string, RegistrationFingerprint>
 >();
+const registeredIdentitiesByDatabase = new WeakMap<object, Set<string>>();
 
 function configCandidatePaths(
 	directory: string,
@@ -55,6 +57,13 @@ function configFingerprint(paths: readonly string[]): string {
 			}
 		})
 		.join("|");
+}
+
+export function unregisterPiProjectEmbeddings(db: ContextDatabase): void {
+	for (const identity of registeredIdentitiesByDatabase.get(db) ?? [])
+		unregisterProjectEmbedding(identity);
+	registeredIdentitiesByDatabase.delete(db);
+	registrationFingerprintsByDatabase.get(db)?.clear();
 }
 
 export async function ensureProjectRegisteredFromPiDirectory(
@@ -93,6 +102,12 @@ export async function ensureProjectRegisteredFromPiDirectory(
 		memoryEnabled: detailed.config.memory.enabled,
 		gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
 	};
+	let registered = registeredIdentitiesByDatabase.get(db);
+	if (!registered) {
+		registered = new Set();
+		registeredIdentitiesByDatabase.set(db, registered);
+	}
+	registered.add(projectIdentity);
 	registerProjectEmbedding(
 		db,
 		projectIdentity,

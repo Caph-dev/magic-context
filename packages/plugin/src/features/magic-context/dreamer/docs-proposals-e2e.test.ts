@@ -10,6 +10,7 @@ import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { listPendingDocsProposals } from "./docs-proposals";
 import { acquireLease } from "./lease";
+import { writeTaskStateJson } from "./storage-task-schedule";
 import { createDreamTaskExecutor } from "./task-executor";
 import { leaseKeyFor } from "./task-registry";
 
@@ -94,10 +95,15 @@ test("maintain-docs stub model cannot edit docs, emits a proposal and skips the 
     const config = { task: "maintain-docs" as const, schedule: "0 4 * * *", timeoutMinutes: 20 };
     const first = await executor(config, ctx);
     expect(first.status).toBe("completed");
+    expect(JSON.parse(first.schedulePatch?.taskStateJson ?? "null")).toEqual({
+        head: git("rev-parse", "HEAD"),
+    });
+    writeTaskStateJson(db, dir, "maintain-docs", first.schedulePatch?.taskStateJson ?? "{}");
     expect(readFileSync(file)).toEqual(before);
     expect(listPendingDocsProposals(dir)).toHaveLength(1);
     const second = await executor(config, ctx);
     expect(second.status).toBe("completed");
+    expect(second.detail).toBe("no commits since last run");
     expect(prompts).toBe(1);
     expect(readFileSync(file)).toEqual(before);
 });

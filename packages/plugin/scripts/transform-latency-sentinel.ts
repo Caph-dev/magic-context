@@ -12,16 +12,21 @@ const HOUR = 3_600_000;
 const WINDOW = 10 * 60_000;
 const MAX_BYTES = 4 * 1024 * 1024; // per file, per invocation
 const AGENT_ID = "agent_b613e5cf2ee55b8c";
-type Kind = "p90" | "single" | "timeout" | "park" | "refusal" | "module_climb";
+type Kind = "p90" | "single" | "timeout" | "park" | "refusal" | "module_climb" | "busy_refusal" | "busy_replay" | "long_lock";
+const BUSY_REPLAY_THRESHOLD = 2;
+const LONG_LOCK_MS = 5_000;
+const UNKNOWN_SESSION = "unknown-session";
 type Pass = { at: number; elapsed: number; module: number | null };
 type Session = { passes: Pass[]; trend: Pass[]; lastAt: number; declines?: Record<string, Record<string, number>> };
 export type LkgDeclineSummary = { sessionId: string; hour: string; reasons: Record<string, number> };
 type Cursor = { dev: number; ino: number; offset: number };
 type Sent = { at: number; severity: number };
-type State = { version: 1; files: Record<string, Cursor>; sessions: Record<string, Session>; sent: Record<string, Sent> };
-export type LatencyAlert = { kind: Kind; sessionId: string; name: string; at: string; detail: string; lkgDeclines: Record<string, number>; count: number; p50: number; p90: number; max: number; moduleP50: number | null; moduleP90: number | null; moduleMax: number | null; pluginP50: number | null; pluginP90: number | null; pluginMax: number | null; load: number[]; loadSampledAt: string };
+type BusyCounts = { refusals: number; replays: number };
+type Hold = { at: number; site: string; ms: number };
+type State = { version: 1; files: Record<string, Cursor>; sessions: Record<string, Session>; sent: Record<string, Sent>; busy?: Record<string, Record<string, BusyCounts>>; holds?: Hold[]; pendingBusy?: Record<string, number>; lastSummaryDay?: string };
+export type LatencyAlert = { kind: Kind; sessionId: string; name: string; at: string; detail: string; lkgDeclines: Record<string, number>; count: number; p50: number; p90: number; max: number; moduleP50: number | null; moduleP90: number | null; moduleMax: number | null; pluginP50: number | null; pluginP90: number | null; pluginMax: number | null; busy?: BusyCounts; lock?: { site: string; count: number; p90: number; max: number }; load: number[]; loadSampledAt: string };
 export type LatencyOptions = { files: string[]; stateFile: string; db: string; peerDb?: string; connectionFile: string; send: boolean; now?: () => number; load?: () => number[]; wake?: (content: string, id: string) => Promise<void>; stdout?: (line: string) => void; stderr?: (line: string) => void; since?: number; until?: number; replay?: boolean; summary?: boolean };
-const empty = (): State => ({ version: 1, files: {}, sessions: {}, sent: {} });
+const empty = (): State => ({ version: 1, files: {}, sessions: {}, sent: {}, busy: {}, holds: [], pendingBusy: {} });
 const quantile = (values: number[], fraction: number) => values.length ? [...values].sort((a, b) => a - b)[Math.ceil(values.length * fraction) - 1] : 0;
 
 function readState(path: string): State {
@@ -57,10 +62,16 @@ export function readNewLines(path: string, cursor: Cursor | undefined, maxBytes 
 const LKG_DECLINE = /^lkg_(?:model_mismatch|invalidated_reshape|content_mismatch|unsafe_seam|seam_invalid|anthropic_reasoning_run_invalid)$/;
 const hourKey = (at: number) => new Date(Math.floor(at / HOUR) * HOUR).toISOString();
 
-function parse(line: string): { sessionId: string; at: number; pass?: Pass; kind?: Kind; detail?: string; decline?: string } | null {
+function parse(line: string): { sessionId: string; at: number; pass?: Pass; kind?: Kind; detail?: string; decline?: string; busy?: keyof BusyCounts; hold?: { site: string; ms: number } } | null {
     const at = Date.parse(line.match(/(?:\[)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z)/)?.[1] ?? "");
     const sessionId = line.match(/\[magic-context\]\[([^\]]+)\]/)?.[1] ?? line.match(/\bsession=(ses_[\w-]+)/)?.[1];
-    if (!sessionId || !Number.isFinite(at)) return null;
+    if (!Number.isFinite(at)) return null;
+    const hold = line.match(/\[magic-context\] slow write transaction: site=(\S+) held=([\d.]+)ms(?:\s|$)/);
+    if (hold && Number.isFinite(Number(hold[2]))) return { sessionId: UNKNOWN_SESSION, at, hold: { site: hold[1]!, ms: Number(hold[2]) } };
+    if (/\[magic-context\] storage-busy refusal stage=\S+/.test(line)) return { sessionId: sessionId ?? UNKNOWN_SESSION, at, busy: "refusals" };
+    if (!sessionId) return null;
+    if (/TRANSIENT STORAGE FAILURE .*: LKG replay served \d+ messages instead of raw \d+/.test(line)) return { sessionId, at, busy: "replays" };
+    if (/\] lkg_replay_served(?:\s|$)/.test(line)) return { sessionId, at, kind: "busy_replay" };
     // Release diagnostics can mention a decline again as `reason=lkg_*`; count only lines whose logged event is the decline code.
     const decline = line.match(/\] (lkg_[a-z_]+)(?:\s|$)/)?.[1];
     if (decline && LKG_DECLINE.test(decline)) return { sessionId, at, decline };
@@ -78,10 +89,12 @@ function parse(line: string): { sessionId: string; at: number; pass?: Pass; kind
     return null;
 }
 
-function addLine(state: State, line: string, load: () => number[]): LatencyAlert[] {
+function addLine(state: State, line: string, load: () => number[], file: string): LatencyAlert[] {
     const event = parse(line);
     if (!event) return [];
     const { sessionId, at } = event;
+    // StorageBusyRefusalError logs without a session ID; parse assigns UNKNOWN_SESSION
+    // instead of guessing which concurrent turn was refused.
     const session = state.sessions[sessionId] ??= { passes: [], trend: [], lastAt: at };
     session.lastAt = at;
     if (event.decline) {
@@ -99,7 +112,7 @@ function addLine(state: State, line: string, load: () => number[]): LatencyAlert
     const modules = passes.flatMap((p) => p.module === null ? [] : [p.module]);
     const plugins = passes.flatMap((p) => p.module === null ? [] : [Math.max(0, p.elapsed - p.module)]);
     const report = (kind: Kind, detail: string, severity: number): LatencyAlert | null => {
-        const key = JSON.stringify([sessionId, kind]);
+        const key = JSON.stringify([kind === "long_lock" ? detail.split(" ")[0] : sessionId, kind]);
         const previous = state.sent[key];
         if (previous && at - previous.at < 6 * HOUR && severity < previous.severity * 1.5) return null;
         state.sent[key] = { at, severity };
@@ -128,7 +141,34 @@ function addLine(state: State, line: string, load: () => number[]): LatencyAlert
                 emit("module_climb", `module median first 5 ${first} ms to last 5 ${last} ms over ${trend.length} passes`, last);
         }
     }
-    if (event.kind) emit(event.kind, event.detail!, 1);
+    if (event.busy === "refusals") (state.pendingBusy ??= {})[file] = at;
+    if (event.kind === "busy_replay") {
+        // The generic replay marker is counted only when a storage-busy diagnostic
+        // immediately preceded it in the same log; unrelated LKG replays stay out.
+        if (at - (state.pendingBusy?.[file] ?? -Infinity) >= 0 && at - state.pendingBusy![file]! <= 5_000) {
+            event.busy = "replays";
+            delete state.pendingBusy![file];
+        }
+    } else if (event.kind) emit(event.kind, event.detail!, 1);
+    if (event.busy) {
+        const counts = ((state.busy ??= {})[sessionId] ??= {})[hourKey(at)] ??= { refusals: 0, replays: 0 };
+        counts[event.busy]++;
+        if (event.busy === "refusals" || counts.replays > BUSY_REPLAY_THRESHOLD) {
+            const alert = report(event.busy === "refusals" ? "busy_refusal" : "busy_replay", `${counts.refusals} storage-busy refusals, ${counts.replays} busy-storage replays this hour`, event.busy === "refusals" ? 1 : counts.replays);
+            if (alert) { alert.busy = { ...counts }; alerts.push(alert); }
+        }
+    }
+    if (event.hold) {
+        const holds = state.holds ??= [];
+        holds.push({ at, ...event.hold });
+        const siteHolds = holds.filter((hold) => hold.site === event.hold!.site && hold.at > at - 24 * HOUR).map((hold) => hold.ms);
+        if (event.hold.ms > LONG_LOCK_MS) {
+            const site = event.hold.site;
+            const stats = { site, count: siteHolds.length, max: Math.max(...siteHolds), p90: quantile(siteHolds, .9) };
+            const alert = report("long_lock", `${site} held ${stats.max.toFixed(1)}ms (p90 ${stats.p90.toFixed(1)}ms, ${stats.count} holds)`, event.hold.ms);
+            if (alert) { alert.lock = stats; alerts.push(alert); }
+        }
+    }
     return alerts;
 }
 
@@ -164,7 +204,7 @@ function names(dbPath: string, peerDbPath: string | undefined, alerts: LatencyAl
 // produces one line per project instead of one alert per child.
 const isUnnamedSession = (alert: LatencyAlert) => alert.name === alert.sessionId || /^(git|dir):/.test(alert.name);
 const seconds = (ms: number | null) => `${((ms ?? 0) / 1000).toFixed(1)} s`;
-const KIND_LABEL: Record<Kind, string> = { p90: "slow p90", single: "slow pass", timeout: "timeout", park: "park", refusal: "refused turn", module_climb: "module time climbing" };
+const KIND_LABEL: Record<Kind, string> = { p90: "slow p90", single: "slow pass", timeout: "timeout", park: "park", refusal: "refused turn", module_climb: "module time climbing", busy_refusal: "storage-busy refusal", busy_replay: "busy-storage replay", long_lock: "long lock holder" };
 
 /** Only a park or a refused turn needs to interrupt; latency alone is reported at medium urgency. */
 export function alertUrgency(alerts: LatencyAlert[]): "high" | "medium" {
@@ -174,7 +214,7 @@ export function alertUrgency(alerts: LatencyAlert[]): "high" | "medium" {
 export function formatAlerts(alerts: LatencyAlert[]): string {
     const groups = new Map<string, { label: string; sessions: Set<string>; alerts: LatencyAlert[] }>();
     for (const alert of alerts) {
-        const unnamed = isUnnamedSession(alert);
+        const unnamed = alert.kind !== "long_lock" && isUnnamedSession(alert);
         const key = unnamed ? `project:${alert.name}` : `session:${alert.sessionId}`;
         const group = groups.get(key) ?? { label: alert.name, sessions: new Set<string>(), alerts: [] };
         group.sessions.add(alert.sessionId);
@@ -190,7 +230,9 @@ export function formatAlerts(alerts: LatencyAlert[]): string {
         const who = key.startsWith("project:") ? `${group.label} (${group.sessions.size} unnamed session${group.sessions.size > 1 ? "s" : ""})` : group.label;
         const declines = group.alerts.filter((alert) => alert.kind === "refusal")
             .flatMap((alert) => Object.entries(alert.lkgDeclines).map(([reason, count]) => `${count} ${reason}`));
-        return `- ${who}: ${kinds}; worst pass ${seconds(worst.max)} (module ${seconds(worst.moduleMax)}); p90 up to ${seconds(p90)}${declines.length ? `; LKG declines ${declines.join(", ")}` : ""}`;
+        const locks = group.alerts.flatMap((alert) => alert.lock ? [alert.lock] : []).map((lock) => `${lock.site} max ${seconds(lock.max)}, p90 ${seconds(lock.p90)} (${lock.count} holds)`);
+        const busy = group.alerts.flatMap((alert) => alert.busy ? [alert.busy] : []).at(-1);
+        return `- ${who}: ${kinds}; worst pass ${seconds(worst.max)} (module ${seconds(worst.moduleMax)}); p90 up to ${seconds(p90)}${busy ? `; busy storage ${busy.refusals} refusals, ${busy.replays} replays/hour` : ""}${locks.length ? `; lock ${locks.join(", ")}` : ""}${declines.length ? `; LKG declines ${declines.join(", ")}` : ""}`;
     });
     const load = alerts[0]?.load.map((value) => value.toFixed(0)).join("/") ?? "?";
     const from = alerts.map((alert) => alert.at).sort()[0];
@@ -225,7 +267,7 @@ export async function runLatencySentinel(options: LatencyOptions): Promise<{ ale
             for (const line of result.lines) {
                 const at = Date.parse(line.match(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z/)?.[0] ?? "");
                 if ((options.since !== undefined && at < options.since) || (options.until !== undefined && at >= options.until) || at > now) continue;
-                alerts.push(...addLine(state, line, options.load ?? loadavg));
+                alerts.push(...addLine(state, line, options.load ?? loadavg, file));
             }
             if (!(options.replay || options.summary) || !result.bounded || result.lines.length === 0) break;
         } while (true);
@@ -239,8 +281,25 @@ export async function runLatencySentinel(options: LatencyOptions): Promise<{ ale
             if (Date.parse(hour) < now - 24 * HOUR) delete session.declines![hour];
     }
     for (const [key, sent] of Object.entries(state.sent)) if (sent.at < now - 6 * HOUR) delete state.sent[key];
-    names(options.db, options.peerDb, alerts);
+    const today = new Date(now).toISOString().slice(0, 10);
+    const yesterday = new Date(now - 24 * HOUR).toISOString().slice(0, 10);
+    const daily = {
+        kind: "transform_latency_daily_summary", day: yesterday,
+        busy: Object.entries(state.busy ?? {}).flatMap(([sessionId, hours]) => Object.entries(hours)
+            .filter(([hour]) => hour.startsWith(yesterday)).map(([hour, counts]) => ({ sessionId, hour, ...counts }))),
+        holds: (state.holds ?? []).filter((hold) => new Date(hold.at).toISOString().startsWith(yesterday)).length,
+        longHolds: (state.holds ?? []).filter((hold) => new Date(hold.at).toISOString().startsWith(yesterday) && hold.ms > LONG_LOCK_MS).length,
+    };
+    const writeDaily = !(options.replay || options.summary) && state.lastSummaryDay !== today;
+    if (writeDaily) state.lastSummaryDay = today;
+    for (const [id, hours] of Object.entries(state.busy ?? {})) {
+        for (const hour of Object.keys(hours)) if (Date.parse(hour) < now - 48 * HOUR) delete hours[hour];
+        if (!Object.keys(hours).length) delete state.busy![id];
+    }
+    state.holds = (state.holds ?? []).filter((hold) => hold.at > now - 48 * HOUR);
+    names(options.db, options.peerDb, alerts.filter((alert) => alert.kind !== "long_lock" && alert.sessionId !== UNKNOWN_SESSION));
     if (!(options.replay || options.summary)) saveState(options.stateFile, state);
+    if (writeDaily) (options.stdout ?? console.log)(JSON.stringify(daily));
     if (options.summary) (options.stdout ?? console.log)(JSON.stringify({ kind: "lkg_decline_summary", declines }));
     else if (alerts.length) {
         const content = formatAlerts(alerts);
