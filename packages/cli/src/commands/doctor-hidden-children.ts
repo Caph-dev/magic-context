@@ -1,6 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
+import {
+    type AsyncProcessInspection,
+    inspectProcessesAsync,
+} from "@magic-context/core/shared/rpc-utils";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { copyDatabaseBundle, defaultInspectHolders } from "./doctor-repair-db";
 
@@ -17,39 +21,89 @@ export interface HiddenChildCleanupOptions {
     contextDbPath: string;
     hostDbPath: string;
     fix?: boolean;
-    inspectHolders?: (contextDbPath: string, hostDbPath: string) => void;
+    inspectHolders?: (contextDbPath: string, hostDbPath: string) => void | Promise<void>;
+    platform?: NodeJS.Platform;
+    processProbe?: () => Promise<AsyncProcessInspection>;
     report?: (message: string) => void;
 }
 
 /** A failed process inspection must never be interpreted as a store with no holders. */
-export function assertHiddenChildStoresClosed(contextDbPath: string, hostDbPath: string): void {
+export async function assertHiddenChildStoresClosed(
+    contextDbPath: string,
+    hostDbPath: string,
+    platform: NodeJS.Platform = process.platform,
+    processProbe: () => Promise<AsyncProcessInspection> = () => inspectProcessesAsync(true),
+): Promise<void> {
+    if (platform === "win32") {
+        const processes = await processProbe();
+        if (
+            processes.pi.state !== "known" ||
+            processes.pi.processIds.length > 0 ||
+            (processes.pi.inconclusivePids?.length ?? 0) > 0 ||
+            processes.processSnapshot?.source !== "cim"
+        ) {
+            throw new Error(
+                "Windows process probe could not rule out OpenCode, Pi or ck-mc holders",
+            );
+        }
+        const unknown = processes.processSnapshot.facts.filter(
+            ({ pid, imageName, commandLine }) =>
+                pid !== process.pid &&
+                ((!imageName && !commandLine) ||
+                    (/^(?:bun|node|deno)(?:\.exe)?$/i.test(imageName ?? "") && !commandLine)),
+        );
+        if (unknown.length)
+            throw new Error(
+                `Windows process identity is unavailable (PID ${unknown.map(({ pid }) => pid).join(", ")})`,
+            );
+        const blockers = processes.processSnapshot.facts.filter(
+            ({ pid, imageName, commandLine }) => {
+                if (pid === process.pid) return false;
+                const image =
+                    (imageName ?? "").toLowerCase().replaceAll("\\", "/").split("/").at(-1) ?? "";
+                return (
+                    /^(?:opencode|opencode2|pi|omp|ck-mc)(?:\.exe)?$/.test(image) ||
+                    /(?:^|[\\/\s"'])(?:ck-mc|opencode2?)(?:\.exe|\.js|\.mjs)?(?:$|[\s"'])/i.test(
+                        commandLine ?? "",
+                    )
+                );
+            },
+        );
+        if (blockers.length)
+            throw new Error(
+                `OpenCode, Pi or ck-mc process is running (PID ${blockers.map(({ pid }) => pid).join(", ")})`,
+            );
+        return;
+    }
     const inspection = defaultInspectHolders(dirname(contextDbPath));
     if (!inspection.safe) {
         throw new Error(
             `database holders cannot be ruled out: ${[...inspection.blockers, inspection.uncertainty].filter(Boolean).join("; ")}`,
         );
     }
-    const result = spawnSync("lsof", ["-Fn"], {
+    const paths = [contextDbPath, hostDbPath].flatMap((path) =>
+        [path, `${path}-wal`, `${path}-shm`].filter(existsSync).map((file) => realpathSync(file)),
+    );
+    const result = spawnSync("lsof", ["-Fn", "--", ...paths], {
         encoding: "utf8",
         timeout: 30_000,
         maxBuffer: 32 * 1024 * 1024,
     });
-    if (result.error || result.status !== 0) {
+    if (
+        result.error ||
+        result.stderr?.trim() ||
+        (result.status !== 0 && !(result.status === 1 && !result.stdout?.trim()))
+    ) {
         throw new Error(
             `lsof could not inspect database holders: ${result.error?.message ?? result.stderr ?? result.status}`,
         );
     }
-    const paths = [contextDbPath, hostDbPath].flatMap((path) => {
-        const resolved = realpathSync(path);
-        return [resolved, `${resolved}-wal`, `${resolved}-shm`, path, `${path}-wal`, `${path}-shm`];
-    });
-    const opened = result.stdout
-        .split("\n")
-        .filter((line) => line.startsWith("n") && paths.includes(line.slice(1)));
+    const opened = result.stdout.split("\n").filter((line) => line.startsWith("n"));
     if (opened.length)
         throw new Error(
             `database holder is present: ${opened.map((line) => line.slice(1)).join(", ")}`,
         );
+    if (result.status === 0) throw new Error("lsof returned success without any file evidence");
 }
 
 function assertVerifiedV2Schema(db: Database): void {
@@ -109,11 +163,11 @@ interface HiddenState {
     [key: string]: unknown;
 }
 
-export function cleanupRetiredHiddenChildren(options: HiddenChildCleanupOptions): {
+export async function cleanupRetiredHiddenChildren(options: HiddenChildCleanupOptions): Promise<{
     waiting: number;
     deleted: number;
     backup?: string;
-} {
+}> {
     const { contextDbPath, hostDbPath, fix = false } = options;
     if (!existsSync(contextDbPath) || !existsSync(hostDbPath)) return { waiting: 0, deleted: 0 };
     const context = new Database(contextDbPath, { readonly: true, fileMustExist: true });
@@ -165,47 +219,70 @@ export function cleanupRetiredHiddenChildren(options: HiddenChildCleanupOptions)
     );
     if (!fix || candidates.length === 0) return { waiting, deleted: 0 };
 
-    const inspect = options.inspectHolders ?? assertHiddenChildStoresClosed;
-    inspect(contextDbPath, hostDbPath);
+    const inspect =
+        options.inspectHolders ??
+        ((context: string, host: string) =>
+            assertHiddenChildStoresClosed(context, host, options.platform, options.processProbe));
+    await inspect(contextDbPath, hostDbPath);
     const backup = `${hostDbPath}.hidden-child-backup-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
     copyDatabaseBundle(hostDbPath, backup);
     options.report?.(`OpenCode store backup: ${backup}`);
-    inspect(contextDbPath, hostDbPath);
+    await inspect(contextDbPath, hostDbPath);
     const writableHost = new Database(hostDbPath);
+    let writableContext: Database | undefined;
+    const deletedIds: string[] = [];
+    let hostLocked = false;
+    let contextLocked = false;
     try {
-        assertVerifiedV2Schema(writableHost);
+        writableHost.exec("PRAGMA busy_timeout = 250");
         writableHost.exec("PRAGMA foreign_keys = ON");
-        writableHost
-            .transaction(() => {
-                for (const id of candidates) {
-                    writableHost
-                        .prepare(
-                            "DELETE FROM session_v2 WHERE id = ? AND json_valid(metadata) AND json_extract(metadata, '$.magic_context') = 'hidden-run'",
-                        )
-                        .run(id);
-                }
-            })
-            .immediate();
+        writableContext = new Database(contextDbPath);
+        writableContext.exec("PRAGMA busy_timeout = 250");
+        try {
+            writableHost.exec("BEGIN EXCLUSIVE");
+            hostLocked = true;
+            writableContext.exec("BEGIN EXCLUSIVE");
+            contextLocked = true;
+        } catch (error) {
+            throw new Error(
+                `Cannot acquire exclusive locks on ${hostDbPath} and ${contextDbPath}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+        assertVerifiedV2Schema(writableHost);
+        for (const id of candidates) {
+            const result = writableHost
+                .prepare(
+                    "DELETE FROM session_v2 WHERE id = ? AND json_valid(metadata) AND json_extract(metadata, '$.magic_context') = 'hidden-run'",
+                )
+                .run(id);
+            if (result.changes > 0) deletedIds.push(id);
+        }
+        for (const { key } of states) {
+            const current = writableContext
+                .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(key) as { value: string } | undefined;
+            if (!current) throw new Error(`Hidden-child state ${key} disappeared during repair`);
+            const state = JSON.parse(current.value) as HiddenState;
+            if (state.version !== 1 || !Array.isArray(state.retired_children)) {
+                throw new Error(`Hidden-child state ${key} changed during repair`);
+            }
+            state.retired_children = state.retired_children.filter(
+                (child) => !deletedIds.includes(child.id),
+            );
+            writableContext
+                .prepare("UPDATE schema_migrations_meta SET value = ? WHERE key = ?")
+                .run(JSON.stringify(state), key);
+        }
+        writableHost.exec("COMMIT");
+        hostLocked = false;
+        writableContext.exec("COMMIT");
+        contextLocked = false;
     } finally {
+        if (contextLocked) writableContext?.exec("ROLLBACK");
+        if (hostLocked) writableHost.exec("ROLLBACK");
+        writableContext?.close();
         writableHost.close();
     }
-    const writableContext = new Database(contextDbPath);
-    try {
-        writableContext
-            .transaction(() => {
-                for (const { key, state } of states) {
-                    state.retired_children = state.retired_children.filter(
-                        (child) => !candidates.includes(child.id),
-                    );
-                    writableContext
-                        .prepare("UPDATE schema_migrations_meta SET value = ? WHERE key = ?")
-                        .run(JSON.stringify(state), key);
-                }
-            })
-            .immediate();
-    } finally {
-        writableContext.close();
-    }
-    options.report?.(`Deleted ${candidates.length} marked, recorded hidden sessions`);
-    return { waiting, deleted: candidates.length, backup };
+    options.report?.(`Deleted ${deletedIds.length} marked, recorded hidden sessions`);
+    return { waiting, deleted: deletedIds.length, backup };
 }

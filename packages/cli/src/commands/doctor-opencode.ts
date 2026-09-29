@@ -1127,7 +1127,7 @@ export async function runDoctor(
     if (openCodeDbCheck.ok) {
         if (storeGeneration === "v2") {
             try {
-                const cleanup = cleanupRetiredHiddenChildren({
+                const cleanup = await cleanupRetiredHiddenChildren({
                     contextDbPath: authorityDbPath,
                     hostDbPath: openCodeDbResolution.path,
                     fix: options.fix,
