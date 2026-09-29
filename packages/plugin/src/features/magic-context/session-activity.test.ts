@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { getDreamTaskBacklog } from "./dreamer/task-gates";
+import { runMigrations } from "./migrations";
 import {
     advanceSessionActivity,
     backfillSessionActivity,
@@ -8,16 +9,46 @@ import {
     readSessionActivity,
 } from "./session-activity";
 import { initializeDatabase } from "./storage-db";
+import { clearSession } from "./storage-meta-session";
 
 let db: Database;
 afterEach(() => db?.close());
 function setup(): Database {
     db = new Database(":memory:");
     initializeDatabase(db);
+    runMigrations(db);
     return db;
 }
 
 describe("retrospective activity", () => {
+    test("session deletion removes activity for OpenCode 1/2 and Pi/OMP without touching backfill state", () => {
+        const db = setup();
+        for (const harness of ["opencode", "opencode2", "pi", "omp"]) {
+            const sessionId = `session-${harness}`;
+            db.prepare(
+                "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, '/repo', 100)",
+            ).run(sessionId, harness);
+            observeSessionActivity(db, sessionId, 100);
+            observeSessionActivity(db, sessionId, 101);
+            expect(readSessionActivity(db, sessionId)).toBe(100);
+            clearSession(db, sessionId);
+            expect(readSessionActivity(db, sessionId)).toBeUndefined();
+            expect(
+                db.prepare("SELECT 1 FROM session_projects WHERE session_id = ?").get(sessionId),
+            ).toBeNull();
+        }
+        db.prepare(
+            "INSERT INTO schema_migrations_meta(key, value) VALUES ('retrospective_activity_backfill:pi:v1', 'completed')",
+        ).run();
+        clearSession(db, "session-pi");
+        expect(
+            db
+                .prepare(
+                    "SELECT value FROM schema_migrations_meta WHERE key = 'retrospective_activity_backfill:pi:v1'",
+                )
+                .get(),
+        ).toEqual({ value: "completed" });
+    });
     test("selects active sessions without binding writes and ignores binding-only changes", () => {
         const db = setup();
         const activeProject = "/repo/active";

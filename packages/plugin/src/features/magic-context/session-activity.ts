@@ -14,6 +14,20 @@ export function sessionActivityKey(sessionId: string): string {
     return `${PREFIX}${sessionId}`;
 }
 
+export function deleteSessionActivity(db: Database, sessionIds: readonly string[]): void {
+    if (sessionIds.length === 0) return;
+    const sessions = pending.get(db);
+    for (const sessionId of sessionIds) {
+        const state = sessions?.get(sessionId);
+        if (state?.timer) clearTimeout(state.timer);
+        sessions?.delete(sessionId);
+    }
+    const placeholders = sessionIds.map(() => "?").join(", ");
+    db.prepare(`DELETE FROM schema_migrations_meta WHERE key IN (${placeholders})`).run(
+        ...sessionIds.map(sessionActivityKey),
+    );
+}
+
 export function readSessionActivity(db: Database, sessionId: string): number | undefined {
     const row = db
         .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
