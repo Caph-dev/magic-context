@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
-import type { execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path, { join } from "node:path";
+import { readRememberedGitIdentity } from "./memory/project-identity-cache";
 import {
     __clearProjectIdentityResolutionCacheForTests,
     __clearProjectIdentityTransientCooldownForTests,
@@ -100,6 +101,63 @@ function makeGitFailure(fields: {
 }
 
 describe("project identity", () => {
+    it("unborn repo resolves to its existing dir identity and switches at the first commit", () => {
+        const directory = makeTempDir("identity-unborn-");
+        execFileSync("git", ["init", "-q", directory]);
+        expect(
+            expectProjectIdentityError(() => resolveProjectIdentityStrict(directory)).errorClass,
+        ).toBe("no_commits");
+        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(resolveProjectIdentityOrFallback(directory)).toBe(expectedDirIdentity(directory));
+        expect(resolveProjectIdentityForSession(directory)).toBe(expectedDirIdentity(directory));
+        expect(readRememberedGitIdentity(directory)).toBeUndefined();
+        execFileSync(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "first",
+            ],
+            { cwd: directory },
+        );
+        const root = execFileSync("git", ["rev-parse", "HEAD"], {
+            cwd: directory,
+            encoding: "utf8",
+        }).trim();
+        expect(resolveProjectIdentityForSession(directory)).toBe(`git:${root}`);
+    });
+
+    it("transient failure with commits and no recorded identity still pauses", () => {
+        const directory = makeTempDir("identity-committed-cold-");
+        execFileSync("git", ["init", "-q", directory]);
+        execFileSync(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "first",
+            ],
+            { cwd: directory },
+        );
+        __setProjectIdentityTestHooks({
+            execFileSync: (() => {
+                throw makeGitFailure({ code: "ETIMEDOUT" });
+            }) as typeof execFileSync,
+        });
+        expect(resolveProjectIdentityForSession(directory)).toBeUndefined();
+        expect(() => resolveProjectIdentity(directory)).toThrow(ProjectIdentityError);
+        expect(readRememberedGitIdentity(directory)).toBeUndefined();
+    });
     it("applies the boot home permission to strict, fallback, and stored identities", () => {
         const home = makeTempDir("identity-home-policy-");
         __setProjectIdentityTestHooks({ homeDirectory: () => home });

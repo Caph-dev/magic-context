@@ -92,7 +92,8 @@ function classifyBackfillError(error: unknown): {
             errorClass:
                 error.errorClass === "dubious_ownership" ||
                 error.errorClass === "home_project_disabled" ||
-                error.errorClass === "git_identity_unavailable"
+                error.errorClass === "git_identity_unavailable" ||
+                error.errorClass === "no_commits"
                     ? "unknown"
                     : error.errorClass,
             errorMessage: error.message,
