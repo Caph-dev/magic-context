@@ -1507,11 +1507,16 @@ describe("project embedding registry", () => {
         prepare.mockRestore();
         const before = (db.prepare("SELECT total_changes() AS count").get() as { count: number })
             .count;
+        const exec = spyOn(db, "exec");
         for (let i = 0; i < 4; i++)
             registerProjectEmbedding(db, identity, config, features, "/tmp/repair-read");
         expect(
             (db.prepare("SELECT total_changes() AS count").get() as { count: number }).count,
         ).toBe(before);
+        expect(
+            exec.mock.calls.filter(([sql]) => String(sql).includes("BEGIN IMMEDIATE")),
+        ).toHaveLength(0);
+        exec.mockRestore();
         expect(hasMisScopedCompartmentChunkEmbeddingsForProject(db, identity)).toBe(false);
         expect(repairMisScopedCompartmentChunkEmbeddingsForProject(db, identity)).toBe(0);
         const plan = db
