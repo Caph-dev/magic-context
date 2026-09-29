@@ -48,7 +48,6 @@
 		"comment-json": "^5.0.0",
 		"onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
 		"quickjs-emscripten": "^0.32.0",
-		"typebox": "^1.3.1",
 		"zod": "^4.1.8"
 	},
 	"optionalDependencies": {
@@ -68,17 +67,22 @@
 		"pi-ai-086": "npm:@earendil-works/pi-ai@0.86.0",
 		"pi-coding-agent-086": "npm:@earendil-works/pi-coding-agent@0.86.0",
 		"pi-coding-agent-087": "npm:@earendil-works/pi-coding-agent@0.87.1",
+		"typebox": "^1.3.1",
 		"typescript": "^5.8.0"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.80.2",
-		"@earendil-works/pi-tui": ">=0.80.2"
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
 	},
 	"peerDependenciesMeta": {
 		"@earendil-works/pi-coding-agent": {
 			"optional": true
 		},
 		"@earendil-works/pi-tui": {
+			"optional": true
+		},
+		"typebox": {
 			"optional": true
 		}
 	},

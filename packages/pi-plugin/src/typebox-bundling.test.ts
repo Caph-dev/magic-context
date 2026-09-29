@@ -14,6 +14,7 @@ interface PiPluginPackageJson {
 	scripts: Record<string, string>;
 	dependencies?: Record<string, string>;
 	peerDependencies?: Record<string, string>;
+	peerDependenciesMeta?: Record<string, { optional?: boolean }>;
 }
 
 const packageJson = JSON.parse(
@@ -41,8 +42,9 @@ describe("TypeBox packaging for the shared Pi/OMP package", () => {
 		expect(externals.filter((name) => /typebox/.test(name))).toEqual([]);
 	});
 
-	it("keeps typebox a regular dependency rather than a host-provided peer", () => {
-		expect(packageJson.dependencies?.typebox).toBeString();
-		expect(packageJson.peerDependencies?.typebox).toBeUndefined();
+	it("declares host-provided typebox as an optional peer while bundling it", () => {
+		expect(packageJson.dependencies?.typebox).toBeUndefined();
+		expect(packageJson.peerDependencies?.typebox).toBe("*");
+		expect(packageJson.peerDependenciesMeta?.typebox?.optional).toBe(true);
 	});
 });
