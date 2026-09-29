@@ -28,6 +28,9 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// aborting the turn when busy storage refuses a pass instead of serving
 			// it raw (38a6a6cd12, "refuse unmanaged prompts on storage contention
 			// and Rust outages"); also a deliberate v1 change.
+			// It was re-minted again when the v1 entry's session-project backfill
+			// took a lease key and the home-project setting, so sessions whose rows
+			// an earlier pass missed are discovered once; also v1.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")
