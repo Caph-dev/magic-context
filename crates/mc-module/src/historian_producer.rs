@@ -292,6 +292,22 @@ pub struct ProducerUsage {
     pub cache_write: u64,
 }
 
+pub(crate) fn producer_token_log(
+    usage: Option<ProducerUsage>,
+    max_tokens: Option<u32>,
+    length_capped: bool,
+) -> Value {
+    serde_json::json!({
+        "input": usage.map(|value| value.input),
+        "output": usage.map(|value| value.output),
+        "reasoning": None::<u64>,
+        "cache_read": usage.map(|value| value.cache_read),
+        "cache_write": usage.map(|value| value.cache_write),
+        "max_tokens": max_tokens,
+        "finish_reason": if length_capped { Some("length") } else { None },
+    })
+}
+
 impl ProducerUsage {
     /// Reads a runner usage object (`input_tokens`, `output_tokens`,
     /// `cached_input_tokens`, `cache_write_tokens`; each optional). Returns `None` when
@@ -1611,6 +1627,19 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::{net::TcpListener, sync::Mutex};
+
+    #[test]
+    fn producer_token_log_distinguishes_missing_usage_from_zero_and_reports_cap() {
+        assert_eq!(
+            producer_token_log(None, None, false),
+            json!({"input":null,"output":null,"reasoning":null,"cache_read":null,"cache_write":null,"max_tokens":null,"finish_reason":null})
+        );
+        let usage = ProducerUsage::from_runner_usage(&json!({"input_tokens":4,"output_tokens":32,"cached_input_tokens":0,"cache_write_tokens":2})).unwrap();
+        assert_eq!(
+            producer_token_log(Some(usage), Some(32), true),
+            json!({"input":4,"output":32,"reasoning":null,"cache_read":0,"cache_write":2,"max_tokens":32,"finish_reason":"length"})
+        );
+    }
 
     #[test]
     fn provider_reset_metadata_survives_open_and_terminal_errors() {

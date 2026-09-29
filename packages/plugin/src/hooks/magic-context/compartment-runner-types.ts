@@ -106,6 +106,7 @@ export interface HiddenCompletion {
     reasoning?: string | null;
     usage: TokenTotals;
     lengthCapped: boolean;
+    tokenLog?: import("../../shared/run-token-log").RunTokenLog;
     /** Original host messages are retained only by transports that expose them. */
     messages?: unknown[];
     providerId?: string;

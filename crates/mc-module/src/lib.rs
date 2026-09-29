@@ -12679,6 +12679,19 @@ impl McHandler {
             };
         }
         let (model, result, child_session) = output.expect("classifier output set");
+        let tokens = historian_producer::producer_token_log(
+            result.usage,
+            Some(CLASSIFY_MAX_OUTPUT_TOKENS),
+            result.length_capped,
+        );
+        tracing::info!(
+            response_chars = result.text.chars().count(),
+            tokens = %tokens,
+            "dreamer classify response received"
+        );
+        if result.length_capped {
+            tracing::warn!(tokens = %tokens, "dreamer classify output hit the length cap");
+        }
         let mut response = json!({
             "ok": true,
             "manifest_text": result.text,

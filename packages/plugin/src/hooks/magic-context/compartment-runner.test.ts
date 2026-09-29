@@ -1872,7 +1872,7 @@ describe("runCompartmentAgent", () => {
         });
 
         const error =
-            "historian ran out of output budget while reasoning (length-capped at 8192 tokens, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant";
+            'historian ran out of output budget while reasoning (length-capped at 8192 tokens, no text; tokens={"input":null,"output":8192,"reasoning":null,"cache_read":null,"cache_write":null,"max_tokens":null,"finish_reason":"length"}) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant';
         expect(getCompartments(db, sessionId)).toHaveLength(0);
         expect(getHistorianFailureState(db, sessionId)).toMatchObject({
             failureCount: 1,
