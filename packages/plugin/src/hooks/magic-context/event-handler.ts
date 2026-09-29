@@ -68,8 +68,10 @@ import {
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
+import { resetPrefixTrimFallbackState } from "./inject-compartments";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
+import { truncateRemovedCompartmentAnchor } from "./reachable-compartment-history";
 import { readRawSessionMessages } from "./read-session-chunk";
 import {
     clearTrackedOpenCodeSession,
@@ -1037,6 +1039,9 @@ export function createEventHandler(deps: EventHandlerDeps) {
             );
 
             try {
+                if (truncateRemovedCompartmentAnchor(deps.db, info.sessionID, info.messageID)) {
+                    resetPrefixTrimFallbackState(info.sessionID);
+                }
                 cleanupRemovedMessageState(deps, info.sessionID, info.messageID);
                 scheduleClearAndReindex(deps.db, info.sessionID, readRawSessionMessages);
 
