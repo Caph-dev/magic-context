@@ -1,5 +1,5 @@
 import type { createOpencodeClient } from "@opencode-ai/sdk";
-
+import { DreamTokenBudgetExceeded } from "../features/magic-context/dreamer/token-budget";
 import { detectOverflow } from "../features/magic-context/overflow-detection";
 import { HiddenAgentStepLimit } from "../v2/hooks/hidden-child";
 import {
@@ -352,7 +352,12 @@ async function abortChildRun(client: Client, sessionId: string): Promise<void> {
  * different model.
  */
 function isNonRetryable(error: unknown, externalSignal?: AbortSignal): boolean {
-    if (externalSignal?.aborted || error instanceof HiddenAgentStepLimit) return true;
+    if (
+        externalSignal?.aborted ||
+        error instanceof HiddenAgentStepLimit ||
+        error instanceof DreamTokenBudgetExceeded
+    )
+        return true;
 
     if (error instanceof Error) {
         if (error.name === "AbortError") return true;
@@ -394,6 +399,7 @@ function classifyPromptFailure(
 ): PromptFailureClass {
     const message = extractMessage(error);
     if (error instanceof HiddenAgentStepLimit) return "step_limit";
+    if (error instanceof DreamTokenBudgetExceeded) return "token_budget";
     if (externalSignal?.aborted || message === "prompt aborted by external signal") {
         return "child_aborted";
     }

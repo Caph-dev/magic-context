@@ -40,6 +40,7 @@ export interface RefreshPrimersArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    tokenBudget?: number;
     language?: string;
     onProgress?: (processed: number) => void;
     /**
@@ -310,6 +311,9 @@ async function refreshOnePrimer(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:refresh-primers",
+                transport: shared.createPromptAsyncTransport(client, agentSessionId, {
+                    tokenBudget: args.tokenBudget,
+                }),
                 fetchOutput: async () => {
                     const messagesResponse = await client.session.messages({
                         path: { id: agentSessionId as string },

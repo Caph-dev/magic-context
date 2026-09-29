@@ -127,6 +127,7 @@ import type {
     TaskExecutor,
     TaskExecutorContext,
 } from "./task-scheduler";
+import { DreamTokenBudgetExceeded } from "./token-budget";
 import { runVerify } from "./verify";
 
 export interface DreamTaskExecutorDeps {
@@ -194,6 +195,16 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
 
     const described = describeError(error);
     const message = described.brief;
+    if (error instanceof DreamTokenBudgetExceeded) {
+        return {
+            failure_class: "token_budget",
+            model_attempted: null,
+            models_tried: [],
+            provider_error: null,
+            timeout_ms: null,
+            child_session_id: error.sessionId,
+        };
+    }
     if (error instanceof Error && error.name === "HiddenAgentStepLimit") {
         return {
             failure_class: "step_limit",
@@ -676,6 +687,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     moduleRoute,
+                    tokenBudget: config.tokenBudget,
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(
@@ -726,6 +738,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                     moduleRoute,
+                    tokenBudget: config.tokenBudget,
                     onProgress: (processed, refused) => reportProgress(processed, refused),
                 });
                 const processed =
@@ -867,6 +880,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                     rawProviderFactory: deps.primerRawProviderFactory,
+                    tokenBudget: config.tokenBudget,
                     onProgress: (processed) => reportProgress(processed),
                 });
                 recordRun("completed", null);
@@ -1349,6 +1363,13 @@ async function runRetrospectiveTask(
                     signal: abortController.signal,
                     fallbackModels: config.fallbackModels,
                     callContext: "dreamer:retrospective",
+                    ...(!hiddenHandle && deps.client
+                        ? {
+                              transport: shared.createPromptAsyncTransport(deps.client, sessionId, {
+                                  tokenBudget: config.tokenBudget,
+                              }),
+                          }
+                        : {}),
                     ...(hiddenHandle && deps.hiddenCompletionExecutor
                         ? {
                               transport: Object.assign(
@@ -1828,6 +1849,11 @@ async function runAgenticTask(
                     signal: abortController.signal,
                     fallbackModels: config.fallbackModels,
                     callContext: `dreamer:${task}`,
+                    transport: shared.createPromptAsyncTransport(
+                        requireDreamClient(deps.client),
+                        sessionId,
+                        { tokenBudget: config.tokenBudget },
+                    ),
                     fetchOutput: async () => {
                         const messagesResponse = await requireDreamClient(
                             deps.client,

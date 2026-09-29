@@ -1,3 +1,13 @@
+export class DreamTokenBudgetExceeded extends Error {
+    constructor(
+        readonly sessionId: string,
+        readonly spent: number,
+    ) {
+        super(`Dreamer child ${sessionId} spent ${spent} prompt tokens (token_budget)`);
+        this.name = "DreamTokenBudgetExceeded";
+    }
+}
+
 export const TOKEN_BUDGET_FINALIZE_MESSAGE =
     "You're out of token budget. Stop investigating: make no more tool calls and output your result now, covering only what you've already checked; leave the rest out.";
 export const TOKEN_BUDGET_TOOL_REFUSAL =
@@ -11,6 +21,26 @@ export interface DreamTokenBudgetState {
     readonly finalizeFired: boolean;
     readonly refusedCalls: number;
     readonly hardStopped: boolean;
+}
+
+const finalizingChildren = new Map<string, ReturnType<typeof createDreamTokenBudget>>();
+
+/** The tool hook runs in the OpenCode plugin process, alongside child polling. */
+export function registerBudgetFinalizeChild(
+    sessionId: string,
+    guard: ReturnType<typeof createDreamTokenBudget>,
+): void {
+    finalizingChildren.set(sessionId, guard);
+}
+
+export function releaseBudgetFinalizeChild(sessionId: string): void {
+    finalizingChildren.delete(sessionId);
+}
+
+export function refuseBudgetedToolCall(
+    sessionId: string,
+): { message: string; hardStopped: boolean } | null {
+    return finalizingChildren.get(sessionId)?.refuseTool() ?? null;
 }
 
 export function createDreamTokenBudget(budget: number) {
