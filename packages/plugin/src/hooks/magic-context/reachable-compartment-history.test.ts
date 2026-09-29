@@ -162,6 +162,23 @@ describe("covered branch ancestry", () => {
         ).toEqual([{ sequence: 1 }]);
     });
 
+    test("a short visible window ending at an old anchor is not a branch cut", () => {
+        const db = seed();
+        expect(truncateUnreachableCompartmentHistory(db, "ses-revert", new Set(["old-1"]))).toBe(
+            false,
+        );
+        expect(
+            db
+                .prepare("SELECT count(*) AS n FROM compartments WHERE session_id = 'ses-revert'")
+                .get(),
+        ).toEqual({ n: 3 });
+        expect(
+            db
+                .prepare("SELECT cached_m0_bytes FROM session_meta WHERE session_id = 'ses-revert'")
+                .get(),
+        ).not.toEqual({ cached_m0_bytes: null });
+    });
+
     test("a compaction-hidden prefix does not delete stored rows or cached bytes", () => {
         const db = seed();
         expect(

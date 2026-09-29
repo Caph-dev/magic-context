@@ -18,7 +18,31 @@ import type { Database } from "../../shared/sqlite";
  * this branch. A host may hide an entire prefix after compaction, so require
  * at least one stored endpoint ID to still occur in the visible messages.
  */
-const noCommonAnchorLogged = new BoundedSessionMap<boolean>(100);
+const ambiguousAncestryLogged = new BoundedSessionMap<boolean>(100);
+
+function logAmbiguousAncestryOnce(sessionId: string, reason: string): void {
+    if (ambiguousAncestryLogged.has(sessionId)) return;
+    ambiguousAncestryLogged.set(sessionId, true);
+    sessionLog(
+        sessionId,
+        `covered history ancestry unknown: ${reason}; leaving compartments unchanged`,
+    );
+}
+
+function hasDivergentSuffix(
+    rows: readonly { startMessageId: string; endMessageId: string }[],
+    reachable: ReadonlySet<string>,
+): boolean {
+    const ids = Array.from(reachable);
+    const storedEndpoints = new Set(rows.flatMap((row) => [row.startMessageId, row.endMessageId]));
+    let lastAnchor = -1;
+    for (let i = 0; i < ids.length; i++) {
+        if (storedEndpoints.has(ids[i])) lastAnchor = i;
+    }
+    // A truncated input ending at an old anchor is not a new branch. Require
+    // actual messages after the shared anchor before deleting stored history.
+    return lastAnchor >= 0 && ids.slice(lastAnchor + 1).some((id) => !storedEndpoints.has(id));
+}
 
 export function firstUnreachableCompartment(
     compartments: readonly { startMessageId: string; endMessageId: string }[],
@@ -173,19 +197,26 @@ export function truncateUnreachableCompartmentHistory(
             reachable.size > 0 &&
             !rows.some(
                 (row) => reachable.has(row.startMessageId) || reachable.has(row.endMessageId),
-            ) &&
-            !noCommonAnchorLogged.has(sessionId)
+            )
         ) {
-            noCommonAnchorLogged.set(sessionId, true);
-            sessionLog(
+            logAmbiguousAncestryOnce(
                 sessionId,
-                "covered history ancestry unknown: no stored endpoint ID on visible branch; compaction or a pending summary may hide the prefix, leaving compartments unchanged",
+                "no stored endpoint ID on visible branch; compaction or a pending summary may hide the prefix",
             );
         }
         return false;
     }
+    if (!hasDivergentSuffix(rows, reachable)) {
+        logAmbiguousAncestryOnce(
+            sessionId,
+            "the visible history ends at a stored anchor without a new branch suffix",
+        );
+        return false;
+    }
     return truncateWithLease(db, sessionId, (currentRows) => {
         const current = firstUnreachableCompartment(currentRows, reachable);
-        return current === null ? null : currentRows[current].sequence;
+        return current === null || !hasDivergentSuffix(currentRows, reachable)
+            ? null
+            : currentRows[current].sequence;
     });
 }
