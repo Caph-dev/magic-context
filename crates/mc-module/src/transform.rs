@@ -12312,10 +12312,15 @@ fn is_ignored_block(block: &CkWireBlock) -> bool {
 }
 
 fn is_dropped_placeholder_text(text: &str) -> bool {
-    static DROPPED_PLACEHOLDERS: OnceLock<regex::Regex> = OnceLock::new();
-    DROPPED_PLACEHOLDERS
-        .get_or_init(|| regex::Regex::new(r"^(?:\s*\[dropped(?: §\d+§)?\])+\s*$").unwrap())
-        .is_match(text)
+    static MARKER_ONLY: OnceLock<regex::Regex> = OnceLock::new();
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && MARKER_ONLY
+            .get_or_init(|| {
+                regex::Regex::new(r"^(?:(?:§\d+§|\[dropped(?: §\d+§)?\]|\[cleared\])\s*)+$")
+                    .unwrap()
+            })
+            .is_match(trimmed)
 }
 
 fn tag_stripped_text(text: &str) -> &str {
@@ -12434,13 +12439,6 @@ fn is_dropped_placeholder_block(block: &CkWireBlock) -> bool {
         &block.kind,
         ck_wire::CkKind::Text { text } | ck_wire::CkKind::Reasoning { text, .. }
             if is_dropped_placeholder_text(text)
-    )
-}
-
-fn has_text_or_reasoning_block(block: &CkWireBlock) -> bool {
-    matches!(
-        &block.kind,
-        ck_wire::CkKind::Text { .. } | ck_wire::CkKind::Reasoning { .. }
     )
 }
 
@@ -12675,8 +12673,9 @@ fn new_frozen_strip_units(
                     is_ignored_block(block)
                         || is_metadata_block(block)
                         || is_dropped_placeholder_block(block)
+                        || matches!(&block.kind, ck_wire::CkKind::Text { text } | ck_wire::CkKind::Reasoning { text, .. } if text.trim().is_empty())
                 })
-                && blocks.iter().any(has_text_or_reasoning_block)
+                && blocks.iter().any(is_dropped_placeholder_block)
             {
                 let unit = strip_unit("placeholder", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
@@ -12767,13 +12766,12 @@ fn apply_surface_strips(
 ) {
     replay_reasoning_clear(frozen_units, &message.mid, rebuilt);
     let sentinel = provider_sentinel_text(req);
-    let whole_strip = (!reasoning_policy.exempt)
-        .then(|| {
-            output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
-                output_message_strip_unit(frozen_units, "system_injected", &message.mid)
-            })
-        })
-        .flatten();
+    let whole_strip =
+        output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
+            (!reasoning_policy.exempt)
+                .then(|| output_message_strip_unit(frozen_units, "system_injected", &message.mid))
+                .flatten()
+        });
     if whole_strip.is_some() {
         rebuilt.content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text: sentinel })];
         rebuilt.mark_modified();
@@ -27389,6 +27387,94 @@ pub(crate) mod tests {
         );
         assert_eq!(in_flight[0]["parts"][0]["text"], "");
         assert_eq!(in_flight[1]["parts"][0]["text"], "thinking-latest");
+    }
+
+    #[test]
+    fn marker_only_final_assistant_freezes_on_bust_and_replays_after_append() {
+        for (provider, sentinel) in [("anthropic", ""), ("openai-compatible", "[dropped]")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let session = format!("marker-only-{provider}");
+            let user = wire_item("user", "user", 1, &["continue"]);
+            let mut assistant = wire_item("assistant", "last", 2, &["§672§ [dropped §672§]"]);
+            assistant
+                .ck
+                .content
+                .push(CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "[cleared]".into(),
+                    signature: None,
+                }));
+            let mut request = req(&session, "cfg0", vec![user, assistant]);
+            request.provider_id = Some(provider.into());
+            let first = run(&store, &request, &spine());
+            assert_eq!(first.action, "HARD");
+            assert_eq!(tail_bytes(&first, "last"), sentinel);
+            assert!(store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:last"));
+            let first_wire = serde_json::to_vec(first.ck_messages.as_ref().unwrap()).unwrap();
+            request
+                .messages
+                .push(wire_item("assistant", "new", 3, &["§655§ [cleared]"]));
+            let second = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&second, "last"), sentinel);
+            assert_eq!(
+                serde_json::to_vec(
+                    &second.ck_messages.as_ref().unwrap()
+                        [..first.ck_messages.as_ref().unwrap().len()]
+                )
+                .unwrap(),
+                first_wire,
+                "the shared prefix must remain byte-identical after append"
+            );
+            assert_eq!(tail_bytes(&second, "new"), "§655§ [cleared]");
+            assert!(!store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:new"));
+        }
+    }
+
+    #[test]
+    fn marker_only_parity_examples() {
+        let cases: Value =
+            serde_json::from_str(include_str!("../../../testdata/marker-only-parity.json"))
+                .unwrap();
+        for text in cases["positive"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            assert!(is_dropped_placeholder_text(text), "positive: {text:?}");
+        }
+        for text in cases["negative"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            assert!(!is_dropped_placeholder_text(text), "negative: {text:?}");
+        }
+    }
+
+    #[test]
+    fn marker_only_text_and_reasoning_blocks_are_complete_markers() {
+        for kind in [
+            ck_wire::CkKind::Text {
+                text: "§672§ [dropped §672§]".into(),
+            },
+            ck_wire::CkKind::Reasoning {
+                text: "[cleared]".into(),
+                signature: None,
+            },
+        ] {
+            assert!(is_dropped_placeholder_block(&CkWireBlock::bare(kind)));
+        }
+        assert!(!is_dropped_placeholder_block(&CkWireBlock::bare(
+            ck_wire::CkKind::Text {
+                text: "see [dropped §3§] above".into(),
+            }
+        )));
     }
 
     #[test]

@@ -1,10 +1,85 @@
 import { describe, expect, it } from "bun:test";
 import { getStrippedPlaceholderIds } from "@magic-context/core/features/magic-context/storage";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
+import markerParity from "../../../testdata/marker-only-parity.json";
+import {
+	isPiMarkerOnlyText,
+	stripPiDroppedPlaceholderMessages,
+} from "./strip-placeholders-pi";
 import { assistantMessage, createTestDb, userMessage } from "./test-utils.test";
 
 describe("stripPiDroppedPlaceholderMessages", () => {
+	it("classifies the shared marker-only parity examples", () => {
+		for (const text of markerParity.positive)
+			expect(isPiMarkerOnlyText(text)).toBe(true);
+		for (const text of markerParity.negative)
+			expect(isPiMarkerOnlyText(text)).toBe(false);
+	});
+
+	it("removes marker-only text and thinking but retains tool-bearing replies", () => {
+		const db = createTestDb();
+		try {
+			const marker = assistantMessage("marker", 2, {
+				content: [
+					{ type: "text", text: "§672§ [dropped §672§]" },
+					{ type: "thinking", thinking: "[cleared]" },
+				],
+			});
+			const tool = assistantMessage("tool", 3, {
+				content: [
+					{ type: "text", text: "[cleared]" },
+					{ type: "toolCall", id: "call", name: "run", arguments: {} },
+				],
+			});
+			const messages = [userMessage("continue", 1), marker, tool];
+			expect(
+				stripPiDroppedPlaceholderMessages({
+					db,
+					sessionId: "ses-thinking-marker",
+					messages,
+					isCacheBusting: true,
+				}),
+			).toEqual({ removed: 1, discovered: 1 });
+			expect(messages).toContain(tool);
+			expect(messages).not.toContain(marker);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("discovers marker-only final replies on a bust and replays only frozen ids on defer", () => {
+		const db = createTestDb();
+		try {
+			const first = [
+				userMessage("continue", 1),
+				assistantMessage("§672§ [dropped §672§]", 2),
+			];
+			const bust = stripPiDroppedPlaceholderMessages({
+				db,
+				sessionId: "ses-marker",
+				messages: first,
+				isCacheBusting: true,
+			});
+			expect(bust).toEqual({ removed: 1, discovered: 1 });
+			const replay = [
+				userMessage("continue", 1),
+				assistantMessage("§672§ [dropped §672§]", 2),
+				assistantMessage("§655§ [cleared]", 3),
+			];
+			const prefix = JSON.stringify(first);
+			const defer = stripPiDroppedPlaceholderMessages({
+				db,
+				sessionId: "ses-marker",
+				messages: replay,
+				isCacheBusting: false,
+			});
+			expect(defer).toEqual({ removed: 1, discovered: 0 });
+			expect(JSON.stringify(replay.slice(0, first.length))).toBe(prefix);
+			expect(replay).toHaveLength(2);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 	it("discovers and removes ONLY assistant placeholder-only messages, never user-role", () => {
 		const db = createTestDb();
 		try {

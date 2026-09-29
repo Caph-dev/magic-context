@@ -282,11 +282,8 @@ describe("whitespace-only assistant tag transition", () => {
         }
     });
 
-    it("preserves provider-specific wholly blank assistant canonicalization", () => {
-        for (const [providerID, expected] of [
-            ["anthropic", ""],
-            ["github-copilot", "[dropped]"],
-        ] as const) {
+    it("does not classify a wholly blank assistant as marker-only", () => {
+        for (const providerID of ["anthropic", "github-copilot"]) {
             const db = openTestDb();
             const sessionId = `ses-wholly-blank-${providerID}`;
             const message = assistant(
@@ -298,7 +295,8 @@ describe("whitespace-only assistant tag transition", () => {
             tagMessages(sessionId, [message], createTagger(), db);
             stripDroppedPlaceholderMessages([message], providerID);
 
-            expect(message.parts).toEqual([{ type: "text", text: expected }]);
+            // No complete marker was present; leave the blank message to its usual provider path.
+            expect(message.parts).toEqual([{ type: "text", text: " \t" }]);
             expect(getTagsBySession(db, sessionId)).toEqual([]);
         }
     });
