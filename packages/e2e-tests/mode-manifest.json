@@ -2461,12 +2461,12 @@
         },
         {
             "path": "tests/opencode2/storage-busy.test.ts",
-            "tier": "excluded",
+            "tier": "ts-only",
             "invocation": {
-                "ts": false,
+                "ts": true,
                 "rust": false
             },
-            "rationale": "OpenCode 2 under a real context.db write lock: a short lock retries, a long one refuses visibly without a raw provider request, busy LKG replays prefix and system together, background contention releases the server. Held out of CI until the 7-second case passes on the pinned 2.0.15 host; run by hand",
+            "rationale": "OpenCode 2 under a real context.db write lock: a short lock retries, a long one refuses visibly without a raw provider request, busy LKG replays prefix and system together, background contention releases the server on the pinned 2.0.15 host",
             "contract_refs": [
                 "OC2-S1"
             ],

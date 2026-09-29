@@ -57,11 +57,14 @@ for (const seconds of [7, 60]) {
             const reader = (locker.stdout as ReadableStream<Uint8Array>).getReader();
             expect(new TextDecoder().decode((await reader.read()).value)).toContain("locked");
             reader.releaseLock();
-            const descriptors = spawnSync("lsof", ["-p", String(locker.pid), "-Fn"], { encoding: "utf8" });
-            expect(descriptors.status).toBe(0);
-            const paths = descriptors.stdout.split("\n").filter(line => line.startsWith("n")).map(line => line.slice(1));
-            assertOpenPaths(paths, fixture.root);
-            expect(paths).toContain(dbPath);
+            for (const pid of [host.pid, locker.pid]) {
+                const descriptors = spawnSync("lsof", ["-p", String(pid), "-Fn"], { encoding: "utf8" });
+                expect(descriptors.status).toBe(0);
+                const paths = descriptors.stdout.split("\n").filter(line => line.startsWith("n")).map(line => line.slice(1));
+                assertOpenPaths(paths, fixture.root);
+                if (pid === locker.pid) expect(paths).toContain(dbPath);
+                console.info(`storage-busy lsof pid=${pid} databases=${JSON.stringify(paths.filter(path => /\.db(?:-wal|-shm)?$/.test(path)))}`);
+            }
             console.info(`storage-busy host=${host.pid} locker=${locker.pid} root=${fixture.root} lsof_context_db=${dbPath}`);
             expect(locker.exitCode).toBeNull();
             const started = Date.now();
@@ -70,8 +73,10 @@ for (const seconds of [7, 60]) {
             await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(80000) });
             const requests = () => host.mock.requests().filter(request => request.body.model === "mock-model" && JSON.stringify(request).includes(text));
             if (seconds === 7) {
+                const elapsed = Date.now() - started;
+                console.info(`storage-busy 7s elapsed=${elapsed}ms requests=${requests().length}`);
                 expect(requests().length).toBeGreaterThan(0);
-                expect(Date.now() - started).toBeGreaterThan(5000);
+                expect(elapsed).toBeGreaterThan(5000);
             } else {
                 expect(requests()).toHaveLength(0);
                 const rows = () => {
@@ -85,7 +90,8 @@ for (const seconds of [7, 60]) {
                 expect(rows().some(row => row.type === "idle" && row.data.includes("interrupted"))).toBe(true);
                 await locker.exited;
                 const logDeadline = Date.now() + 10000;
-                while (!readFileSync(logPath, "utf8").includes("storage-busy refusal stage=") && Date.now() < logDeadline) await Bun.sleep(100);
+                while (!existsSync(logPath) && Date.now() < logDeadline) await Bun.sleep(100);
+                while (existsSync(logPath) && !readFileSync(logPath, "utf8").includes("storage-busy refusal stage=") && Date.now() < logDeadline) await Bun.sleep(100);
                 expect(readFileSync(logPath, "utf8")).toContain("storage-busy refusal stage=");
                 expect(readFileSync(logPath, "utf8")).toContain("database is locked");
                 expect(requests()).toHaveLength(0);
@@ -93,8 +99,10 @@ for (const seconds of [7, 60]) {
             }
             await locker.exited;
         } catch (error) {
-            console.error(`storage-busy fixture ${fixture.root}`, error, host.stderr());
-            console.error(readFileSync(logPath, "utf8"));
+            console.error(`storage-busy fixture ${fixture.root}; original error:`, error);
+            console.error(`storage-busy host stderr:\n${host.stderr()}`);
+            console.error(`storage-busy host stdout:\n${host.stdout()}`);
+            console.error(`storage-busy expected Magic Context log ${logPath}:\n${existsSync(logPath) ? readFileSync(logPath, "utf8") : "(missing)"}`);
             throw error;
         } finally {
             locker?.kill();
@@ -253,5 +261,10 @@ test("OpenCode 2 background contention releases the server after one busy timeou
         expect(recorded.elapsed).toBeGreaterThanOrEqual(4500);
         expect(recorded.elapsed).toBeLessThan(7500);
         console.info(`background elapsed_ms=${recorded.elapsed} second_session_response_ms=${latency}; lock still held`);
+    } catch (error) {
+        console.error(`background fixture ${fixture.root}; original error:`, error);
+        console.error(`background host stderr:\n${host.stderr()}`);
+        console.error(`background host stdout:\n${host.stdout()}`);
+        throw error;
     } finally { locker?.kill(); await host.stop(); }
 },120000);
