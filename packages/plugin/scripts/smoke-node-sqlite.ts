@@ -121,23 +121,45 @@ try {
 
     const writer = new Database(dbPath);
     writer.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=50");
-    for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
+    // A BEGIN inside a transform pass waits up to 250 ms for another writer
+    // (the async admission retries, not this synchronous attempt, cover longer
+    // holds). A 120 ms hold must be waited out; a 650 ms hold must surface as
+    // SqliteAcquisitionBusyError so the pass can replay or refuse.
+    const holdLock = (holdMs: number) => {
         const locker = spawn(process.execPath, ["--input-type=module", "-e", `
             import { DatabaseSync } from 'node:sqlite';
             const db = new DatabaseSync(${JSON.stringify(dbPath)});
             db.exec('BEGIN IMMEDIATE');
             console.log('LOCKED');
-            setTimeout(() => { db.exec('ROLLBACK'); db.close(); }, 650);
+            setTimeout(() => { db.exec('ROLLBACK'); db.close(); }, ${holdMs});
         `], { stdio: ["ignore", "pipe", "pipe"] });
         const exited = new Promise<void>((resolve, reject) => {
             locker.once("error", reject);
             locker.once("exit", code => code === 0 ? resolve() : reject(new Error(`locker exit ${code}`)));
         });
-        await new Promise<void>((resolve, reject) => {
+        const locked = new Promise<void>((resolve, reject) => {
             let output = "";
             locker.stdout.on("data", chunk => { output += String(chunk); if (output.includes("LOCKED")) resolve(); });
             locker.once("error", reject);
         });
+        return { exited, locked };
+    };
+    {
+        const { exited, locked } = holdLock(650);
+        await locked;
+        let threw = "";
+        try {
+            withSqliteTransformPass(() => {
+                writer.transaction(() => writer.prepare("INSERT INTO t(v,flag) VALUES(?,?)").run("long-hold", 1)).immediate();
+            });
+        } catch (error) {
+            threw = error instanceof Error ? error.name : String(error);
+        } finally { await exited; }
+        check("in-pass acquisition past its budget surfaces SqliteAcquisitionBusyError", threw === "SqliteAcquisitionBusyError");
+    }
+    for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
+        const { exited, locked } = holdLock(120);
+        await locked;
         let callbacks = 0;
         const callback = () => { callbacks++; writer.prepare("INSERT INTO t(v,flag) VALUES(?,?)").run(mode, 1); };
         try {
