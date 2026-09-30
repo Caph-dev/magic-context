@@ -322,6 +322,11 @@ async function verifyOneBatch(
     let agentSessionId: string | null = null;
     let promptSettled = false;
     const startedAt = Date.now();
+    let budgetFinalized = false;
+    const onBudgetUpdate: NonNullable<VerifyArgs["onBudgetUpdate"]> = (state) => {
+        budgetFinalized ||= state.finalizeFired;
+        args.onBudgetUpdate?.(state);
+    };
     try {
         const headAtPrompt = await readGitHead(args.sessionDirectory);
         const evidence =
@@ -339,7 +344,7 @@ async function verifyOneBatch(
                 prompt,
                 title: "magic-context-dream-verify",
                 callContext: "dreamer:verify",
-                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate },
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 language: args.language,
@@ -360,6 +365,7 @@ async function verifyOneBatch(
                 batch,
                 run.validated,
                 evidence?.head ?? headAtPrompt,
+                budgetFinalized,
             );
         }
         const client = args.client;
@@ -398,7 +404,7 @@ async function verifyOneBatch(
                 // slice below is the only timer (see prompt-async-transport.ts).
                 transport: shared.createPromptAsyncTransport(client, agentSessionId, {
                     tokenBudget: args.tokenBudget,
-                    onBudgetUpdate: args.onBudgetUpdate,
+                    onBudgetUpdate,
                 }),
                 timeoutMs: sliceMs,
                 signal,
@@ -439,6 +445,7 @@ async function verifyOneBatch(
             batch,
             run.validated,
             evidence?.head ?? headAtPrompt,
+            budgetFinalized,
         );
     } catch (error) {
         const desc = describeError(error);
@@ -537,6 +544,7 @@ async function applyParsedVerifyManifest(
     batch: VerifyPromptMemory[],
     parsed: ParsedVerifyManifest,
     headAtPrompt?: string | null,
+    budgetFinalized = false,
 ): Promise<VerifyVerdictCounts> {
     const batchIds = new Set(batch.map((m) => m.id));
     const batchById = new Map(batch.map((memory) => [memory.id, memory]));
@@ -562,12 +570,17 @@ async function applyParsedVerifyManifest(
     );
     assertNoDuplicateManifestIds(validIds, "verify");
 
-    // A closed root rules out truncation, but fewer than half of the requested ids
-    // is more likely a confused response to another request than an ordinary tail
-    // omission. Reject before any writes so an unrelated minority cannot be banked.
-    if (validIds.length * 2 < batch.length) {
+    // The token guard asks the child to stop investigating and return only ids it
+    // checked, so low coverage is expected then. Without that stop request, reject
+    // low coverage before writes: the child may have answered a different batch.
+    if (!budgetFinalized && validIds.length * 2 < batch.length) {
         throw new Error(
             `verify manifest covers ${validIds.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`,
+        );
+    }
+    if (budgetFinalized && validIds.length < batch.length) {
+        log(
+            `[dreamer] verify: accepted partial manifest after token budget: ${validIds.length}/${batch.length}`,
         );
     }
     if (validIds.length === 0) {
