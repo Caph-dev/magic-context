@@ -14,6 +14,9 @@ use mc_module::{manifest_with_route_targets, McHandler, DEFAULT_MODULE_ID};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Consume the inherited pipe before initialization can start any helper;
+    // the SDK's HELLO and historian route opens reuse this process-wide cache.
+    subc_os::launch_nonce()?;
     // Fleet convention: a side-effect-free single-line --version, evaluated before
     // any runtime argument so supervisors and test substrates can probe the binary
     // without a connection file.

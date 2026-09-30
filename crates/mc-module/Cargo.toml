@@ -29,6 +29,7 @@ subc-protocol = { workspace = true }
 subc-control = { workspace = true }
 subc-transport = { workspace = true }
 subc-client-rs = { workspace = true }
+subc-os = { path = "../../../subconscious/crates/subc-os" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Provider context-overflow error patterns (scheduler unit). Plain regex (no

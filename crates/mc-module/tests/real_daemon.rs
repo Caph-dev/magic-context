@@ -86,6 +86,7 @@ impl Drop for ModuleProcess {
 async fn cereb_full_sync_through_real_daemon() {
     std::env::remove_var(subc_protocol::SUBC_MODULE_ID_ENV);
     std::env::remove_var(subc_protocol::SUBC_LAUNCH_NONCE_ENV);
+    std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
     let fixture =
         fs::read(std::env::var("MC_SYNC_PROBE_FIXTURE").expect("fixture required")).unwrap();
     let workspace = workspace_root();
@@ -166,6 +167,7 @@ async fn mc_transform_spine_through_real_daemon() {
     // identity.
     std::env::remove_var(subc_protocol::SUBC_MODULE_ID_ENV);
     std::env::remove_var(subc_protocol::SUBC_LAUNCH_NONCE_ENV);
+    std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
 
     let workspace = workspace_root();
     let subconscious = subconscious_root(&workspace);
