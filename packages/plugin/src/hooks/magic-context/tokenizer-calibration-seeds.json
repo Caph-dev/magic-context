@@ -221,6 +221,20 @@
     "proseRatio": 1.000017
   },
   {
+    "prefix": "openai/gpt-6-sol",
+    "systemRatio": 1.000278,
+    "toolsRatio": 0.850953,
+    "proseRatio": 1.000017,
+    "provenance": "Mirrored from openai/gpt-6-astra; prose inherited-unmeasured. Reported OAuth system/tools counts match GPT-5.5; no independent API-key measurement."
+  },
+  {
+    "prefix": "openai/gpt-6.1-sol",
+    "systemRatio": 1.000278,
+    "toolsRatio": 0.850953,
+    "proseRatio": 1.000017,
+    "provenance": "Mirrored from openai/gpt-6-astra; prose inherited-unmeasured. Reported OAuth system/tools counts match GPT-5.5; no independent API-key measurement."
+  },
+  {
     "prefix": "openai/gpt-5",
     "systemRatio": 1,
     "toolsRatio": 0.84

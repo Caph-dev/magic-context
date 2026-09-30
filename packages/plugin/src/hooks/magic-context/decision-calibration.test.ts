@@ -1,7 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import resolverCases from "../../../../../tests/fixtures/calibration-resolver.json";
 import fixture from "../../../../../tests/fixtures/decision-calibration.json";
-import { localBudget, providerMass, resolveDecisionCalibration } from "./decision-calibration";
+import {
+    calibrationForModelKey,
+    localBudget,
+    providerMass,
+    resolveDecisionCalibration,
+} from "./decision-calibration";
 import seeds from "./tokenizer-calibration-seeds.json";
 
 describe("static decision calibration", () => {
@@ -16,6 +21,18 @@ describe("static decision calibration", () => {
             );
             expect(result.seeded).toBe(row !== undefined);
         }
+    });
+    it("seeds both Sol models and prices the reported prompt without unknown fit inflation", () => {
+        for (const key of ["openai/gpt-6-sol", "openai/gpt-6.1-sol"]) {
+            const seed = calibrationForModelKey(key);
+            expect(seed.seeded).toBe(true);
+            expect(seed.source).toBe("seed");
+            expect(seed.matchedPrefix).toBe(key);
+            expect(providerMass({ system: 8000, prose: 192000 }, seed, true)).toBe(200006);
+        }
+        const unknown = calibrationForModelKey("openai/gpt-6-madeup");
+        expect(unknown.seeded).toBe(false);
+        expect(providerMass({ system: 8000, prose: 192000 }, unknown, true)).toBe(400000);
     });
     it("calibrates the supplied Fable section fixture independently with one final ceil", () => {
         const seed = resolveDecisionCalibration("anthropic", "claude-fable-5-1");

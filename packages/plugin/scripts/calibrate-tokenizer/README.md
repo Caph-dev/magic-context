@@ -51,6 +51,12 @@ Reference: https://developers.openai.com/api/docs/guides/token-counting?lang=pyt
 
 Both accepted. Existing openai-codex/* result rows and OAuth routing remain separate and unchanged. The GPT-5 fallback test excludes 5.5 now because its more-specific measured entry deliberately supersedes the family default. No unmeasured provider aliases added.
 
+### Sol inherited seeds — 2026-09-30
+
+The `openai/gpt-6-sol` and `openai/gpt-6.1-sol` seeds mirror Astra, not independent measurements. Their seed `provenance` metadata marks prose as inherited-unmeasured. Reported ChatGPT OAuth fixture counts are 14,400 SYSTEM and 17,362 TOOLS for both Sol models, matching GPT-5.5; prose was not measured on that route.
+
+Attempted `bun run scripts/calibrate-tokenizer/index.ts --only gpt-6-sol,gpt-6.1-sol,gpt-6-astra` with an isolated HOME to avoid live credentials/stores. All three returned `SKIP: no API key for openai`; no OPENAI_API_KEY was available to the harness. The free Responses route includes the prose fixture, but could not measure any class without an API key. OAuth usage does not measure prose. No existing measured result rows were overwritten in the delivered changes. Retry the same command with an endpoint-authorized OPENAI_API_KEY to replace the inherited approximation.
+
 ## Kimi / Moonshot
 
 Reference: https://platform.kimi.ai/docs/api/estimate. Adapter sends SYSTEM as a system message, TOOLS as chat function schemas, and PROSE as a user message to `POST https://api.moonshot.ai/v1/tokenizers/estimate-token-count`; reads `data.total_tokens`, baseline-subtracted. Credentials: MOONSHOT_API_KEY or ~/.config/kimi.key. The docs list kimi-k2.6 but do not explicitly list a tools field in the estimate schema; the tools cross-check will stop the harness if a server silently ignores it.

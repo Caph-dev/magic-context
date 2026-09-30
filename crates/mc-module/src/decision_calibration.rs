@@ -3,7 +3,7 @@
 
 use mc_store::FrozenDecisionCalibration;
 
-pub const CALIBRATION_TABLE_REVISION: &str = "2026-09-23-model-id-generation-v2";
+pub const CALIBRATION_TABLE_REVISION: &str = "2026-09-30-sol-tokenizer-seeds-v3";
 
 /// Class ratios resolved for a model by the caller.
 #[derive(Debug, Clone, Copy)]
@@ -410,6 +410,40 @@ mod tests {
             assert_eq!(thawed.system_ratio, result.system_ratio, "{key}");
             assert_eq!(thawed.seeded, result.seeded, "{key}");
         }
+    }
+
+    #[test]
+    fn sol_seeds_price_reported_prompt_without_unknown_fit_inflation() {
+        for key in ["openai/gpt-6-sol", "openai/gpt-6.1-sol"] {
+            let seed = DecisionCalibration::for_model(Some(key));
+            assert!(seed.seeded, "{key}");
+            assert_eq!(seed_source(Some(key)), "seed", "{key}");
+            assert_eq!(
+                seed.provider_mass(
+                    LocalMass {
+                        system: 8000.0,
+                        tools: 0.0,
+                        prose: 192000.0
+                    },
+                    true
+                ),
+                200006.0,
+                "{key}"
+            );
+        }
+        let unknown = DecisionCalibration::for_model(Some("openai/gpt-6-madeup"));
+        assert!(!unknown.seeded);
+        assert_eq!(
+            unknown.provider_mass(
+                LocalMass {
+                    system: 8000.0,
+                    tools: 0.0,
+                    prose: 192000.0
+                },
+                true
+            ),
+            400000.0
+        );
     }
 
     #[test]
