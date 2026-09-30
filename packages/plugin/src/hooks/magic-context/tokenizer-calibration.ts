@@ -42,7 +42,7 @@ const CALIBRATION_TABLE: CalibrationEntry[] = calibrationSeeds;
 const NEUTRAL: ModelCalibration = { systemRatio: 1.0, toolsRatio: 1.0, proseRatio: 1.0 };
 
 /** Version of the static measurements and family-inheritance rules, independent of session usage samples. */
-export const CALIBRATION_TABLE_REVISION = "2026-09-23-model-id-generation-v2";
+export const CALIBRATION_TABLE_REVISION = "2026-09-30-sol-tokenizer-seeds-v3";
 
 export const UNKNOWN_FIT_RATIO = Math.max(
     2,

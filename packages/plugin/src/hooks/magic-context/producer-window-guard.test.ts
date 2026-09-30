@@ -116,3 +116,19 @@ test("inconsistent configured output cannot turn every producer prompt into a re
         }),
     ).toBeNull();
 });
+
+test("Sol producer prompts use seeded fit while an unmeasured variant stays fail closed", () => {
+    const prompt = {
+        sourceLocal: 192000,
+        systemLocal: 8000,
+        toolsLocal: 0,
+        contextLimitTokens: 400000,
+        inputLimitTokens: 272000,
+        maxOutputTokens: 128000,
+    };
+    for (const modelKey of ["openai/gpt-6-sol", "openai/gpt-6.1-sol", "openai/gpt-5.6-terra"])
+        expect(producerPromptFailureReason({ ...prompt, modelKey })).toBeNull();
+    expect(producerPromptFailureReason({ ...prompt, modelKey: "openai/gpt-6-madeup" })).toContain(
+        "producer_prompt_exceeds_window",
+    );
+});
