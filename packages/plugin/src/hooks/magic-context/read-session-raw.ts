@@ -197,8 +197,16 @@ export function readRawSessionMessagePageFromDb(
     afterOrdinal: number,
     limit: number,
     finalWatermark = Number.MAX_SAFE_INTEGER,
+    after?: RawMessageOrdinalAnchor,
 ): RawMessage[] {
-    const messageRows = readRawMessagePageRows(db, sessionId, afterOrdinal, limit, finalWatermark);
+    const messageRows = readRawMessagePageRows(
+        db,
+        sessionId,
+        afterOrdinal,
+        limit,
+        finalWatermark,
+        after,
+    );
     if (messageRows.length === 0) return [];
 
     const placeholders = messageRows.map(() => "?").join(", ");
@@ -221,17 +229,27 @@ function readRawMessagePageRows(
     afterOrdinal: number,
     limit: number,
     finalWatermark: number,
+    after?: RawMessageOrdinalAnchor,
 ): PagedRawMessageRow[] {
     const remaining = Math.max(0, Math.floor(finalWatermark) - Math.floor(afterOrdinal));
     const pageSize = Math.min(Math.max(1, Math.floor(limit)), remaining);
     if (pageSize === 0) return [];
 
+    // The ordinal seek is needed only for the first page of a range. Later
+    // pages resume after the last filtered row, including timestamp ties. The
+    // redundant lower bound lets SQLite seek the session/time index before
+    // evaluating the tie-break and JSON filter.
+    const parameters: Array<string | number> = [sessionId];
+    if (after) parameters.push(after.timeCreated, after.timeCreated, after.timeCreated, after.id);
+    parameters.push(pageSize);
+    if (!after) parameters.push(Math.max(0, Math.floor(afterOrdinal)));
     return db
         .prepare(
             `SELECT id, data, time_created, time_updated
              FROM message
              WHERE session_id = ?
-               AND NOT (
+                ${after ? "AND time_created >= ? AND (time_created > ? OR (time_created = ? AND id > ?))" : ""}
+                AND NOT (
                    CASE WHEN json_valid(data) = 1
                         THEN COALESCE(json_extract(data, '$.summary'), 0)
                         ELSE 0 END = 1
@@ -240,9 +258,9 @@ function readRawMessagePageRows(
                             ELSE '' END = 'stop'
                )
              ORDER BY time_created ASC, id ASC
-             LIMIT ? OFFSET ?`,
+             LIMIT ? ${after ? "" : "OFFSET ?"}`,
         )
-        .all(sessionId, pageSize, Math.max(0, Math.floor(afterOrdinal)))
+        .all(...parameters)
         .filter(isRawMessageRow)
         .map(
             (row, index): PagedRawMessageRow => ({
@@ -334,8 +352,16 @@ export function readRawSessionMessageSummaryPageFromDb(
     afterOrdinal: number,
     limit: number,
     finalWatermark = Number.MAX_SAFE_INTEGER,
+    after?: RawMessageOrdinalAnchor,
 ): RawMessage[] {
-    const messageRows = readRawMessagePageRows(db, sessionId, afterOrdinal, limit, finalWatermark);
+    const messageRows = readRawMessagePageRows(
+        db,
+        sessionId,
+        afterOrdinal,
+        limit,
+        finalWatermark,
+        after,
+    );
     if (messageRows.length === 0) return [];
 
     const placeholders = messageRows.map(() => "?").join(", ");

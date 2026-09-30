@@ -296,13 +296,13 @@ function attachPiPartVersion(
 	});
 }
 
-function convertEntriesToRawMessageRange(
+export function* iterateEntriesToRawMessageRange(
 	entries: Iterable<unknown>,
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
-): RawMessage[] {
-	const result: RawMessage[] = [];
+): Generator<RawMessage> {
+	let emitted = 0;
 	const normalizedAfter = Math.max(0, Math.floor(afterOrdinal));
 	const normalizedLimit = Math.max(1, Math.floor(limit));
 	const normalizedWatermark = Math.max(
@@ -316,27 +316,26 @@ function convertEntriesToRawMessageRange(
 	let pendingFirstRealVersion: string | number = "";
 	let pendingFirstCreatedAt: number | null = null;
 
-	const appendMessage = (
+	const appendMessage = function* (
 		id: string,
 		role: string,
 		version: string | number,
 		createdAt: number | null,
 		parts: () => unknown[],
-	): boolean => {
+	): Generator<RawMessage, boolean> {
 		const ordinal = nextOrdinal++;
 		if (ordinal > normalizedAfter && ordinal <= normalizedWatermark) {
-			result.push({
+			emitted++;
+			yield {
 				ordinal,
 				id,
 				role,
 				parts: parts(),
 				version,
 				...(createdAt === null ? {} : { createdAt }),
-			});
+			};
 		}
-		return (
-			result.length >= normalizedLimit || nextOrdinal > normalizedWatermark
-		);
+		return emitted >= normalizedLimit || nextOrdinal > normalizedWatermark;
 	};
 
 	for (const entry of entries) {
@@ -363,7 +362,7 @@ function convertEntriesToRawMessageRange(
 		if (role === "user") {
 			const version = rawEntryVersion(entry);
 			const bufferedToolParts = pendingToolParts;
-			const done = appendMessage(
+			const done = yield* appendMessage(
 				entry.id,
 				"user",
 				version,
@@ -387,7 +386,7 @@ function convertEntriesToRawMessageRange(
 				const bufferedToolParts = pendingToolParts;
 				const pendingId = pendingFirstRealId;
 				const pendingVersion = pendingFirstRealVersion;
-				const done = appendMessage(
+				const done = yield* appendMessage(
 					`${SYNTH_USER_ID_PREFIX}${pendingId}`,
 					"user",
 					pendingVersion,
@@ -404,7 +403,7 @@ function convertEntriesToRawMessageRange(
 
 			const version = rawEntryVersion(entry);
 			if (
-				appendMessage(
+				yield* appendMessage(
 					entry.id,
 					"assistant",
 					version,
@@ -421,7 +420,7 @@ function convertEntriesToRawMessageRange(
 		// shift. Their empty content projection keeps system prompts and tool
 		// declarations out of historian prose while chunk coverage absorbs the slot.
 		if (
-			appendMessage(
+			yield* appendMessage(
 				entry.id,
 				typeof role === "string" ? role : "unknown",
 				rawEntryVersion(entry),
@@ -435,10 +434,10 @@ function convertEntriesToRawMessageRange(
 
 	if (
 		hasPendingToolParts &&
-		result.length < normalizedLimit &&
+		emitted < normalizedLimit &&
 		nextOrdinal <= normalizedWatermark
 	) {
-		appendMessage(
+		yield* appendMessage(
 			`${SYNTH_USER_ID_PREFIX}${pendingFirstRealId}`,
 			"user",
 			pendingFirstRealVersion,
@@ -446,20 +445,20 @@ function convertEntriesToRawMessageRange(
 			() => pendingToolParts,
 		);
 	}
-
-	return result;
 }
 
 /** Pure full conversion exposed for callers that need an entire Pi branch. */
 export function convertEntriesToRawMessages(
 	entries: readonly unknown[],
 ): RawMessage[] {
-	return convertEntriesToRawMessageRange(
-		entries,
-		0,
-		Number.MAX_SAFE_INTEGER,
-		Number.MAX_SAFE_INTEGER,
-	);
+	return [
+		...iterateEntriesToRawMessageRange(
+			entries,
+			0,
+			Number.MAX_SAFE_INTEGER,
+			Number.MAX_SAFE_INTEGER,
+		),
+	];
 }
 
 /** Convert only one raw-message page without hydrating the rest of the Pi branch. */
@@ -469,12 +468,14 @@ export function convertEntriesToRawMessagePage(
 	limit: number,
 	finalWatermark: number,
 ): RawMessage[] {
-	return convertEntriesToRawMessageRange(
-		entries,
-		afterOrdinal,
-		limit,
-		finalWatermark,
-	);
+	return [
+		...iterateEntriesToRawMessageRange(
+			entries,
+			afterOrdinal,
+			limit,
+			finalWatermark,
+		),
+	];
 }
 
 export interface MessageEntry {

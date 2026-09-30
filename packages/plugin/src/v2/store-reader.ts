@@ -1,3 +1,4 @@
+import type { RawMessageOrdinalAnchor } from "../hooks/magic-context/read-session-raw";
 import {
     assertOpenCodeStoreGeneration,
     resolveOpenCodeDbPath,
@@ -345,6 +346,7 @@ export class V2StoreReader {
         afterOrdinal: number,
         limit: number,
         finalWatermark: number,
+        after?: RawMessageOrdinalAnchor,
     ): StoreRow[] {
         return trackDecodeOperation("messagePage", () => {
             if (!Number.isSafeInteger(afterOrdinal) || afterOrdinal < 0)
@@ -355,6 +357,22 @@ export class V2StoreReader {
                 throw new Error("Invalid raw-message watermark");
             const pageSize = Math.min(limit, finalWatermark - afterOrdinal);
             if (pageSize <= 0) return [];
+            // A carried row id maps to seq with a point lookup, not another
+            // ordinal OFFSET. The remaining ordinal count bounds the watermark.
+            if (after) {
+                const anchor = this.db
+                    .prepare("SELECT seq FROM session_message WHERE session_id = ? AND id = ?")
+                    .get(sessionID, after.id) as { seq: number } | undefined;
+                if (anchor) {
+                    return (
+                        this.db
+                            .prepare(`SELECT id, session_id, type, seq, time_created, data
+                        FROM session_message WHERE session_id = ? AND seq > ?
+                        AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS}) ORDER BY seq ASC LIMIT ?`)
+                            .all(sessionID, anchor.seq, ...RAW_MESSAGE_TYPES, pageSize) as RawRow[]
+                    ).map(decode);
+                }
+            }
             const maximumSeq = Number.MAX_SAFE_INTEGER;
             const rows = this.db
                 .prepare(V2_MESSAGE_PAGE_SQL)
