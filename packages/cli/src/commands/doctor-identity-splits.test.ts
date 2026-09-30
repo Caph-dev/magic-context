@@ -55,7 +55,7 @@ test("reports directory data after the first commit before a git session binding
     const db = new Database(":memory:");
     const host = new Database(":memory:");
     try {
-        execFileSync("git", ["init", "-q", directory]);
+        execFileSync("git", ["init", "-q", directory], { windowsHide: true });
         db.exec(
             "CREATE TABLE session_projects(session_id TEXT, harness TEXT, project_path TEXT); CREATE TABLE memories(project_path TEXT)",
         );
@@ -79,11 +79,12 @@ test("reports directory data after the first commit before a git session binding
                 "-qm",
                 "first",
             ],
-            { cwd: directory },
+            { cwd: directory, windowsHide: true },
         );
         const root = execFileSync("git", ["rev-parse", "HEAD"], {
             cwd: directory,
             encoding: "utf8",
+            windowsHide: true,
         }).trim();
         const splits = findIdentitySplits(db, host);
         expect(splits).toEqual([

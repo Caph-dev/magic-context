@@ -103,7 +103,7 @@ function makeGitFailure(fields: {
 describe("project identity", () => {
     it("unborn repo resolves to its existing dir identity and switches at the first commit", () => {
         const directory = makeTempDir("identity-unborn-");
-        execFileSync("git", ["init", "-q", directory]);
+        execFileSync("git", ["init", "-q", directory], { windowsHide: true });
         expect(
             expectProjectIdentityError(() => resolveProjectIdentityStrict(directory)).errorClass,
         ).toBe("no_commits");
@@ -123,18 +123,19 @@ describe("project identity", () => {
                 "-qm",
                 "first",
             ],
-            { cwd: directory },
+            { cwd: directory, windowsHide: true },
         );
         const root = execFileSync("git", ["rev-parse", "HEAD"], {
             cwd: directory,
             encoding: "utf8",
+            windowsHide: true,
         }).trim();
         expect(resolveProjectIdentityForSession(directory)).toBe(`git:${root}`);
     });
 
     it("transient failure with commits and no recorded identity still pauses", () => {
         const directory = makeTempDir("identity-committed-cold-");
-        execFileSync("git", ["init", "-q", directory]);
+        execFileSync("git", ["init", "-q", directory], { windowsHide: true });
         execFileSync(
             "git",
             [
@@ -147,7 +148,7 @@ describe("project identity", () => {
                 "-qm",
                 "first",
             ],
-            { cwd: directory },
+            { cwd: directory, windowsHide: true },
         );
         __setProjectIdentityTestHooks({
             execFileSync: (() => {

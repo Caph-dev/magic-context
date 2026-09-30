@@ -219,7 +219,7 @@ describe("sidebar snapshot RPC failures", () => {
         const directory = mkdtempSync(join(tmpdir(), "sidebar-unborn-"));
         const db = createTestDb();
         try {
-            execFileSync("git", ["init", "-q", directory]);
+            execFileSync("git", ["init", "-q", directory], { windowsHide: true });
             const identity = `dir:${createHash("md5").update(directory).digest("hex").slice(0, 12)}`;
             insertMemory(db, {
                 projectPath: identity,
@@ -237,7 +237,7 @@ describe("sidebar snapshot RPC failures", () => {
 
     test("paused sidebar logs once per directory and reason without stacks", () => {
         const directory = mkdtempSync(join(tmpdir(), "sidebar-paused-"));
-        execFileSync("git", ["init", "-q", directory]);
+        execFileSync("git", ["init", "-q", directory], { windowsHide: true });
         const db = createTestDb();
         const logged = spyOn(logger, "log").mockImplementation(() => {});
         try {
