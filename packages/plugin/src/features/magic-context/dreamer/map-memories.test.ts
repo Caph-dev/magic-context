@@ -1333,11 +1333,14 @@ test("a budget-finalized mapping manifest banks its closed subset", async () => 
             category: "ARCHITECTURE",
             content: "Budgeted mapping fact.",
         });
-        insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "ARCHITECTURE",
-            content: "Another mapping fact for the next run.",
-        });
+        const others = Array.from({ length: 51 }, (_, index) =>
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: `Another mapping fact ${index} for the next run.`,
+            }),
+        );
+        const covered = [memory, ...others.slice(0, 9)];
         const messages: unknown[] = [];
         let sends = 0;
         let aborted = false;
@@ -1380,7 +1383,7 @@ test("a budget-finalized mapping manifest banks its closed subset", async () => 
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<mappings><memory id="${memory.id}" independent="true"/></mappings>`,
+                                    text: `<mappings>${covered.map((item) => `<memory id="${item.id}" files="src/fact.ts"/>`).join("")}</mappings>`,
                                 },
                             ],
                         });
@@ -1399,9 +1402,53 @@ test("a budget-finalized mapping manifest banks its closed subset", async () => 
         } as never;
         const result = await mapMemories(args);
         expect(sends).toBe(2);
-        expect(result.independent).toBe(1);
-        expect(result.remaining).toBe(1);
+        expect(result.mapped).toBe(10);
+        expect(result.remaining).toBe(42);
         expect(result.complete).toBe(false);
+        expect(
+            selectMapMemoryInputs(db, projectIdentity, dir)
+                .map((item) => item.id)
+                .sort((a, b) => a - b),
+        ).toEqual(
+            others
+                .slice(9)
+                .map((item) => item.id)
+                .sort((a, b) => a - b),
+        );
+        for (const item of covered) {
+            expect(getMemoryVerifications(db, [item.id]).get(item.id)?.files).toEqual([
+                "src/fact.ts",
+            ]);
+        }
+    } finally {
+        closeQuietly(db);
+    }
+});
+
+test("non-budget mapping rejects a 10/52 manifest without writes", async () => {
+    const db = freshDb();
+    try {
+        const project = "git:non-budget-map";
+        const dir = tempProject();
+        const items = Array.from({ length: 52 }, (_, index) =>
+            insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `Fact ${index}.`,
+            }),
+        );
+        const args = mapArgs(db, dir, project);
+        await expect(
+            applyBatchMappings(
+                args,
+                selectMapMemoryInputs(db, project, dir),
+                `<mappings>${items
+                    .slice(0, 10)
+                    .map((item) => `<memory id="${item.id}" files="src/fact.ts"/>`)
+                    .join("")}</mappings>`,
+            ),
+        ).rejects.toThrow("rejecting mostly-wrong manifest");
+        expect(selectMapMemoryInputs(db, project, dir)).toHaveLength(52);
     } finally {
         closeQuietly(db);
     }

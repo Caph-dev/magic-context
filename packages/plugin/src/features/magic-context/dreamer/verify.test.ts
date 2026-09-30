@@ -1471,3 +1471,117 @@ describe("applyVerifyManifest", () => {
         }
     });
 });
+
+for (const budgeted of [true, false]) {
+    test(`${budgeted ? "budget-finalized verification banks" : "non-budget verification rejects"} a 10/52 manifest`, async () => {
+        const db = freshDb();
+        try {
+            const project = "git:budget-verify";
+            const dir = gitProject();
+            const items = Array.from({ length: 52 }, (_, index) =>
+                insertMemory(db, {
+                    projectPath: project,
+                    category: "ARCHITECTURE",
+                    content: `Verified fact ${index}.`,
+                }),
+            );
+            for (const item of items) recordMemoryVerifications(db, item.id, ["src/old.ts"], 1_000);
+            let coveredIds: number[] = [];
+            let manifest = "";
+            const args = verifyArgs(db, dir, project);
+            // Stop after the first batch so its omitted ids and the untouched tail
+            // can be observed before the next run.
+            args.onProgress = () => {
+                args.deadline = Date.now();
+            };
+            let sends = 0;
+            let aborted = false;
+            const messages: unknown[] = [];
+            args.tokenBudget = budgeted ? 100 : undefined;
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "verify-budget-child" } }),
+                    abort: async () => {
+                        aborted = true;
+                        return { data: true };
+                    },
+                    messages: async () => ({ data: [...messages] }),
+                    status: async () => {
+                        if (budgeted && sends === 1 && !aborted) {
+                            if (messages.length === 1)
+                                messages.push({
+                                    info: {
+                                        id: "step",
+                                        role: "assistant",
+                                        finish: "tool-calls",
+                                        tokens: { input: 81 },
+                                        time: { created: 1, completed: 2 },
+                                    },
+                                    parts: [{ type: "tool" }],
+                                });
+                            return { data: { "verify-budget-child": { type: "busy" } } };
+                        }
+                        if (messages.length === (budgeted ? 3 : 1))
+                            messages.push({
+                                info: {
+                                    id: "final",
+                                    role: "assistant",
+                                    finish: "stop",
+                                    tokens: { input: 1 },
+                                    time: { created: 3, completed: 4 },
+                                },
+                                parts: [{ type: "text", text: manifest }],
+                            });
+                        return { data: {} };
+                    },
+                    promptAsync: async (request: { body: { parts: Array<{ text: string }> } }) => {
+                        sends++;
+                        if (sends === 1) {
+                            coveredIds = [...request.body.parts[0].text.matchAll(/^\[(\d+)\]/gm)]
+                                .slice(0, 10)
+                                .map((match) => Number(match[1]));
+                            manifest = `<verify>${coveredIds.map((id) => `<verified id="${id}" files="src/old.ts"/>`).join("")}</verify>`;
+                        }
+                        messages.push({
+                            info: { id: `user-${sends}`, role: "user" },
+                            parts: request.body.parts,
+                        });
+                        return { data: undefined };
+                    },
+                    delete: async () => ({}),
+                },
+            } as never;
+            const result = await runVerify(args);
+            expect(sends).toBe(budgeted ? 2 : 1);
+            expect(result.verified).toBe(budgeted ? 10 : 0);
+            expect(result.remaining).toBe(budgeted ? 42 : 52);
+            const stored = getMemoryVerifications(
+                db,
+                items.map((item) => item.id),
+            );
+            expect(coveredIds).toHaveLength(10);
+            for (const item of items) {
+                if (budgeted && coveredIds.includes(item.id))
+                    expect(stored.get(item.id)?.verifiedAt).toBeGreaterThan(1_000);
+                else expect(stored.get(item.id)?.verifiedAt).toBe(1_000);
+            }
+            if (budgeted) {
+                const resumed = scriptedVerifyClient((_call, ids) => {
+                    expect([...ids].sort((a, b) => a - b)).toEqual(
+                        items
+                            .filter((item) => !coveredIds.includes(item.id))
+                            .map((item) => item.id)
+                            .sort((a, b) => a - b),
+                    );
+                    return { kind: "manifest" };
+                });
+                args.client = resumed.client as never;
+                args.tokenBudget = undefined;
+                args.deadline = Date.now() + VERIFY_BATCH_FLOOR_MS + 60_000;
+                expect((await runVerify(args)).verified).toBe(42);
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+}

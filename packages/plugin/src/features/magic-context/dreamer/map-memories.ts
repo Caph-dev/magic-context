@@ -320,10 +320,11 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
 }
 
 /**
- * Map ONE batch in its OWN child session. Per-batch try/finally retires a settled
- * child inline and leaves an unsettled child to the age-gated sweep. An unclosed
- * manifest records nothing, while a closed manifest can safely bank its valid
- * subset before a targeted retry handles any omissions.
+ * Map one batch in its own child session. Cleanup deletes a finished session;
+ * unfinished sessions are left for the stale-child cleanup job. A manifest missing
+ * its closing XML root writes nothing. Complete XML may commit a subset and retry
+ * only omitted ids once. If the token guard asked the child to stop investigating,
+ * omitted ids wait for the next run rather than spending another child budget.
  */
 async function mapOneBatch(
     args: MapMemoriesArgs,
@@ -334,6 +335,11 @@ async function mapOneBatch(
     let agentSessionId: string | null = null;
     let promptSettled = false;
     const startedAt = Date.now();
+    let budgetFinalized = false;
+    const onBudgetUpdate: NonNullable<MapMemoriesArgs["onBudgetUpdate"]> = (state) => {
+        budgetFinalized ||= state.finalizeFired;
+        args.onBudgetUpdate?.(state);
+    };
     try {
         const prompt = buildMapMemoriesPrompt(args.projectIdentity, batch);
         if (args.hiddenCompletionExecutor) {
@@ -346,7 +352,7 @@ async function mapOneBatch(
                 prompt,
                 title: "magic-context-dream-map-memories",
                 callContext: "dreamer:map-memories",
-                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate },
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 timeoutMs: sliceMs,
@@ -358,9 +364,19 @@ async function mapOneBatch(
                 status: "completed",
                 messages: run.completion.messages ?? [],
             });
-            const outcome = await applyParsedBatchMappings(args, batch, run.validated);
+            const outcome = await applyParsedBatchMappings(
+                args,
+                batch,
+                run.validated,
+                budgetFinalized,
+            );
             const returnedIds = new Set(run.validated.map((entry) => entry.id));
-            return { ...outcome, requeue: batch.filter((memory) => !returnedIds.has(memory.id)) };
+            return {
+                ...outcome,
+                requeue: budgetFinalized
+                    ? []
+                    : batch.filter((memory) => !returnedIds.has(memory.id)),
+            };
         }
         const client = args.client;
         if (!client)
@@ -399,7 +415,7 @@ async function mapOneBatch(
                 // slice below is the only timer (see prompt-async-transport.ts).
                 transport: shared.createPromptAsyncTransport(client, agentSessionId, {
                     tokenBudget: args.tokenBudget,
-                    onBudgetUpdate: args.onBudgetUpdate,
+                    onBudgetUpdate,
                 }),
                 timeoutMs: sliceMs,
                 signal,
@@ -430,7 +446,7 @@ async function mapOneBatch(
         promptSettled = true;
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
-        const outcome = await applyParsedBatchMappings(args, batch, run.validated);
+        const outcome = await applyParsedBatchMappings(args, batch, run.validated, budgetFinalized);
         const returnedIds = new Set(
             run.validated
                 .filter((entry) => batch.some((memory) => memory.id === entry.id))
@@ -438,7 +454,7 @@ async function mapOneBatch(
         );
         return {
             ...outcome,
-            requeue: batch.filter((memory) => !returnedIds.has(memory.id)),
+            requeue: budgetFinalized ? [] : batch.filter((memory) => !returnedIds.has(memory.id)),
         };
     } catch (error) {
         const desc = describeError(error);
@@ -497,6 +513,7 @@ async function applyParsedBatchMappings(
     args: MapMemoriesArgs,
     batch: MapMemoryInput[],
     parsed: ParsedMemoryMapping[],
+    budgetFinalized = false,
 ): Promise<{ mapped: number; independent: number }> {
     const batchIds = new Set(batch.map((memory) => memory.id));
     const valid = parsed.filter((entry) => batchIds.has(entry.id));
@@ -511,12 +528,17 @@ async function applyParsedBatchMappings(
         "mappings",
     );
 
-    // A closed root rules out truncation, but fewer than half of the requested ids
-    // is more likely a confused response to another request than an ordinary tail
-    // omission. Reject before any writes so an unrelated minority cannot be banked.
-    if (valid.length * 2 < batch.length) {
+    // The token guard asks the child to stop investigating and return only ids it
+    // checked, so low coverage is expected then. Without that stop request, reject
+    // low coverage before writes: the child may have answered a different batch.
+    if (!budgetFinalized && valid.length * 2 < batch.length) {
         throw new Error(
             `mappings manifest covers ${valid.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`,
+        );
+    }
+    if (budgetFinalized && valid.length < batch.length) {
+        log(
+            `[dreamer] map-memories: accepted partial manifest after token budget: ${valid.length}/${batch.length}`,
         );
     }
     if (valid.length === 0) return { mapped: 0, independent: 0 };
