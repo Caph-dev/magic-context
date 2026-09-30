@@ -126,7 +126,14 @@ let activeAbsoluteCountCache: Map<string, number> | null = null;
  */
 export interface RawMessageProvider {
     readMessages(): RawMessage[];
-    readMessagePage?: (afterOrdinal: number, limit: number, finalWatermark: number) => RawMessage[];
+    readMessagePage?: (
+        afterOrdinal: number,
+        limit: number,
+        finalWatermark: number,
+        after?: RawMessageOrdinalAnchor,
+    ) => RawMessage[];
+    /** A single source traversal; iterator cleanup must release resources on early exit. */
+    iterateMessageRange?: (fromOrdinal: number, toOrdinal: number) => Iterable<RawMessage>;
     readMessageById?: (messageId: string) => RawMessage | null;
     readMessagePartsById?: (messageId: string) => RawMessageParts | null;
     hasMessageById?: (messageId: string) => boolean;
@@ -154,7 +161,12 @@ export interface RawMessageProvider {
  * the all-history conversion read is intentionally absent from this interface.
  */
 export interface BoundedRawMessageProvider {
-    readMessagePage(afterOrdinal: number, limit: number, finalWatermark: number): RawMessage[];
+    readMessagePage(
+        afterOrdinal: number,
+        limit: number,
+        finalWatermark: number,
+        after?: RawMessageOrdinalAnchor,
+    ): RawMessage[];
     readMessageById(messageId: string): RawMessage | null;
     readMessagePartsById(messageId: string): RawMessageParts | null;
     hasMessageById(messageId: string): boolean;
@@ -374,6 +386,8 @@ function readRawSessionMessageRangeFromSource(
     toOrdinal: number,
 ): RawMessage[] {
     const provider = sessionProviders.get(sessionId);
+    if (provider?.iterateMessageRange)
+        return [...provider.iterateMessageRange(fromOrdinal, toOrdinal)];
     if (provider && !provider.readMessagePage) {
         return provider
             .readMessages()
@@ -383,12 +397,20 @@ function readRawSessionMessageRangeFromSource(
 
     const messages: RawMessage[] = [];
     let afterOrdinal = fromOrdinal - 1;
+    let after: RawMessageOrdinalAnchor | undefined;
     while (afterOrdinal < toOrdinal) {
         const limit = Math.min(RAW_MESSAGE_RANGE_PAGE_SIZE, toOrdinal - afterOrdinal);
         const page = provider?.readMessagePage
-            ? provider.readMessagePage(afterOrdinal, limit, toOrdinal)
+            ? provider.readMessagePage(afterOrdinal, limit, toOrdinal, after)
             : withReadOnlySessionDb((db) =>
-                  readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, toOrdinal),
+                  readRawSessionMessagePageFromDb(
+                      db,
+                      sessionId,
+                      afterOrdinal,
+                      limit,
+                      toOrdinal,
+                      after,
+                  ),
               );
         if (page.length === 0) break;
         let nextOrdinal = afterOrdinal;
@@ -399,6 +421,8 @@ function readRawSessionMessageRangeFromSource(
         }
         if (nextOrdinal <= afterOrdinal) break;
         afterOrdinal = nextOrdinal;
+        const last = page.at(-1);
+        after = last ? { timeCreated: last.createdAt ?? 0, id: last.id } : undefined;
     }
     return messages;
 }
@@ -427,6 +451,12 @@ export function visitRawSessionMessages(
     const to = Math.floor(toOrdinal);
     if (to < from) return;
     const provider = sessionProviders.get(sessionId);
+    if (provider?.iterateMessageRange) {
+        for (const message of provider.iterateMessageRange(from, to)) {
+            if (!visit(message)) return;
+        }
+        return;
+    }
     if (provider && !provider.readMessagePage) {
         for (const message of provider.readMessages()) {
             if (message.ordinal < from || message.ordinal > to) continue;
@@ -438,15 +468,23 @@ export function visitRawSessionMessages(
 
     const pageSize = Math.max(1, Math.floor(options.pageSize ?? RAW_MESSAGE_VISIT_PAGE_SIZE));
     let afterOrdinal = from - 1;
+    let after: RawMessageOrdinalAnchor | undefined;
     while (afterOrdinal < to) {
         const limit = Math.min(pageSize, to - afterOrdinal);
         const cursor = afterOrdinal;
         const page = provider?.readMessagePage
-            ? provider.readMessagePage(cursor, limit, to)
+            ? provider.readMessagePage(cursor, limit, to, after)
             : withReadOnlySessionDb((db) =>
                   options.summary
-                      ? readRawSessionMessageSummaryPageFromDb(db, sessionId, cursor, limit, to)
-                      : readRawSessionMessagePageFromDb(db, sessionId, cursor, limit, to),
+                      ? readRawSessionMessageSummaryPageFromDb(
+                            db,
+                            sessionId,
+                            cursor,
+                            limit,
+                            to,
+                            after,
+                        )
+                      : readRawSessionMessagePageFromDb(db, sessionId, cursor, limit, to, after),
               );
         if (page.length === 0) return;
         let nextOrdinal = afterOrdinal;
@@ -457,6 +495,8 @@ export function visitRawSessionMessages(
         }
         if (nextOrdinal <= afterOrdinal) return;
         afterOrdinal = nextOrdinal;
+        const last = page.at(-1);
+        after = last ? { timeCreated: last.createdAt ?? 0, id: last.id } : undefined;
     }
 }
 

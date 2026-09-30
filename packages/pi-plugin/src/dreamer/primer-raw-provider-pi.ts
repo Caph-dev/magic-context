@@ -3,7 +3,10 @@ import { PRIMER_SEED_CAP_TOKENS } from "@magic-context/core/features/magic-conte
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { RAW_SUMMARY_TEXT_MAX_CHARS } from "@magic-context/core/hooks/magic-context/read-session-raw";
-import { convertEntriesToRawMessagePage } from "../read-session-pi";
+import {
+	convertEntriesToRawMessagePage,
+	iterateEntriesToRawMessageRange,
+} from "../read-session-pi";
 import { findSession, lines } from "./bounded-session-reader";
 import { resolvePiCodingAgentModule } from "./pi-session-api";
 
@@ -125,6 +128,16 @@ export function createPiPrimerRawProviderFactory(
 			return {
 				readMessages() {
 					throw new Error("Pi primer history requires bounded pages");
+				},
+				iterateMessageRange(from, to) {
+					// One iterator owns the JSONL traversal. Closing it after an early
+					// visitor exit also closes the bounded line reader's descriptor.
+					return iterateEntriesToRawMessageRange(
+						summaryEntries(path),
+						from - 1,
+						Number.MAX_SAFE_INTEGER,
+						to,
+					);
 				},
 				readMessagePage(after, limit, watermark) {
 					// Re-open per page: no file descriptor survives early visitor

@@ -101,6 +101,7 @@ export interface V2RawMessageReader {
         afterOrdinal: number,
         limit: number,
         finalWatermark: number,
+        after?: RawMessageOrdinalAnchor,
     ): RawMessage[];
     findById(sessionID: string, messageID: string): RawMessage | null;
     findPartsById(sessionID: string, messageID: string): RawMessageParts | null;
@@ -228,11 +229,12 @@ export function createV2RawMessageReader(openReader: () => V2StoreReader): V2Raw
             afterOrdinal: number,
             limit: number,
             finalWatermark: number,
+            after?: RawMessageOrdinalAnchor,
         ) => {
             const reader = openReader();
             try {
                 return rawMessagePage(
-                    reader.messagePage(sessionID, afterOrdinal, limit, finalWatermark),
+                    reader.messagePage(sessionID, afterOrdinal, limit, finalWatermark, after),
                     afterOrdinal,
                 );
             } finally {
@@ -335,8 +337,8 @@ export function createV2RawMessageProvider(
     sessionID: string,
 ): BoundedRawMessageProvider {
     return {
-        readMessagePage: (afterOrdinal, limit, finalWatermark) =>
-            reader.readPage(sessionID, afterOrdinal, limit, finalWatermark),
+        readMessagePage: (afterOrdinal, limit, finalWatermark, after) =>
+            reader.readPage(sessionID, afterOrdinal, limit, finalWatermark, after),
         readMessageById: (messageID) => reader.findById(sessionID, messageID),
         readMessagePartsById: (messageID) => reader.findPartsById(sessionID, messageID),
         hasMessageById: (messageID) => reader.hasById(sessionID, messageID),

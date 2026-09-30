@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildPrimerSeed } from "@magic-context/core/features/magic-context/dreamer/primer-seed";
@@ -24,7 +24,9 @@ afterEach(() => {
 		rmSync(dir, { recursive: true, force: true });
 });
 function store(entries: unknown[]) {
-	const dir = mkdtempSync(join(tmpdir(), "mc-primer-pi-pages-"));
+	const root = join(tmpdir(), "magic-context", "issue-576");
+	mkdirSync(root, { recursive: true });
+	const dir = mkdtempSync(join(root, "mc-primer-pi-pages-"));
 	dirs.push(dir);
 	writeFileSync(
 		join(dir, "session.jsonl"),
@@ -215,4 +217,66 @@ test("Pi primer default discovery uses the host agent directory and project subd
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
 	}
+});
+
+test("Pi streaming ranges equal paged rows through folded tool results and close on early exit", async () => {
+	const entries: unknown[] = [];
+	for (let i = 0; i < 100; i++) {
+		entries.push(entry(`u${i}`, { role: "user", content: `question ${i}` }));
+		entries.push(
+			entry(`a${i}`, {
+				role: "assistant",
+				content: [{ type: "text", text: `answer ${i}` }],
+			}),
+		);
+		entries.push(
+			entry(`t${i}`, {
+				role: "toolResult",
+				toolCallId: `c${i}`,
+				toolName: "read",
+				content: [{ type: "text", text: "output" }],
+			}),
+		);
+		entries.push(
+			entry(`b${i}`, {
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+			}),
+		);
+	}
+	const dir = store(entries);
+	const provider = await createPiPrimerRawProviderFactory({ sessionDir: dir })(
+		"origin",
+	);
+	if (!provider?.iterateMessageRange || !provider.readMessagePage)
+		throw new Error("Missing streaming provider");
+	for (const [from, to] of [
+		[1, 400],
+		[297, 400],
+		[49, 261],
+	]) {
+		const expected = [];
+		for (let after = from - 1; after < to; ) {
+			const page = provider.readMessagePage(after, 7, to);
+			expected.push(...page);
+			after = page[page.length - 1].ordinal;
+		}
+		expect([...provider.iterateMessageRange(from, to)]).toEqual(expected);
+	}
+	const iterate = provider.iterateMessageRange;
+	let closed = false;
+	const source = {
+		...provider,
+		*iterateMessageRange(from: number, to: number) {
+			try {
+				yield* iterate(from, to);
+			} finally {
+				closed = true;
+			}
+		},
+	};
+	withRawMessageProvider("origin", source, () =>
+		visitRawSessionMessages("origin", 1, 400, () => false),
+	);
+	expect(closed).toBe(true);
 });
