@@ -16,8 +16,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_protocol::{
-    BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority,
-    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
@@ -1017,7 +1016,7 @@ impl HistorianProducer {
                 self.config.harness.clone(),
                 session,
             ),
-            consumer_identity: consumer_identity_from_env(),
+            consumer_identity: consumer_identity_from_launch(),
             consumer_capabilities: None,
             admission_facts: None,
         };
@@ -1487,9 +1486,10 @@ fn unit_error_info(unit: &Value) -> UnitErrorInfo {
     }
 }
 
-fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
+fn consumer_identity_from_launch() -> Option<ConsumerIdentity> {
     let module_id = std::env::var(SUBC_MODULE_ID_ENV).ok()?;
-    let launch_nonce = std::env::var(SUBC_LAUNCH_NONCE_ENV).ok()?;
+    // Share the SDK's cached HELLO read: the first read consumes and closes the pipe.
+    let launch_nonce = subc_client_rs::launch_nonce().ok()??.value().to_owned();
     (!module_id.is_empty() && !launch_nonce.is_empty()).then_some(ConsumerIdentity {
         module_id,
         launch_nonce,
@@ -1627,6 +1627,51 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::{net::TcpListener, sync::Mutex};
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_only_launch_identity_reuses_sdk_nonce() {
+        const CHILD: &str = "MC_TEST_PIPE_IDENTITY_CHILD";
+        const NONCE: &str = "pipe-only-mc-launch-nonce";
+        const TEST: &str = "historian_producer::tests::pipe_only_launch_identity_reuses_sdk_nonce";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os(subc_protocol::SUBC_LAUNCH_NONCE_ENV).is_none());
+            // HELLO uses this same accessor before the historian opens a route.
+            let hello_nonce = subc_client_rs::launch_nonce().unwrap().unwrap();
+            assert_eq!(hello_nonce.value(), NONCE);
+            assert_eq!(hello_nonce.source().as_str(), "fd");
+            let provenance = crate::manifest("magic-context").provenance.unwrap();
+            assert_eq!(
+                serde_json::to_value(provenance).unwrap()["launch_nonce_source"],
+                "fd"
+            );
+            for _ in 0..2 {
+                let identity = consumer_identity_from_launch().expect("pipe-only route identity");
+                assert_eq!(identity.module_id, "magic-context");
+                assert_eq!(identity.launch_nonce, NONCE);
+            }
+            return;
+        }
+
+        // A fresh process isolates the process-wide nonce cache from other tests.
+        let handoff = subc_os::LaunchNonceHandoff::new(NONCE).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(SUBC_MODULE_ID_ENV, "magic-context")
+            .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+            .env(subc_os::LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
+        handoff.install_last(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "pipe-only child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
 
     #[test]
     fn producer_token_log_distinguishes_missing_usage_from_zero_and_reports_cap() {

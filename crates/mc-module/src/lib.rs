@@ -19678,7 +19678,7 @@ pub fn manifest_with_route_targets(
     // the marker and fails loudly on absence, which is the correct failure
     // surface for a malformed stamp.
     .provenance(match build_provenance(option_env!("MC_BUILD_SHA"), None, None) {
-        Ok(provenance) => Some(provenance),
+        Ok(provenance) => Some(provenance.with_launch_nonce_source(subc_client_rs::launch_nonce_source())),
         Err(err) => {
             tracing::warn!("mc-module: MC_BUILD_SHA rejected by provenance form check, omitting deploy marker: {err}");
             None

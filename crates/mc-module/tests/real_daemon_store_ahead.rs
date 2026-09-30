@@ -88,7 +88,8 @@ impl Isolation {
                 "MAGIC_CONTEXT_STORAGE_DIR",
                 self.data_home.join("cortexkit").join("magic-context"),
             )
-            .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV);
+            .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+            .env_remove(subc_os::LAUNCH_NONCE_FD_ENV);
     }
 
     fn connection_file(&self) -> PathBuf {
@@ -118,6 +119,7 @@ impl Drop for Process {
 async fn a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform() {
     std::env::remove_var(subc_protocol::SUBC_MODULE_ID_ENV);
     std::env::remove_var(subc_protocol::SUBC_LAUNCH_NONCE_ENV);
+    std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
 
     let workspace = workspace_root();
     let subconscious = workspace.parent().unwrap().join("subconscious");
