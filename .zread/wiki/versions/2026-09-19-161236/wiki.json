@@ -1,0 +1,241 @@
+{
+  "id": "2026-09-19-161236",
+  "generated_at": "2026-09-19T08:12:36.779694Z",
+  "language": "zh",
+  "pages": [
+    {
+      "slug": "1-xiang-mu-gai-lan-wei-bian-ma-dai-li-da-zao-de-zi-wo-guan-li-shang-xia-wen-yu-chang-qi-ji-yi",
+      "title": "项目概览：为编码代理打造的自我管理上下文与长期记忆",
+      "file": "1-xiang-mu-gai-lan-wei-bian-ma-dai-li-da-zao-de-zi-wo-guan-li-shang-xia-wen-yu-chang-qi-ji-yi.md",
+      "section": "快速上手",
+      "level": "Beginner"
+    },
+    {
+      "slug": "2-kuai-su-kai-shi-an-zhuang-xiang-dao-shou-ci-hui-hua-yu-zui-xiao-ke-yong-pei-zhi",
+      "title": "快速开始：安装向导、首次会话与最小可用配置",
+      "file": "2-kuai-su-kai-shi-an-zhuang-xiang-dao-shou-ci-hui-hua-yu-zui-xiao-ke-yong-pei-zhi.md",
+      "section": "快速上手",
+      "level": "Beginner"
+    },
+    {
+      "slug": "3-pei-zhi-ti-xi-yu-yin-cang-dai-li-mo-xing-xuan-ze",
+      "title": "配置体系与隐藏代理模型选择",
+      "file": "3-pei-zhi-ti-xi-yu-yin-cang-dai-li-mo-xing-xuan-ze.md",
+      "section": "快速上手",
+      "level": "Beginner"
+    },
+    {
+      "slug": "4-duo-su-zhu-tong-zhi-chi-opencode-pi-omp",
+      "title": "多宿主统一支持：OpenCode · Pi · OMP",
+      "file": "4-duo-su-zhu-tong-zhi-chi-opencode-pi-omp.md",
+      "section": "快速上手",
+      "level": "Beginner"
+    },
+    {
+      "slug": "5-ming-ling-xiang-dao-setup-doctor-migrate-gong-zuo-liu",
+      "title": "命令向导：setup / doctor / migrate 工作流",
+      "file": "5-ming-ling-xiang-dao-setup-doctor-migrate-gong-zuo-liu.md",
+      "section": "快速上手",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "6-jian-rong-xing-chong-tu-jian-ce-yu-gu-zhang-pai-cha",
+      "title": "兼容性冲突检测与故障排查",
+      "file": "6-jian-rong-xing-chong-tu-jian-ce-yu-gu-zhang-pai-cha.md",
+      "section": "快速上手",
+      "level": "Beginner"
+    },
+    {
+      "slug": "7-dan-cang-duo-bao-jia-gou-yu-yun-xing-shi-fen-ceng",
+      "title": "单仓多包架构与运行时分层",
+      "file": "7-dan-cang-duo-bao-jia-gou-yu-yun-xing-shi-fen-ceng.md",
+      "section": "深入探索",
+      "group": "架构与设计哲学",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "8-huan-cun-wen-ding-xing-de-he-xin-she-ji-zhe-xue",
+      "title": "缓存稳定性的核心设计哲学",
+      "file": "8-huan-cun-wen-ding-xing-de-he-xin-she-ji-zhe-xue.md",
+      "section": "深入探索",
+      "group": "架构与设计哲学",
+      "level": "Advanced"
+    },
+    {
+      "slug": "9-zhuan-huan-tong-dao-sheng-ming-zhou-qi-yu-jie-duan-hua-fen",
+      "title": "转换通道生命周期与阶段划分",
+      "file": "9-zhuan-huan-tong-dao-sheng-ming-zhou-qi-yu-jie-duan-hua-fen.md",
+      "section": "深入探索",
+      "group": "上下文转换引擎",
+      "level": "Advanced"
+    },
+    {
+      "slug": "10-m-0-m-1-huan-cun-bu-ju-yu-wu-hua-hong-fa-tiao-jian",
+      "title": "m[0]/m[1] 缓存布局与物化触发条件",
+      "file": "10-m-0-m-1-huan-cun-bu-ju-yu-wu-hua-hong-fa-tiao-jian.md",
+      "section": "深入探索",
+      "group": "上下文转换引擎",
+      "level": "Advanced"
+    },
+    {
+      "slug": "11-bian-geng-men-kong-yu-yan-chi-gong-zuo-bu-bian-liang",
+      "title": "变更门控与延迟工作不变量",
+      "file": "11-bian-geng-men-kong-yu-yan-chi-gong-zuo-bu-bian-liang.md",
+      "section": "深入探索",
+      "group": "上下文转换引擎",
+      "level": "Advanced"
+    },
+    {
+      "slug": "12-nei-rong-bo-chi-shao-bing-yu-que-ding-xing-zhong-fang",
+      "title": "内容剥离、哨兵与确定性重放",
+      "file": "12-nei-rong-bo-chi-shao-bing-yu-que-ding-xing-zhong-fang.md",
+      "section": "深入探索",
+      "group": "上下文转换引擎",
+      "level": "Advanced"
+    },
+    {
+      "slug": "13-historian-fen-qu-liu-cheng-chan-zhi-xiao-yan-fa-bu",
+      "title": "Historian 分区流程：产制·校验·发布",
+      "file": "13-historian-fen-qu-liu-cheng-chan-zhi-xiao-yan-fa-bu.md",
+      "section": "深入探索",
+      "group": "历史压缩",
+      "level": "Advanced"
+    },
+    {
+      "slug": "14-fen-qu-shuai-jian-xuan-ran-yu-zhong-yao-xing-fen-ji",
+      "title": "分区衰减渲染与重要性分级",
+      "file": "14-fen-qu-shuai-jian-xuan-ran-yu-zhong-yao-xing-fen-ji.md",
+      "section": "深入探索",
+      "group": "历史压缩",
+      "level": "Advanced"
+    },
+    {
+      "slug": "15-shou-bao-hu-wei-bu-bian-jie-yu-shang-xia-wen-chuang-kou-ji-he",
+      "title": "受保护尾部边界与上下文窗口几何",
+      "file": "15-shou-bao-hu-wei-bu-bian-jie-yu-shang-xia-wen-chuang-kou-ji-he.md",
+      "section": "深入探索",
+      "group": "历史压缩",
+      "level": "Advanced"
+    },
+    {
+      "slug": "16-xiang-mu-ji-yi-ti-xi-yu-wu-lei-zhi-shi-fen-lei-fa",
+      "title": "项目记忆体系与五类知识分类法",
+      "file": "16-xiang-mu-ji-yi-ti-xi-yu-wu-lei-zhi-shi-fen-lei-fa.md",
+      "section": "深入探索",
+      "group": "记忆与召回",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "17-tong-sou-suo-yu-qian-ru-guan-xian",
+      "title": "统一搜索与嵌入管线",
+      "file": "17-tong-sou-suo-yu-qian-ru-guan-xian.md",
+      "section": "深入探索",
+      "group": "记忆与召回",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "18-gong-zuo-qu-yu-kua-su-zhu-ji-yi-gong-xiang",
+      "title": "工作区与跨宿主记忆共享",
+      "file": "18-gong-zuo-qu-yu-kua-su-zhu-ji-yi-gong-xiang.md",
+      "section": "深入探索",
+      "group": "记忆与召回",
+      "level": "Advanced"
+    },
+    {
+      "slug": "19-dreamer-ren-wu-diao-du-yu-zhi-xing-mo-xing",
+      "title": "Dreamer 任务调度与执行模型",
+      "file": "19-dreamer-ren-wu-diao-du-yu-zhi-xing-mo-xing.md",
+      "section": "深入探索",
+      "group": "后台维护",
+      "level": "Advanced"
+    },
+    {
+      "slug": "20-zhi-neng-bi-ji-yu-yong-hu-hua-xiang-guan-xian",
+      "title": "智能笔记与用户画像管线",
+      "file": "20-zhi-neng-bi-ji-yu-yong-hu-hua-xiang-guan-xian.md",
+      "section": "深入探索",
+      "group": "后台维护",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "21-sqlite-cun-chu-mo-shi-qian-yi-yu-shi-jian-chuo-yue-ding",
+      "title": "SQLite 存储模式、迁移与时间戳约定",
+      "file": "21-sqlite-cun-chu-mo-shi-qian-yi-yu-shi-jian-chuo-yue-ding.md",
+      "section": "深入探索",
+      "group": "持久化",
+      "level": "Advanced"
+    },
+    {
+      "slug": "22-xiao-xi-li-shi-yu-git-ti-jiao-suo-yin",
+      "title": "消息历史与 Git 提交索引",
+      "file": "22-xiao-xi-li-shi-yu-git-ti-jiao-suo-yin.md",
+      "section": "深入探索",
+      "group": "持久化",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "23-opencode-1-yu-opencode-2-gua-pei-ceng",
+      "title": "OpenCode 1 与 OpenCode 2 适配层",
+      "file": "23-opencode-1-yu-opencode-2-gua-pei-ceng.md",
+      "section": "深入探索",
+      "group": "宿主适配与多运行时",
+      "level": "Advanced"
+    },
+    {
+      "slug": "24-pi-omp-cha-jian-yu-kua-su-zhu-dui-deng-shi-xian",
+      "title": "Pi / OMP 插件与跨宿主对等实现",
+      "file": "24-pi-omp-cha-jian-yu-kua-su-zhu-dui-deng-shi-xian.md",
+      "section": "深入探索",
+      "group": "宿主适配与多运行时",
+      "level": "Advanced"
+    },
+    {
+      "slug": "25-rust-yun-xing-shi-mo-shi-yu-subc-mo-kuai-ji-cheng",
+      "title": "Rust 运行时模式与 subc 模块集成",
+      "file": "25-rust-yun-xing-shi-mo-shi-yu-subc-mo-kuai-ji-cheng.md",
+      "section": "深入探索",
+      "group": "宿主适配与多运行时",
+      "level": "Advanced"
+    },
+    {
+      "slug": "26-ctx_-dai-li-gong-ju-ji",
+      "title": "ctx_* 代理工具集",
+      "file": "26-ctx_-dai-li-gong-ju-ji.md",
+      "section": "深入探索",
+      "group": "交互界面",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "27-ming-ling-xi-tong-yu-tui-ce-bian-lan",
+      "title": "命令系统与 TUI 侧边栏",
+      "file": "27-ming-ling-xi-tong-yu-tui-ce-bian-lan.md",
+      "section": "深入探索",
+      "group": "交互界面",
+      "level": "Beginner"
+    },
+    {
+      "slug": "28-zhuo-mian-yi-biao-pan",
+      "title": "桌面仪表盘",
+      "file": "28-zhuo-mian-yi-biao-pan.md",
+      "section": "深入探索",
+      "group": "交互界面",
+      "level": "Beginner"
+    },
+    {
+      "slug": "29-rust-he-xin-fen-lei-qi-cun-chu-fen-ci-qi",
+      "title": "Rust 核心：分类器·存储·分词器",
+      "file": "29-rust-he-xin-fen-lei-qi-cun-chu-fen-ci-qi.md",
+      "section": "深入探索",
+      "group": "质量保障",
+      "level": "Advanced"
+    },
+    {
+      "slug": "30-duan-dao-duan-ce-shi-yu-su-zhu-ce-shi-ju-zhen",
+      "title": "端到端测试与宿主测试矩阵",
+      "file": "30-duan-dao-duan-ce-shi-yu-su-zhu-ce-shi-ju-zhen.md",
+      "section": "深入探索",
+      "group": "质量保障",
+      "level": "Advanced"
+    }
+  ]
+}
