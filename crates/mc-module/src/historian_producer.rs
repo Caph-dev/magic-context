@@ -1019,6 +1019,8 @@ impl HistorianProducer {
             consumer_identity: consumer_identity_from_launch(),
             consumer_capabilities: None,
             admission_facts: None,
+            // Historian routes carry no session scope; they run under the module's own identity.
+            scope: None,
         };
         let corr = self.next_corr();
         let body = serde_json::to_vec(&request)?;
